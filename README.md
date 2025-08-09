@@ -7,6 +7,7 @@
 - [Installation](#installation)
 - [Usage](#usage)
 - [Examples](#examples)
+- [Going Forward](#goingforward)
 - [License](#license)
 - [Contributing](#contributing)
 - [Author](#author)
@@ -61,6 +62,18 @@ muxm input.mkv output.mp4
 # Dry run for testing
 muxm --dry-run input.mkv output.mp4
 ```
+
+## Going Forward <a id="goingforward"></a>
+-	Environment Configuration – Support local (.env.local) and global (.env) files to adjust constants, variables, and flags without editing the script.
+-	Batch Directory Processing – Add logic to process all compatible files in a directory (including subdirectories) with filtering by extension or codec.
+-	Parallel Processing Option – Allow multi-threaded encoding when hardware resources are available, with automatic core detection.
+-	Codec Expansion – Broaden compatibility to include VP9, AV1, and ProRes workflows while preserving current Dolby Vision/HDR handling.
+-	Format Presets – Introduce named presets for different targets (Apple TV, Plex, archival storage, YouTube).
+-	Logging Enhancements – Support JSON log output for easier integration with monitoring systems or CI pipelines.
+-	Interactive Mode – Add a guided CLI wizard for non-technical users to configure a job without needing full command-line knowledge.
+-	Self-Update Mechanism – Include an update command to pull the latest release from GitHub automatically.
+-	Custom Naming Templates – Allow users to define output filename patterns with variables (e.g., {title}_{codec}_{crf}).
+-	Checksum Verification – Integrate optional hash verification of inputs and outputs for data integrity.
 
 ## 📄 License <a id="license"></a>
 
