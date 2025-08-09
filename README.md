@@ -1,4 +1,4 @@
-# MuxMaster
+# ![muxm](./assets/muxm_header_small.png) MuxMaster
 
 **MuxMaster** – a versatile, cross-platform video repacking and encoding utility that preserves HDR, Dolby Vision, and high-quality audio while optimizing for Plex and Apple TV Direct Play. Supports smart codec handling, color space matching, error recovery, and optional stereo fallback.
 
