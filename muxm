@@ -1,5 +1,27 @@
 #!/usr/bin/env bash
-# ==============================================================================
+# =============================================================================
+#  MuxMaster™ Freeware License v1.0
+#  Copyright © 2025 Jamey Wicklund (theBluWiz)
+#
+#  This software is provided free of charge for personal, non-commercial use.
+#  "Non-commercial use" means use by an individual for personal purposes
+#  with no direct or indirect monetary gain. Any business, government, or
+#  organizational use requires a separate paid license.
+#
+#  You may NOT modify, redistribute, reverse-engineer, or use MuxMaster
+#  commercially without explicit written permission.
+#
+#  “MuxMaster” is a trademark of Jamey Wicklund. All rights reserved.
+#
+#  This license applies only to the specific version of MuxMaster to which
+#  it is attached. Future versions may have different terms.
+#
+#  Provided “AS IS” without warranty of any kind. Use at your own risk.
+#
+#  Governing Law: Washington State, USA
+#  Contact: thebluwiz@thoughtspace.place
+# =============================================================================
+
 # MuxMaster v1.0  —  “muxm” CLI
 # Universal DV/HLG/HDR10/SDR → MP4 (Apple TV Direct Play) Encoder
 #

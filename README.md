@@ -12,7 +12,7 @@
 - [Author](#author)
 
 
-## ✨ Features
+## ✨ Features <a id="features"></a>
 
 - **Preserves HDR & Dolby Vision** – Keeps original color depth and HDR metadata where possible
 - **Audio Preservation** – Retains E-AC-3, AC-3, or AAC without re-encoding; converts others to best Direct Play-compatible format
@@ -26,7 +26,7 @@
 
 ---
 
-## 📦 Installation
+## 📦 Installation <a id="installation"></a>
 
 ```bash
 # Clone the repository
@@ -40,7 +40,7 @@ chmod +x muxm
 sudo mv muxm /usr/local/bin/muxm
 ```
 
-## 🚀 Usage
+## 🚀 Usage <a id="usage"></a>
 
 ```bash
 muxm <source file> <target file>
@@ -52,7 +52,7 @@ muxm <source file> <target file>
 - `--dry-run` – Simulate without writing output
 - `--parallelize` / `-p` – Encode audio in parallel
 
-## 🔍 Examples
+## 🔍 Examples <a id="examples"></a>
 
 ```bash
 # Standard encode, defaults to CRF 18 and 192k stereo fallback
@@ -61,19 +61,20 @@ muxm input.mkv output.mp4
 # Dry run for testing
 muxm --dry-run input.mkv output.mp4
 ```
-## 📄 License
+
+## 📄 License <a id="license"></a>
 
 MuxMaster is freeware for personal, non-commercial use.
 Any business, government, or organizational use requires a paid license.
 
 Full license text available in [LICENSE.md](./LICENSE.md)
 
-## 🤝 Contributing
+## 🤝 Contributing <a id="contributing"></a>
 
 Contributions are welcome for bug reports, feature requests, and documentation improvements.
 Please note that all code changes must be approved by the maintainer and comply with the license.
 
-## 📧 Contact
+## 👤 Author <a id="author"></a>
 
 Maintainer: Jamey Wicklund (theBluWiz)  
 Email: [thebluwiz@thoughtspace.place](mailto:thebluwiz@thoughtspace.place)

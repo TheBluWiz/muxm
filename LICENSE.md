@@ -50,4 +50,4 @@ This agreement shall be governed by and construed in accordance with the laws of
 ---
 
 ## 8. Contact
-For commercial licensing inquiries or permissions, contact: **thebluwiz.dev@gmail.com**
+For commercial licensing inquiries or permissions, contact: [**thebluwiz@thoughtspace.place**](mailto:thebluwiz@thoughtspace.place)
