@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  MuxMaster™ Freeware License v1.0
+#  Copyright © 2025 Jamey Wicklund (theBluWiz)
+#
+#  This software is provided free of charge for personal, non-commercial use.
+#  "Non-commercial use" means use by an individual for personal purposes
+#  with no direct or indirect monetary gain. Any business, government, or
+#  organizational use requires a separate paid license.
+#
+#  You may NOT modify, redistribute, reverse-engineer, or use MuxMaster
+#  commercially without explicit written permission.
+#
+#  “MuxMaster” is a trademark of Jamey Wicklund. All rights reserved.
+#
+#  This license applies only to the specific version of MuxMaster to which
+#  it is attached. Future versions may have different terms.
+#
+#  Provided “AS IS” without warranty of any kind. Use at your own risk.
+#
+#  Governing Law: Washington State, USA
+#  Contact: thebluwiz@thoughtspace.place
+# =============================================================================
+
+# MuxMaster v1.0  —  “muxm” CLI
+# Universal DV/HLG/HDR10/SDR → MP4 (Apple TV Direct Play) Encoder
+#
+# WHAT THIS DOES:
+# - Re-encodes video to HEVC Main10 with correct color tags; preserves DV (P7→P8.1) when present.
+# - Copies E-AC-3/AC-3/AAC audio; otherwise transcodes (stereo→AAC 192k, multi→E-AC-3).
+# - Adds AAC stereo fallback if main >2ch. Produces video-only if no audio in source.
+# - Robust traps/logging, atomic finalize (OUT.tmp→OUT), optional parallel audio, checksum, dry-run.
+#
+# QUICK INSTALL:
+#   ./MuxMaster.sh --install               # symlink to /usr/local/bin/muxm (may require sudo)
+#   muxm --version                         # use the short CLI name thereafter
+#
+# CLI:
+#   muxm [options] <source.mkv> [target.mp4]
+# Options:
+#   -p, --parallelize   Run primary + stereo audio jobs in parallel (single-thread each)
+#       --checksum      Write SHA-256 checksum next to final MP4
+#       --dry-run       Detect + print the full plan, then exit without doing work
+#   -h, --help          Show usage and exit
+#   -V, --version       Show version and exit
+#       --install       Symlink this script to /usr/local/bin/muxm and exit
+#
+# EXIT CODES:
+#   0  OK | 1 generic | 10 tool missing | 11 bad args | 20/21/22 DV errors | 30 audio | 31 stereo
+#   130 SIGINT | 143 SIGTERM
