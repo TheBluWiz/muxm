@@ -8,7 +8,6 @@
 # =============================================================================
 
 set -euo pipefail
-# macOS ships Bash 3.2; guard newer shopt
 if shopt -q inherit_errexit 2>/dev/null; then shopt -s inherit_errexit; fi
 [[ "${DEBUG:-0}" == "1" ]] && set -x
 
@@ -21,12 +20,14 @@ readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
 readonly VERSION="1.0"
 
-ALLOW_DV_FALLBACK="${ALLOW_DV_FALLBACK:-1}"   # 1=fallback to non-DV, 0=abort on DV failure
+ALLOW_DV_FALLBACK="${ALLOW_DV_FALLBACK:-1}"
 PARALLEL_AUDIO=0
 CHECKSUM=0
 DRY_RUN=0
-KEEP_TEMP=0       # new: keep working files on failure if set via --keep-temp/-k
-LEVEL_VALUE=""    # new: optional x265 level (e.g. 5.1) via --level/-l
+KEEP_TEMP=0            # keep working files on FAILURE
+KEEP_TEMP_ALWAYS=0     # keep on SUCCESS and FAILURE
+LEVEL_VALUE=""         # x265 level-idc via --level/-l
+PRESET_VALUE="slower"  # default preset unless -p/--preset overrides
 
 CRF_VALUE=18
 STEREO_BITRATE=192k
@@ -34,7 +35,6 @@ STEREO_BITRATE=192k
 readonly FFMPEG_FLAGS="-hide_banner -loglevel error -y"
 readonly FFPROBE_FLAGS="-v error"
 
-# Default x265 params: no level set by default (no warnings under CRF)
 X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
 X265_PARAMS="$X265_PARAMS_BASE"
 
@@ -46,75 +46,69 @@ FAILED=0
 FAIL_MSG=""
 EXIT_CODE=1
 
-die()  {
-  local code=1
-  if [[ $# -gt 1 && "$1" =~ ^[0-9]+$ ]]; then code="$1"; shift; fi
-  FAILED=1; EXIT_CODE="$code"; FAIL_MSG="Fatal: $*"
-  printf "❌ ERROR: %s\n" "$FAIL_MSG" >&2
-  exit "$code"
-}
-on_error() {
-  local lineno="$1" cmd="$2" status="$3"
-  FAILED=1
-  EXIT_CODE="${EXIT_CODE:-$status}"
-  FAIL_MSG="Command failed at line $lineno: $cmd (exit $status)"
-  printf "❌ ERROR: %s\n" "$FAIL_MSG" >&2
-}
-mark_done() { COMPLETED_STEPS+=("$1"); }
+die()  { local code=1; if [[ $# -gt 1 && "$1" =~ ^[0-9]+$ ]]; then code="$1"; shift; fi; FAILED=1; EXIT_CODE="$code"; FAIL_MSG="Fatal: $*"; printf "❌ ERROR: %s\n" "$FAIL_MSG" >&2; exit "$code"; }
+on_error(){ local lineno="$1" cmd="$2" status="$3"; FAILED=1; EXIT_CODE="${EXIT_CODE:-$status}"; FAIL_MSG="Command failed at line $lineno: $cmd (exit $status)"; printf "❌ ERROR: %s\n" "$FAIL_MSG" >&2; }
+mark_done(){ COMPLETED_STEPS+=("$1"); }
 
-need() { command -v "$1" >/dev/null 2>&1 || die 10 "Missing required tool: $1"; }
-timestamp() { date +"%Y-%m-%d %H:%M:%S"; }
-realpath_fallback() { if command -v realpath >/dev/null 2>&1; then realpath "$1"; else echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; fi; }
-filesize_pretty() { if command -v gstat >/dev/null 2>&1; then gstat -c "%n %s bytes" "$1"; else ls -lh "$1"; fi; }
-kill_if_running(){ local pid="$1"; [[ -n "$pid" ]] || return 0; kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true; }
-checksum_cmd(){ command -v sha256sum >/dev/null 2>&1 && { echo "sha256sum"; return; } ; command -v shasum >/dev/null 2>&1 && { echo "shasum -a 256"; return; }; echo ""; }
+need(){ command -v "$1" >/dev/null 2>&1 || die 10 "Missing required tool: $1"; }
+timestamp(){ date +"%Y-%m-%d %H:%M:%S"; }
+realpath_fallback(){ if command -v realpath >/dev/null 2>&1; then realpath "$1"; else echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; fi; }
+filesize_pretty(){ if command -v gstat >/dev/null 2>&1; then gstat -c "%n %s bytes" "$1"; else ls -lh "$1"; fi; }
+kill_if_running(){ local pid="${1:-}"; [[ -n "$pid" ]] || return 0; if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null || true; fi; }
+checksum_cmd(){ command -v sha256sum >/dev/null 2>&1 && { echo "sha256sum"; return; }; command -v shasum >/dev/null 2>&1 && { echo "shasum -a 256"; return; }; echo ""; }
 write_checksum(){ local p="$1" c; c="$(checksum_cmd)"; [[ -z "$c" ]] && { warn "Checksum tool not found"; return 0; }; note "Writing checksum → ${p}.sha256"; $c "$p" > "${p}.sha256"; }
 
 # ---------- ffprobe helpers ----------
-_probe_field() { ffprobe $FFPROBE_FLAGS -show_entries "stream=$1" -of default=nk=1:nw=1 "$2" 2>/dev/null | head -n1 || true; }
-_has_stream()  { ffprobe $FFPROBE_FLAGS -show_entries stream=codec_type -of default=nk=1:nw=1 "$1" 2>/dev/null | grep -q "$2"; }
-_vcodec_name() { ffprobe $FFPROBE_FLAGS -select_streams v:0 -show_entries stream=codec_name -of default=nk=1:nw=1 "$1" 2>/dev/null | head -n1 || true; }
+_probe_field(){ ffprobe $FFPROBE_FLAGS -show_entries "stream=$1" -of default=nk=1:nw=1 "$2" 2>/dev/null | head -n1 || true; }
+_has_stream(){ ffprobe $FFPROBE_FLAGS -show_entries stream=codec_type -of default=nk=1:nw=1 "$1" 2>/dev/null | grep -q "$2"; }
+_vcodec_name(){ ffprobe $FFPROBE_FLAGS -select_streams v:0 -show_entries stream=codec_name -of default=nk=1:nw=1 "$1" 2>/dev/null | head -n1 || true; }
 
 # ---------- Requirements ----------
 need ffmpeg
 need ffprobe
 need MP4Box
-need dovi_tool   # >= 2.0
+need dovi_tool
 
 # ---------- Usage / CLI ----------
 print_usage(){ cat <<EOF
-Usage: ${CLI_NAME} [--dry-run] [--checksum] [-p|--parallelize] [-k|--keep-temp] [-l|--level <N>] <source.mkv> [target.mp4]
+Usage: ${CLI_NAME} [--dry-run] [--checksum] [-j|--parallelize] [-k|--keep-temp] [-K|--keep-temp-always] [-l|--level <N>] [-p|--preset <name>] <source.mkv> [target.mp4]
 
 Options:
-  -p, --parallelize        Encode audio tasks in parallel
-      --checksum           Write a SHA-256 checksum file next to output
-      --dry-run            Plan and print steps without writing output
-  -k, --keep-temp          Keep working files on FAILURE (success still cleans)
-  -l, --level <N>          Set x265 level-idc (e.g. 5.1). With CRF, x265 may warn
-                           about VBV unless you also provide vbv settings manually.
-  -h, --help               Show this help
-  -V, --version            Show version
-      --install            Symlink ${CLI_NAME} to /usr/local/bin (may require sudo)
+  -j, --parallelize           Encode audio tasks in parallel
+      --checksum              Write a SHA-256 checksum file next to output
+      --dry-run               Plan and print steps without writing output
+  -k, --keep-temp             Keep working files on FAILURE
+  -K, --keep-temp-always      Keep working files on SUCCESS and FAILURE
+  -l, --level <N>             Set x265 level-idc (e.g. 5.1). With CRF, x265 may warn without VBV.
+  -p, --preset <name>         x265 preset: ultrafast, superfast, veryfast, faster, fast,
+                              medium, slow, slower, veryslow, placebo. Default: slower
+  -h, --help                  Show this help
+  -V, --version               Show version
+      --install               Symlink ${CLI_NAME} to /usr/local/bin (may require sudo)
 EOF
 }
-print_version(){ echo "${APP_NAME} v${VERSION} (${CLI_NAME})"; }
-do_install(){
-  local target="/usr/local/bin/${CLI_NAME}" self
-  self="$(realpath_fallback "$0")"
-  [[ -w "$(dirname "$target")" ]] || warn "You may need sudo to install to ${target}"
-  ln -sf "$self" "$target" || die 11 "Failed to create symlink: $target"
-  note "Installed symlink: $target → $self"; exit 0
-}
 
-USAGE_SHORT="Usage: ${CLI_NAME} [--dry-run] [--checksum] [-p|--parallelize] [-k|--keep-temp] [-l|--level <N>] <source.mkv> [target.mp4]"
+print_version(){ echo "${APP_NAME} v${VERSION} (${CLI_NAME})"; }
+do_install(){ local target="/usr/local/bin/${CLI_NAME}" self; self="$(realpath_fallback "$0")"; [[ -w "$(dirname "$target")" ]] || warn "You may need sudo to install to ${target}"; ln -sf "$self" "$target" || die 11 "Failed to create symlink: $target"; note "Installed symlink: $target → $self"; exit 0; }
+
+is_valid_preset(){ case "$1" in ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo) return 0;; *) return 1;; esac; }
+
+USAGE_SHORT="Usage: ${CLI_NAME} [--dry-run] [--checksum] [-j|--parallelize] [-k|--keep-temp] [-K|--keep-temp-always] [-l|--level <N>] [-p|--preset <name>] <source.mkv> [target.mp4]"
 POSITIONALS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -p|--parallelize) PARALLEL_AUDIO=1; shift ;;
+    -j|--parallelize) PARALLEL_AUDIO=1; shift ;;
     --checksum) CHECKSUM=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
-    -k|--keep-temp) KEEP_TEMP=1; shift ;;                       # NEW
-    -l|--level) LEVEL_VALUE="${2:-}"; [[ -z "${LEVEL_VALUE}" ]] && die 11 "Missing value for --level"; shift 2 ;;  # NEW
+    -k|--keep-temp) KEEP_TEMP=1; shift ;;
+    -K|--keep-temp-always) KEEP_TEMP_ALWAYS=1; shift ;;
+    -l|--level) LEVEL_VALUE="${2:-}"; [[ -z "${LEVEL_VALUE}" ]] && die 11 "Missing value for --level"; shift 2 ;;
+    -p|--preset)
+      PRESET_VALUE="${2:-}"; [[ -z "${PRESET_VALUE}" ]] && die 11 "Missing value for --preset"
+      if ! is_valid_preset "$PRESET_VALUE"; then
+        die 11 "Invalid preset: '${PRESET_VALUE}'. Accepted: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo."
+      fi
+      shift 2 ;;
     -h|--help) print_usage; exit 0 ;;
     -V|--version) print_version; exit 0 ;;
     --install) do_install ;;
@@ -132,16 +126,7 @@ OUT="${POSITIONALS[1]:-}"
 
 SRC_ABS="$(realpath_fallback "$SRC")"; [[ -f "$SRC_ABS" ]] || die 11 "Source not found: $SRC_ABS"
 
-# If a level was requested, add it to x265 params (no VBV by default).
-if [[ -n "$LEVEL_VALUE" ]]; then
-  X265_PARAMS="${X265_PARAMS_BASE}:level-idc=${LEVEL_VALUE}"
-fi
-
-# Default OUT next to SRC if not provided, then resolve to absolute
-if [[ -z "${OUT:-}" ]]; then
-  base="${SRC_ABS%.*}"
-  OUT="${base}.mp4"
-fi
+if [[ -z "${OUT:-}" ]]; then base="${SRC_ABS%.*}"; OUT="${base}.mp4"; fi
 OUT_DIR="$(cd "$(dirname "$OUT")" && pwd)"
 OUT_BASENAME="$(basename "$OUT")"
 OUT_ABS="${OUT_DIR}/${OUT_BASENAME}"
@@ -155,19 +140,51 @@ LOGFILE="$WORKDIR/muxm.$(date +%Y%m%d-%H%M%S).log"
 
 # ---------- Traps ----------
 on_exit() {
-  if (( FAILED == 0 )); then
-    if (( DRY_RUN )); then note "DRY-RUN complete — no files were created."
-    else [[ -f "$TMP_OUT" ]] && mv -f "$TMP_OUT" "$OUT"; (( CHECKSUM )) && write_checksum "$OUT"; note "Build SUCCEEDED."; fi
-    if [[ ${#COMPLETED_STEPS[@]} -gt 0 ]]; then echo "---- Completed steps ----"; for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s"; done; fi
-    { echo "Completed: $(timestamp)"; printf "%s\n" "${COMPLETED_STEPS[@]:-}"; } >"${OUT_DIR}/$(basename "${OUT}")${DRY_RUN:+.dryrun}.log" 2>/dev/null || true
-    if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" ]]; then rm -rf "$WORKDIR"; else [[ "${DEBUG:-0}" == "1" ]] && note "DEBUG=1 → keeping workdir: $WORKDIR"; fi
+  # Only consider success if we actually produced a non-empty output file
+  local have_result=0
+  if [[ -n "${TMP_OUT:-}" && -s "$TMP_OUT" ]]; then
+    have_result=1
+  elif [[ -n "${OUT:-}" && -s "$OUT" ]]; then
+    have_result=1
+  fi
+
+  if (( FAILED == 0 && have_result == 1 )); then
+    if (( DRY_RUN )); then
+      note "DRY-RUN complete — no files were created."
+    else
+      [[ -f "$TMP_OUT" ]] && mv -f "$TMP_OUT" "$OUT"
+      (( CHECKSUM )) && write_checksum "$OUT"
+      note "Build SUCCEEDED."
+    fi
+
+    if [[ ${#COMPLETED_STEPS[@]} -gt 0 ]]; then
+      echo "---- Completed steps ----"
+      for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s"; done
+    fi
+
+    # FIX: only add .dryrun when DRY_RUN == 1
+    local _suffix=""
+    [[ $DRY_RUN -eq 1 ]] && _suffix=".dryrun"
+    { echo "Completed: $(timestamp)"; printf "%s\n" "${COMPLETED_STEPS[@]:-}"; } \
+      > "${OUT_DIR}/$(basename "${OUT}")${_suffix}.log" 2>/dev/null || true
+
+    if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && "${KEEP_TEMP_ALWAYS:-0}" != "1" ]]; then
+      rm -rf "$WORKDIR"
+    else
+      note "Keeping workdir: $WORKDIR"
+    fi
     exit 0
   else
+    [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely earlier parse/runtime error)."
     printf "❌ Build FAILED. %s\n" "$FAIL_MSG" >&2
-    if [[ ${#COMPLETED_STEPS[@]} -gt 0 ]]; then echo "---- Completed steps ----"; for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s"; done; fi
+
+    if [[ ${#COMPLETED_STEPS[@]} -gt 0 ]]; then
+      echo "---- Completed steps ----"
+      for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s"; done
+    fi
     echo "See log: $LOGFILE"
-    # Keep artifacts on failure if --keep-temp OR DEBUG=1
-    if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && "${KEEP_TEMP:-0}" != "1" ]]; then
+
+    if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && "${KEEP_TEMP:-0}" != "1" && "${KEEP_TEMP_ALWAYS:-0}" != "1" ]]; then
       rm -rf "$WORKDIR"
     else
       note "Keeping failure artifacts at: $WORKDIR"
@@ -181,22 +198,22 @@ trap 'FAILED=1; EXIT_CODE=143; FAIL_MSG="Terminated (SIGTERM)"; exit 143' TERM
 trap 'on_exit' EXIT
 
 # ---------- Temp paths ----------
-V_SRC_DV="$WORKDIR/video_src.hevc"  # Annex-B for DV ops
-V_SRC_ES="$WORKDIR/video_src.es"    # raw ES when not DV
+V_SRC_DV="$WORKDIR/video_src.hevc"
+V_SRC_ES="$WORKDIR/video_src.es"
 RPU_P7="$WORKDIR/rpu_p7.bin"
 RPU_P81="$WORKDIR/rpu_p81.bin"
 V_BASE="$WORKDIR/video_base.hevc"
 V_MIXED="$WORKDIR/video_mixed.hevc"
-A_PRIMARY="$WORKDIR/audio_primary.bin"
+A_PRIMARY=""
+AAC_STEREO=""
 MP4_BASE="$WORKDIR/primary_base.mp4"
-AAC_STEREO="$WORKDIR/stereo.m4a"
 
 # ---------- Banner ----------
 say "=== ${APP_NAME} v${VERSION} — CLI: ${CLI_NAME}"
 say "=== Input      : $SRC_ABS"
 say "=== Output     : $OUT"
 say "=== Workdir    : $WORKDIR"
-say "=== Defaults   : CRF=$CRF_VALUE  StereoBitrate=$STEREO_BITRATE"
+say "=== Defaults   : CRF=$CRF_VALUE  StereoBitrate=$STEREO_BITRATE  Preset=$PRESET_VALUE"
 (( DRY_RUN )) && note "DRY-RUN is ON"
 
 # ---------- Color/DV analysis ----------
@@ -235,28 +252,35 @@ demux_to_annexb() {
   local src="$1" out="$2" need_annexb="$3"
   local vcodec; vcodec="$(_vcodec_name "$src")"; vcodec="$(printf %s "$vcodec" | tr '[:upper:]' '[:lower:]')"
   local fmt="" bsf=""
-  if [[ "$vcodec" == "hevc" || "$vcodec" == "h265" ]]; then fmt="hevc"; bsf="hevc_mp4toannexb"
-  elif [[ "$vcodec" == "h264" || "$vcodec" == "avc1" ]]; then fmt="h264"; bsf="h264_mp4toannexb"
-  else warn "Unknown/unsupported video codec ($vcodec) for raw ES demux; skipping demux."; : > "$out"; return 0; fi
-  (( DRY_RUN )) && { say "DRY-RUN: demux raw $fmt ${need_annexb:+(Annex-B)} → $out"; return 0; }
-  if [[ "$need_annexb" == "1" ]]; then ffmpeg $FFMPEG_FLAGS -i "$src" -map 0:v:0 -c copy -bsf:v "$bsf" -f "$fmt" "$out"
-  else                                      ffmpeg $FFMPEG_FLAGS -i "$src" -map 0:v:0 -c copy                 -f "$fmt" "$out"; fi
+  if [[ "$vcodec" == "hevc" || "$vcodec" == "h265" ]]; then
+    fmt="hevc"; bsf="hevc_mp4toannexb"
+  elif [[ "$vcodec" == "h264" || "$vcodec" == "avc1" ]]; then
+    fmt="h264"; bsf="h264_mp4toannexb"
+  else
+    warn "Unknown/unsupported video codec ($vcodec) for raw ES demux; skipping demux."
+    : > "$out"
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    # need_annexb is intended as a boolean flag; show hint only when non-zero
+    local _annex_hint=""
+    [[ "${need_annexb:-0}" -ne 0 ]] && _annex_hint=" (Annex-B)"
+    say "DRY-RUN: demux raw $fmt${_annex_hint} → $out"
+    return 0
+  fi
+
+  if [[ "$need_annexb" == "1" ]]; then
+    ffmpeg $FFMPEG_FLAGS -i "$src" -map 0:v:0 -c copy -bsf:v "$bsf" -f "$fmt" "$out"
+  else
+    ffmpeg $FFMPEG_FLAGS -i "$src" -map 0:v:0 -c copy                 -f "$fmt" "$out"
+  fi
 }
 
 # ---------- dovi_tool helpers (v2.x) ----------
-dv_extract_rpu() {
-  local in="$1" out="$2"
-  (( DRY_RUN )) && { say "DRY-RUN: dovi_tool extract-rpu \"$in\" -o \"$out\""; return 0; }
-  dovi_tool extract-rpu "$in" -o "$out"
-}
-dv_convert_p7_to_p81() {
-  # v2.x: 'convert' subcommand; many builds require --mode 2 for P7->P8.1
-  local in="$1" out="$2"
-  (( DRY_RUN )) && { say "DRY-RUN: dovi_tool convert \"$in\" -o \"$out\" --mode 2"; return 0; }
-  dovi_tool convert "$in" -o "$out" --mode 2
-}
-dv_inject_with_rpu() {
-  # Try a few widely-seen v2.x syntaxes; return 0 on first success
+dv_extract_rpu(){ local in="$1" out="$2"; (( DRY_RUN )) && { say "DRY-RUN: dovi_tool extract-rpu \"$in\" -o \"$out\""; return 0; }; dovi_tool extract-rpu "$in" -o "$out"; }
+dv_convert_p7_to_p81(){ local in="$1" out="$2"; (( DRY_RUN )) && { say "DRY-RUN: dovi_tool convert \"$in\" -o \"$out\" --mode 2"; return 0; }; dovi_tool convert "$in" -o "$out" --mode 2; }
+dv_inject_with_rpu(){
   local base="$1" out="$2" rpu="$3"
   (( DRY_RUN )) && { say "DRY-RUN: dovi_tool inject-rpu -i \"$base\" -o \"$out\" --rpu-in \"$rpu\" (or variants)"; return 0; }
   dovi_tool inject-rpu -i "$base" -o "$out" --rpu-in "$rpu" && return 0
@@ -268,18 +292,25 @@ dv_inject_with_rpu() {
 # ---------- Decide color + DV ----------
 decide_color_and_pixfmt "$SRC_ABS"
 
+if [[ "$PROFILE_DESC" != "HDR10" && "$PROFILE_DESC" != "HLG" ]]; then
+  X265_PARAMS="${X265_PARAMS_BASE/:hdr-opt=1/}"
+else
+  X265_PARAMS="$X265_PARAMS_BASE"
+fi
+[[ -n "$LEVEL_VALUE" ]] && X265_PARAMS="${X265_PARAMS}:level-idc=${LEVEL_VALUE}"
+
 IS_DV=0
 if ffprobe $FFPROBE_FLAGS -show_streams -select_streams v "$SRC_ABS" 2>/dev/null | grep -qi 'dolby_vision\|dv_profile'; then
-  IS_DV=1; note "Dolby Vision detected — will extract, then inject; convert only if injection fails."
+  IS_DV=1; note "Dolby Vision detected — extract → inject; convert only if injection fails."
 else
   note "No Dolby Vision detected."
 fi
 
 # [1/15] Prepare ES / Annex-B
-say "[1/15] Preparing raw elementary stream${IS_DV:+ (Annex-B for DV)}…"
+# FIX: only print the DV hint when IS_DV == 1
+say "[1/15] Preparing raw elementary stream$([[ $IS_DV -eq 1 ]] && echo ' (Annex-B for DV)')…"
 if (( IS_DV == 1 )); then
   demux_to_annexb "$SRC_ABS" "$V_SRC_DV" 1; mark_done "Demux DV Annex-B → $(basename "$V_SRC_DV")"
-  [[ "${DEBUG:-0}" == "1" && -s "$V_SRC_DV" ]] && { echo "--- annex-b stream ready: $V_SRC_DV ---" >>"$LOGFILE" || true; }
 else
   demux_to_annexb "$SRC_ABS" "$V_SRC_ES" 1; mark_done "Demux raw ES → $(basename "$V_SRC_ES")"
 fi
@@ -293,14 +324,14 @@ if (( IS_DV == 1 )); then
   fi
 fi
 
-# [3/15] (no conversion yet) — encode base first, then attempt inject; convert only if inject fails
+# [3/15] encode base first
 
 # [4/15] Encode base video
-say "[4/15] Encoding base video ($PROFILE_DESC, $TARGET_PIXFMT) → $V_BASE"
+say "[4/15] Encoding base video ($PROFILE_DESC, $TARGET_PIXFMT, preset $PRESET_VALUE) → $V_BASE"
 if (( DRY_RUN )); then
-  say "DRY-RUN: x265 encode (CRF $CRF_VALUE) → $V_BASE"
+  say "DRY-RUN: x265 encode (CRF $CRF_VALUE, preset $PRESET_VALUE) → $V_BASE"
 else
-  ffmpeg $FFMPEG_FLAGS -i "$SRC_ABS" -map 0:v:0 -c:v libx265 -crf "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" \
+  ffmpeg $FFMPEG_FLAGS -i "$SRC_ABS" -map 0:v:0 -c:v libx265 -preset "$PRESET_VALUE" -crf "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" \
     -x265-params "$X265_PARAMS" "${COLOR_ARGS[@]}" -an "$V_BASE"
 fi
 mark_done "Encode base"
@@ -326,24 +357,36 @@ fi
 # [6/15] Audio presence
 HAS_AUDIO=0; _has_stream "$SRC_ABS" audio && HAS_AUDIO=1
 
-# [7-9/15] Prepare audio
+# [7) Decide audio temp names/formats]
 AIDX=0
 ACODEC="$(ffprobe $FFPROBE_FLAGS -select_streams a:0 -show_entries stream=codec_name -of default=nk=1:nw=1 "$SRC_ABS" || true)"
 ACHANNELS="$(ffprobe $FFPROBE_FLAGS -select_streams a:0 -show_entries stream=channels   -of default=nk=1:nw=1 "$SRC_ABS" || true)"; [[ -z "$ACHANNELS" ]] && ACHANNELS=2
 ADD_STEREO=0; [[ "$ACHANNELS" -gt 2 ]] && ADD_STEREO=1
 
+A_PRIMARY_FMT=""
+case "$ACODEC" in
+  aac)   A_PRIMARY="$WORKDIR/audio_primary.m4a" ;;
+  eac3)  A_PRIMARY="$WORKDIR/audio_primary.eac3"; A_PRIMARY_FMT="eac3" ;;
+  ac3)   A_PRIMARY="$WORKDIR/audio_primary.ac3";  A_PRIMARY_FMT="ac3"  ;;
+  *)     A_PRIMARY="$WORKDIR/audio_primary.m4a" ;;
+esac
+AAC_STEREO="$WORKDIR/stereo.m4a"
+
+# [8/15] Prepare audio
 if (( HAS_AUDIO == 1 )); then
   if (( PARALLEL_AUDIO == 1 )); then
     say "[8/15] Preparing primary audio (parallel mode) → $A_PRIMARY"
     if [[ "$ACODEC" == "eac3" || "$ACODEC" == "ac3" || "$ACODEC" == "aac" ]]; then
-      ( ffmpeg $FFMPEG_FLAGS -i "$SRC_ABS" -map 0:a:"$AIDX" -c copy "$A_PRIMARY" ) & PID_PRIMARY=$!; note "Direct Play codec detected ($ACODEC). Copying."
+      if [[ "$ACODEC" == "aac" ]]; then ( ffmpeg $FFMPEG_FLAGS -i "$SRC_ABS" -map 0:a:"$AIDX" -c copy -f mp4 "$A_PRIMARY" ) & PID_PRIMARY=$!
+      else                                ( ffmpeg $FFMPEG_FLAGS -i "$SRC_ABS" -map 0:a:"$AIDX" -c copy ${A_PRIMARY_FMT:+-f "$A_PRIMARY_FMT"} "$A_PRIMARY" ) & PID_PRIMARY=$!
+      fi
+      note "Direct Play codec detected ($ACODEC). Copying without conversion."
     else
-      if (( ACHANNELS <= 2 )); then ( ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 "$A_PRIMARY" ) & PID_PRIMARY=$!; note "Stereo codec not ideal; transcoding to AAC $STEREO_BITRATE."
-      else channels_to_keep="$ACHANNELS"; (( channels_to_keep > 8 )) && channels_to_keep=8; ( ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a eac3 -b:a "$([[ $channels_to_keep -ge 7 ]] && echo 768k || echo 640k)" -ac "$channels_to_keep" "$A_PRIMARY" ) & PID_PRIMARY=$!; note "Multichannel codec not ideal; transcoding to E-AC-3."
+      if (( ACHANNELS <= 2 )); then ( ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$A_PRIMARY" ) & PID_PRIMARY=$!; note "Unsupported stereo codec ($ACODEC). Transcoding to AAC $STEREO_BITRATE."
+      else channels_to_keep="$ACHANNELS"; (( channels_to_keep > 8 )) && channels_to_keep=8; A_PRIMARY="$WORKDIR/audio_primary.eac3"; A_PRIMARY_FMT="eac3"; ( ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a eac3 -b:a "$([[ $channels_to_keep -ge 7 ]] && echo 768k || echo 640k)" -ac "$channels_to_keep" -f eac3 "$A_PRIMARY" ) & PID_PRIMARY=$!; note "Unsupported multichannel codec ($ACODEC). Transcoding to E-AC-3."
       fi
     fi
-    if (( ADD_STEREO == 1 )); then say "[9/15] Creating AAC stereo fallback (parallel) → $AAC_STEREO"; ( ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 "$AAC_STEREO" ) & PID_STEREO=$!
-    else : > "$AAC_STEREO"; PID_STEREO=""; fi
+    if (( ADD_STEREO == 1 )); then say "[9/15] Creating AAC stereo fallback (parallel) → $AAC_STEREO"; ( ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$AAC_STEREO" ) & PID_STEREO=$!; else : > "$AAC_STEREO"; PID_STEREO=""; fi
     PRIMARY_STATUS=0; STEREO_STATUS=0
     [[ -n "${PID_PRIMARY:-}" ]] && { if ! wait "$PID_PRIMARY"; then PRIMARY_STATUS=$?; kill_if_running "$PID_STEREO"; fi; }
     [[ -n "${PID_STEREO:-}"  ]] && { if ! wait "$PID_STEREO";  then STEREO_STATUS=$?;  kill_if_running "$PID_PRIMARY"; fi; }
@@ -353,15 +396,17 @@ if (( HAS_AUDIO == 1 )); then
   else
     say "[8/15] Preparing primary audio → $A_PRIMARY"
     if [[ "$ACODEC" == "eac3" || "$ACODEC" == "ac3" || "$ACODEC" == "aac" ]]; then
-      ffmpeg $FFMPEG_FLAGS -i "$SRC_ABS" -map 0:a:"$AIDX" -c copy "$A_PRIMARY"; note "Direct Play codec detected ($ACODEC). Copying."
+      if [[ "$ACODEC" == "aac" ]]; then ffmpeg $FFMPEG_FLAGS -i "$SRC_ABS" -map 0:a:"$AIDX" -c copy -f mp4 "$A_PRIMARY"
+      else                               ffmpeg $FFMPEG_FLAGS -i "$SRC_ABS" -map 0:a:"$AIDX" -c copy ${A_PRIMARY_FMT:+-f "$A_PRIMARY_FMT"} "$A_PRIMARY"
+      fi
+      note "Direct Play codec detected ($ACODEC). Copying without conversion."
     else
-      if (( ACHANNELS <= 2 )); then ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 "$A_PRIMARY"; note "Stereo codec not ideal; transcoding to AAC $STEREO_BITRATE."
-      else channels_to_keep="$ACHANNELS"; (( channels_to_keep > 8 )) && channels_to_keep=8; ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a eac3 -b:a "$([[ $channels_to_keep -ge 7 ]] && echo 768k || echo 640k)" -ac "$channels_to_keep" "$A_PRIMARY"; note "Multichannel codec not ideal; transcoding to E-AC-3."
+      if (( ACHANNELS <= 2 )); then ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$A_PRIMARY"; note "Unsupported stereo codec ($ACODEC). Transcoding to AAC $STEREO_BITRATE."
+      else channels_to_keep="$ACHANNELS"; (( channels_to_keep > 8 )) && channels_to_keep=8; A_PRIMARY="$WORKDIR/audio_primary.eac3"; A_PRIMARY_FMT="eac3"; ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a eac3 -b:a "$([[ $channels_to_keep -ge 7 ]] && echo 768k || echo 640k)" -ac "$channels_to_keep" -f eac3 "$A_PRIMARY"; note "Unsupported multichannel codec ($ACODEC). Transcoding to E-AC-3."
       fi
     fi
     mark_done "Primary audio prepared"
-    if (( ADD_STEREO == 1 )); then say "[9/15] Creating AAC stereo fallback → $AAC_STEREO"; ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 "$AAC_STEREO"; mark_done "Create AAC stereo"
-    else note "[9/15] Primary audio is stereo; no extra stereo fallback needed."; : > "$AAC_STEREO"; fi
+    if (( ADD_STEREO == 1 )); then say "[9/15] Creating AAC stereo fallback → $AAC_STEREO"; ffmpeg $FFMPEG_FLAGS -threads 1 -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$AAC_STEREO"; mark_done "Create AAC stereo"; else note "[9/15] Primary audio is stereo; no extra stereo fallback needed."; : > "$AAC_STEREO"; fi
   fi
 else
   : > "$A_PRIMARY"; : > "$AAC_STEREO"; note "No audio tracks detected; continuing with video-only."
@@ -382,8 +427,9 @@ say "[11/15] Assembling final MP4 → $TMP_OUT"
 if (( DRY_RUN )); then say "DRY-RUN: finalize → $TMP_OUT"
 else
   if [[ -s "$AAC_STEREO" ]]; then MP4Box -quiet -add "$MP4_BASE" -add "$AAC_STEREO:name=Stereo:lang=eng" -inter 500 -new "$TMP_OUT"
-  else                               cp -f "$MP4_BASE" "$TMP_OUT"
+  else cp -f "$MP4_BASE" "$TMP_OUT"
   fi
+  [[ ! -s "$TMP_OUT" ]] && die 40 "Final temp output not created or empty: $TMP_OUT"
 fi
 mark_done "Finalize MP4"
 
@@ -396,8 +442,7 @@ if (( DRY_RUN )); then say "DRY-RUN: ffprobe verify $TMP_OUT"; else ffprobe -hid
 mark_done "Verify output"
 
 # [14/15] Size
-say "[14/15] Output (temp) size:"
-if (( DRY_RUN )); then say "DRY-RUN: size of $TMP_OUT"; else filesize_pretty "$TMP_OUT"; fi
+say "[14/15] Output (temp) size:"; if (( DRY_RUN )); then say "DRY-RUN: size of $TMP_OUT"; else filesize_pretty "$TMP_OUT"; fi
 
 # [15/15] Move in EXIT trap
 note "✅ Staging complete — will atomically move to: $OUT"
