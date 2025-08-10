@@ -4,7 +4,7 @@
 #  Copyright © 2025 Jamey Wicklund (theBluWiz)
 # =============================================================================
 # Universal DV/HLG/HDR10/SDR → MP4 (Apple TV Direct Play) Encoder
-# Assumes: ffmpeg, ffprobe, MP4Box, dovi_tool >= 2.0
+# Requires: ffmpeg, ffprobe, MP4Box, dovi_tool >= 2.0
 # =============================================================================
 
 set -euo pipefail
@@ -25,13 +25,18 @@ ALLOW_DV_FALLBACK="${ALLOW_DV_FALLBACK:-1}"   # 1=fallback to non-DV, 0=abort on
 PARALLEL_AUDIO=0
 CHECKSUM=0
 DRY_RUN=0
+KEEP_TEMP=0       # new: keep working files on failure if set via --keep-temp/-k
+LEVEL_VALUE=""    # new: optional x265 level (e.g. 5.1) via --level/-l
 
 CRF_VALUE=18
 STEREO_BITRATE=192k
 
 readonly FFMPEG_FLAGS="-hide_banner -loglevel error -y"
 readonly FFPROBE_FLAGS="-v error"
-readonly X265_PARAMS='profile=main10:level-idc=5.1:repeat-headers=1:hdr-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
+
+# Default x265 params: no level set by default (no warnings under CRF)
+X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
+X265_PARAMS="$X265_PARAMS_BASE"
 
 say()  { printf "%s\n" "$*" >&2; }
 note() { printf "ℹ️  %s\n" "$*" >&2; }
@@ -60,7 +65,7 @@ mark_done() { COMPLETED_STEPS+=("$1"); }
 need() { command -v "$1" >/dev/null 2>&1 || die 10 "Missing required tool: $1"; }
 timestamp() { date +"%Y-%m-%d %H:%M:%S"; }
 realpath_fallback() { if command -v realpath >/dev/null 2>&1; then realpath "$1"; else echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; fi; }
-filesize_pretty() { if command -v gstat >/dev/null 2>&1; then gstat -c "%n %s bytes" "$1"; else ls -lh "$1"; fi }
+filesize_pretty() { if command -v gstat >/dev/null 2>&1; then gstat -c "%n %s bytes" "$1"; else ls -lh "$1"; fi; }
 kill_if_running(){ local pid="$1"; [[ -n "$pid" ]] || return 0; kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true; }
 checksum_cmd(){ command -v sha256sum >/dev/null 2>&1 && { echo "sha256sum"; return; } ; command -v shasum >/dev/null 2>&1 && { echo "shasum -a 256"; return; }; echo ""; }
 write_checksum(){ local p="$1" c; c="$(checksum_cmd)"; [[ -z "$c" ]] && { warn "Checksum tool not found"; return 0; }; note "Writing checksum → ${p}.sha256"; $c "$p" > "${p}.sha256"; }
@@ -74,11 +79,22 @@ _vcodec_name() { ffprobe $FFPROBE_FLAGS -select_streams v:0 -show_entries stream
 need ffmpeg
 need ffprobe
 need MP4Box
-need dovi_tool
+need dovi_tool   # >= 2.0
 
 # ---------- Usage / CLI ----------
 print_usage(){ cat <<EOF
-Usage: ${CLI_NAME} [--dry-run] [--checksum] [-p|--parallelize] <source.mkv> [target.mp4]
+Usage: ${CLI_NAME} [--dry-run] [--checksum] [-p|--parallelize] [-k|--keep-temp] [-l|--level <N>] <source.mkv> [target.mp4]
+
+Options:
+  -p, --parallelize        Encode audio tasks in parallel
+      --checksum           Write a SHA-256 checksum file next to output
+      --dry-run            Plan and print steps without writing output
+  -k, --keep-temp          Keep working files on FAILURE (success still cleans)
+  -l, --level <N>          Set x265 level-idc (e.g. 5.1). With CRF, x265 may warn
+                           about VBV unless you also provide vbv settings manually.
+  -h, --help               Show this help
+  -V, --version            Show version
+      --install            Symlink ${CLI_NAME} to /usr/local/bin (may require sudo)
 EOF
 }
 print_version(){ echo "${APP_NAME} v${VERSION} (${CLI_NAME})"; }
@@ -90,13 +106,15 @@ do_install(){
   note "Installed symlink: $target → $self"; exit 0
 }
 
-USAGE_SHORT="Usage: ${CLI_NAME} [--dry-run] [--checksum] [-p|--parallelize] <source.mkv> [target.mp4]"
+USAGE_SHORT="Usage: ${CLI_NAME} [--dry-run] [--checksum] [-p|--parallelize] [-k|--keep-temp] [-l|--level <N>] <source.mkv> [target.mp4]"
 POSITIONALS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -p|--parallelize) PARALLEL_AUDIO=1; shift ;;
     --checksum) CHECKSUM=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    -k|--keep-temp) KEEP_TEMP=1; shift ;;                       # NEW
+    -l|--level) LEVEL_VALUE="${2:-}"; [[ -z "${LEVEL_VALUE}" ]] && die 11 "Missing value for --level"; shift 2 ;;  # NEW
     -h|--help) print_usage; exit 0 ;;
     -V|--version) print_version; exit 0 ;;
     --install) do_install ;;
@@ -114,7 +132,16 @@ OUT="${POSITIONALS[1]:-}"
 
 SRC_ABS="$(realpath_fallback "$SRC")"; [[ -f "$SRC_ABS" ]] || die 11 "Source not found: $SRC_ABS"
 
-if [[ -z "${OUT:-}" ]]; then base="${SRC_ABS%.*}"; OUT="${base}.mp4"; fi
+# If a level was requested, add it to x265 params (no VBV by default).
+if [[ -n "$LEVEL_VALUE" ]]; then
+  X265_PARAMS="${X265_PARAMS_BASE}:level-idc=${LEVEL_VALUE}"
+fi
+
+# Default OUT next to SRC if not provided, then resolve to absolute
+if [[ -z "${OUT:-}" ]]; then
+  base="${SRC_ABS%.*}"
+  OUT="${base}.mp4"
+fi
 OUT_DIR="$(cd "$(dirname "$OUT")" && pwd)"
 OUT_BASENAME="$(basename "$OUT")"
 OUT_ABS="${OUT_DIR}/${OUT_BASENAME}"
@@ -139,7 +166,12 @@ on_exit() {
     printf "❌ Build FAILED. %s\n" "$FAIL_MSG" >&2
     if [[ ${#COMPLETED_STEPS[@]} -gt 0 ]]; then echo "---- Completed steps ----"; for s in "${COMPLETED_STEPS[@]}"; do echo "  • $s"; done; fi
     echo "See log: $LOGFILE"
-    if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" ]]; then rm -rf "$WORKDIR"; else note "DEBUG=1 → keeping failure artifacts at: $WORKDIR"; fi
+    # Keep artifacts on failure if --keep-temp OR DEBUG=1
+    if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && "${KEEP_TEMP:-0}" != "1" ]]; then
+      rm -rf "$WORKDIR"
+    else
+      note "Keeping failure artifacts at: $WORKDIR"
+    fi
     exit "${EXIT_CODE:-1}"
   fi
 }
@@ -227,11 +259,8 @@ dv_inject_with_rpu() {
   # Try a few widely-seen v2.x syntaxes; return 0 on first success
   local base="$1" out="$2" rpu="$3"
   (( DRY_RUN )) && { say "DRY-RUN: dovi_tool inject-rpu -i \"$base\" -o \"$out\" --rpu-in \"$rpu\" (or variants)"; return 0; }
-  # 1) Explicit flags
   dovi_tool inject-rpu -i "$base" -o "$out" --rpu-in "$rpu" && return 0
-  # 2) Positional base + -o + --rpu-in
   dovi_tool inject-rpu "$base" -o "$out" --rpu-in "$rpu" && return 0
-  # 3) Some builds accept: --input/--out (keep as last)
   dovi_tool inject-rpu --input "$base" --out "$out" --rpu-in "$rpu" && return 0
   return 1
 }
@@ -264,12 +293,16 @@ if (( IS_DV == 1 )); then
   fi
 fi
 
-# [3/15] (no conversion yet) — we’ll encode base first, then attempt inject; convert only if inject fails
+# [3/15] (no conversion yet) — encode base first, then attempt inject; convert only if inject fails
 
 # [4/15] Encode base video
 say "[4/15] Encoding base video ($PROFILE_DESC, $TARGET_PIXFMT) → $V_BASE"
-if (( DRY_RUN )); then say "DRY-RUN: x265 encode (CRF $CRF_VALUE) → $V_BASE"
-else ffmpeg $FFMPEG_FLAGS -i "$SRC_ABS" -map 0:v:0 -c:v libx265 -crf "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" -x265-params "$X265_PARAMS" "${COLOR_ARGS[@]}" -an "$V_BASE"; fi
+if (( DRY_RUN )); then
+  say "DRY-RUN: x265 encode (CRF $CRF_VALUE) → $V_BASE"
+else
+  ffmpeg $FFMPEG_FLAGS -i "$SRC_ABS" -map 0:v:0 -c:v libx265 -crf "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" \
+    -x265-params "$X265_PARAMS" "${COLOR_ARGS[@]}" -an "$V_BASE"
+fi
 mark_done "Encode base"
 
 # [5/15] Inject DV (try pass-through first; convert only if needed)
