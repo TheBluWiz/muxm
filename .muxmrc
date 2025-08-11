@@ -1,0 +1,225 @@
+# ================================================================
+#  MuxMaster .muxmrc — project config (example with explanations)
+#  Precedence: Script defaults → /etc/.muxmrc → ~/.muxmrc → ./.muxmrc → CLI flags
+#  Tip: Uncomment a line to override. Keep values shell-safe.
+# ================================================================
+
+# =========================
+# Video (x265) fundamentals
+# =========================
+
+# CRF (Constant Rate Factor): 0–51 (lower = higher quality, larger files)
+#   0: lossless (huge files)
+#  14–18: visually transparent for high-quality sources
+#  19–22: good balance (typical streaming encodes)
+#  23–28: smaller files, visible compression on complex content
+#  >28: archival only when size is critical
+#CRF_VALUE=18
+
+# Preset: speed/efficiency trade-off (faster → bigger files, slower → smaller)
+# Options: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo
+#   Good defaults: "slower" for quality-first, "slow/medium" for speedier runs
+#PRESET_VALUE=slower
+
+# Base x265 params: advanced tuning as a single string
+# Keep values colon-separated. Override entirely if you know what you’re doing.
+#X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
+
+# Level/IDR constraint for compatibility (e.g., 5.1). Leave empty to let encoder decide.
+# If you set a level, conservative VBV limits (below) can prevent device buffer underruns.
+#LEVEL_VALUE=5.1
+
+# Conservative VBV guardrails (apply when LEVEL_VALUE is set)
+#   1 = apply cautious vbv-maxrate/bufsize suited to Apple TV-like playbacks
+#   0 = don’t apply additional limits (may increase risk on strict players)
+#CONSERVATIVE_VBV=1
+
+# Internal VBV ceilings used when CONSERVATIVE_VBV==1 and a level is set:
+# Adjust only for expert tuning / specific device envelopes.
+#LEVEL_VBV_4_1_MAXRATE=10000k; LEVEL_VBV_4_1_BUFSIZE=20000k
+#LEVEL_VBV_5_0_MAXRATE=25000k; LEVEL_VBV_5_0_BUFSIZE=50000k
+#LEVEL_VBV_5_1_MAXRATE=40000k; LEVEL_VBV_5_1_BUFSIZE=80000k
+#LEVEL_VBV_5_2_MAXRATE=60000k; LEVEL_VBV_5_2_BUFSIZE=120000k
+
+
+# =========================
+# Pixel format / Chroma
+# =========================
+
+# Force chroma subsampling 4:2:0 (most Direct Play targets require 4:2:0)
+#   1 = downsample 4:2:2/4:4:4 → 4:2:0
+#   0 = keep source chroma (may break direct play)
+#FORCE_CHROMA_420=1
+
+# SDR 10-bit policy:
+#   1 = if source is 10-bit SDR, keep 10-bit (reduces banding, slightly larger)
+#   0 = force 8-bit for SDR
+#SDR_USE_10BIT_IF_SRC_10BIT=1
+
+# Target pixel format when HDR (HLG/HDR10/DV base) is detected
+# Usually leave as yuv420p10le for HDR compatibility.
+#HDR_TARGET_PIXFMT=yuv420p10le
+
+
+# =========================
+# Threads / parallelism
+# =========================
+
+# Threads for ffmpeg (empty = let ffmpeg decide)
+# Rule of thumb: CPU cores * 1–2. Too high can hurt efficiency on x265.
+#THREADS=
+
+
+# =========================
+# Dolby Vision handling
+# =========================
+
+# Disable DV handling entirely
+#   1 = ignore DV (treat as HDR10/SDR as applicable)
+#   0 = detect DV, try extract/inject workflow
+#DISABLE_DV=0
+
+# Allow fallback if DV injection/conversion fails
+#   1 = continue with non-DV (safer)
+#   0 = treat DV failure as fatal
+#ALLOW_DV_FALLBACK=1
+
+# Try converting Profile 7 RPU → Profile 8.1 if direct inject fails
+#   1 = attempt P7→P8.1 (common for MP4 distribution)
+#   0 = do not attempt conversion
+#DV_CONVERT_TO_P81_IF_FAIL=1
+
+
+# =========================
+# Audio selection strategy
+# =========================
+
+# Language preference list (comma-separated, lower priority left→right)
+# Include "und" to allow undetermined tags to rank.
+#AUDIO_LANG_PREF=eng
+
+# Codec preference order (leftmost best)
+# Common: eac3,ac3,aac,other — favors passthrough when possible.
+#AUDIO_CODEC_PREFERENCE=eac3,ac3,aac,other
+
+# Scoring weights (advanced):
+#   Channels multiplier: score += channels * MULTIPLIER
+#   Surround bonus: added if channels >= 6
+#   Language bonus: added if language matches list above
+#AUDIO_SCORE_CHANNEL_MULTIPLIER=20
+#AUDIO_SCORE_SURROUND_BONUS=30
+#AUDIO_SCORE_LANG_BONUS_ENG=25
+
+
+# =========================
+# Audio transcode policy
+# =========================
+
+# Stereo AAC bitrate (when transcoding or creating a fallback)
+# Typical: 160k–256k; 192k is a solid default.
+#STEREO_BITRATE=192k
+
+# Maximum output channels (caps E-AC-3 downmix target when transcoding)
+#   6 = 5.1, 8 = 7.1
+#MAX_AUDIO_CHANNELS=8
+
+# Add a stereo AAC fallback track when primary >2ch (useful for mobile/airpods)
+#   1 = add stereo fallback
+#   0 = no stereo track
+#ADD_STEREO_IF_MULTICH=1
+
+# E-AC-3 bitrates used when transcoding multichannel
+#   5.1 typical: 448k–640k  (default 640k)
+#   7.1 typical: 640k–960k  (default 768k is a good balance)
+#EAC3_BITRATE_5_1=640k
+#EAC3_BITRATE_7_1=768k
+
+# Run stereo and primary audio jobs in parallel (faster on many-core CPUs)
+#   1 = parallel
+#   0 = serial (simpler logs, similar total time for short audio)
+#PARALLEL_AUDIO=0
+
+
+# =========================
+# Mux / output container
+# =========================
+
+# Output extension: mp4|m4v|mov
+#OUTPUT_EXT=mp4
+
+# MP4 interleave in milliseconds (larger = fewer seeks; smaller = smoother start on some players)
+# Typical: 500–1000ms. If you see "buffering" on old devices, try 1000.
+#MP4_INTERLEAVE_MS=500
+
+# Default language tag for audio when missing
+#TAG_LANGUAGE_DEFAULT=und
+
+# Include audio track titles from source in the MP4 container
+#   1 = include when present
+#   0 = omit
+#INCLUDE_AUDIO_TITLES=1
+
+# MP4Box verbosity: keep quiet unless debugging mux issues
+#   1 = -quiet (recommended)
+#   0 = verbose
+#MP4BOX_QUIET=1
+
+
+# =========================
+# Operational controls
+# =========================
+
+# Write a SHA-256 checksum next to final output
+#   1 = write .sha256 file
+#   0 = skip
+#CHECKSUM=0
+
+# Dry-run: plan the steps without generating real outputs
+#   1 = simulate (great for verifying choices)
+#   0 = real encode
+#DRY_RUN=0
+
+# Keep temp dir when a build fails (for debugging)
+#   1 = keep on failure
+#   0 = clean up on failure
+#KEEP_TEMP=0
+
+# Always keep temp dir (success or failure)
+#   1 = keep always (useful for post-mortem or re-use)
+#   0 = normal cleanup on success
+#KEEP_TEMP_ALWAYS=0
+
+# Warn if output volume has less than N GB free
+#DISK_FREE_WARN_GB=5
+
+
+# =========================
+# ffmpeg / ffprobe UX
+# =========================
+
+# Hide ffmpeg banner
+#   1 = hide
+#   0 = show (useful for debugging versions/build opts)
+#FFMPEG_HIDE_BANNER=1
+
+# ffmpeg log level: quiet|panic|fatal|error|warning|info|verbose|debug|trace
+#   "error" is quiet but shows issues; "warning/info" for more chatter.
+#FFMPEG_LOGLEVEL=error
+
+# Overwrite outputs without prompting
+#   1 = pass -y to ffmpeg
+#   0 = prompt (safer when experimenting)
+#FFMPEG_OVERWRITE=1
+
+# ffprobe log level (same scale as ffmpeg)
+#FFPROBE_LOGLEVEL=error
+
+
+# =========================
+# Demux / raw prep policy
+# =========================
+
+# Use Annex-B bitstream filter when demuxing raw ES (helps DV/H.264/H.265 workflows)
+#   1 = apply mp4toannexb bsf
+#   0 = direct copy elementary stream
+#ANNEXB_FOR_DEMUX=1
