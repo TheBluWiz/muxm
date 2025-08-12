@@ -126,195 +126,26 @@ cp_or_dryrun() {
 # ---------- Write default .muxmrc (used by --install) ----------
 _write_default_muxmrc() {
   local conf_path="$1"
-
   # Helper: write the full default config to a given path
   _write_template() {
     local _out="$1"
     umask 022
     cat >"$_out" <<'CONF'
-# =============================================================================
-#  MuxMaster .muxmrc — Project/User Configuration (installed default)
-# -----------------------------------------------------------------------------
-# Precedence at runtime (lowest → highest):
-#   1) Script defaults
-#   2) /etc/.muxmrc
-#   3) $HOME/.muxmrc
-#   4) ./.muxmrc (project-local)
-#   5) CLI flags
-#
-# Notes:
-# - Uncomment any line to override.
-# - This file is sourced by bash; keep values shell-safe.
-# =============================================================================
-
-# ------- Video encode (libx265) -------
-# CRF_VALUE controls quality/bitrate: lower = higher quality & larger files.
-#   Typical useful range: 16–28. Lower than 16 = very high quality/large files.
-#   16–20 = visually excellent for high-quality sources.
-#   21–24 = good balance for most content.
-#   25–28 = smaller files, quality trade-offs more visible.
-# Default: 18
-#CRF_VALUE=18
-
-# PRESET_VALUE trades encode speed for efficiency: ultrafast..placebo
-#   ultrafast/veryfast = fastest, larger files
-#   medium = default x265 balance
-#   slow/slower/veryslow = smaller files, much slower
-# Default: slower
-#PRESET_VALUE=slower
-
-# X265_PARAMS_BASE — advanced encoder tuning (colon-separated key=value)
-# Default is tuned for 10-bit HDR-capable output and strong psychovisual quality.
-#X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
-
-# LEVEL_VALUE — target level-idc (e.g., 5.1). Leave empty to let encoder decide.
-#LEVEL_VALUE=
-
-# CONSERVATIVE_VBV — when a level is set, apply safer vbv-maxrate/bufsize caps.
-# 1 = on (default), 0 = off.
-#CONSERVATIVE_VBV=1
-
-# Level guardrails (used when CONSERVATIVE_VBV=1 and LEVEL_VALUE is set)
-#LEVEL_VBV_4_1_MAXRATE=10000k; LEVEL_VBV_4_1_BUFSIZE=20000k
-#LEVEL_VBV_5_0_MAXRATE=25000k; LEVEL_VBV_5_0_BUFSIZE=50000k
-#LEVEL_VBV_5_1_MAXRATE=40000k; LEVEL_VBV_5_1_BUFSIZE=80000k
-#LEVEL_VBV_5_2_MAXRATE=60000k; LEVEL_VBV_5_2_BUFSIZE=120000k
-
-
-# ------- Pixel format / chroma policy -------
-# FORCE_CHROMA_420 — Force downsample 4:2:2/4:4:4 → 4:2:0 for Direct Play.
-# 1 = on (default), 0 = off
-#FORCE_CHROMA_420=1
-
-# SDR_USE_10BIT_IF_SRC_10BIT — keep SDR 10-bit if source is 10-bit.
-# 1 = on (default), 0 = off
-#SDR_USE_10BIT_IF_SRC_10BIT=1
-
-# HDR_TARGET_PIXFMT — pixel format used for HDR10/HLG targets
-# Default: yuv420p10le
-#HDR_TARGET_PIXFMT=yuv420p10le
-
-
-# ------- Threads -------
-# THREADS — ffmpeg -threads N; empty lets ffmpeg decide.
-#THREADS=
-
-
-# ------- Dolby Vision policy -------
-# DISABLE_DV — 1 to skip any Dolby Vision handling.
-# DISABLE_DV=0 means: try to pass through RPU; convert to 8.1 if needed.
-#DISABLE_DV=0
-
-# ALLOW_DV_FALLBACK — proceed without DV if DV inject/convert fails.
-# 1 = on (default), 0 = treat as fatal
-#ALLOW_DV_FALLBACK=1
-
-# DV_CONVERT_TO_P81_IF_FAIL — when DV inject fails, attempt P7→P8.1 conversion.
-# 1 = on (default), 0 = off
-#DV_CONVERT_TO_P81_IF_FAIL=1
-
-
-# ------- Audio selection (preferences & weights) -------
-# AUDIO_LANG_PREF — comma-separated preferred languages (ISO-639-2/3 codes).
-#AUDIO_LANG_PREF=eng
-
-# AUDIO_CODEC_PREFERENCE — order of desirability.
-#AUDIO_CODEC_PREFERENCE=eac3,ac3,aac,other
-
-# Scoring knobs for automatic track selection:
-#AUDIO_SCORE_CHANNEL_MULTIPLIER=20     # Weight per channel
-#AUDIO_SCORE_SURROUND_BONUS=30         # Bonus if ch>=6
-#AUDIO_SCORE_LANG_BONUS_ENG=25         # Bonus if language in AUDIO_LANG_PREF
-
-
-# ------- Audio transcode policy -------
-# STEREO_BITRATE — AAC stereo bitrate
-#STEREO_BITRATE=192k
-
-# MAX_AUDIO_CHANNELS — cap output channels if transcoding multichannel.
-#MAX_AUDIO_CHANNELS=8
-
-# ADD_STEREO_IF_MULTICH — also create AAC stereo track when primary >2ch.
-# 1 = on (default), 0 = off
-#ADD_STEREO_IF_MULTICH=1
-
-# EAC3_BITRATE_5_1 / EAC3_BITRATE_7_1 — default bitrates when transcoding to E-AC-3.
-#EAC3_BITRATE_5_1=640k
-#EAC3_BITRATE_7_1=768k
-
-# PARALLEL_AUDIO — run audio jobs in parallel (where supported).
-#PARALLEL_AUDIO=0
-
-
-# ------- Muxing / output -------
-# OUTPUT_EXT — mp4|m4v|mov
-#OUTPUT_EXT=mp4
-
-# MP4_INTERLEAVE_MS — MP4Box -inter value (ms); 500 balances seek & write perf.
-#MP4_INTERLEAVE_MS=500
-
-# TAG_LANGUAGE_DEFAULT — default language tag when missing.
-#TAG_LANGUAGE_DEFAULT=und
-
-# INCLUDE_AUDIO_TITLES — copy source audio title tags into MP4.
-#INCLUDE_AUDIO_TITLES=1
-
-# MP4BOX_QUIET — pass -quiet to MP4Box (1 = on, 0 = verbose)
-#MP4BOX_QUIET=1
-
-
-# ------- Operational defaults -------
-# CHECKSUM — write SHA-256 checksum next to final output.
-#CHECKSUM=0
-
-# DRY_RUN — plan steps, don’t write outputs.
-#DRY_RUN=0
-
-# KEEP_TEMP — keep workdir on failure.
-#KEEP_TEMP=0
-
-# KEEP_TEMP_ALWAYS — keep workdir on success and failure (debug).
-#KEEP_TEMP_ALWAYS=0
-
-# DISK_FREE_WARN_GB — warn if FS has less than N GiB available.
-#DISK_FREE_WARN_GB=5
-
-
-# ------- ffmpeg/ffprobe UX -------
-# FFMPEG_HIDE_BANNER — hide ffmpeg banner (1 = on, 0 = off)
-#FFMPEG_HIDE_BANNER=1
-
-# FFMPEG_LOGLEVEL — ffmpeg log level:
-#   quiet|panic|fatal|error|warning|info|verbose|debug|trace
-#FFMPEG_LOGLEVEL=error
-
-# FFMPEG_OVERWRITE — pass -y to ffmpeg (1 = on, 0 = off)
-#FFMPEG_OVERWRITE=1
-
-# FFPROBE_LOGLEVEL — ffprobe -v level
-#FFPROBE_LOGLEVEL=error
-
-
-# ------- Demux policy -------
-# ANNEXB_FOR_DEMUX — use Annex-B bitstream filter when demuxing raw ES.
-#ANNEXB_FOR_DEMUX=1
+    ... (config template content) ...
 CONF
     chmod 0644 "$_out" || true
   }
-
   # If no file, write fresh
   if [[ ! -e "$conf_path" ]]; then
     _write_template "$conf_path"
     note "Wrote default config → $conf_path"
     return 0
   fi
-
   # File exists: prompt to overwrite
   say "Config already exists at: $conf_path"
   printf "Overwrite with default and back up the current file? [y/N]: " >&2
   local ans
   if ! read -r ans; then ans=""; fi
-
   case "$ans" in
     [Yy]|[Yy][Ee][Ss])
       local ts backup_dir backup_path
@@ -963,16 +794,38 @@ say "=== Defaults   : CRF=$CRF_VALUE  StereoBitrate=$STEREO_BITRATE  Preset=$PRE
 (( DRY_RUN )) && note "DRY-RUN is ON"
 [[ ${#MUXM_CONFIG_LOADED[@]} -gt 0 ]] && note "Config layers: ${MUXM_CONFIG_LOADED[*]}"
 
-# ---------- ffprobe helpers ----------
-_probe_field(){ ffprobe "${FFPROBE_FLAGS[@]}" -show_entries "stream=$1" -of default=nk=1:nw=1 "$2" 2>/dev/null | head -n1 || true; }
-_has_stream(){ ffprobe "${FFPROBE_FLAGS[@]}" -show_entries stream=codec_type -of default=nk=1:nw=1 "$1" 2>/dev/null | grep -q "$2"; }
-_vcodec_name(){ ffprobe "${FFPROBE_FLAGS[@]}" -select_streams v:0 -show_entries stream=codec_name -of default=nk=1:nw=1 "$1" 2>/dev/null | head -n1 || true; }
+# ---------- ffprobe Helpers (20) ----------
+# Safe, quiet field probe (first line only)
+_probe_field(){
+  # $1=field list for -show_entries stream=..., $2=file
+  ffprobe "${FFPROBE_FLAGS[@]}" -show_entries "stream=$1" \
+          -of default=nk=1:nw=1 "$2" 2>/dev/null | head -n1 || true
+}
 
-# ---------- Color/DV analysis ----------
+# Robust stream-type detector that won't trip -e/pipefail
+_has_stream(){
+  # $1=file, $2=codec_type: audio|video|subtitle|data
+  local types
+  types="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_entries stream=codec_type \
+           -of default=nk=1:nw=1 "$1" 2>/dev/null || true)"
+  # Compare inside awk to keep pipeline exit 0
+  printf '%s\n' "$types" | awk -v want="$2" 'BEGIN{IGNORECASE=1} $0==want{found=1} END{exit !found}'
+}
+
+# Primary video codec name (v:0), lowercase
+_vcodec_name(){
+  ffprobe "${FFPROBE_FLAGS[@]}" -select_streams v:0 \
+          -show_entries stream=codec_name -of default=nk=1:nw=1 "$1" 2>/dev/null \
+    | head -n1 | tr '[:upper:]' '[:lower:]' || true
+}
+
+# ---------- Color Space & Pixel Format Decision (21) ----------
 IS_DV=0
 PROFILE_DESC="SDR"
 TARGET_PIXFMT="yuv420p"
 COLOR_ARGS=()
+
+# Defaults for audio-related metadata (filled later)
 A_LANG="$TAG_LANGUAGE_DEFAULT"
 A_TITLE=""
 AIDX=0
@@ -980,8 +833,11 @@ HAS_AUDIO=0
 
 decide_color_and_pixfmt() {
   local src="$1" pix prim trc cspace
-  pix="$(_probe_field pix_fmt "$src")"; prim="$(_probe_field color_primaries "$src")"
-  trc="$(_probe_field color_transfer "$src")"; cspace="$(_probe_field color_space "$src")"
+  pix="$(_probe_field pix_fmt "$src")"
+  prim="$(_probe_field color_primaries "$src")"
+  trc="$(_probe_field color_transfer "$src")"
+  cspace="$(_probe_field color_space "$src")"
+
   prim="$(printf %s "$prim"   | tr '[:upper:]' '[:lower:]')"
   trc="$(printf %s "$trc"     | tr '[:upper:]' '[:lower:]')"
   cspace="$(printf %s "$cspace"| tr '[:upper:]' '[:lower:]')"
@@ -989,7 +845,8 @@ decide_color_and_pixfmt() {
 
   local is_10bit=0 chroma="420"
   [[ "$pix" =~ p10 ]] && is_10bit=1
-  [[ "$pix" =~ 422 ]] && chroma="422"; [[ "$pix" =~ 444 ]] && chroma="444"
+  [[ "$pix" =~ 422 ]] && chroma="422"
+  [[ "$pix" =~ 444 ]] && chroma="444"
 
   if (( FORCE_CHROMA_420 )) && [[ "$chroma" != "420" ]]; then
     warn "Source chroma is 4:${chroma}; downsampling to 4:2:0 for Apple TV Direct Play."
@@ -1010,20 +867,10 @@ decide_color_and_pixfmt() {
   PROFILE_DESC="$profile"; TARGET_PIXFMT="$tgt_pix"
 }
 
-detect_dv() {
-  (( DISABLE_DV )) && return 1
-  if ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>/dev/null \
-      | grep -m1 -qiE 'dolby_vision|dv_profile|dovi|dvhe|dvh1|com\.dolby\.vision'; then
-    return 0
-  fi
-  ffprobe "${FFPROBE_FLAGS[@]}" -show_frames -read_intervals %+#5 -select_streams v:0 "$SRC_ABS" 2>/dev/null \
-    | grep -m1 -qiE 'DOVI|dolby' && return 0
-  return 1
-}
-
-# x265 params
+# ---------- x265 Params & Level/VBV Guardrails (22) ----------
 X265_PARAMS="$X265_PARAMS_BASE"
 decide_color_and_pixfmt "$SRC_ABS"
+# Drop HDR-only tune when not HDR/HLG
 if [[ "$PROFILE_DESC" != "HDR10" && "$PROFILE_DESC" != "HLG" ]]; then
   X265_PARAMS="${X265_PARAMS/:hdr-opt=1/}"
 fi
@@ -1047,7 +894,20 @@ apply_level_vbv() {
 }
 [[ -n "$LEVEL_VALUE" ]] && apply_level_vbv "$LEVEL_VALUE"
 
-IS_DV=0
+# ---------- Dolby Vision Detection & Flags (23) ----------
+detect_dv() {
+  (( DISABLE_DV )) && return 1
+  # Check stream tags quickly
+  if ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>/dev/null \
+      | grep -m1 -qiE 'dolby_vision|dv_profile|dovi|dvhe|dvh1|com\.dolby\.vision'; then
+    return 0
+  fi
+  # Lightweight frame scan (first few frames)
+  ffprobe "${FFPROBE_FLAGS[@]}" -show_frames -read_intervals %+#5 -select_streams v:0 "$SRC_ABS" 2>/dev/null \
+    | grep -m1 -qiE 'DOVI|dolby' && return 0
+  return 1
+}
+
 if detect_dv; then
   IS_DV=1; note "Dolby Vision detected — extract → inject; convert only if injection fails."
 else
@@ -1055,23 +915,42 @@ else
 fi
 (( DISABLE_DV )) && note "DV handling explicitly disabled via --no-dv."
 
-# ---------- Audio selection utilities ----------
-_ap_audio_field()  { local idx="$1" field="$2"; ffprobe "${FFPROBE_FLAGS[@]}" -select_streams a:"$idx" -show_entries "stream=$field" -of default=nk=1:nw=1 "$SRC_ABS" 2>/dev/null | head -n1; }
-_ap_audio_tag()    { local idx="$1" tag="$2";   ffprobe "${FFPROBE_FLAGS[@]}" -select_streams a:"$idx" -show_entries "stream_tags=$tag" -of default=nk=1:nw=1 "$SRC_ABS" 2>/dev/null | head -n1; }
-list_audio_indices(){
-  # Return positional audio indexes: 0..N-1 (what ffmpeg -map 0:a:N expects)
+# ---------- Audio Selection Utilities (24) ----------
+# Hardened helpers that never fail under -eEuo pipefail and cope with odd metadata.
+
+# Count positional audio streams (what -map 0:a:N uses)
+_audio_count() {
   local n
   n="$(ffprobe "${FFPROBE_FLAGS[@]}" -select_streams a \
-        -show_entries stream=index -of default=nk=1:nw=1 "$SRC_ABS" 2>/dev/null \
-        | wc -l | tr -d '[:space:]')"
-  [[ -z "$n" || "$n" -lt 1 ]] && return 0
-  local i
+        -show_entries stream=index -of csv=p=0 "$SRC_ABS" 2>/dev/null | wc -l | tr -d '[:space:]')"
+  [[ -n "$n" ]] || n=0
+  echo "$n"
+}
+
+# List 0..N-1
+list_audio_indices(){
+  local n i
+  n="$(_audio_count)"
   for (( i=0; i<n; i++ )); do echo "$i"; done
+}
+
+# Safe field/tag getters (first line only)
+_ap_audio_field() { # $1=idx, $2=field
+  local out=""
+  out="$(ffprobe "${FFPROBE_FLAGS[@]}" -select_streams "a:$1" \
+         -show_entries "stream=$2" -of default=nk=1:nw=1 "$SRC_ABS" 2>/dev/null || true)"
+  printf '%s\n' "${out%%$'\n'*}"
+}
+_ap_audio_tag() {   # $1=idx, $2=tag
+  local out=""
+  out="$(ffprobe "${FFPROBE_FLAGS[@]}" -select_streams "a:$1" \
+         -show_entries "stream_tags=$2" -of default=nk=1:nw=1 "$SRC_ABS" 2>/dev/null || true)"
+  printf '%s\n' "${out%%$'\n'*}"
 }
 
 describe_audio_stream() {
   local i="$1" codec ch layout lang title br kbps
-  codec="$(_ap_audio_field "$i" codec_name)"
+  codec="$(_ap_audio_field "$i" codec_name | tr '[:upper:]' '[:lower:]')"
   ch="$(_ap_audio_field "$i" channels)"; [[ -z "$ch" ]] && ch="?"
   layout="$(_ap_audio_field "$i" channel_layout)"
   lang="$(_ap_audio_tag "$i" language)"; [[ -z "$lang" ]] && lang="und"
@@ -1081,36 +960,34 @@ describe_audio_stream() {
   printf "#%s: %s %s%s [%s]%s%s\n" \
     "$i" "${codec:-?}" "${ch}" "${layout:+ ($layout)}" "$lang" "${title:+ — $title}" "${kbps:+, $kbps}"
 }
+
+# Codec preference ranking (lower is better)
 _muxm_codec_rank(){
-  local codec
-  codec="$(printf %s "$1" | tr '[:upper:]' '[:lower:]')"
+  local codec; codec="$(printf %s "$1" | tr '[:upper:]' '[:lower:]')"
   local IFS=, pref i=0
   for pref in $AUDIO_CODEC_PREFERENCE; do
-    if [[ "$codec" == "$pref" ]]; then
-      echo "$i"
-      return
-    fi
+    if [[ "$codec" == "$pref" ]]; then echo "$i"; return; fi
     ((i++))
   done
   echo "$i"
 }
+
+# Language bonus if in preferred set
 _muxm_lang_bonus(){
-  local lang
-  lang="$(printf %s "$1" | tr '[:upper:]' '[:lower:]')"
+  local lang; lang="$(printf %s "$1" | tr '[:upper:]' '[:lower:]')"
   local IFS=, pref
   for pref in $AUDIO_LANG_PREF; do
-    if [[ "$lang" == "$pref" ]]; then
-      echo "$AUDIO_SCORE_LANG_BONUS_ENG"
-      return
-    fi
+    if [[ "$lang" == "$pref" ]]; then echo "$AUDIO_SCORE_LANG_BONUS_ENG"; return; fi
   done
   echo 0
 }
+
+# Score stream: codec rank, channels, surround bonus, language
 score_audio_stream() {
   local i="$1" codec ch lang score=0 rank
-  codec="$( _ap_audio_field "$i" codec_name | tr '[:upper:]' '[:lower:]' )"
-  ch="$( _ap_audio_field "$i" channels )"; [[ -z "$ch" ]] && ch=2
-  lang="$( _ap_audio_tag "$i" language | tr '[:upper:]' '[:lower:]' )"
+  codec="$(_ap_audio_field "$i" codec_name | tr '[:upper:]' '[:lower:]')"
+  ch="$(_ap_audio_field "$i" channels)"; [[ -z "$ch" ]] && ch=2
+  lang="$(_ap_audio_tag "$i" language | tr '[:upper:]' '[:lower:]')"
   rank="$(_muxm_codec_rank "$codec")"
   (( score += 400 - (rank*80) ))
   (( score += ch * AUDIO_SCORE_CHANNEL_MULTIPLIER ))
@@ -1118,6 +995,8 @@ score_audio_stream() {
   (( score += $(_muxm_lang_bonus "$lang") ))
   echo "$score"
 }
+
+# Choose best existing index (never empty)
 auto_select_best_audio() {
   local idxs=() i score best_idx=0 best_score=-1
   while IFS= read -r i; do [[ -n "$i" ]] && idxs+=("$i"); done < <(list_audio_indices)
@@ -1128,19 +1007,23 @@ auto_select_best_audio() {
   done
   echo "$best_idx"
 }
+
+# Resolve the audio index; respect override; never return empty
 resolve_audio_track_index() {
   local idxs=() i
   while IFS= read -r i; do [[ -n "$i" ]] && idxs+=("$i"); done < <(list_audio_indices)
-   if [[ -n "${AUDIO_TRACK_OVERRIDE:-}" ]]; then
-     [[ $AUDIO_TRACK_OVERRIDE =~ ^[0-9]+$ ]] || die 11 "--audio-track must be a non-negative integer"
-     printf '%s\n' "${idxs[@]}" | grep -qx "$AUDIO_TRACK_OVERRIDE" || die 11 "Requested --audio-track $AUDIO_TRACK_OVERRIDE not found"
-     echo "$AUDIO_TRACK_OVERRIDE"; return
-   fi
-   if (( ${#idxs[@]} >= 1 )); then auto_select_best_audio; return; fi
-   echo 0
+
+  if [[ -n "${AUDIO_TRACK_OVERRIDE:-}" ]]; then
+    [[ $AUDIO_TRACK_OVERRIDE =~ ^[0-9]+$ ]] || die 11 "--audio-track must be a non-negative integer"
+    printf '%s\n' "${idxs[@]}" | grep -qx "$AUDIO_TRACK_OVERRIDE" || die 11 "Requested --audio-track $AUDIO_TRACK_OVERRIDE not found"
+    echo "$AUDIO_TRACK_OVERRIDE"; return
+  fi
+
+  (( ${#idxs[@]} > 0 )) && { auto_select_best_audio; return; }
+  echo 0
 }
 
-# ---------- Temp paths ----------
+# ---------- Temp Paths (25) ----------
 V_SRC_DV="$WORKDIR/video_src.hevc"
 V_SRC_ES="$WORKDIR/video_src.es"
 RPU_P7="$WORKDIR/rpu_p7.bin"
@@ -1151,43 +1034,76 @@ A_PRIMARY=""
 AAC_STEREO=""
 MP4_BASE="$WORKDIR/primary_base.mp4"
 
-# [1/15] Prepare ES / Annex-B
+# ---------- Demux to ES / Annex‑B (Step [1/15]) (26) ----------
 say "[1/15] Preparing raw elementary stream$([[ $IS_DV -eq 1 ]] && echo ' (Annex-B for DV)')…"
+
 demux_to_annexb() {
   local src="$1" out="$2" need_annexb="$3"
-  local vcodec; vcodec="$(_vcodec_name "$src")"; vcodec="$(printf %s "$vcodec" | tr '[:upper:]' '[:lower:]')"
+  local vcodec; vcodec="$(_vcodec_name "$src")"
   local fmt="" bsf=""
-  if [[ "$vcodec" == "hevc" || "$vcodec" == "h265" ]]; then fmt="hevc"; bsf="hevc_mp4toannexb"
-  elif [[ "$vcodec" == "h264" || "$vcodec" == "avc1" ]]; then fmt="h264"; bsf="h264_mp4toannexb"
-  else warn "Unknown/unsupported video codec ($vcodec) for raw ES demux; skipping demux."; : > "$out"; return 0; fi
+  if [[ "$vcodec" == "hevc" || "$vcodec" == "h265" ]]; then
+    fmt="hevc"; bsf="hevc_mp4toannexb"
+  elif [[ "$vcodec" == "h264" || "$vcodec" == "avc1" ]]; then
+    fmt="h264"; bsf="h264_mp4toannexb"
+  else
+    warn "Unknown/unsupported video codec ($vcodec) for raw ES demux; skipping demux."
+    : > "$out"
+    return 0
+  fi
 
-  if (( DRY_RUN )); then local _annex_hint=""; [[ "${need_annexb:-0}" -ne 0 ]] && _annex_hint=" (Annex-B)"; say "DRY-RUN: demux raw $fmt${_annex_hint} → $out"; : > "$out"; return 0; fi
+  if (( DRY_RUN )); then
+    local _annex_hint=""
+    [[ "${need_annexb:-0}" -ne 0 ]] && _annex_hint=" (Annex-B)"
+    say "DRY-RUN: demux raw $fmt${_annex_hint} → $out"
+    : > "$out"
+    return 0
+  fi
 
   if [[ "$need_annexb" == "1" || $ANNEXB_FOR_DEMUX -ne 0 ]]; then
     ffmpeg "${FFMPEG_FLAGS[@]}" -i "$src" -map 0:v:0 -c copy -bsf:v "$bsf" -f "$fmt" "$out"
   else
-    ffmpeg "${FFMPEG_FLAGS[@]}" -i "$src" -map 0:v:0 -c copy                 -f "$fmt" "$out"
+    ffmpeg "${FFMPEG_FLAGS[@]}" -i "$src" -map 0:v:0 -c copy                -f "$fmt" "$out"
   fi
 }
+
+# Choose DV path if present (light probe already ran earlier)
 if (( DISABLE_DV == 0 )) && ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>/dev/null | grep -m1 -qiE 'dolby_vision|dv_profile|dovi|dvhe|dvh1|com\.dolby\.vision'; then
-  demux_to_annexb "$SRC_ABS" "$V_SRC_DV" 1; mark_done "Demux DV Annex-B → $(basename "$V_SRC_DV")"; IS_DV=1
+  demux_to_annexb "$SRC_ABS" "$V_SRC_DV" 1
+  mark_done "Demux DV Annex-B → $(basename "$V_SRC_DV")"
+  IS_DV=1
 else
-  demux_to_annexb "$SRC_ABS" "$V_SRC_ES" 1; mark_done "Demux raw ES → $(basename "$V_SRC_ES")"; IS_DV=0
+  demux_to_annexb "$SRC_ABS" "$V_SRC_ES" 1
+  mark_done "Demux raw ES → $(basename "$V_SRC_ES")"
+  IS_DV=0
 fi
 
-# [2/15] Extract RPU
+# ---------- DV RPU Extraction (Step [2/15]) (27) ----------
 if (( IS_DV == 1 && DISABLE_DV == 0 )); then
   say "[2/15] Extracting Dolby Vision RPU → $RPU_P7"
-  dv_extract_rpu() { local in="$1" out="$2"; if (( DRY_RUN )); then say "DRY-RUN: dovi_tool extract-rpu → $out"; : > "$out"; return 0; fi; dovi_tool extract-rpu -i "$in" -o "$out"; }
-  if dv_extract_rpu "$V_SRC_DV" "$RPU_P7"; then mark_done "Extract RPU"; else
-    if (( ALLOW_DV_FALLBACK )); then warn "RPU extract failed; proceeding without DV."; IS_DV=0
-    else die 20 "DV RPU extract failed. Set ALLOW_DV_FALLBACK=1 or pass --no-dv to continue without DV."; fi
+  dv_extract_rpu() {
+    local in="$1" out="$2"
+    if (( DRY_RUN )); then
+      say "DRY-RUN: dovi_tool extract-rpu → $out"
+      : > "$out"
+      return 0
+    fi
+    dovi_tool extract-rpu -i "$in" -o "$out"
+  }
+  if dv_extract_rpu "$V_SRC_DV" "$RPU_P7"; then
+    mark_done "Extract RPU"
+  else
+    if (( ALLOW_DV_FALLBACK )); then
+      warn "RPU extract failed; proceeding without DV."
+      IS_DV=0
+    else
+      die 20 "DV RPU extract failed. Set ALLOW_DV_FALLBACK=1 or pass --no-dv to continue without DV."
+    fi
   fi
 fi
 
 # [3/15] (reserved)
 
-# [4/15] Encode base video
+# ---------- Base Video Encode (Step [4/15]) (28) ----------
 say "[4/15] Encoding base video ($PROFILE_DESC, $TARGET_PIXFMT, preset $PRESET_VALUE, CRF $CRF_VALUE) → $V_BASE"
 if (( DRY_RUN )); then
   say "DRY-RUN: x265 encode (CRF $CRF_VALUE, preset $PRESET_VALUE) → $V_BASE"
@@ -1199,8 +1115,9 @@ else
 fi
 mark_done "Encode base"
 
-# [5/15] DV inject/convert (DRY-RUN-safe)
+# ---------- DV Inject / P7→P8.1 Convert (Step [5/15]) (29) ----------
 say "[5/15] Finalizing video stream (DV inject if available) → $V_MIXED"
+
 dv_inject_with_rpu(){
   local base="$1" out="$2" rpu="$3"
   if (( DRY_RUN )); then
@@ -1210,6 +1127,7 @@ dv_inject_with_rpu(){
   fi
   dovi_tool inject-rpu -i "$base" -r "$rpu" -o "$out"
 }
+
 dv_convert_p7_to_p81(){
   local in="$1" out="$2"
   if (( DRY_RUN )); then
@@ -1225,12 +1143,14 @@ dv_convert_p7_to_p81(){
 
 if (( IS_DV == 1 && DISABLE_DV == 0 )); then
   if dv_inject_with_rpu "$V_BASE" "$V_MIXED" "$RPU_P7"; then
-    note "DV injection succeeded with extracted RPU (treated as P8.x)."; mark_done "DV inject (pass-through)"
+    note "DV injection succeeded with extracted RPU (treated as P8.x)."
+    mark_done "DV inject (pass-through)"
   else
     if (( DV_CONVERT_TO_P81_IF_FAIL )); then
       note "Initial DV injection failed — attempting P7→P8.1 conversion of RPU."
       if dv_convert_p7_to_p81 "$RPU_P7" "$RPU_P81" && dv_inject_with_rpu "$V_BASE" "$V_MIXED" "$RPU_P81"; then
-        note "RPU converted and injection succeeded (Profile 7 → P8.1)."; mark_done "DV convert+inject"
+        note "RPU converted and injection succeeded (Profile 7 → P8.1)."
+        mark_done "DV convert+inject"
       else
         if (( ALLOW_DV_FALLBACK )); then
           warn "DV conversion/injection failed; using non-DV base video."
@@ -1251,61 +1171,106 @@ if (( IS_DV == 1 && DISABLE_DV == 0 )); then
     fi
   fi
 else
-  cp_or_dryrun "$V_BASE" "$V_MIXED"; mark_done "Use base video (non-DV)"
+  cp_or_dryrun "$V_BASE" "$V_MIXED"
+  mark_done "Use base video (non-DV)"
 fi
 
-# [6/15] Audio presence & index resolve
-_has_stream "$SRC_ABS" audio && HAS_AUDIO=1 || HAS_AUDIO=0
+# ---------- Audio Presence & Index Resolve (Step [6/15]) (30) ----------
+# Use hardened detector to avoid tripping -eEuo pipefail if grep returns 1
+if _has_stream "$SRC_ABS" audio; then
+  HAS_AUDIO=1
+else
+  HAS_AUDIO=0
+fi
+
 if (( HAS_AUDIO )); then
   AIDX="$(resolve_audio_track_index)"
+  # Fill metadata defensively; always provide something sane
   A_LANG="$(_ap_audio_tag "$AIDX" language)"; [[ -z "$A_LANG" ]] && A_LANG="$TAG_LANGUAGE_DEFAULT"
   A_TITLE="$(_ap_audio_tag "$AIDX" title)"
   note "[Audio Select] Using track #$AIDX: $(describe_audio_stream "$AIDX")"
+
+  # Short debug dump to verify what we saw (non-fatal, helpful during tuning)
+  say "[6b] Detected audio streams:"
+  for i in $(list_audio_indices); do
+    describe_audio_stream "$i" || true
+  done
 else
-  AIDX=0; A_LANG="$TAG_LANGUAGE_DEFAULT"; A_TITLE=""
+  AIDX=0
+  A_LANG="$TAG_LANGUAGE_DEFAULT"
+  A_TITLE=""
+  note "No audio tracks detected; continuing with video-only."
 fi
 
-# [7/15] Decide audio temp names/formats
-ACODEC="$(ffprobe "${FFPROBE_FLAGS[@]}" -select_streams a:"$AIDX" -show_entries stream=codec_name -of default=nk=1:nw=1 "$SRC_ABS" || true)"
-ACHANNELS="$(ffprobe "${FFPROBE_FLAGS[@]}" -select_streams a:"$AIDX" -show_entries stream=channels   -of default=nk=1:nw=1 "$SRC_ABS" || true)"; [[ -z "$ACHANNELS" ]] && ACHANNELS=2
-ADD_STEREO=0; [[ "$ACHANNELS" -gt 2 ]] && ADD_STEREO=1
+# ---------- Audio Formats & Temp Names (Step [7/15]) (31) ----------
+# Detect codec/channels defensively and pick temp filenames/containers.
+ACODEC="$(ffprobe "${FFPROBE_FLAGS[@]}" -select_streams a:"$AIDX" -show_entries stream=codec_name -of default=nk=1:nw=1 "$SRC_ABS" 2>/dev/null | head -n1 | tr '[:upper:]' '[:lower:]' || true)"
+ACHANNELS="$(ffprobe "${FFPROBE_FLAGS[@]}" -select_streams a:"$AIDX" -show_entries stream=channels   -of default=nk=1:nw=1 "$SRC_ABS" 2>/dev/null | head -n1 || true)"
+[[ -z "$ACHANNELS" ]] && ACHANNELS=2
+
+ADD_STEREO=0
+(( ACHANNELS > 2 )) && ADD_STEREO=1
 
 A_PRIMARY_FMT=""
 case "$ACODEC" in
   aac)   A_PRIMARY="$WORKDIR/audio_primary.m4a" ;;
   eac3)  A_PRIMARY="$WORKDIR/audio_primary.eac3"; A_PRIMARY_FMT="eac3" ;;
   ac3)   A_PRIMARY="$WORKDIR/audio_primary.ac3";  A_PRIMARY_FMT="ac3"  ;;
-  *)     A_PRIMARY="$WORKDIR/audio_primary.m4a" ;;
+  *)     A_PRIMARY="$WORKDIR/audio_primary.m4a" ;;  # default container for AAC
 esac
 AAC_STEREO="$WORKDIR/stereo.m4a"
 
-# [8-9/15] Prepare audio (serial or parallel)
+# ---------- Audio Preparation (primary + optional stereo) (Steps [8–9/15]) (32) ----------
 start_aac_stereo_job() {
-  if [[ -n "$THREADS" ]]; then ffmpeg "${FFMPEG_FLAGS[@]}" -threads "$THREADS" -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$AAC_STEREO"
-  else                          ffmpeg "${FFMPEG_FLAGS[@]}"                    -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$AAC_STEREO"
+  # Always encode a clean AAC stereo track in MP4 container
+  if [[ -n "$THREADS" ]]; then
+    ffmpeg "${FFMPEG_FLAGS[@]}" -threads "$THREADS" -i "$SRC_ABS" -map 0:a:"$AIDX" \
+      -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$AAC_STEREO"
+  else
+    ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$AIDX" \
+      -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$AAC_STEREO"
   fi
 }
+
 prepare_primary_audio_copy_or_transcode() {
-  if [[ "$ACODEC" == "eac3" || "$ACODEC" == "ac3" || "$ACODEC" == "aac" ]]; then
-    if [[ "$ACODEC" == "aac" ]]; then ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$AIDX" -c copy -f mp4 "$A_PRIMARY"
-    else                               ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$AIDX" -c copy ${A_PRIMARY_FMT:+-f "$A_PRIMARY_FMT"} "$A_PRIMARY"
+  # Copy when codec is already Direct Play-friendly (AAC/EC-3/AC-3); otherwise transcode.
+  if [[ "$ACODEC" == "aac" || "$ACODEC" == "eac3" || "$ACODEC" == "ac3" ]]; then
+    if [[ "$ACODEC" == "aac" ]]; then
+      # Ensure proper MP4 framing for AAC (avoids ADTS-in-MP4 weirdness on some builds)
+      ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$AIDX" -c copy -movflags +faststart -f mp4 "$A_PRIMARY"
+    else
+      # Raw copy for EC-3/AC-3 into their native containers
+      ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$AIDX" -c copy ${A_PRIMARY_FMT:+-f "$A_PRIMARY_FMT"} "$A_PRIMARY"
     fi
     note "Direct Play codec detected ($ACODEC). Copying without conversion."
-  else
-    if (( ACHANNELS <= 2 )); then
-      if [[ -n "$THREADS" ]]; then ffmpeg "${FFMPEG_FLAGS[@]}" -threads "$THREADS" -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$A_PRIMARY"
-      else                          ffmpeg "${FFMPEG_FLAGS[@]}"                    -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$A_PRIMARY"
-      fi
-      note "Unsupported stereo codec ($ACODEC). Transcoding to AAC $STEREO_BITRATE."
+    return 0
+  fi
+
+  # Otherwise, transcode based on channel count
+  if (( ACHANNELS <= 2 )); then
+    if [[ -n "$THREADS" ]]; then
+      ffmpeg "${FFMPEG_FLAGS[@]}" -threads "$THREADS" -i "$SRC_ABS" -map 0:a:"$AIDX" \
+        -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$A_PRIMARY"
     else
-      channels_to_keep="$ACHANNELS"; (( channels_to_keep > MAX_AUDIO_CHANNELS )) && channels_to_keep="$MAX_AUDIO_CHANNELS"
-      A_PRIMARY="$WORKDIR/audio_primary.eac3"; A_PRIMARY_FMT="eac3"
-      _eac3_br="$([[ $channels_to_keep -ge 7 ]] && echo "$EAC3_BITRATE_7_1" || echo "$EAC3_BITRATE_5_1")"
-      if [[ -n "$THREADS" ]]; then ffmpeg "${FFMPEG_FLAGS[@]}" -threads "$THREADS" -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a eac3 -b:a "$_eac3_br" -ac "$channels_to_keep" -f eac3 "$A_PRIMARY"
-      else                          ffmpeg "${FFMPEG_FLAGS[@]}"                    -i "$SRC_ABS" -map 0:a:"$AIDX" -c:a eac3 -b:a "$_eac3_br" -ac "$channels_to_keep" -f eac3 "$A_PRIMARY"
-      fi
-      note "Unsupported multichannel codec ($ACODEC). Transcoding to E-AC-3."
+      ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$AIDX" \
+        -c:a aac -b:a "$STEREO_BITRATE" -ac 2 -f mp4 "$A_PRIMARY"
     fi
+    note "Unsupported stereo codec ($ACODEC). Transcoding to AAC $STEREO_BITRATE."
+  else
+    # Transcode multichannel to E-AC-3 with sane bitrate caps
+    local channels_to_keep="$ACHANNELS"
+    (( channels_to_keep > MAX_AUDIO_CHANNELS )) && channels_to_keep="$MAX_AUDIO_CHANNELS"
+    A_PRIMARY="$WORKDIR/audio_primary.eac3"; A_PRIMARY_FMT="eac3"
+    local _eac3_br
+    if (( channels_to_keep >= 7 )); then _eac3_br="$EAC3_BITRATE_7_1"; else _eac3_br="$EAC3_BITRATE_5_1"; fi
+    if [[ -n "$THREADS" ]]; then
+      ffmpeg "${FFMPEG_FLAGS[@]}" -threads "$THREADS" -i "$SRC_ABS" -map 0:a:"$AIDX" \
+        -c:a eac3 -b:a "$_eac3_br" -ac "$channels_to_keep" -f eac3 "$A_PRIMARY"
+    else
+      ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$AIDX" \
+        -c:a eac3 -b:a "$_eac3_br" -ac "$channels_to_keep" -f eac3 "$A_PRIMARY"
+    fi
+    note "Unsupported multichannel codec ($ACODEC). Transcoding to E-AC-3 $_eac3_br."
   fi
 }
 
@@ -1319,16 +1284,20 @@ if (( HAS_AUDIO )); then
     else
       : > "$AAC_STEREO"; PID_STEREO=""
     fi
+
     PRIMARY_STATUS=0; STEREO_STATUS=0
     [[ -n "${PID_PRIMARY:-}" ]] && { if ! wait "$PID_PRIMARY"; then PRIMARY_STATUS=$?; kill_if_running "$PID_STEREO"; fi; }
     [[ -n "${PID_STEREO:-}"  ]] && { if ! wait "$PID_STEREO";  then STEREO_STATUS=$?;  kill_if_running "$PID_PRIMARY"; fi; }
     (( PRIMARY_STATUS != 0 )) && die 30 "Primary audio job failed (exit $PRIMARY_STATUS)."
     (( ADD_STEREO == 1 && ADD_STEREO_IF_MULTICH == 1 && STEREO_STATUS != 0 )) && die 31 "Stereo fallback job failed (exit $STEREO_STATUS)."
-    mark_done "Primary audio prepared (parallel)"; (( ADD_STEREO && ADD_STEREO_IF_MULTICH )) && mark_done "Create AAC stereo (parallel)"
+
+    mark_done "Primary audio prepared (parallel)"
+    (( ADD_STEREO && ADD_STEREO_IF_MULTICH )) && mark_done "Create AAC stereo (parallel)"
   else
     say "[8/15] Preparing primary audio → $A_PRIMARY"
     prepare_primary_audio_copy_or_transcode
     mark_done "Primary audio prepared"
+
     if (( ADD_STEREO )) && (( ADD_STEREO_IF_MULTICH )); then
       say "[9/15] Creating AAC stereo fallback → $AAC_STEREO"
       start_aac_stereo_job
@@ -1339,10 +1308,11 @@ if (( HAS_AUDIO )); then
     fi
   fi
 else
-  : > "$A_PRIMARY"; : > "$AAC_STEREO"; note "No audio tracks detected; continuing with video-only."
+  : > "$A_PRIMARY"; : > "$AAC_STEREO"
+  note "No audio tracks detected; continuing with video-only."
 fi
 
-# [10/15] Mux primary MP4
+# ---------- Primary MP4 Mux (video + primary audio) (Step [10/15]) (33) ----------
 say "[10/15] Muxing primary MP4 → $MP4_BASE"
 if (( DRY_RUN )); then
   say "DRY-RUN: MP4Box mux → $MP4_BASE"
@@ -1351,15 +1321,27 @@ else
   _mp4box_quiet=(); (( MP4BOX_QUIET )) && _mp4box_quiet=(-quiet)
   _title_arg=""
   (( INCLUDE_AUDIO_TITLES )) && [[ -n "$A_TITLE" ]] && _title_arg=":name=$A_TITLE"
+
   if [[ -s "$A_PRIMARY" ]]; then
-    MP4Box "${_mp4box_quiet[@]}" -add "$V_MIXED" -add "$A_PRIMARY:lang=$A_LANG${_title_arg}" -inter "$MP4_INTERLEAVE_MS" -new "$MP4_BASE"
+    # Try MP4Box first for consistent interleaving
+    if ! MP4Box "${_mp4box_quiet[@]}" -add "$V_MIXED" -add "$A_PRIMARY:lang=$A_LANG${_title_arg}" -inter "$MP4_INTERLEAVE_MS" -new "$MP4_BASE"; then
+      warn "MP4Box failed to import audio (codec/container support). Falling back to ffmpeg for mux."
+      # ffmpeg fallback mux (handles EC-3/AC-3-in-MP4 correctly)
+      ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
+        -i "$V_MIXED" -i "$A_PRIMARY" \
+        -map 0:v:0 -map 1:a:0 -c copy -movflags +faststart "$MP4_BASE"
+    fi
   else
-    MP4Box "${_mp4box_quiet[@]}" -add "$V_MIXED" -inter "$MP4_INTERLEAVE_MS" -new "$MP4_BASE"
+    # Video-only
+    if ! MP4Box "${_mp4box_quiet[@]}" -add "$V_MIXED" -inter "$MP4_INTERLEAVE_MS" -new "$MP4_BASE"; then
+      ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
+        -i "$V_MIXED" -map 0:v:0 -c copy -movflags +faststart "$MP4_BASE"
+    fi
   fi
 fi
 mark_done "Mux primary"
 
-# [11/15] Assemble final
+# ---------- Final Assembly (add stereo or copy base) (Step [11/15]) (34) ----------
 say "[11/15] Assembling final MP4 → $TMP_OUT"
 if (( DRY_RUN )); then
   say "DRY-RUN: finalize → $TMP_OUT"
@@ -1367,7 +1349,13 @@ if (( DRY_RUN )); then
 else
   _mp4box_quiet=(); (( MP4BOX_QUIET )) && _mp4box_quiet=(-quiet)
   if [[ -s "$AAC_STEREO" ]]; then
-    MP4Box "${_mp4box_quiet[@]}" -add "$MP4_BASE" -add "$AAC_STEREO:name=Stereo:lang=$A_LANG" -inter "$MP4_INTERLEAVE_MS" -new "$TMP_OUT"
+    # Try MP4Box to append the stereo track with language + title
+    if ! MP4Box "${_mp4box_quiet[@]}" -add "$MP4_BASE" -add "$AAC_STEREO:name=Stereo:lang=$A_LANG" -inter "$MP4_INTERLEAVE_MS" -new "$TMP_OUT"; then
+      warn "MP4Box failed to append stereo track. Falling back to ffmpeg."
+      ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
+        -i "$MP4_BASE" -i "$AAC_STEREO" \
+        -map 0 -map 1:a:0 -c copy -movflags +faststart "$TMP_OUT"
+    fi
   else
     cp -f "$MP4_BASE" "$TMP_OUT"
   fi
@@ -1375,10 +1363,14 @@ else
 fi
 mark_done "Finalize MP4"
 
-# [12/15] DV note
-if (( IS_DV == 1 && DISABLE_DV == 0 )); then note "Dolby Vision present in output (P8.1 injected or pass-through)."; else note "Output is non-DV (HDR10/HLG/SDR as applicable)."; fi
+# ---------- DV Presence Note (Step [12/15]) (35) ----------
+if (( IS_DV == 1 && DISABLE_DV == 0 )); then
+  note "Dolby Vision present in output (P8.1 injected or pass-through)."
+else
+  note "Output is non-DV (HDR10/HLG/SDR as applicable)."
+fi
 
-# [13/15] Verify
+# ---------- Verification (Step [13/15]) (36) ----------
 say "[13/15] Verifying streams…"
 if (( DRY_RUN )); then
   say "DRY-RUN: ffprobe verify $TMP_OUT"
@@ -1387,7 +1379,7 @@ else
 fi
 mark_done "Verify output"
 
-# [14/15] Size
+# ---------- Output Size (Step [14/15]) (37) ----------
 say "[14/15] Output (temp) size:"
 if (( DRY_RUN )); then
   say "DRY-RUN: size of $TMP_OUT"
@@ -1395,5 +1387,5 @@ else
   filesize_pretty "$TMP_OUT"
 fi
 
-# [15/15] Move in EXIT trap
+# ---------- Finalize/Mv Happens in EXIT Trap (Step [15/15]) (38) ----------
 note "✅ Staging complete — will atomically move to: $OUT"
