@@ -870,9 +870,15 @@ decide_color_and_pixfmt() {
 # ---------- x265 Params & Level/VBV Guardrails (22) ----------
 X265_PARAMS="$X265_PARAMS_BASE"
 decide_color_and_pixfmt "$SRC_ABS"
-# Drop HDR-only tune when not HDR/HLG
-if [[ "$PROFILE_DESC" != "HDR10" && "$PROFILE_DESC" != "HLG" ]]; then
+
+# If we're not HDR10, ensure hdr-opt is NOT present (covers HLG and SDR).
+if [[ "$PROFILE_DESC" != "HDR10" ]]; then
   X265_PARAMS="${X265_PARAMS/:hdr-opt=1/}"
+fi
+
+# If (and only if) we are HDR10, enable HDR10 signaling and set x265's colorimetry.
+if [[ "$PROFILE_DESC" == "HDR10" ]]; then
+  X265_PARAMS="${X265_PARAMS}:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited"
 fi
 
 apply_level_vbv() {
@@ -894,10 +900,10 @@ apply_level_vbv() {
 }
 [[ -n "$LEVEL_VALUE" ]] && apply_level_vbv "$LEVEL_VALUE"
 
-# ---------- Dolby Vision Detection & Flags (23) ----------
+# ---------- Dolby Vision Detection (23) ----------
 detect_dv() {
   (( DISABLE_DV )) && return 1
-  # Check stream tags quickly
+  # Fast stream tag check
   if ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>/dev/null \
       | grep -m1 -qiE 'dolby_vision|dv_profile|dovi|dvhe|dvh1|com\.dolby\.vision'; then
     return 0
@@ -908,8 +914,10 @@ detect_dv() {
   return 1
 }
 
+IS_DV=0
 if detect_dv; then
-  IS_DV=1; note "Dolby Vision detected — extract → inject; convert only if injection fails."
+  IS_DV=1
+  note "Dolby Vision detected — extract → inject; convert only if injection fails."
 else
   note "No Dolby Vision detected."
 fi
@@ -1111,7 +1119,16 @@ if (( DRY_RUN )); then
 else
   ffargs=( "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c:v libx265 -preset "$PRESET_VALUE" -crf "$CRF_VALUE" -pix_fmt "$TARGET_PIXFMT" )
   [[ -n "$THREADS" ]] && ffargs+=( -threads "$THREADS" )
-  ffmpeg "${ffargs[@]}" -x265-params "$X265_PARAMS" "${COLOR_ARGS[@]}" -an "$V_BASE"
+
+  # HDR10 path: explicit PQ/BT.2020 tags so x265 and container agree.
+  if [[ "$PROFILE_DESC" == "HDR10" ]]; then
+    ffmpeg "${ffargs[@]}" -x265-params "$X265_PARAMS" \
+      -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv \
+      -an "$V_BASE"
+  else
+    # HLG or SDR: use COLOR_ARGS determined in decide_color_and_pixfmt
+    ffmpeg "${ffargs[@]}" -x265-params "$X265_PARAMS" "${COLOR_ARGS[@]}" -an "$V_BASE"
+  fi
 fi
 mark_done "Encode base"
 
