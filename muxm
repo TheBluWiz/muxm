@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  MuxMaster™ Freeware License v1.0
+#  MuxMaster™ Freeware License v0.9
 #  Copyright © 2025 Jamey Wicklund (theBluWiz)
 # =============================================================================
 # Universal DV/HLG/HDR10/SDR → MP4 (Apple TV Direct Play) Encoder
@@ -19,7 +19,7 @@ if shopt -q inherit_errexit 2>/dev/null; then shopt -s inherit_errexit; fi
 # ===== Section 2: Branding / CLI constants (locked; not configurable) =========================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="1.4"  # 1.4: pipelines + skip flags + robust subtitle probing
+readonly VERSION="0.9"  # 0.9: pipelines + skip flags + robust subtitle probing
 
 # ===== Section 3: Globals =====================================================================
 declare -a COMPLETED_STEPS=()
@@ -1423,9 +1423,9 @@ build_subtitle_plan(){
   title="$(_sp_sub_tag "$i" title)"
   forced="$(_sp_sub_dispo_forced "$i")"
   if _is_sdh_title "$title"; then
-    is_sdh=0
-  else
     is_sdh=1
+  else
+    is_sdh=0
   fi
 
     if (( SUB_INCLUDE_FORCED )) && { (( forced )) || _is_forced_title "$title"; }; then
@@ -1598,35 +1598,37 @@ main() {
     fi
 
     local sn=0
-    for kind in "${sub_order[@]}"; do
+    if (( ${#sub_order[@]:-0} )); then
+      for kind in "${sub_order[@]}"; do
       case "$kind" in
-        forced)
-          ff_meta+=(
-            -metadata:s:s:"$sn" language=eng
-            -metadata:s:s:"$sn" title="English (Forced)"
-            -metadata:s:s:"$sn" handler_name="English (Forced)"
-            -disposition:s:"$sn" forced+default
-          )
-          ;;
-        full)
-          ff_meta+=(
-            -metadata:s:s:"$sn" language=eng
-            -metadata:s:s:"$sn" title="English"
-            -metadata:s:s:"$sn" handler_name="English"
-            -disposition:s:"$sn" 0
-          )
-          ;;
-        sdh)
-          ff_meta+=(
-            -metadata:s:s:"$sn" language=eng
-            -metadata:s:s:"$sn" title="English (SDH)"
-            -metadata:s:s:"$sn" handler_name="English (SDH)"
-            -disposition:s:"$sn" 0
-          )
-          ;;
+          forced)
+            ff_meta+=(
+              -metadata:s:s:"$sn" language=eng
+              -metadata:s:s:"$sn" title="English (Forced)"
+              -metadata:s:s:"$sn" handler_name="English (Forced)"
+              -disposition:s:"$sn" forced+default
+            )
+            ;;
+          full)
+            ff_meta+=(
+              -metadata:s:s:"$sn" language=eng
+              -metadata:s:s:"$sn" title="English"
+              -metadata:s:s:"$sn" handler_name="English"
+              -disposition:s:"$sn" 0
+            )
+            ;;
+          sdh)
+            ff_meta+=(
+              -metadata:s:s:"$sn" language=eng
+              -metadata:s:s:"$sn" title="English (SDH)"
+              -metadata:s:s:"$sn" handler_name="English (SDH)"
+              -disposition:s:"$sn" 0
+            )
+            ;;
       esac
       ((sn++))
-    done
+      done
+    fi
 
     if [[ -n "$src_sub_idx" ]]; then
       ff_meta+=(
