@@ -1026,15 +1026,15 @@ test_toggles() {
     "--tonemap|TONEMAP_HDR_TO_SDR        = 1"
     "--no-tonemap|TONEMAP_HDR_TO_SDR        = 0"
     # ---- Positive toggles for flags tested only via --no- elsewhere (32k-32t) ----
-    "--skip-if-ideal|SKIP_IF_IDEAL             = 1"
+    # Note: --skip-if-ideal, --checksum, --sub-burn-forced, --video-copy-if-compliant
+    # are tested explicitly below the loop (with their --no- counterpart prepended)
+    # because ~/.muxmrc or the default profile already sets them to 1, which would
+    # make the single-flag form trivially pass without actually testing the flag.
     "--report-json|REPORT_JSON               = 1"
-    "--checksum|CHECKSUM                  = 1"
     "--strip-metadata|STRIP_METADATA            = 1"
     "--keep-chapters|KEEP_CHAPTERS             = 1"
     "--no-keep-chapters|KEEP_CHAPTERS             = 0"
-    "--sub-burn-forced|SUB_BURN_FORCED           = 1"
     "--sub-export-external|SUB_EXPORT_EXTERNAL       = 1"
-    "--video-copy-if-compliant|VIDEO_COPY_IF_COMPLIANT   = 1"
     "--force-replace-source|FORCE_REPLACE_SOURCE      = 1"
     # ---- External subtitle toggles ----
     "--ext-subs|EXT_SUB_ENABLED           = 1"
@@ -1057,6 +1057,22 @@ test_toggles() {
     out="$(run_muxm "$flag" --print-effective-config)"
     assert_contains "$expected" "$flag: registered" "$out"
   done
+
+  # ---- Positive toggles that need explicit override of .muxmrc/profile defaults ----
+  # These flags are already set to 1 by ~/.muxmrc or the default profile, so the
+  # single-flag form would pass trivially. Prepend the --no- form to establish a
+  # known-0 baseline before testing the positive flag.
+  out="$(run_muxm --no-checksum --checksum --print-effective-config)"
+  assert_contains "CHECKSUM                  = 1" "--checksum: registered" "$out"
+
+  out="$(run_muxm --no-skip-if-ideal --skip-if-ideal --print-effective-config)"
+  assert_contains "SKIP_IF_IDEAL             = 1" "--skip-if-ideal: registered" "$out"
+
+  out="$(run_muxm --no-sub-burn-forced --sub-burn-forced --print-effective-config)"
+  assert_contains "SUB_BURN_FORCED           = 1" "--sub-burn-forced: registered" "$out"
+
+  out="$(run_muxm --no-video-copy-if-compliant --video-copy-if-compliant --print-effective-config)"
+  assert_contains "VIDEO_COPY_IF_COMPLIANT   = 1" "--video-copy-if-compliant: registered" "$out"
 
   # ---- Value flags (non-toggle) ----
   out="$(run_muxm --max-copy-bitrate 30000k --print-effective-config)"
@@ -3393,7 +3409,7 @@ test_output() {
   outfile="$TESTDIR/out_checksum.mp4"
   log "Testing --checksum..."
   if assert_encode "Checksum test encode" "$outfile" \
-       --checksum --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv"; then
+       --checksum --checksum-algo sha256 --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv"; then
     local sha_file="${outfile}.sha256"
     if [[ -f "$sha_file" ]]; then
       pass "--checksum: SHA-256 file created"
