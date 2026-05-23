@@ -394,7 +394,7 @@ spinner() {
   [[ -t ${TERM_FD:-2} ]] || show=0
   while kill -0 "$pid" 2>/dev/null; do
     (( show )) && _term_print '\r  %s  [ %s ]' "$msg" "${sym[i]}" || true
-    (( i = (i+1) % 4 ))
+    i=$(( (i+1) % 4 ))
     sleep 0.2
   done
   (( show )) && _term_print '\r  %s  [ done ]\n' "$msg" || true
