@@ -8,9 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ### Added
 
+- **`atv-directplay-animation` and `youtube-upload` e2e test coverage** — Both profiles are now included in the `test_profile_e2e` matrix. Previously had zero end-to-end encode coverage; each entry validates container extension, video codec, and profile-specific properties (10-bit pixel format for `atv-directplay-animation`, H.264 + AAC for `youtube-upload`).
+- **`--hw-accel-allow-sw` / `--no-hw-accel-allow-sw` toggle tests** — Added to `TOGGLE_CASES` in `test_toggles`; the flags were parsed by the CLI but absent from the toggle coverage suite.
+- **`--sub-preserve-bitmap` / `--no-sub-preserve-bitmap` toggle tests** — Added to `TOGGLE_CASES` in `test_toggles` alongside the existing `--sub-preserve-format` pair.
+- **`--x264-params` value-flag test** — Verifies that `X264_PARAMS_BASE` is set correctly in the effective config; the flag had toggle coverage in the config suite but no direct value assertion.
 - **Hardware acceleration foundation (Phase 1)** — Plumbing for the upcoming VideoToolbox (v1.5.0) and NVENC (v1.6.0) backends. Introduces the `--hw-accel` CLI flag (and matching `HW_ACCEL` variable in `.muxmrc`) accepting `none`, `auto`, `videotoolbox`, or `nvenc`. Detection probes populate `HW_ACCEL_AVAILABLE` from `ffmpeg -encoders`; `auto` resolves to the best available backend. Compatibility gates identify incompatible combinations (Dolby Vision, `libaom-av1`, AV1 on VideoToolbox, pre-Ada NVENC for AV1) and fall back to software with a recorded reason. Explicit backends that aren't available fail fast with a precise error. No encode behavior changes yet: the existing software encoders remain in use.
 - **`docs/HW_ACCEL.md`** — Architecture document describing the resolver flow, gates, and forward plan for Phase 2 (VideoToolbox calibration) and Phase 3 (NVENC calibration).
 - **`hw_accel` test suite** (`tests/test_muxm.sh --suite hw_accel`) — Config-only regression coverage: CLI parsing, `.muxmrc` loading, CLI-over-rc precedence, rejection of invalid values, explicit-backend strict check, profile-level compatibility warnings, and `auto` resolution on platforms without hardware encoders.
+
+### Changed
+
+- **`--x265-params` test strengthened** — Previously only asserted encode success. Now captures the workdir log path from muxm output and greps for the custom param value (`aq-mode=4`) in the logged ffmpeg command, confirming the flag is forwarded to the encoder and not silently dropped.
+- **`--video-copy-if-compliant` test now verifies the copy path** — The existing test passed `--preset ultrafast`, which sets `_CLI_PRESET_EXPLICIT=1` and always forces a re-encode, making the copy path unreachable. A second pass now runs with isolated `HOME` and no explicit CRF or preset, then asserts the "will copy directly from source" message appears in muxm output.
+- **`--skip-video` assertion tightened** — Replaced a broad keyword grep (`skip|video|warn|error|cannot|invalid|disabled`) with `assert_exit 42` plus a check for the specific error message `"incompatible with producing a valid output file"`, matching muxm's documented exit code for this incompatible flag.
 
 ## [1.4.0] - 2026-04-11
 
