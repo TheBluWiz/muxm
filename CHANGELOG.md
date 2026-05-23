@@ -51,6 +51,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ### Fixed
 
+- **`spinner()` false ERR trap killing encodes** — `(( i = (i+1) % 4 ))` evaluates to 0 (falsy) every fourth iteration when the index wraps to zero, returning exit code 1 and triggering the ERR trap under `set -eEuo pipefail`. Any encode step where the spinner ran in the main shell context (most visibly the final mux) would be killed with a spurious `Command failed` error. Fixed by using the assignment form `i=$(( (i+1) % 4 ))`, which always exits 0.
+- **SHA-256 sidecar test skipping when `CHECKSUM_ALGO` is overridden via `.muxmrc`** — The `--checksum` encode test did not pass `--checksum-algo sha256` explicitly, so a `.muxmrc` that sets `CHECKSUM_ALGO=blake2b` caused the test to produce a `.b2` sidecar while looking for `.sha256`, silently skipping rather than failing. The algorithm flag is now passed explicitly.
+- **Positive toggle tests passing trivially when `.muxmrc` pre-sets the value** — `--checksum`, `--skip-if-ideal`, `--sub-burn-forced`, and `--video-copy-if-compliant` were in the single-flag `TOGGLE_CASES` loop, where they passed even when the flag was broken because `~/.muxmrc` or the default profile already set those variables to `1`. Moved to explicit two-flag tests (`--no-X` followed by `--X`) that establish a known-zero baseline before asserting the positive flag takes effect.
+
 - **`--help` and `--version` silently exiting** — `_prescan_args` used post-increment (`counter++`) from zero, which evaluates to `0` under `set -e` and triggered the ERR trap before the help/version output could print. Replaced with `counter=$(( counter + 1 ))`.
 - **Post-increment bug in config-override parser** — The same `(( flag++ ))` from-zero pattern in the boolean config-override parser caused silent exits when a boolean flag appeared at argument position 0. Fixed with `$(( flag + 1 ))` assignment form.
 - **`report_add` producing invalid JSON** — Values containing newlines, tabs, or carriage returns were written literally into the JSON string, producing unparseable output. Values are now escaped before insertion.
