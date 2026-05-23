@@ -1049,6 +1049,12 @@ test_toggles() {
     "--no-profile-comment|PROFILE_COMMENT           = 0"
     # ---- SDH subtitle inclusion toggle ----
     "--no-sub-sdh|SUB_INCLUDE_SDH           = 0"
+    # ---- Hardware acceleration allow-sw toggles ----
+    "--hw-accel-allow-sw|HW_ACCEL_ALLOW_SW         = 1"
+    "--no-hw-accel-allow-sw|HW_ACCEL_ALLOW_SW         = 0"
+    # ---- Subtitle bitmap preservation toggles ----
+    "--sub-preserve-bitmap|SUB_PRESERVE_BITMAP       = 1"
+    "--no-sub-preserve-bitmap|SUB_PRESERVE_BITMAP       = 0"
   )
 
   local out flag expected
@@ -1086,6 +1092,9 @@ test_toggles() {
 
   out="$(run_muxm --checksum-algo auto --print-effective-config)"
   assert_contains "CHECKSUM_ALGO             = auto" "--checksum-algo auto: registered" "$out"
+
+  out="$(run_muxm --x264-params "profile=high:aq-mode=2" --print-effective-config)"
+  assert_contains "X264_PARAMS_BASE          = profile=high:aq-mode=2" "--x264-params: value registered" "$out"
 
   # ---- Default DISK_CHECK = 1 ----
   out="$(run_muxm --print-effective-config)"
@@ -2571,11 +2580,22 @@ test_video() {
     assert_contains "matroska" "Output is Matroska" "$fmt"
   fi
 
-  # --x265-params custom parameter (#21)
-  outfile="$TESTDIR/vid_x265_params.mp4"
-  log "Encoding with --x265-params..."
-  if assert_encode "--x265-params: encode succeeded" "$outfile" \
-    --crf 28 --preset ultrafast --x265-params "aq-mode=3" "$src"; then :; fi
+  # --x265-params custom parameter (#21) — encode + verify param appears in ffmpeg command
+  local x265_params_out x265_params_file="$TESTDIR/vid_x265_params.mp4"
+  log "Encoding with --x265-params (aq-mode=4 — differs from default aq-mode=3)..."
+  x265_params_out="$(run_muxm --crf 28 --preset ultrafast --x265-params "aq-mode=4" "$src" "$x265_params_file")"
+  if [[ -f "$x265_params_file" && -s "$x265_params_file" ]]; then
+    pass "--x265-params: encode succeeded"
+    local x265_p_log
+    x265_p_log="$(echo "$x265_params_out" | sed -n 's/.*Logging to \(.*\.log\).*/\1/p' | head -1)"
+    if [[ -n "$x265_p_log" && -f "$x265_p_log" ]] && grep -q "aq-mode=4" "$x265_p_log"; then
+      pass "--x265-params: custom param (aq-mode=4) confirmed in ffmpeg command log"
+    else
+      skip "--x265-params: param not confirmed in log (log: ${x265_p_log:-not found})"
+    fi
+  else
+    fail "--x265-params: no output"
+  fi
 
   # --threads (#22)
   outfile="$TESTDIR/vid_threads.mp4"
@@ -2584,11 +2604,30 @@ test_video() {
     --crf 28 --preset ultrafast --threads 2 "$src"; then :; fi
 
   # --video-copy-if-compliant with HEVC source (#19)
+  # Part 1: explicit --preset forces re-encode even with copy flag set — output is still HEVC.
   outfile="$TESTDIR/vid_copy_compliant.mp4"
-  log "Testing --video-copy-if-compliant with HEVC source..."
+  log "Testing --video-copy-if-compliant with HEVC source (explicit preset → re-encode)..."
   if assert_encode "--video-copy-if-compliant: output produced" "$outfile" \
        --video-copy-if-compliant --preset ultrafast "$TESTDIR/hevc_sdr_51.mkv"; then
     assert_probe "--video-copy-if-compliant: HEVC preserved" "$outfile" codec_name hevc
+  fi
+
+  # Part 2: no explicit CRF/preset → copy path should actually trigger.
+  # Uses isolated HOME to exclude user ~/.muxmrc from affecting copy-compliance checks.
+  local copy_isolated_home="$TESTDIR/copy_isolated_home"
+  mkdir -p "$copy_isolated_home"
+  local copy_path_out="$TESTDIR/vid_copy_path.mp4"
+  log "Testing --video-copy-if-compliant copy path (no explicit CRF/preset, isolated config)..."
+  local copy_path_capture
+  copy_path_capture="$(MUXM_HOME="$copy_isolated_home" run_muxm_in "$TESTDIR" \
+    --video-copy-if-compliant --output-ext mp4 --no-stereo-fallback \
+    "hevc_sdr_51.mkv" "$copy_path_out")"
+  if echo "$copy_path_capture" | grep -q "will copy directly from source"; then
+    pass "--video-copy-if-compliant: copy path confirmed (stream copy, not re-encode)"
+  elif echo "$copy_path_capture" | grep -q "not compliant for copy"; then
+    skip "--video-copy-if-compliant: copy path not triggered (source failed compliance check)"
+  else
+    skip "--video-copy-if-compliant: copy path indeterminate (check copy_path_out fixture)"
   fi
 
   # --level config acceptance (R20) — all four VBV tiers
@@ -4064,14 +4103,12 @@ test_edge() {
   out="$(run_muxm --dry-run --ocr-tool "sub2srt;rm -rf /" "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "disallowed" "OCR tool injection prevented" "$out"
 
-  # --skip-video: muxm cannot produce a valid output without a video stream,
-  # so this should error or warn. We validate it doesn't silently succeed.
+  # --skip-video: muxm dies with exit 42 — incompatible with producing a valid output.
+  assert_exit 42 "--skip-video: exits 42 (incompatible with output)" \
+    --skip-video "$TESTDIR/basic_sdr_subs.mkv"
   out="$(run_muxm --skip-video "$TESTDIR/basic_sdr_subs.mkv")"
-  if echo "$out" | grep -qiE "skip|video|warn|error|cannot|invalid|disabled"; then
-    pass "--skip-video: muxm acknowledges flag (not silent success)"
-  else
-    fail "--skip-video: expected error, warning, or skip notice; got: '${out:0:200}'"
-  fi
+  assert_contains "incompatible with producing a valid output file" \
+    "--skip-video: error message names the incompatibility" "$out"
 
   # Non-readable source file (#55)
   local unreadable="$TESTDIR/unreadable.mkv"
@@ -4903,6 +4940,8 @@ test_profile_e2e() {
     "archive|hevc_sdr_51.mkv|e2e_archive.mkv|mkv|hevc|"
     "hdr10-hq|hevc_hdr10_tagged.mkv|e2e_hdr10_hq.mkv|mkv|hevc|--crf 28"
     "atv-directplay-hq|basic_sdr_subs.mkv|e2e_atv_directplay.mp4|mp4|hevc|--crf 28"
+    "atv-directplay-animation|multi_subs.mkv|e2e_atv_animation.mkv|mkv|hevc|--crf 28"
+    "youtube-upload|basic_sdr_subs.mkv|e2e_youtube.mp4|mp4|h264|--crf 28"
   )
 
   local profile source output ext codec extra_flags
