@@ -307,6 +307,11 @@ Validates filename collision auto-versioning and source replacement flags. Uses 
 | 130 | Commentary track deprioritized | Main feature selected over commentary (same codec/ch/lang) | ✅ |
 | 131 | `--audio-titles` encode | Output audio stream has descriptive title tag | ✅ |
 | 132 | `--no-audio-titles` encode | No descriptive codec title in output audio stream | ✅ |
+| 133 | Native stereo preferred over downmix | 5.1 + AAC 2.0 source → "Native stereo track found" logged | ✅ |
+| 134 | No native stereo → synthetic downmix | Surround-only source → "No native stereo track available" logged | ✅ |
+| 135 | Commentary stereo skipped | 5.1 + commentary-titled 2.0 → downmix used, not the commentary track | ✅ |
+| 136 | Native FLAC stereo stream-copied into MKV (regression) | EAC3 5.1 + FLAC 2.0 → output keeps 2 audio streams; stereo is 2ch, `codec_name=flac` (stream-copied, not dropped). Guards the hardcoded-`.aac` muxer bug that silently dropped non-AAC native stereo tracks. | ✅ |
+| 137 | Native AC3 stereo stream-copied into MP4 (regression) | EAC3 5.1 + AC3 2.0 → output keeps 2 audio streams; stereo is 2ch, `codec_name=ac3`. Covers the MP4/MOV copy branch of the same bug. | ✅ |
 
 ### 1.13 Subtitle Pipeline (suite: `subs`)
 

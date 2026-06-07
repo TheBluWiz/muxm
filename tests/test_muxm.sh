@@ -3093,6 +3093,92 @@ _test_audio_native_stereo() {
   out="$(run_muxm --crf 51 --preset ultrafast --output-ext mkv --stereo-fallback "$TESTDIR/commentary_stereo.mkv")"
   assert_contains "No native stereo track available" \
     "Commentary stereo skipped, downmix used instead" "$out"
+
+  # Test 4 (regression): non-AAC native stereo must be stream-copied into MKV.
+  # Reproduces the "Project Hail Mary" report: EAC3 5.1 primary + FLAC 2.0 stereo.
+  # The native-stereo copy path wrote to a hardcoded audio_stereo.aac intermediate;
+  # ffmpeg picks the muxer from that extension, and the .aac (ADTS) muxer rejects
+  # FLAC ("adts muxer supports only codec aac"), so the copy failed and muxm
+  # silently dropped the stereo track — output had only the surround stream.
+  # Earlier tests used an AAC native track (copy into .aac happens to work) and
+  # only asserted the "Native stereo track found" log line, which is emitted
+  # before the copy, so the failure went undetected. This test probes the actual
+  # output streams to prove the stereo track survived.
+  local nf_src="$TESTDIR/native_stereo_flac.mkv"
+  local nf_out="$TESTDIR/native_stereo_flac_out.mkv"
+  log "Testing native FLAC stereo stream-copied into MKV (regression)..."
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=teal:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -f lavfi -i "sine=frequency=660:duration=1" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -map 0:v -map 1:a -map 2:a \
+    -c:a:0 eac3 -b:a:0 384k -ac:a:0 6 \
+    -c:a:1 flac -ac:a:1 2 \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:a:1 language=eng \
+    "$nf_src"
+  out="$(run_muxm --crf 51 --preset ultrafast --output-ext mkv --stereo-fallback "$nf_src" "$nf_out")"
+  assert_contains "Native stereo track found" \
+    "FLAC native stereo: preference path taken" "$out"
+  if [[ -s "$nf_out" ]]; then
+    # Before the fix the stereo track was dropped, leaving a single audio stream.
+    assert_stream_count "FLAC native stereo: stereo track muxed into output" "$nf_out" a 2 2
+    local nf_ch nf_codec
+    nf_ch="$(probe_audio "$nf_out" channels 1)"
+    nf_codec="$(probe_audio "$nf_out" codec_name 1)"
+    if [[ "$nf_ch" == "2" ]]; then
+      pass "FLAC native stereo: second track is 2ch"
+    else
+      fail "FLAC native stereo: second track channels — expected '2', got '$nf_ch'"
+    fi
+    if [[ "$nf_codec" == "flac" ]]; then
+      pass "FLAC native stereo: stream-copied (codec_name=flac, not transcoded/dropped)"
+    else
+      fail "FLAC native stereo: stereo codec — expected 'flac', got '$nf_codec'"
+    fi
+  else
+    fail "FLAC native stereo: no output produced"
+  fi
+
+  # Test 5 (regression): the MP4/MOV copy branch also copies AC3/EAC3 verbatim,
+  # so a non-AAC stereo (AC3 here) hit the same hardcoded-.aac failure. The fix
+  # derives the intermediate extension from the native codec for these too.
+  local na_src="$TESTDIR/native_stereo_ac3.mkv"
+  local na_out="$TESTDIR/native_stereo_ac3_out.mp4"
+  log "Testing native AC3 stereo stream-copied into MP4 (regression)..."
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=navy:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -f lavfi -i "sine=frequency=660:duration=1" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -map 0:v -map 1:a -map 2:a \
+    -c:a:0 eac3 -b:a:0 384k -ac:a:0 6 \
+    -c:a:1 ac3 -b:a:1 192k -ac:a:1 2 \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:a:1 language=eng \
+    "$na_src"
+  out="$(run_muxm --crf 51 --preset ultrafast --output-ext mp4 --stereo-fallback "$na_src" "$na_out")"
+  assert_contains "Native stereo track found" \
+    "AC3 native stereo: preference path taken" "$out"
+  if [[ -s "$na_out" ]]; then
+    assert_stream_count "AC3 native stereo: stereo track muxed into output" "$na_out" a 2 2
+    local na_ch na_codec
+    na_ch="$(probe_audio "$na_out" channels 1)"
+    na_codec="$(probe_audio "$na_out" codec_name 1)"
+    if [[ "$na_ch" == "2" ]]; then
+      pass "AC3 native stereo: second track is 2ch"
+    else
+      fail "AC3 native stereo: second track channels — expected '2', got '$na_ch'"
+    fi
+    if [[ "$na_codec" == "ac3" ]]; then
+      pass "AC3 native stereo: stream-copied (codec_name=ac3, not transcoded/dropped)"
+    else
+      fail "AC3 native stereo: stereo codec — expected 'ac3', got '$na_codec'"
+    fi
+  else
+    fail "AC3 native stereo: no output produced"
+  fi
 }
 
 # === Suite: Subtitle Pipeline ===

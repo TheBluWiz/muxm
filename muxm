@@ -8009,6 +8009,12 @@ run_audio_pipeline(){
           mark_done "Stereo fallback prepared (native)"
         fi
       else
+        # Stream-copy: the intermediate must use an extension matching the
+        # native codec, not the default .aac. ffmpeg picks the muxer from the
+        # extension, and the .aac (ADTS) muxer only accepts AAC — copying any
+        # other codec (FLAC/AC3/EAC3) into it fails ("adts muxer supports only
+        # codec aac"), silently dropping the stereo track.
+        AAC_STEREO="$WORKDIR/audio_stereo.$(_audio_copy_ext "$_native_sc")"
         ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map "0:a:${_native_si}" -c copy "$AAC_STEREO" \
           2>"$WORKDIR/audio_stereo.err" &
         local _ns_pid=$!
