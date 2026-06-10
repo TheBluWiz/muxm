@@ -1750,7 +1750,7 @@ test_profiles() {
   # atv-directplay-hq specifics
   out="$(run_muxm --profile atv-directplay-hq --print-effective-config)"
   assert_contains "OUTPUT_EXT                = " "atv-directplay: passthrough container (empty = resolve from source)" "$out"
-  assert_contains "SUB_BURN_FORCED           = 1" "atv-directplay: burn forced subs" "$out"
+  assert_contains "SUB_BURN_FORCED           = 0" "atv-directplay: soft forced subs (not burned)" "$out"
   assert_contains "SKIP_IF_IDEAL             = 1" "atv-directplay: skip-if-ideal on" "$out"
   assert_contains "MAX_COPY_BITRATE          = 50000k" "atv-directplay: bitrate ceiling" "$out"
   assert_contains "LEVEL_VALUE               = 5.1" "atv-directplay: Level 5.1 VBV cap" "$out"
@@ -1765,7 +1765,7 @@ test_profiles() {
   assert_contains "EAC3_BITRATE_7_1          = 768k" "atv-directplay-animation: EAC3 7.1 bitrate" "$out"
   assert_contains "SUB_MULTI_TRACK           = 1"   "atv-directplay-animation: multi-track subtitles enabled" "$out"
   assert_contains "SUB_PRESERVE_TEXT_FORMAT  = 1"   "atv-directplay-animation: ASS/SSA preservation enabled" "$out"
-  assert_contains "SUB_BURN_FORCED           = 1"   "atv-directplay-animation: forced sub burning on (for MP4 Direct Play)" "$out"
+  assert_contains "SUB_BURN_FORCED           = 0"   "atv-directplay-animation: soft forced subs (not burned)" "$out"
   assert_contains "SDR_FORCE_10BIT           = 1"   "atv-directplay-animation: 10-bit SDR for anti-banding" "$out"
   assert_contains "LEVEL_VALUE               = 5.1" "atv-directplay-animation: Level 5.1 VBV cap" "$out"
   assert_contains "CONSERVATIVE_VBV          = 1"   "atv-directplay-animation: conservative VBV active" "$out"
@@ -1800,6 +1800,7 @@ test_profiles() {
   assert_contains "KEEP_CHAPTERS             = 0" "universal: chapters stripped" "$out"
   assert_contains "STRIP_METADATA            = 1" "universal: metadata stripped" "$out"
   assert_contains "OUTPUT_EXT                = mp4" "universal: MP4 container" "$out"
+  assert_contains "SUB_BURN_FORCED           = 1" "universal: burn forced subs (only profile that burns by default)" "$out"
 
   # youtube-upload specifics
   out="$(run_muxm --profile youtube-upload --print-effective-config)"
@@ -1817,7 +1818,7 @@ test_profiles() {
   assert_contains "SUB_INCLUDE_FORCED        = 1"           "youtube-upload: include forced subs" "$out"
   assert_contains "SUB_INCLUDE_FULL          = 1"           "youtube-upload: include full subs" "$out"
   assert_contains "SUB_INCLUDE_SDH           = 0"           "youtube-upload: exclude SDH subs" "$out"
-  assert_contains "SUB_BURN_FORCED           = 1"           "youtube-upload: burn forced subs" "$out"
+  assert_contains "SUB_BURN_FORCED           = 0"           "youtube-upload: soft forced subs (not burned)" "$out"
   assert_contains "SUB_EXPORT_EXTERNAL       = 1"           "youtube-upload: export external subs" "$out"
   assert_contains "STRIP_METADATA            = 1"           "youtube-upload: strip metadata" "$out"
   assert_contains "KEEP_CHAPTERS             = 1"           "youtube-upload: keep chapters" "$out"
@@ -2272,67 +2273,59 @@ test_dryrun() {
   assert_contains "[container-passthrough] Source .mkv" \
     "dry-run archive + mkv source: passthrough logs mkv resolution" "$out"
 
-  # atv-directplay-hq + mkv source: passthrough → OUTPUT_EXT=mkv → MKV subtitle adjustment fires.
-  # Expect both the passthrough log and the subtitle-adjustment log messages.
+  # atv-directplay-hq + mkv source: passthrough → OUTPUT_EXT=mkv → MKV subtitle adjustment fires
+  # (enables ASS/SSA + PGS bitmap preservation; forced subs are already soft by profile default).
   out="$(run_muxm --dry-run --profile atv-directplay-hq "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "[container-passthrough] Source .mkv" \
     "dry-run atv + mkv source: passthrough logs mkv resolution" "$out"
-  assert_contains "[atv-directplay-hq] MKV output: disabling forced-sub burning" \
-    "dry-run atv + mkv source: MKV subtitle adjustment fires (SUB_BURN_FORCED→0)" "$out"
   assert_contains "[atv-directplay-hq] MKV output: enabling native ASS/SSA" \
-    "dry-run atv + mkv source: ASS/SSA preservation enabled" "$out"
+    "dry-run atv + mkv source: MKV subtitle adjustment fires (ASS/SSA preservation enabled)" "$out"
 
   # atv-directplay-hq + mp4 source: passthrough → OUTPUT_EXT=mp4 → NO MKV subtitle adjustment.
   out="$(run_muxm --dry-run --profile atv-directplay-hq "$TESTDIR/compliant.mp4")"
   assert_contains "[container-passthrough] Source .mp4" \
     "dry-run atv + mp4 source: passthrough logs mp4 resolution" "$out"
-  if ! echo "$out" | grep -qF "[atv-directplay-hq] MKV output: disabling forced-sub burning"; then
+  if ! echo "$out" | grep -qF "[atv-directplay-hq] MKV output: enabling native ASS/SSA"; then
     pass "dry-run atv + mp4 source: MKV subtitle adjustment does NOT fire (mp4 passthrough)"
   else
     fail "dry-run atv + mp4 source: MKV subtitle adjustment fired unexpectedly for mp4 output"
   fi
 
-  # atv-directplay-hq + mkv source + --sub-burn-forced: _CLI_SUB_BURN_FORCED=1 →
-  # the "disabling forced-sub burning" branch is skipped, but ASS preservation still fires.
+  # atv-directplay-hq + mkv source + --sub-burn-forced: CLI flag overrides profile default (burn=0)
+  # and keeps SUB_BURN_FORCED=1; ASS/SSA preservation still fires for MKV.
+  out2="$(run_muxm --profile atv-directplay-hq --sub-burn-forced --print-effective-config)"
+  assert_contains "SUB_BURN_FORCED           = 1" \
+    "atv + --sub-burn-forced: CLI flag overrides profile default (burn active)" "$out2"
   out="$(run_muxm --dry-run --profile atv-directplay-hq --sub-burn-forced "$TESTDIR/basic_sdr_subs.mkv")"
-  if ! echo "$out" | grep -qF "[atv-directplay-hq] MKV output: disabling forced-sub burning"; then
-    pass "dry-run atv + mkv + --sub-burn-forced: CLI override respected (no disabling msg)"
-  else
-    fail "dry-run atv + mkv + --sub-burn-forced: disabling msg appeared despite _CLI_SUB_BURN_FORCED=1"
-  fi
   assert_contains "[atv-directplay-hq] MKV output: enabling native ASS/SSA" \
     "dry-run atv + mkv + --sub-burn-forced: ASS preservation still enabled regardless" "$out"
 
   # ---- atv-directplay-animation passthrough + MKV subtitle adjustment ----
 
-  # atv-directplay-animation + mkv source: passthrough → OUTPUT_EXT=mkv → MKV subtitle adjustment fires.
-  # Section 15 should disable SUB_BURN_FORCED and enable ASS/SSA preservation.
+  # atv-directplay-animation + mkv source: passthrough → OUTPUT_EXT=mkv → MKV subtitle adjustment fires
+  # (enables ASS/SSA + PGS bitmap preservation; forced subs are already soft by profile default).
   out="$(run_muxm --dry-run --profile atv-directplay-animation "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "[container-passthrough] Source .mkv" \
     "dry-run atv-directplay-animation + mkv source: passthrough logs mkv resolution" "$out"
-  assert_contains "[atv-directplay-animation] MKV output: disabling forced-sub burning" \
-    "dry-run atv-directplay-animation + mkv source: MKV subtitle adjustment fires (SUB_BURN_FORCED→0)" "$out"
   assert_contains "[atv-directplay-animation] MKV output: enabling native ASS/SSA" \
-    "dry-run atv-directplay-animation + mkv source: ASS/SSA preservation enabled" "$out"
+    "dry-run atv-directplay-animation + mkv source: MKV subtitle adjustment fires (ASS/SSA preservation enabled)" "$out"
 
   # atv-directplay-animation + mp4 source: passthrough → OUTPUT_EXT=mp4 → NO MKV subtitle adjustment.
   out="$(run_muxm --dry-run --profile atv-directplay-animation "$TESTDIR/compliant.mp4")"
   assert_contains "[container-passthrough] Source .mp4" \
     "dry-run atv-directplay-animation + mp4 source: passthrough logs mp4 resolution" "$out"
-  if ! echo "$out" | grep -qF "[atv-directplay-animation] MKV output: disabling forced-sub burning"; then
+  if ! echo "$out" | grep -qF "[atv-directplay-animation] MKV output: enabling native ASS/SSA"; then
     pass "dry-run atv-directplay-animation + mp4 source: MKV subtitle adjustment does NOT fire"
   else
     fail "dry-run atv-directplay-animation + mp4 source: MKV subtitle adjustment fired unexpectedly"
   fi
 
-  # atv-directplay-animation + mkv source + --sub-burn-forced: _CLI_SUB_BURN_FORCED=1 →
-  # the "disabling forced-sub burning" branch is skipped, but ASS preservation still fires.
+  # atv-directplay-animation + mkv source + --sub-burn-forced: CLI flag overrides profile default
+  # (burn=0) and keeps SUB_BURN_FORCED=1; ASS/SSA preservation still fires for MKV.
+  out2="$(run_muxm --profile atv-directplay-animation --sub-burn-forced --print-effective-config)"
+  assert_contains "SUB_BURN_FORCED           = 1" \
+    "atv-directplay-animation + --sub-burn-forced: CLI flag overrides profile default (burn active)" "$out2"
   out="$(run_muxm --dry-run --profile atv-directplay-animation --sub-burn-forced "$TESTDIR/basic_sdr_subs.mkv")"
-  if ! echo "$out" | grep -qF "[atv-directplay-animation] MKV output: disabling forced-sub burning"; then
-    pass "dry-run atv-directplay-animation + mkv + --sub-burn-forced: CLI override respected"
-  else
-    fail "dry-run atv-directplay-animation + mkv + --sub-burn-forced: disabling msg appeared despite _CLI_SUB_BURN_FORCED=1"
-  fi
   assert_contains "[atv-directplay-animation] MKV output: enabling native ASS/SSA" \
     "dry-run atv-directplay-animation + mkv + --sub-burn-forced: ASS preservation still enabled" "$out"
 

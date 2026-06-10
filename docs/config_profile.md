@@ -131,10 +131,9 @@ text-based subtitles.
   included); otherwise re-encoded at CRF 17 / slower with level 5.1 VBV
   constraints.
 - Surround audio is transcoded to E-AC-3 (Apple TV cannot Direct Play TrueHD).
-- For MP4 output: forced subtitles are burned into the video; all others are
-  embedded as `mov_text`.
-- For MKV output: forced subtitles are kept as soft subs; native ASS/SSA
-  formatting is preserved.
+- Forced subtitles are embedded as soft subs (`mov_text` for MP4, native format
+  for MKV); all others are also embedded as `mov_text`.
+- For MKV output: native ASS/SSA formatting is preserved.
 - The skip-if-ideal heuristic avoids re-processing compliant files.
 
 **CLI:** `muxm --profile atv-directplay-hq input.mkv`  
@@ -161,8 +160,7 @@ transcoding on playback, styled subs preserved.
 - Multi-track subtitles: all matching tracks stream-copied. Native ASS/SSA
   preserved for MKV output.
 - Container follows the source (MKV in → MKV out; MP4 in → MP4 out).
-- For MP4 output: forced subtitles burned in. For MKV output: soft subs with
-  native ASS/SSA preservation.
+- Forced subtitles are soft subs in any container. For MKV output: native ASS/SSA preservation.
 
 **CLI:** `muxm --profile atv-directplay-animation show.mkv`  
 **Script:** `apply_profile_atv_directplay_animation()` — Section 11
@@ -285,7 +283,7 @@ size.
   (`profile=high:rc-lookahead=60:aq-mode=2:aq-strength=1.0`).
 - AAC stereo at 256k (YouTube processes stereo audio during re-encode).
 - Dolby Vision disabled; HDR10 metadata preserved so YouTube can use it.
-- Forced subtitles burned into the video stream.
+- Forced subtitles are embedded as soft subs (mov_text).
 - All other dialogue subtitles (excluding SDH) exported as an external `.srt`
   file for upload to YouTube Studio.
 - Non-essential metadata stripped; chapters stripped.

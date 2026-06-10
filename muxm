@@ -1528,13 +1528,13 @@ Strip DV, keep HDR10. CRF 17, lossless audio + stereo fallback. MKV.
 .B atv\-directplay\-hq
 Apple TV Direct Play. DV\-aware, E\-AC\-3. Passthrough container
 (MKV sources stay MKV, MP4 sources stay MP4). HEVC Main10, DV P8.1,
-AAC stereo fallback. Forced subs burned for MP4; soft with native ASS preservation for MKV.
+AAC stereo fallback. Soft forced subs (mov_text); native ASS/SSA preservation for MKV.
 .TP
 .B atv\-directplay\-animation
 Apple TV Direct Play, animation quality. CRF 16, E\-AC\-3, ASS/SSA + PGS bitmap subs.
 Passthrough container. HEVC 10\-bit (even SDR), animation\-tuned x265,
 multi\-track subs. Lossless audio transcoded to E\-AC\-3 (ATV cannot Direct Play TrueHD/DTS\-HD MA).
-Forced subs burned for MP4; soft with native ASS preservation for MKV.
+Soft forced subs (mov_text); native ASS/SSA preservation for MKV.
 .TP
 .B streaming\-hevc
 HEVC CRF 20 for Plex/Jellyfin. HDR10, E\-AC\-3. MP4. Preset medium,
@@ -1568,7 +1568,7 @@ H.264 SDR, AAC stereo. Lean, play anywhere. MP4. Tone\-map HDR, burn forced subs
 strip chapters/metadata.
 .TP
 .B youtube\-upload
-H.264 high\-profile, CRF 16, preset slow. AAC stereo 256k, burn forced subs,
+H.264 high\-profile, CRF 16, preset slow. AAC stereo 256k, soft forced subs,
 export full subs as external SRT. MP4. Strips metadata, keeps chapters.
 No tone\-mapping (YouTube handles HDR). Designed for master\-quality uploads.
 .SH COMMON OPTIONS
@@ -2126,7 +2126,7 @@ derived from input. Use \fB\-\-profile\fR for device\-optimized settings.
 .TP
 .B muxm \-\-profile atv\-directplay\-hq Movie.mkv
 Encode for Apple TV direct play with Dolby Vision P8.1, E\-AC\-3 surround,
-AAC stereo fallback, and burned forced subtitles.
+AAC stereo fallback, and soft forced subtitles.
 .TP
 .B muxm \-\-profile streaming\-hevc \-\-audio\-lang\-pref spa,eng Movie.mkv
 Encode for Plex/Jellyfin streaming, preferring Spanish audio over English.
@@ -3181,7 +3181,7 @@ HEADER
   echo "# Maximum subtitle tracks to include in output"
   _V SUB_MAX_TRACKS
   printf '\n'
-  echo "# Burn forced subtitles into the video stream (hardcoded, cannot be turned off)"
+  echo "# Burn forced subtitles into the video stream"
   _V SUB_BURN_FORCED
   printf '\n'
   echo "# Export non-forced subtitles as external .srt files alongside output"
@@ -3752,7 +3752,7 @@ apply_profile_atv_directplay_hq() {
   # mkv sources produce mkv output; mp4 sources produce mp4 output.
   # Apple TV Direct Play supports both containers for HEVC Main10 + DV P8.1.
   # When output is mkv, the post-resolution block (Section 15) enables native
-  # ASS subtitle preservation and disables forced-sub burning. See Step 8.
+  # ASS/SSA subtitle preservation. See Section 15.
   OUTPUT_EXT=""
   # Video: prefer copy if compliant; else HEVC Main10
   VIDEO_CODEC="libx265"
@@ -3771,11 +3771,11 @@ apply_profile_atv_directplay_hq() {
   STEREO_BITRATE="256k"
   EAC3_BITRATE_5_1="640k"
   EAC3_BITRATE_7_1="768k"
-  # Subs: burn forced (or mov_text); keep others as mov_text
+  # Subs: soft forced (mov_text); keep others as mov_text
   SUB_INCLUDE_FORCED=1
   SUB_INCLUDE_FULL=1
   SUB_INCLUDE_SDH=1
-  SUB_BURN_FORCED=1
+  SUB_BURN_FORCED=0
   SUB_EXPORT_EXTERNAL=0
   # Chapters/metadata: keep
   KEEP_CHAPTERS=1
@@ -3791,8 +3791,8 @@ apply_profile_atv_directplay_animation() {
   ALLOW_DV_FALLBACK=1
   DV_CONVERT_TO_P81_IF_FAIL=1
   # Container: passthrough — preserve source container (same as atv-directplay-hq).
-  # When output is MKV the post-resolution block (Section 15) disables forced-sub
-  # burning and confirms ASS preservation. See Section 15.
+  # When output is MKV the post-resolution block (Section 15) enables native
+  # ASS/SSA preservation. See Section 15.
   OUTPUT_EXT=""
   # Video: prefer copy if compliant; else HEVC Main10 with animation-tuned params
   VIDEO_CODEC="libx265"
@@ -3816,14 +3816,13 @@ apply_profile_atv_directplay_animation() {
   STEREO_BITRATE="256k"
   EAC3_BITRATE_5_1="640k"
   EAC3_BITRATE_7_1="768k"
-  # Subs: multi-track; burn forced subs for MP4 Direct Play (overridden to soft for MKV
-  # by the post-resolution block in Section 15). Preserve ASS/SSA natively.
+  # Subs: multi-track; soft forced subs. Preserve ASS/SSA natively.
   SUB_MULTI_TRACK=1
   SUB_INCLUDE_FORCED=1
   SUB_INCLUDE_FULL=1
   SUB_INCLUDE_SDH=1
   SUB_MAX_TRACKS=6
-  SUB_BURN_FORCED=1
+  SUB_BURN_FORCED=0
   SUB_EXPORT_EXTERNAL=0
   SUB_PRESERVE_TEXT_FORMAT=1
   # Chapters/metadata: keep
@@ -3990,7 +3989,7 @@ apply_profile_animation() {
 }
 
 apply_profile_youtube_upload() {
-  # Goal: H.264 high-profile for YouTube ingestion. Master quality, AAC stereo, burn/export subs.
+  # Goal: H.264 high-profile for YouTube ingestion. Master quality, AAC stereo, soft/export subs.
   DISABLE_DV=1
   ALLOW_DV_FALLBACK=0
   DV_CONVERT_TO_P81_IF_FAIL=0
@@ -4013,11 +4012,11 @@ apply_profile_youtube_upload() {
   STEREO_BITRATE="256k"
   AUDIO_LOSSLESS_PASSTHROUGH=0
   ADD_STEREO_IF_MULTICH=0
-  # Subs: burn forced, export full as external SRT
+  # Subs: soft forced, export full as external SRT
   SUB_INCLUDE_FORCED=1
   SUB_INCLUDE_FULL=1
   SUB_INCLUDE_SDH=0
-  SUB_BURN_FORCED=1
+  SUB_BURN_FORCED=0
   SUB_EXPORT_EXTERNAL=1
   # Chapters/metadata: strip fluff, keep chapters
   STRIP_METADATA=1
@@ -4276,7 +4275,7 @@ Profiles (--profile NAME):
   streaming-av1              AV1 CRF 30, Opus audio. Optimized for AV1-capable platforms. MP4.
   animation                  Anime/cartoon. CRF 16, lossless audio, ASS subs. MKV.
   universal                  H.264 SDR, AAC stereo. Lean, play anywhere. MP4.
-  youtube-upload             H.264 high-profile CRF 16. AAC stereo, burn forced subs. MP4.
+  youtube-upload             H.264 high-profile CRF 16. AAC stereo, soft forced subs. MP4.
 
 Common options:
   -h, --help                  Show this help
@@ -4580,8 +4579,6 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       ;;
 
     atv-directplay-animation)
-      # Note: SUB_BURN_FORCED is overridden for MKV output post-resolution (Section 15).
-
       # MKV explicit override (passthrough may also produce MKV — that is intentional)
       [[ "$OUTPUT_EXT" == "mkv" ]] && (( _OUTPUT_EXT_EXPLICIT )) && \
         _warn_conflict "$PROFILE_NAME" "--output-ext mkv" \
@@ -5049,14 +5046,9 @@ fi
 
 # ---- atv-directplay-hq / atv-directplay-animation: MKV-output subtitle adjustment ----------
 # When either ATV profile produces MKV output (via passthrough or explicit --output-ext mkv),
-# switch from burned forced subs (MP4-required) to soft subtitles with native ASS preservation.
-# MP4 output path is unchanged: SUB_BURN_FORCED=1, SUB_PRESERVE_TEXT_FORMAT=0 (hq) or =1 (animation).
+# enable native ASS/SSA format and PGS bitmap preservation.
 if [[ "${PROFILE_NAME:-}" == "atv-directplay-hq" || "${PROFILE_NAME:-}" == "atv-directplay-animation" ]] \
     && [[ "$OUTPUT_EXT" == "mkv" ]]; then
-  if (( ! _CLI_SUB_BURN_FORCED )); then
-    SUB_BURN_FORCED=0
-    log "[${PROFILE_NAME}] MKV output: disabling forced-sub burning (soft subs preferred)."
-  fi
   SUB_PRESERVE_TEXT_FORMAT=1
   log "[${PROFILE_NAME}] MKV output: enabling native ASS/SSA format preservation."
   SUB_PRESERVE_BITMAP=1

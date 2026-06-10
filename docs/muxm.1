@@ -64,13 +64,13 @@ Strip DV, keep HDR10. CRF 17, lossless audio + stereo fallback. MKV.
 .B atv\-directplay\-hq
 Apple TV Direct Play. DV\-aware, E\-AC\-3. Passthrough container
 (MKV sources stay MKV, MP4 sources stay MP4). HEVC Main10, DV P8.1,
-AAC stereo fallback. Forced subs burned for MP4; soft with native ASS preservation for MKV.
+AAC stereo fallback. Soft forced subs (mov_text); native ASS/SSA preservation for MKV.
 .TP
 .B atv\-directplay\-animation
 Apple TV Direct Play, animation quality. CRF 16, E\-AC\-3, ASS/SSA + PGS bitmap subs.
 Passthrough container. HEVC 10\-bit (even SDR), animation\-tuned x265,
 multi\-track subs. Lossless audio transcoded to E\-AC\-3 (ATV cannot Direct Play TrueHD/DTS\-HD MA).
-Forced subs burned for MP4; soft with native ASS preservation for MKV.
+Soft forced subs (mov_text); native ASS/SSA preservation for MKV.
 .TP
 .B streaming\-hevc
 HEVC CRF 20 for Plex/Jellyfin. HDR10, E\-AC\-3. MP4. Preset medium,
@@ -104,7 +104,7 @@ H.264 SDR, AAC stereo. Lean, play anywhere. MP4. Tone\-map HDR, burn forced subs
 strip chapters/metadata.
 .TP
 .B youtube\-upload
-H.264 high\-profile, CRF 16, preset slow. AAC stereo 256k, burn forced subs,
+H.264 high\-profile, CRF 16, preset slow. AAC stereo 256k, soft forced subs,
 export full subs as external SRT. MP4. Strips metadata, keeps chapters.
 No tone\-mapping (YouTube handles HDR). Designed for master\-quality uploads.
 .SH COMMON OPTIONS
@@ -709,7 +709,7 @@ derived from input. Use \fB\-\-profile\fR for device\-optimized settings.
 .TP
 .B muxm \-\-profile atv\-directplay\-hq Movie.mkv
 Encode for Apple TV direct play with Dolby Vision P8.1, E\-AC\-3 surround,
-AAC stereo fallback, and burned forced subtitles.
+AAC stereo fallback, and soft forced subtitles.
 .TP
 .B muxm \-\-profile streaming\-hevc \-\-audio\-lang\-pref spa,eng Movie.mkv
 Encode for Plex/Jellyfin streaming, preferring Spanish audio over English.

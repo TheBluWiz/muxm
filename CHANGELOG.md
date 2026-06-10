@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ### Changed
 
+- **Forced subtitle burn-in narrowed to `universal` only** — `atv-directplay-hq`, `atv-directplay-animation`, and `youtube-upload` no longer burn forced subtitles by default. Forced foreign-dialogue subs are now soft (mov_text in MP4, native format in MKV). `universal` remains the only profile that burns by default. Any profile can opt in via `--sub-burn-forced`.
 - **`--x265-params` test strengthened** — Previously only asserted encode success. Now captures the workdir log path from muxm output and greps for the custom param value (`aq-mode=4`) in the logged ffmpeg command, confirming the flag is forwarded to the encoder and not silently dropped.
 - **`--video-copy-if-compliant` test now verifies the copy path** — The existing test passed `--preset ultrafast`, which sets `_CLI_PRESET_EXPLICIT=1` and always forces a re-encode, making the copy path unreachable. A second pass now runs with isolated `HOME` and no explicit CRF or preset, then asserts the "will copy directly from source" message appears in muxm output.
 - **`--skip-video` assertion tightened** — Replaced a broad keyword grep (`skip|video|warn|error|cannot|invalid|disabled`) with `assert_exit 42` plus a check for the specific error message `"incompatible with producing a valid output file"`, matching muxm's documented exit code for this incompatible flag.
