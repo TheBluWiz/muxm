@@ -318,7 +318,9 @@ Falls through to the score-all pass if no qualifying stereo track exists.
 Used by the \fBuniversal\fR profile; toggle with this flag for any profile.
 .TP
 .BR \-\-stereo\-fallback " , " \-\-no\-stereo\-fallback
-Enable/disable automatic AAC stereo track when primary >2ch.
+Enable/disable a second AAC stereo track alongside a multichannel (>2ch)
+primary. Off by default in every profile; enable to add a phone-friendly
+fallback track.
 .TP
 .BR \-\-stereo\-bitrate " " \fIRATE\fR
 Stereo track bitrate (e.g., 192k).
