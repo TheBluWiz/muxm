@@ -1000,6 +1000,8 @@ test_toggles() {
     "--no-sub-export-external|SUB_EXPORT_EXTERNAL       = 0"
     "--no-video-copy-if-compliant|VIDEO_COPY_IF_COMPLIANT   = 0"
     # ---- Positive toggles not covered by other suites ----
+    "--prefer-stereo|AUDIO_PREFER_STEREO       = 1"
+    "--no-prefer-stereo|AUDIO_PREFER_STEREO       = 0"
     "--stereo-fallback|ADD_STEREO_IF_MULTICH     = 1"
     "--no-conservative-vbv|CONSERVATIVE_VBV          = 0"
     # ---- DV policy toggles ----
@@ -1801,6 +1803,9 @@ test_profiles() {
   assert_contains "STRIP_METADATA            = 1" "universal: metadata stripped" "$out"
   assert_contains "OUTPUT_EXT                = mp4" "universal: MP4 container" "$out"
   assert_contains "SUB_BURN_FORCED           = 1" "universal: burn forced subs (only profile that burns by default)" "$out"
+  assert_contains "AUDIO_PREFER_STEREO       = 1" "universal: native stereo preference enabled" "$out"
+  assert_contains "MAX_AUDIO_CHANNELS        = 2" "universal: channel ceiling at 2 (stereo downmix)" "$out"
+  assert_contains "AUDIO_FORCE_CODEC         = aac" "universal: force AAC for maximum compatibility" "$out"
 
   # youtube-upload specifics
   out="$(run_muxm --profile youtube-upload --print-effective-config)"
@@ -1810,8 +1815,8 @@ test_profiles() {
   assert_contains "OUTPUT_EXT                = mp4"         "youtube-upload: MP4 container" "$out"
   assert_contains "DISABLE_DV                = 1"           "youtube-upload: DV disabled" "$out"
   assert_contains "TONEMAP_HDR_TO_SDR        = 0"           "youtube-upload: no tone-mapping" "$out"
-  assert_contains "AUDIO_FORCE_CODEC         = aac"         "youtube-upload: force AAC" "$out"
-  assert_contains "MAX_AUDIO_CHANNELS        = 2"           "youtube-upload: stereo only" "$out"
+  assert_contains "AUDIO_FORCE_CODEC         = <auto>"       "youtube-upload: no forced codec (best track passthrough)" "$out"
+  assert_contains "MAX_AUDIO_CHANNELS        = 8"           "youtube-upload: no channel cap (global default)" "$out"
   assert_contains "STEREO_BITRATE            = 256k"        "youtube-upload: 256k stereo" "$out"
   assert_contains "AUDIO_LOSSLESS_PASSTHROUGH = 0"          "youtube-upload: no lossless passthrough" "$out"
   assert_contains "ADD_STEREO_IF_MULTICH     = 0"           "youtube-upload: no stereo fallback" "$out"
@@ -3172,6 +3177,21 @@ _test_audio_native_stereo() {
   else
     fail "AC3 native stereo: no output produced"
   fi
+
+  # Test 6: AUDIO_PREFER_STEREO (--prefer-stereo / --profile universal)
+  # Source has 5.1 AC3 + stereo AAC. With --prefer-stereo, the stereo track should
+  # be selected as the primary (logged as "AUDIO_PREFER_STEREO: native 2ch track found").
+  log "Testing AUDIO_PREFER_STEREO: native 2ch preferred as primary..."
+  out="$(run_muxm --crf 51 --preset ultrafast --output-ext mp4 --prefer-stereo "$TESTDIR/native_stereo.mkv")"
+  assert_contains "AUDIO_PREFER_STEREO: native 2ch track found" \
+    "--prefer-stereo: native stereo selected as primary" "$out"
+
+  # Test 7: AUDIO_PREFER_STEREO fallthrough on surround-only source.
+  # No native stereo exists; must log fallthrough and still produce output.
+  log "Testing AUDIO_PREFER_STEREO fallthrough: surround-only source..."
+  out="$(run_muxm --crf 51 --preset ultrafast --output-ext mp4 --prefer-stereo "$TESTDIR/surround_only.mkv")"
+  assert_contains "AUDIO_PREFER_STEREO: no qualifying native 2ch track found" \
+    "--prefer-stereo fallthrough: surround-only source falls back to score-all" "$out"
 }
 
 # === Suite: Subtitle Pipeline ===

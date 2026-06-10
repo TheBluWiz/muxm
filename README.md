@@ -64,15 +64,15 @@ muxm --profile <name> input.mkv
 | Profile | Goal | Video | Audio | Subtitles | DV |
 | --- | --- | --- | --- | --- | --- |
 | `archive` | Lossless preservation | Copy (no re-encode) | All tracks, lossless passthrough | Multi-track stream-copy (all types, up to 99) | Preserve |
-| `hdr10-hq` | Max HDR10 quality | HEVC CRF 17 | Lossless + stereo fallback | Single-track per type, soft subs | Strip |
-| `atv-directplay-hq` | Apple TV Direct Play | HEVC Main10 (copy if compliant) | E-AC-3 + AAC stereo | Soft forced (mov_text); others as mov_text; PGS→OCR | Convert to P8.1 (auto, if possible) |
+| `hdr10-hq` | Max HDR10 quality | HEVC CRF 17 | Lossless passthrough | Single-track per type, soft subs | Strip |
+| `atv-directplay-hq` | Apple TV Direct Play | HEVC Main10 (copy if compliant) | E-AC-3 | Soft forced (mov_text); others as mov_text; PGS→OCR | Convert to P8.1 (auto, if possible) |
 | `av1-hq` | High-quality AV1 archive | AV1 CRF 20, preset 6 | Lossless passthrough | Single-track per type, soft subs | Disabled (AV1 pipeline) |
-| `streaming-hevc` | Modern HEVC streaming | HEVC CRF 20 | E-AC-3 448k + AAC stereo | Soft forced + full (no SDH); PGS→OCR | Strip |
-| `streaming-av1` | AV1 streaming | AV1 CRF 30, preset 6 | Opus 256k + AAC stereo | Soft forced + full (no SDH); PGS→OCR | Strip |
-| `animation` | Anime/cartoon optimized | HEVC CRF 16, 10-bit | Lossless + stereo fallback | Multi-track stream-copy (up to 6); preserve ASS/SSA | Strip |
+| `streaming-hevc` | Modern HEVC streaming | HEVC CRF 20 | E-AC-3 448k | Soft forced + full (no SDH); PGS→OCR | Strip |
+| `streaming-av1` | AV1 streaming | AV1 CRF 30, preset 6 | Opus 256k | Soft forced + full (no SDH); PGS→OCR | Strip |
+| `animation` | Anime/cartoon optimized | HEVC CRF 16, 10-bit | Lossless passthrough | Multi-track stream-copy (up to 6); preserve ASS/SSA | Strip |
 | `atv-directplay-animation` | Anime for Apple TV Direct Play | HEVC CRF 16, slower, animation psy params | E-AC-3 (lossless transcoded for ATV) | Multi-track; native ASS/SSA; soft forced | Strip |
-| `universal` | Play anywhere | H.264 SDR (tone-map HDR) | AAC stereo | Burn forced; export others as external SRT | Strip |
-| `youtube-upload` | YouTube upload prep | H.264 High CRF 16, slow | AAC stereo 256k | Soft forced; export full subs as SRT | Disabled (HDR10 preserved) |
+| `universal` | Play anywhere | H.264 SDR (tone-map HDR) | AAC stereo (native preferred, else downmix) | Burn forced; export others as external SRT | Strip |
+| `youtube-upload` | YouTube upload prep | H.264 High CRF 16, slow | Best-scored track (surround allowed) | Soft forced; export full subs as SRT | Disabled (HDR10 preserved) |
 
 ### `archive` — Lossless Archival
 
@@ -86,7 +86,7 @@ muxm --profile archive movie.mkv
 
 ### `hdr10-hq` — High Quality HDR10
 
-Strips Dolby Vision layers and re-encodes to clean HDR10 HEVC at CRF 17. Preserves lossless audio (TrueHD, DTS-HD MA, FLAC) and adds a stereo fallback track. MKV output.
+Strips Dolby Vision layers and re-encodes to clean HDR10 HEVC at CRF 17. Preserves lossless audio (TrueHD, DTS-HD MA, FLAC) via passthrough. MKV output.
 
 ```bash
 muxm --profile hdr10-hq movie.mkv
@@ -94,7 +94,7 @@ muxm --profile hdr10-hq movie.mkv
 
 ### `atv-directplay-hq` — Apple TV Direct Play
 
-Targets true Direct Play on Apple TV 4K via Plex: MP4 container, HEVC Main10 with DV Profile 8.1 when possible, E-AC-3 surround (with Atmos JOC when present) with AAC stereo fallback, and soft forced subtitles (mov_text). Copies compliant video without re-encoding. Skips processing if source is already ATV-compliant.
+Targets true Direct Play on Apple TV 4K via Plex: MP4 container, HEVC Main10 with DV Profile 8.1 when possible, E-AC-3 surround (with Atmos JOC when present), and soft forced subtitles (mov_text). Copies compliant video without re-encoding. Skips processing if source is already ATV-compliant.
 
 ```bash
 muxm --profile atv-directplay-hq movie.mkv
@@ -112,7 +112,7 @@ muxm --profile av1-hq movie.mkv
 
 ### `streaming-hevc` — Modern HEVC Streaming
 
-Optimized for Plex, Jellyfin, and Emby on modern clients: Shield, Fire TV, Roku Ultra, smart TVs, and web browsers. HEVC CRF 20 with E-AC-3 surround at streaming-friendly bitrates, AAC stereo fallback, and soft subtitles. Always outputs MP4. Strips DV and keeps HDR10. Balances quality with file size.
+Optimized for Plex, Jellyfin, and Emby on modern clients: Shield, Fire TV, Roku Ultra, smart TVs, and web browsers. HEVC CRF 20 with E-AC-3 surround at streaming-friendly bitrates and soft subtitles. Always outputs MP4. Strips DV and keeps HDR10. Balances quality with file size.
 
 > Formerly `streaming`, which is still accepted as a deprecated alias.
 
@@ -122,7 +122,7 @@ muxm --profile streaming-hevc movie.mkv
 
 ### `streaming-av1` — AV1 Streaming
 
-AV1 streaming encode for modern clients with AV1 decode support (Fire TV Stick 4K Max, Chromecast with Google TV, web browsers). AV1 CRF 30, preset 6, Opus audio at 256k (`AUDIO_FORCE_BITRATE="256k"`), AAC stereo fallback, soft subtitles. Always outputs MP4. Strips DV; HDR10 preserved. Delivers smaller files than `streaming-hevc` at equivalent perceptual quality on supported hardware.
+AV1 streaming encode for modern clients with AV1 decode support (Fire TV Stick 4K Max, Chromecast with Google TV, web browsers). AV1 CRF 30, preset 6, Opus audio at 256k (`AUDIO_FORCE_BITRATE="256k"`), soft subtitles. Always outputs MP4. Strips DV; HDR10 preserved. Delivers smaller files than `streaming-hevc` at equivalent perceptual quality on supported hardware.
 
 > **Requires AV1 encoder support in ffmpeg** — see the note under [`av1-hq`](#av1-hq--high-quality-av1) above.
 
@@ -148,7 +148,7 @@ muxm --profile atv-directplay-animation show.mkv
 
 ### `universal` — Universal Compatibility
 
-Plays on everything: old Rokus, mobile devices, web browsers, and non-HDR TVs. Tone-maps HDR to SDR, encodes to H.264, forces AAC stereo audio, burns forced subtitles, exports others as external SRT, and strips chapters and non-essential metadata. Always outputs MP4.
+Plays on everything: old Rokus, mobile devices, web browsers, and non-HDR TVs. Tone-maps HDR to SDR, encodes to H.264, produces a single AAC stereo track (selects the best native stereo track if present; otherwise downmixes the best-scored surround track to stereo), burns forced subtitles, exports others as external SRT, and strips chapters and non-essential metadata. Always outputs MP4.
 
 ```bash
 muxm --profile universal movie.mkv
@@ -156,7 +156,7 @@ muxm --profile universal movie.mkv
 
 ### `youtube-upload` — YouTube Upload Prep
 
-Optimized for uploading to YouTube. Encodes to H.264 High profile at CRF 16 with the `slow` preset and AAC stereo at 256k in an MP4 container. Forced subtitles are embedded as soft subs (mov_text); all other dialogue subtitles (excluding SDH) are exported as an external `.srt` file for upload to YouTube Studio. Dolby Vision is disabled; HDR10 metadata is preserved so YouTube can use it during its own re-encode. Strips non-essential metadata; chapter markers are preserved.
+Optimized for uploading to YouTube. Encodes to H.264 High profile at CRF 16 with the `slow` preset in an MP4 container. Audio is kept as the best-scored track — surround is allowed and passed through, giving YouTube's encoder the cleanest source. Forced subtitles are embedded as soft subs (mov_text); all other dialogue subtitles (excluding SDH) are exported as an external `.srt` file for upload to YouTube Studio. Dolby Vision is disabled; HDR10 metadata is preserved so YouTube can use it during its own re-encode. Strips non-essential metadata; chapter markers are preserved.
 
 Because YouTube re-encodes every upload regardless, the goal is to give YouTube's encoder the cleanest, highest-quality source possible — not to minimize file size. CRF 16 with `slow` delivers near-transparent quality that survives YouTube's compression with noticeably less artifacting than a smaller source would.
 

@@ -244,6 +244,7 @@ declare -i AUDIO_SCORE_COMMENTARY_PENALTY=200
 STEREO_BITRATE="192k"
 declare -i MAX_AUDIO_CHANNELS=8
 declare -i ADD_STEREO_IF_MULTICH=1
+declare -i AUDIO_PREFER_STEREO=0
 EAC3_BITRATE_5_1="640k"
 EAC3_BITRATE_7_1="768k"
 
@@ -1022,7 +1023,7 @@ for _pcd_v in \
   DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL \
   AUDIO_LANG_PREF AUDIO_CODEC_PREFERENCE \
   AUDIO_MULTI_TRACK AUDIO_KEEP_COMMENTARY \
-  STEREO_BITRATE MAX_AUDIO_CHANNELS ADD_STEREO_IF_MULTICH \
+  STEREO_BITRATE MAX_AUDIO_CHANNELS ADD_STEREO_IF_MULTICH AUDIO_PREFER_STEREO \
   EAC3_BITRATE_5_1 EAC3_BITRATE_7_1 AUDIO_FORCE_CODEC AUDIO_FORCE_BITRATE AUDIO_LOSSLESS_PASSTHROUGH \
   SUB_LANG_PREF SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_MAX_TRACKS \
   SUB_BURN_FORCED SUB_EXPORT_EXTERNAL SUB_PRESERVE_TEXT_FORMAT \
@@ -1523,12 +1524,12 @@ The former name
 is accepted as a backwards\-compatible alias and emits a deprecation notice.
 .TP
 .B hdr10\-hq
-Strip DV, keep HDR10. CRF 17, lossless audio + stereo fallback. MKV.
+Strip DV, keep HDR10. CRF 17, lossless audio passthrough. MKV.
 .TP
 .B atv\-directplay\-hq
 Apple TV Direct Play. DV\-aware, E\-AC\-3. Passthrough container
-(MKV sources stay MKV, MP4 sources stay MP4). HEVC Main10, DV P8.1,
-AAC stereo fallback. Soft forced subs (mov_text); native ASS/SSA preservation for MKV.
+(MKV sources stay MKV, MP4 sources stay MP4). HEVC Main10, DV P8.1.
+Soft forced subs (mov_text); native ASS/SSA preservation for MKV.
 .TP
 .B atv\-directplay\-animation
 Apple TV Direct Play, animation quality. CRF 16, E\-AC\-3, ASS/SSA + PGS bitmap subs.
@@ -1537,15 +1538,15 @@ multi\-track subs. Lossless audio transcoded to E\-AC\-3 (ATV cannot Direct Play
 Soft forced subs (mov_text); native ASS/SSA preservation for MKV.
 .TP
 .B streaming\-hevc
-HEVC CRF 20 for Plex/Jellyfin. HDR10, E\-AC\-3. MP4. Preset medium,
-AAC stereo. Targets Shield, Fire TV, Roku, smart TVs, web.
+HEVC CRF 20 for Plex/Jellyfin. HDR10, E\-AC\-3. MP4. Preset medium.
+Targets Shield, Fire TV, Roku, smart TVs, web.
 The former name
 .B streaming
 is accepted as a backwards\-compatible alias and emits a deprecation notice.
 .TP
 .B av1\-hq
 High\-quality AV1 archival via SVT\-AV1. CRF 20, preset 6. HDR10 preserved,
-DV disabled. MKV. Lossless audio passthrough with AAC stereo fallback.
+DV disabled. MKV. Lossless audio passthrough.
 SHA\-256 checksum. VMAF 93.48 at 4K HDR (parity with HEVC CRF 18).
 See
 .I docs/AV1_CALIBRATION.md
@@ -1553,8 +1554,8 @@ for methodology.
 .TP
 .B streaming\-av1
 AV1 streaming. CRF 30, preset 6. Opus 256k surround
-.RB ( AUDIO_FORCE_BITRATE=256k ),
-AAC stereo fallback. MP4 container.
+.RB ( AUDIO_FORCE_BITRATE=256k ).
+MP4 container.
 Optimized for platforms that accept AV1 (YouTube, Netflix ingest).
 VMAF 97.70 at 1080p SDR, 90.65 at 4K HDR.
 .TP
@@ -1565,11 +1566,11 @@ multi\-track subs (ASS/SSA + PGS bitmap).
 .TP
 .B universal
 H.264 SDR, AAC stereo. Lean, play anywhere. MP4. Tone\-map HDR, burn forced subs,
-strip chapters/metadata.
+strip chapters/metadata. Prefers native stereo track; downmixes surround if none found.
 .TP
 .B youtube\-upload
-H.264 high\-profile, CRF 16, preset slow. AAC stereo 256k, soft forced subs,
-export full subs as external SRT. MP4. Strips metadata, keeps chapters.
+H.264 high\-profile, CRF 16, preset slow. Best\-scored audio track (surround allowed),
+soft forced subs, export full subs as external SRT. MP4. Strips metadata, keeps chapters.
 No tone\-mapping (YouTube handles HDR). Designed for master\-quality uploads.
 .SH COMMON OPTIONS
 .TP
@@ -1770,6 +1771,11 @@ profile sets this to 256k to pin Opus surround at an appropriate bitrate.
 .TP
 .BR \-\-audio\-lossless\-passthrough " , " \-\-no\-audio\-lossless\-passthrough
 Allow/disallow lossless codecs (TrueHD, DTS\-HD MA, FLAC) to copy through.
+.TP
+.BR \-\-prefer\-stereo " , " \-\-no\-prefer\-stereo
+Select the best native 2ch track instead of the highest-scored surround track.
+Falls through to the score-all pass if no qualifying stereo track exists.
+Used by the \fBuniversal\fR profile; toggle with this flag for any profile.
 .TP
 .BR \-\-stereo\-fallback " , " \-\-no\-stereo\-fallback
 Enable/disable automatic AAC stereo track when primary >2ch.
@@ -2126,7 +2132,7 @@ derived from input. Use \fB\-\-profile\fR for device\-optimized settings.
 .TP
 .B muxm \-\-profile atv\-directplay\-hq Movie.mkv
 Encode for Apple TV direct play with Dolby Vision P8.1, E\-AC\-3 surround,
-AAC stereo fallback, and soft forced subtitles.
+and soft forced subtitles.
 .TP
 .B muxm \-\-profile streaming\-hevc \-\-audio\-lang\-pref spa,eng Movie.mkv
 Encode for Plex/Jellyfin streaming, preferring Spanish audio over English.
@@ -2272,7 +2278,7 @@ Major variable groups:
 .B Audio
 .BR AUDIO_LANG_PREF ", " AUDIO_CODEC_PREFERENCE ", "
 .BR AUDIO_TRACK_OVERRIDE ", " AUDIO_FORCE_CODEC ", "
-.BR MAX_AUDIO_CHANNELS ", " ADD_STEREO_IF_MULTICH ", "
+.BR MAX_AUDIO_CHANNELS ", " ADD_STEREO_IF_MULTICH ", " AUDIO_PREFER_STEREO ", "
 .BR STEREO_BITRATE ", " EAC3_BITRATE_5_1 ", " EAC3_BITRATE_7_1 ", "
 .BR AUDIO_LOSSLESS_PASSTHROUGH ", " INCLUDE_AUDIO_TITLES .
 .TP
@@ -2583,7 +2589,7 @@ _muxm_completions() {
             --max-copy-bitrate
 
             --audio-track --audio-lang-pref
-            --stereo-fallback --no-stereo-fallback --stereo-bitrate
+            --prefer-stereo --no-prefer-stereo --stereo-fallback --no-stereo-fallback --stereo-bitrate
             --audio-force-codec
             --audio-lossless-passthrough --no-audio-lossless-passthrough
             --audio-titles --no-audio-titles
@@ -2879,7 +2885,7 @@ _create_config_emit() {
     DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL
     AUDIO_LANG_PREF AUDIO_CODEC_PREFERENCE
     AUDIO_MULTI_TRACK AUDIO_KEEP_COMMENTARY
-    STEREO_BITRATE MAX_AUDIO_CHANNELS ADD_STEREO_IF_MULTICH
+    STEREO_BITRATE MAX_AUDIO_CHANNELS ADD_STEREO_IF_MULTICH AUDIO_PREFER_STEREO
     EAC3_BITRATE_5_1 EAC3_BITRATE_7_1 AUDIO_FORCE_CODEC AUDIO_FORCE_BITRATE AUDIO_LOSSLESS_PASSTHROUGH
     SUB_LANG_PREF SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_MAX_TRACKS
     SUB_BURN_FORCED SUB_EXPORT_EXTERNAL SUB_PRESERVE_TEXT_FORMAT
@@ -3147,6 +3153,9 @@ HEADER
   printf '\n'
   echo "# Add a stereo AAC fallback track when primary >2ch"
   _V ADD_STEREO_IF_MULTICH
+  printf '\n'
+  echo "# Prefer a native 2ch track over the best-scored surround track (universal only)"
+  _V AUDIO_PREFER_STEREO
   printf '\n'
   echo "# E-AC-3 bitrates for multichannel transcode"
   _V EAC3_BITRATE_5_1
@@ -3441,6 +3450,8 @@ _create_config() {
       --sdr-force-10bit)            _CC_OVERRIDES[SDR_FORCE_10BIT]=1;                                                                   (( ++_cc_oi )) ;;
       --no-sdr-force-10bit)         _CC_OVERRIDES[SDR_FORCE_10BIT]=0;                                                                   (( ++_cc_oi )) ;;
       # Audio
+      --prefer-stereo)              _CC_OVERRIDES[AUDIO_PREFER_STEREO]=1;                                                               (( ++_cc_oi )) ;;
+      --no-prefer-stereo)           _CC_OVERRIDES[AUDIO_PREFER_STEREO]=0;                                                               (( ++_cc_oi )) ;;
       --stereo-fallback)            _CC_OVERRIDES[ADD_STEREO_IF_MULTICH]=1;                                                             (( ++_cc_oi )) ;;
       --no-stereo-fallback)         _CC_OVERRIDES[ADD_STEREO_IF_MULTICH]=0;                                                             (( ++_cc_oi )) ;;
       --audio-force-codec)          _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[AUDIO_FORCE_CODEC]="$_cc_val";         (( _cc_oi += 2 )) ;;
@@ -3729,9 +3740,9 @@ apply_profile_hdr10_hq() {
   X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
   HDR_TARGET_PIXFMT="yuv420p10le"
   FORCE_CHROMA_420=1
-  # Audio: lossless passthrough + stereo fallback
+  # Audio: lossless passthrough
   AUDIO_LOSSLESS_PASSTHROUGH=1
-  ADD_STEREO_IF_MULTICH=1
+  ADD_STEREO_IF_MULTICH=0
   STEREO_BITRATE="256k"
   # Subs: keep all; no burn
   SUB_INCLUDE_FORCED=1
@@ -3765,9 +3776,9 @@ apply_profile_atv_directplay_hq() {
   X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:hdr10=1:hdr10-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
   HDR_TARGET_PIXFMT="yuv420p10le"
   FORCE_CHROMA_420=1
-  # Audio: E-AC-3 for surround (ATV can't Direct Play TrueHD), AAC stereo fallback
+  # Audio: E-AC-3 for surround (ATV can't Direct Play TrueHD)
   AUDIO_LOSSLESS_PASSTHROUGH=0
-  ADD_STEREO_IF_MULTICH=1
+  ADD_STEREO_IF_MULTICH=0
   STEREO_BITRATE="256k"
   EAC3_BITRATE_5_1="640k"
   EAC3_BITRATE_7_1="768k"
@@ -3809,10 +3820,10 @@ apply_profile_atv_directplay_animation() {
   FORCE_CHROMA_420=1
   SDR_USE_10BIT_IF_SRC_10BIT=1
   SDR_FORCE_10BIT=1
-  # Audio: E-AC-3 for surround (ATV cannot Direct Play TrueHD/DTS-HD MA), AAC stereo fallback.
+  # Audio: E-AC-3 for surround (ATV cannot Direct Play TrueHD/DTS-HD MA).
   # Lossless tracks are transcoded rather than passed through.
   AUDIO_LOSSLESS_PASSTHROUGH=0
-  ADD_STEREO_IF_MULTICH=1
+  ADD_STEREO_IF_MULTICH=0
   STEREO_BITRATE="256k"
   EAC3_BITRATE_5_1="640k"
   EAC3_BITRATE_7_1="768k"
@@ -3846,10 +3857,11 @@ apply_profile_universal() {
   CRF_VALUE=22
   PRESET_VALUE="slow"
   FORCE_CHROMA_420=1
-  # Audio: AAC stereo only (MAX_AUDIO_CHANNELS=2 forces downmix to stereo)
+  # Audio: single AAC stereo track — best native stereo track if present, else downmix
   AUDIO_FORCE_CODEC="aac"
   AUDIO_LOSSLESS_PASSTHROUGH=0
   ADD_STEREO_IF_MULTICH=0
+  AUDIO_PREFER_STEREO=1
   MAX_AUDIO_CHANNELS=2
   STEREO_BITRATE="256k"
   # Subs: burn forced; export others as external SRT
@@ -3878,9 +3890,9 @@ apply_profile_streaming_hevc() {
   X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:hdr10=1:hdr10-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
   HDR_TARGET_PIXFMT="yuv420p10le"
   FORCE_CHROMA_420=1
-  # Audio: E-AC-3 surround (streaming bitrates), AAC stereo fallback
+  # Audio: E-AC-3 surround (streaming bitrates)
   AUDIO_LOSSLESS_PASSTHROUGH=0
-  ADD_STEREO_IF_MULTICH=1
+  ADD_STEREO_IF_MULTICH=0
   STEREO_BITRATE="192k"
   EAC3_BITRATE_5_1="448k"
   EAC3_BITRATE_7_1="640k"
@@ -3912,7 +3924,7 @@ apply_profile_av1_hq() {
   HDR_TARGET_PIXFMT="yuv420p10le"
   FORCE_CHROMA_420=1
   AUDIO_LOSSLESS_PASSTHROUGH=1
-  ADD_STEREO_IF_MULTICH=1
+  ADD_STEREO_IF_MULTICH=0
   STEREO_BITRATE="256k"
   SUB_INCLUDE_FORCED=1
   SUB_INCLUDE_FULL=1
@@ -3942,7 +3954,7 @@ apply_profile_streaming_av1() {
   AUDIO_FORCE_CODEC="libopus"
   # Multichannel bitrate controlled via AUDIO_FORCE_BITRATE
   AUDIO_FORCE_BITRATE="256k"
-  ADD_STEREO_IF_MULTICH=1
+  ADD_STEREO_IF_MULTICH=0
   STEREO_BITRATE="192k"
   SUB_INCLUDE_FORCED=1
   SUB_INCLUDE_FULL=1
@@ -3969,9 +3981,9 @@ apply_profile_animation() {
   FORCE_CHROMA_420=1
   SDR_USE_10BIT_IF_SRC_10BIT=1
   SDR_FORCE_10BIT=1
-  # Audio: lossless passthrough + stereo fallback (FLAC-first for anime releases)
+  # Audio: lossless passthrough (FLAC-first for anime releases)
   AUDIO_LOSSLESS_PASSTHROUGH=1
-  ADD_STEREO_IF_MULTICH=1
+  ADD_STEREO_IF_MULTICH=0
   STEREO_BITRATE="192k"
   AUDIO_CODEC_PREFERENCE="flac,truehd,eac3,ac3,aac,alac,other"
   # Subs: multi-track, keep all, never burn (preserve ASS styling + PGS bitmaps)
@@ -4006,9 +4018,7 @@ apply_profile_youtube_upload() {
   # HDR: preserve pixel format, no DV, no tone-map (let YouTube handle it)
   TONEMAP_HDR_TO_SDR=0
   HDR_TARGET_PIXFMT="yuv420p10le"
-  # Audio: AAC stereo only (YouTube ingestion requirement)
-  AUDIO_FORCE_CODEC="aac"
-  MAX_AUDIO_CHANNELS=2
+  # Audio: keep the best-scored track; YouTube re-encodes server-side
   STEREO_BITRATE="256k"
   AUDIO_LOSSLESS_PASSTHROUGH=0
   ADD_STEREO_IF_MULTICH=0
@@ -4394,6 +4404,8 @@ while [[ $# -gt 0 ]]; do
     --audio-track) AUDIO_TRACK_OVERRIDE="${2:-}"; shift 2 ;;
     --audio-lang-pref) AUDIO_LANG_PREF="${2:-}"; shift 2 ;;
     --stereo-bitrate) STEREO_BITRATE="${2:-}"; shift 2 ;;
+    --prefer-stereo) AUDIO_PREFER_STEREO=1; shift ;;
+    --no-prefer-stereo) AUDIO_PREFER_STEREO=0; shift ;;
     --stereo-fallback) ADD_STEREO_IF_MULTICH=1; shift ;;
     --no-stereo-fallback) ADD_STEREO_IF_MULTICH=0; shift ;;
     --audio-force-codec) AUDIO_FORCE_CODEC="${2:-}"; shift 2 ;;
@@ -4851,6 +4863,7 @@ Effective config (post config-files + profile + CLI):
 
   [Audio — Transcode / Policy]
   ADD_STEREO_IF_MULTICH     = $ADD_STEREO_IF_MULTICH
+  AUDIO_PREFER_STEREO       = $AUDIO_PREFER_STEREO
   STEREO_BITRATE            = $STEREO_BITRATE
   EAC3_BITRATE_5_1          = $EAC3_BITRATE_5_1
   EAC3_BITRATE_7_1          = $EAC3_BITRATE_7_1
@@ -7412,6 +7425,38 @@ select_best_audio(){
       return 0
     fi
     warn "Requested --audio-track $AUDIO_TRACK_OVERRIDE is invalid (must be 0-$((n-1))). Using auto-selection."
+  fi
+
+  # When AUDIO_PREFER_STEREO is set, prefer a native exactly-2ch track ranked by the
+  # existing scorer. Falls through to the score-all pass if no qualifying track found.
+  if (( AUDIO_PREFER_STEREO )); then
+    local ps_best_line="" ps_best_score=-999999
+    for (( i=0; i<n; i++ )); do
+      local ps_ch ps_vi ps_hi ps_title ps_line ps_score
+      ps_ch="$(_audio_channels "$i")"
+      [[ -z "$ps_ch" || ! "$ps_ch" =~ ^[0-9]+$ ]] && ps_ch=0
+      (( ps_ch != 2 )) && continue
+      ps_title="$(_audio_title "$i")"
+      _audio_is_commentary "$ps_title" && continue
+      ps_vi="$(_jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$i].disposition.visual_impaired // 0")"
+      ps_hi="$(_jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$i].disposition.hearing_impaired // 0")"
+      (( ps_vi )) && continue
+      (( ps_hi )) && continue
+      ps_line="$(_score_audio_stream "$i")"
+      ps_score="${ps_line%%$'\t'*}"
+      if [[ "$ps_score" =~ ^-?[0-9]+$ ]] && (( ps_score > ps_best_score )); then
+        ps_best_score="$ps_score"
+        ps_best_line="$ps_line"
+      fi
+    done
+    if [[ -n "$ps_best_line" ]]; then
+      local ps_idx
+      ps_idx="${ps_best_line#*$'\t'}"; ps_idx="${ps_idx%%$'\t'*}"
+      note "[Audio] AUDIO_PREFER_STEREO: native 2ch track found at stream #${ps_idx}. Selecting over scored best."
+      echo "$ps_idx"
+      return 0
+    fi
+    note "[Audio] AUDIO_PREFER_STEREO: no qualifying native 2ch track found. Falling through to score-all pass."
   fi
 
   # Score all tracks, select best, and collect summary in one pass

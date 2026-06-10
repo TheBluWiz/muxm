@@ -59,12 +59,12 @@ The former name
 is accepted as a backwards\-compatible alias and emits a deprecation notice.
 .TP
 .B hdr10\-hq
-Strip DV, keep HDR10. CRF 17, lossless audio + stereo fallback. MKV.
+Strip DV, keep HDR10. CRF 17, lossless audio passthrough. MKV.
 .TP
 .B atv\-directplay\-hq
 Apple TV Direct Play. DV\-aware, E\-AC\-3. Passthrough container
-(MKV sources stay MKV, MP4 sources stay MP4). HEVC Main10, DV P8.1,
-AAC stereo fallback. Soft forced subs (mov_text); native ASS/SSA preservation for MKV.
+(MKV sources stay MKV, MP4 sources stay MP4). HEVC Main10, DV P8.1.
+Soft forced subs (mov_text); native ASS/SSA preservation for MKV.
 .TP
 .B atv\-directplay\-animation
 Apple TV Direct Play, animation quality. CRF 16, E\-AC\-3, ASS/SSA + PGS bitmap subs.
@@ -73,15 +73,15 @@ multi\-track subs. Lossless audio transcoded to E\-AC\-3 (ATV cannot Direct Play
 Soft forced subs (mov_text); native ASS/SSA preservation for MKV.
 .TP
 .B streaming\-hevc
-HEVC CRF 20 for Plex/Jellyfin. HDR10, E\-AC\-3. MP4. Preset medium,
-AAC stereo. Targets Shield, Fire TV, Roku, smart TVs, web.
+HEVC CRF 20 for Plex/Jellyfin. HDR10, E\-AC\-3. MP4. Preset medium.
+Targets Shield, Fire TV, Roku, smart TVs, web.
 The former name
 .B streaming
 is accepted as a backwards\-compatible alias and emits a deprecation notice.
 .TP
 .B av1\-hq
 High\-quality AV1 archival via SVT\-AV1. CRF 20, preset 6. HDR10 preserved,
-DV disabled. MKV. Lossless audio passthrough with AAC stereo fallback.
+DV disabled. MKV. Lossless audio passthrough.
 SHA\-256 checksum. VMAF 93.48 at 4K HDR (parity with HEVC CRF 18).
 See
 .I docs/AV1_CALIBRATION.md
@@ -89,8 +89,8 @@ for methodology.
 .TP
 .B streaming\-av1
 AV1 streaming. CRF 30, preset 6. Opus 256k surround
-.RB ( AUDIO_FORCE_BITRATE=256k ),
-AAC stereo fallback. MP4 container.
+.RB ( AUDIO_FORCE_BITRATE=256k ).
+MP4 container.
 Optimized for platforms that accept AV1 (YouTube, Netflix ingest).
 VMAF 97.70 at 1080p SDR, 90.65 at 4K HDR.
 .TP
@@ -101,11 +101,11 @@ multi\-track subs (ASS/SSA + PGS bitmap).
 .TP
 .B universal
 H.264 SDR, AAC stereo. Lean, play anywhere. MP4. Tone\-map HDR, burn forced subs,
-strip chapters/metadata.
+strip chapters/metadata. Prefers native stereo track; downmixes surround if none found.
 .TP
 .B youtube\-upload
-H.264 high\-profile, CRF 16, preset slow. AAC stereo 256k, soft forced subs,
-export full subs as external SRT. MP4. Strips metadata, keeps chapters.
+H.264 high\-profile, CRF 16, preset slow. Best\-scored audio track (surround allowed),
+soft forced subs, export full subs as external SRT. MP4. Strips metadata, keeps chapters.
 No tone\-mapping (YouTube handles HDR). Designed for master\-quality uploads.
 .SH COMMON OPTIONS
 .TP
@@ -311,6 +311,11 @@ profile sets this to 256k to pin Opus surround at an appropriate bitrate.
 .TP
 .BR \-\-audio\-lossless\-passthrough " , " \-\-no\-audio\-lossless\-passthrough
 Allow/disallow lossless codecs (TrueHD, DTS\-HD MA, FLAC) to copy through.
+.TP
+.BR \-\-prefer\-stereo " , " \-\-no\-prefer\-stereo
+Select the best native 2ch track instead of the highest-scored surround track.
+Falls through to the score-all pass if no qualifying stereo track exists.
+Used by the \fBuniversal\fR profile; toggle with this flag for any profile.
 .TP
 .BR \-\-stereo\-fallback " , " \-\-no\-stereo\-fallback
 Enable/disable automatic AAC stereo track when primary >2ch.
@@ -709,7 +714,7 @@ derived from input. Use \fB\-\-profile\fR for device\-optimized settings.
 .TP
 .B muxm \-\-profile atv\-directplay\-hq Movie.mkv
 Encode for Apple TV direct play with Dolby Vision P8.1, E\-AC\-3 surround,
-AAC stereo fallback, and soft forced subtitles.
+and soft forced subtitles.
 .TP
 .B muxm \-\-profile streaming\-hevc \-\-audio\-lang\-pref spa,eng Movie.mkv
 Encode for Plex/Jellyfin streaming, preferring Spanish audio over English.
@@ -855,7 +860,7 @@ Major variable groups:
 .B Audio
 .BR AUDIO_LANG_PREF ", " AUDIO_CODEC_PREFERENCE ", "
 .BR AUDIO_TRACK_OVERRIDE ", " AUDIO_FORCE_CODEC ", " AUDIO_FORCE_BITRATE ", "
-.BR MAX_AUDIO_CHANNELS ", " ADD_STEREO_IF_MULTICH ", "
+.BR MAX_AUDIO_CHANNELS ", " ADD_STEREO_IF_MULTICH ", " AUDIO_PREFER_STEREO ", "
 .BR STEREO_BITRATE ", " EAC3_BITRATE_5_1 ", " EAC3_BITRATE_7_1 ", "
 .BR AUDIO_LOSSLESS_PASSTHROUGH ", " INCLUDE_AUDIO_TITLES .
 .TP
