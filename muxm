@@ -6011,6 +6011,7 @@ resolve_video_encoder() {
       # Phase 3 fills in: libx265 → hevc_nvenc, libx264 → h264_nvenc,
       # libsvt-av1 → av1_nvenc (when av1_nvenc is available).
       HW_ACCEL_FALLBACK_REASON="NVENC dispatch pending (Phase 3 implementation)"
+      note "Hardware acceleration disabled for this encode: $HW_ACCEL_FALLBACK_REASON."
       ;;
   esac
 }

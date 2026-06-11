@@ -2106,7 +2106,7 @@ test_conflicts() {
 # and has platform-dependent semantics (resolved backend varies by host). The
 # auto-resolution and strict-check assertions are host-aware.
 test_hw_accel() {
-  section "Hardware Acceleration (Phase 1 foundation)"
+  section "Hardware Acceleration (Phase 1 + Phase 2)"
 
   local out
 
@@ -2212,6 +2212,77 @@ EOF
   else
     skip "strict-check for missing hevc_nvenc: host has nvenc"
   fi
+
+  # === Phase 2: VideoToolbox quality knob and encode-path fallback ===
+
+  # --- --hw-accel-quality out-of-range rejection ---
+  assert_exit "$EXIT_VALIDATION" "--hw-accel-quality 101: rejected" \
+    --hw-accel-quality 101 --print-effective-config
+  assert_exit "$EXIT_VALIDATION" "--hw-accel-quality abc: rejected" \
+    --hw-accel-quality abc --print-effective-config
+  out="$(run_muxm --hw-accel-quality 101 --print-effective-config)"
+  assert_contains "Invalid --hw-accel-quality" \
+    "--hw-accel-quality 101: error message names the flag" "$out"
+  # Boundary values 0 and 100 must be accepted.
+  out="$(run_muxm --hw-accel-quality 0 --print-effective-config)"
+  assert_contains "HW_ACCEL_QUALITY          = 0" "--hw-accel-quality 0: accepted" "$out"
+  out="$(run_muxm --hw-accel-quality 100 --print-effective-config)"
+  assert_contains "HW_ACCEL_QUALITY          = 100" "--hw-accel-quality 100: accepted" "$out"
+
+  # --- --hw-accel-quality appears in --print-effective-config ---
+  out="$(run_muxm --hw-accel-quality 80 --print-effective-config)"
+  assert_contains "HW_ACCEL_QUALITY          = 80" \
+    "--hw-accel-quality 80: visible in effective config" "$out"
+  out="$(run_muxm --print-effective-config)"
+  assert_contains "HW_ACCEL_QUALITY          = <profile default>" \
+    "HW_ACCEL_QUALITY: omitted flag shows '<profile default>'" "$out"
+
+  # --- VT+AV1 encode-path fallback reason logged to stderr ---
+  # The profile warning fires at parse time (--print-effective-config path). This
+  # test exercises resolve_video_encoder() specifically via --dry-run so the
+  # "Hardware acceleration disabled" note from the encode path is covered.
+  # hw_accel is media-free; create a minimal probeable source inside the guard.
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" && "$(uname -m 2>/dev/null)" == "arm64" ]] \
+      && ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}' | grep -qx hevc_videotoolbox; then
+    local vt_dry_src="$TESTDIR/vt_av1_probe.mkv"
+    ffmpeg -f lavfi -i "color=c=black:s=64x64:r=1" -t 1 -c:v libx264 -an \
+      -y "$vt_dry_src" >/dev/null 2>&1
+    out="$(run_muxm --dry-run --profile av1-hq --hw-accel videotoolbox "$vt_dry_src")"
+    assert_contains "Hardware acceleration disabled for this encode" \
+      "VT+AV1 encode path: fallback note visible in stderr" "$out"
+    assert_contains "VideoToolbox has no AV1 encoder" \
+      "VT+AV1 encode path: reason text correct" "$out"
+  else
+    skip "VT+AV1 encode-path fallback: host lacks hevc_videotoolbox on Apple Silicon"
+  fi
+
+  # --- NVENC stub fallback reason logged to stderr ---
+  # resolve_video_encoder() is only reachable when hevc_nvenc is present;
+  # without it, the Section 14 strict check fires at exit 10 first.
+  if ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}' | grep -qx hevc_nvenc; then
+    local nvenc_dry_src="$TESTDIR/nvenc_probe.mkv"
+    ffmpeg -f lavfi -i "color=c=black:s=64x64:r=1" -t 1 -c:v libx264 -an \
+      -y "$nvenc_dry_src" >/dev/null 2>&1
+    out="$(run_muxm --dry-run --hw-accel nvenc --profile hdr10-hq "$nvenc_dry_src")"
+    assert_contains "NVENC dispatch pending" \
+      "NVENC stub: fallback reason logged to stderr" "$out"
+  else
+    skip "NVENC stub fallback: host lacks hevc_nvenc"
+  fi
+
+  # --- VT_QUALITY_MAP resolution in --print-effective-config ---
+  # Profile in map → calibrated value; profile absent from map → VT_QUALITY_DEFAULT.
+  # Use "archive" for the absent-from-map case — it is not in VT_QUALITY_MAP,
+  # so it always shows the default regardless of any config-file profile default.
+  out="$(run_muxm --profile hdr10-hq --print-effective-config)"
+  assert_contains "VT_QUALITY (active profile) = 70" \
+    "VT_QUALITY_MAP: hdr10-hq resolved to calibrated value (70)" "$out"
+  out="$(run_muxm --profile youtube-upload --print-effective-config)"
+  assert_contains "VT_QUALITY (active profile) = 75" \
+    "VT_QUALITY_MAP: youtube-upload resolved to calibrated value (75)" "$out"
+  out="$(run_muxm --profile archive --print-effective-config)"
+  assert_contains "VT_QUALITY (active profile) = 65 (default)" \
+    "VT_QUALITY_MAP: profile not in map shows VT_QUALITY_DEFAULT" "$out"
 
   # --- Cleanup ---
   rm -rf "$rc_home"
