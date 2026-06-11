@@ -84,7 +84,17 @@ Hardware encoders do **not** accept `-x265-params`; `build_videotoolbox_params()
 Phase 2 and Phase 3 each commit a calibration document (`docs/VIDEOTOOLBOX_CALIBRATION.md`, `docs/NVENC_CALIBRATION.md`) modeled on [`AV1_CALIBRATION.md`](AV1_CALIBRATION.md):
 
 - **Reference clips:** 120s *City of God* (1080p SDR) + 120s *Avatar: The Way of Water* (4K HDR10), extracted from `-ss 0 -t 120`.
-- **Software baseline:** `libx265 -crf 17 -preset slower` (and `libx264 -crf 22 -preset slow` for `universal` / `youtube-upload`).
+- **Software baseline:** per-profile CRF values used in Phase 2 calibration:
+
+  | Profile | Encoder | CRF | Preset |
+  |---|---|---|---|
+  | `hdr10-hq` | libx265 | 17 | slower |
+  | `atv-directplay-hq` | libx265 | 17 | slower |
+  | `atv-directplay-animation` | libx265 | 16 | slower |
+  | `animation` | libx265 | 16 | slower |
+  | `streaming-hevc` | libx265 | 20 | medium |
+  | `universal` | libx264 | 22 | slow |
+  | `youtube-upload` | libx264 | 16 | slow |
 - **Sweep:** per-profile, sweep the hardware backend's quality knob across a reasonable range.
 - **Metric:** mean VMAF (`vmaf_v0.6.1`). Pass threshold: Δ ≤ 0.5 VMAF vs software baseline. Document any profile that cannot meet parity with the size/speed trade-off made.
 - **Harness:** `tools/hw_compare.sh` (Phase 2) generalizes `tools/av1_compare.sh` with an `--encoder` argument.

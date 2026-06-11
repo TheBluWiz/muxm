@@ -2220,6 +2220,8 @@ EOF
     --hw-accel-quality 101 --print-effective-config
   assert_exit "$EXIT_VALIDATION" "--hw-accel-quality abc: rejected" \
     --hw-accel-quality abc --print-effective-config
+  assert_exit "$EXIT_VALIDATION" "--hw-accel-quality -1: rejected" \
+    --hw-accel-quality -1 --print-effective-config
   out="$(run_muxm --hw-accel-quality 101 --print-effective-config)"
   assert_contains "Invalid --hw-accel-quality" \
     "--hw-accel-quality 101: error message names the flag" "$out"

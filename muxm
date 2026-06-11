@@ -4972,7 +4972,11 @@ fi
 case "$HW_ACCEL" in
   videotoolbox|nvenc)
     if [[ "$HW_ACCEL_RESOLVED" != "$HW_ACCEL" ]]; then
-      die 10 "Hardware acceleration '--hw-accel $HW_ACCEL' requested, but no matching encoder (hevc_${HW_ACCEL}) is available in this ffmpeg build. Install an ffmpeg build with ${HW_ACCEL} support, or use --hw-accel none/auto."
+      if [[ "$HW_ACCEL" == "videotoolbox" ]] && ! is_apple_silicon && ffmpeg_has_encoder "hevc_videotoolbox"; then
+        die 10 "Hardware acceleration '--hw-accel videotoolbox' requires Apple Silicon (arm64 Darwin). hevc_videotoolbox is present in this ffmpeg build but VideoToolbox is only accessible on Apple Silicon hosts. Use --hw-accel none or --hw-accel auto."
+      else
+        die 10 "Hardware acceleration '--hw-accel $HW_ACCEL' requested, but no matching encoder (hevc_${HW_ACCEL}) is available in this ffmpeg build. Install an ffmpeg build with ${HW_ACCEL} support, or use --hw-accel none/auto."
+      fi
     fi
     ;;
 esac
@@ -6026,7 +6030,11 @@ apply_level_vbv() {
   # VideoToolbox picks its own level; it does not accept x265-params and has
   # no corresponding vbv-maxrate knob. Skip for HW backends.
   case "$VIDEO_ENCODER_FFMPEG" in
-    hevc_videotoolbox|h264_videotoolbox) return 0 ;;
+    hevc_videotoolbox|h264_videotoolbox)
+      if [[ -n "${LEVEL_VALUE:-}" ]] || (( ${CONSERVATIVE_VBV:-0} )); then
+        warn "VideoToolbox does not enforce x265 level/VBV constraints (LEVEL_VALUE=${LEVEL_VALUE:-unset}, CONSERVATIVE_VBV=${CONSERVATIVE_VBV:-0}) — Apple TV Direct Play compliance is not guaranteed for this encode."
+      fi
+      return 0 ;;
   esac
   local lvl="$1" maxrate="" bufsize=""
   if (( CONSERVATIVE_VBV )); then
@@ -6735,6 +6743,9 @@ run_video_pipeline() {
       # H.264 via Apple Silicon VideoToolbox.
       # VideoToolbox uses `-q:v` (assembled by build_videotoolbox_params into
       # VIDEOTOOLBOX_ARGS) instead of -crf, and does not accept -preset.
+      if [[ "$TARGET_PIXFMT" == *"10"* ]]; then
+        warn "h264_videotoolbox does not support 10-bit output — TARGET_PIXFMT=${TARGET_PIXFMT} overridden to yuv420p."
+      fi
       log "→ Encoding video (H.264/SDR via VideoToolbox, q:v ${VIDEOTOOLBOX_ARGS[1]:-?}) → $V_BASE"
       encode_args=(
         -c:v h264_videotoolbox
