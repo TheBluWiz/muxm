@@ -2282,6 +2282,12 @@ EOF
   out="$(run_muxm --profile youtube-upload --print-effective-config)"
   assert_contains "VT_QUALITY (active profile) = 75" \
     "VT_QUALITY_MAP: youtube-upload resolved to calibrated value (75)" "$out"
+  out="$(run_muxm --profile animation --print-effective-config)"
+  assert_contains "VT_QUALITY (active profile) = 65" \
+    "VT_QUALITY_MAP: animation resolved to calibrated value (65)" "$out"
+  out="$(run_muxm --profile atv-directplay-animation --print-effective-config)"
+  assert_contains "VT_QUALITY (active profile) = 65" \
+    "VT_QUALITY_MAP: atv-directplay-animation resolved to calibrated value (65)" "$out"
   out="$(run_muxm --profile archive --print-effective-config)"
   assert_contains "VT_QUALITY (active profile) = 65 (default)" \
     "VT_QUALITY_MAP: profile not in map shows VT_QUALITY_DEFAULT" "$out"

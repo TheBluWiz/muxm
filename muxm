@@ -191,19 +191,25 @@ HW_ACCEL_FALLBACK_REASON=""        # set when an incompatibility forces software
 # Empirically calibrated q:v values — see docs/VIDEOTOOLBOX_CALIBRATION.md.
 # Method: VMAF sweep vs each profile's SW baseline; pass = |Δ VMAF| ≤ 0.5.
 # Calibrating clip: Clip B (4K HDR10) for HDR profiles; Clip A (1080p SDR)
-# for SDR/upload profiles. Sweeps run 2026-06-10/11.
+# for SDR/upload profiles; Clip C (1080p SDR animation: Arcane S01E01) for
+# animation profiles. Sweeps run 2026-06-10/11.
 # The default (65) applies when --profile is not set or the profile is absent.
 #
 # youtube-upload: q:v 75 is SDR-calibrated (Clip A). The 4K HDR cross-check
 # calibrated at q:v 80, but that path (H.264 + HDR + no tone-map) produces
 # 8-bit output with PQ metadata — an accepted limitation. See OQ#3 in
 # docs/VIDEOTOOLBOX_CALIBRATION.md §5.
+#
+# animation / atv-directplay-animation: q:v 65 calibrated on Clip C. Live-action
+# calibration (Clip B) gave q:v 70, but animation content (sharp edges,
+# flat gradients) shifts the operating point. VT ignores x265 profile params,
+# so both profiles produce identical HW VMAF; values reflect animation content.
 declare -A VT_QUALITY_MAP=(
   [hdr10-hq]=70
   [atv-directplay-hq]=70
-  [atv-directplay-animation]=70
+  [atv-directplay-animation]=65
   [streaming-hevc]=65
-  [animation]=70
+  [animation]=65
   [universal]=70
   [youtube-upload]=75
 )

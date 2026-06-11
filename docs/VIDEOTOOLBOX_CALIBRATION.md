@@ -19,8 +19,11 @@
 |---|---|---|---|---|---|---|
 | A | *City of God* | 2002 | 1080p | SDR | yuv420p | High-motion urban drama, fast cuts, complex textures |
 | B | *Avatar: Fire and Ash* | 2025 | 4K | HDR10 + DV Profile 7 | yuv420p10le (base layer) | CGI-heavy, wide dynamic range, dense motion |
+| C | *Arcane* S01E01 | 2021 | 1080p | SDR | yuv420p | CG animation; sharp line-art, flat gradient backgrounds, banding-prone surfaces, mixed action and static scenes |
 
-Both clips: 120 s extracted from start of feature (`-ss 0 -t 120`), MKV container, video-only (`-an`).
+Clips A and B: 120 s extracted from start of feature (`-ss 0 -t 120`), MKV container, video-only.  
+Clip C: 120 s extracted at 5:00 (`-ss 300 -t 120`), stream-copy, MKV container.  
+All clips: video-only (`-an`).
 
 Clip B carries Dolby Vision Profile 7 RPU side data. The DV layer is inert during the HEVC baseline and HW encodes — the HDR10 base layer (`smpte2084`, `bt2020`) is what both SW and VT encode. DV presence is confirmed safe for calibration (see planning doc §3.2).
 
@@ -55,10 +58,11 @@ Each sweep encodes the clip at multiple `q:v` values, computes VMAF against the 
 
 Each profile is primarily calibrated from the clip that represents its real-world use:
 
-- **HDR profiles** (`hdr10-hq`, `atv-directplay-hq`, `atv-directplay-animation`, `animation`): Clip B (4K HDR10) is representative. Clip A (1080p SDR) is a cross-check.
+- **HDR profiles** (`hdr10-hq`, `atv-directplay-hq`): Clip B (4K HDR10) is representative. Clip A (1080p SDR) is a cross-check.
+- **Animation profiles** (`animation`, `atv-directplay-animation`): Clip C (1080p SDR animation) is representative. Clips A and B from Phase 2 live-action content were the initial calibration; Clip C supersedes them for the final `VT_QUALITY_MAP` value.
 - **SDR/upload profiles** (`streaming-hevc`, `universal`, `youtube-upload`): Clip A (1080p SDR) is primary. Clip B (4K HDR10) is a cross-check.
 
-When the two clips disagree on calibrated q:v, the representative clip wins. Cross-check results are informational and noted where relevant.
+When clips disagree on calibrated q:v, the representative clip wins. Cross-check results are informational and noted where relevant.
 
 ---
 
@@ -128,7 +132,7 @@ Representative cal_q: **70**
 
 SW baseline: libx265 CRF 16 slower
 
-**Clip A (1080p SDR, cross-check)** — SW VMAF 98.65
+**Clip A (1080p SDR, live-action cross-check)** — SW VMAF 98.65
 
 | q:v | HW VMAF | Δ     | Pass |
 |-----|---------|-------|------|
@@ -140,7 +144,7 @@ SW baseline: libx265 CRF 16 slower
 
 Cross-check cal_q: 65 (full sweep passes)
 
-**Clip B (4K HDR10, representative)** — SW VMAF 99.04
+**Clip B (4K HDR10, live-action cross-check)** — SW VMAF 99.04
 
 | q:v | HW VMAF | Δ     | Pass |
 |-----|---------|-------|------|
@@ -150,7 +154,21 @@ Cross-check cal_q: 65 (full sweep passes)
 | 80  | 99.34   | −0.30 | PASS |
 | 85  | 99.41   | −0.37 | PASS |
 
-Representative cal_q: **70**
+Live-action cal_q: 70 (superseded by Clip C below)
+
+**Clip C (1080p SDR animation, representative)** — SW VMAF 84.44  
+*x265 note: `hdr10-opt` disabled by x265 on SDR source — non-fatal warning, encode completed normally at CRF 16 slower.*
+
+| q:v | HW VMAF | Δ     | Pass |
+|-----|---------|-------|------|
+| 60  | 83.33   | +1.11 | FAIL |
+| 65  | 84.05   | +0.39 | PASS |
+| 70  | 84.51   | −0.07 | PASS |
+| 75  | 84.65   | −0.21 | PASS |
+| 80  | 84.84   | −0.40 | PASS |
+| 85  | 84.93   | −0.49 | PASS |
+
+Representative cal_q: **65** (updated from live-action value of 70)
 
 ---
 
@@ -158,7 +176,7 @@ Representative cal_q: **70**
 
 SW baseline: libx265 CRF 16 slower
 
-**Clip A (1080p SDR, cross-check)** — SW VMAF 98.65
+**Clip A (1080p SDR, live-action cross-check)** — SW VMAF 98.65
 
 | q:v | HW VMAF | Δ     | Pass |
 |-----|---------|-------|------|
@@ -170,7 +188,7 @@ SW baseline: libx265 CRF 16 slower
 
 Cross-check cal_q: 65 (full sweep passes)
 
-**Clip B (4K HDR10, representative)** — SW VMAF 99.15
+**Clip B (4K HDR10, live-action cross-check)** — SW VMAF 99.15
 
 | q:v | HW VMAF | Δ     | Pass |
 |-----|---------|-------|------|
@@ -180,7 +198,20 @@ Cross-check cal_q: 65 (full sweep passes)
 | 80  | 99.34   | −0.19 | PASS |
 | 85  | 99.41   | −0.26 | PASS |
 
-Representative cal_q: **70**
+Live-action cal_q: 70 (superseded by Clip C below)
+
+**Clip C (1080p SDR animation, representative)** — SW VMAF 84.44
+
+| q:v | HW VMAF | Δ     | Pass |
+|-----|---------|-------|------|
+| 60  | 83.33   | +1.11 | FAIL |
+| 65  | 84.05   | +0.39 | PASS |
+| 70  | 84.51   | −0.07 | PASS |
+| 75  | 84.65   | −0.21 | PASS |
+| 80  | 84.84   | −0.40 | PASS |
+| 85  | 84.93   | −0.49 | PASS |
+
+Representative cal_q: **65** (updated from live-action value of 70)
 
 ---
 
@@ -292,21 +323,32 @@ At high q:v settings, VT regularly overshoots the SW baseline by more than 0.5 V
 
 The VT quality curve at 4K is non-linear relative to the SW references — small q:v increments produce larger-than-expected VMAF jumps, narrowing the passing window.
 
-### All stub values were underestimated
+### Animation content shifts the operating point
 
-Every profile's Phase 2 Commit 1 stub was too low. The planning doc stubs were conservative midpoints; the actual calibration required higher q:v across the board:
+The live-action Phase 2 calibration set `animation` and `atv-directplay-animation` to q:v 70 based on Clips A and B (*City of God*, *Avatar*). After re-calibrating on Clip C (*Arcane* S01E01 — CG animation), both profiles calibrate to **q:v 65**.
 
-| Profile | Stub | Calibrated | Δ |
-|---|---|---|---|
-| `hdr10-hq` | 65 | 70 | +5 |
-| `atv-directplay-hq` | 65 | 70 | +5 |
-| `atv-directplay-animation` | 65 | 70 | +5 |
-| `animation` | 65 | 70 | +5 |
-| `streaming-hevc` | 60 | 65 | +5 |
-| `universal` | 60 | 70 | **+10** |
-| `youtube-upload` | 70 | 75 | +5 |
+The shift happens because VT's quality curve relative to libx265 CRF 16 is content-dependent:
 
-The `universal` stub was the furthest off — a 10-point underestimate. This is because `h264_videotoolbox` at q:v 60–65 produces H.264 significantly below the x264 CRF 22 slow baseline on 1080p SDR content, and the stub was anchored to an earlier rough estimate rather than a measured sweep.
+- **Live-action (Clips A/B):** VT at q:v 65 is 0.61–0.72 VMAF *below* the SW baseline on the representative HDR clip — a bidirectional FAIL. q:v 70 is needed to reach parity.
+- **Animation (Clip C):** VT at q:v 65 is 0.39 VMAF *below* the SW baseline — a PASS. q:v 60 fails (Δ 1.11). The SW baseline VMAF is 84.44 vs. 99+ for live-action, reflecting that Arcane's sharp line-art and flat gradients are harder to compress at CRF 16, raising the relative bar for VT to match.
+
+The HW VMAF values at each q:v are identical between `animation` and `atv-directplay-animation` (confirming the §3.1 finding), even though `atv-directplay-animation` includes `hdr10-opt` in its x265 params — x265 disabled those params on the SDR source with a non-fatal warning.
+
+### All Phase 2 stub values were underestimated
+
+Every profile's Phase 2 Commit 1 stub was too low. The planning doc stubs were conservative midpoints; the live-action calibration required higher q:v across the board:
+
+| Profile | Stub | Live-action cal_q | Animation cal_q | **Final** |
+|---|---|---|---|---|
+| `hdr10-hq` | 65 | 70 | — | **70** |
+| `atv-directplay-hq` | 65 | 70 | — | **70** |
+| `atv-directplay-animation` | 65 | 70 | 65 | **65** |
+| `animation` | 65 | 70 | 65 | **65** |
+| `streaming-hevc` | 60 | 65 | — | **65** |
+| `universal` | 60 | 70 | — | **70** |
+| `youtube-upload` | 70 | 75 | — | **75** |
+
+The `universal` stub was the furthest off — a 10-point underestimate. The animation profiles returned to their stub value after animation-content calibration, but via a different path: the stub was a guess, whereas q:v 65 is now a measured result on representative content.
 
 ### `streaming-hevc` has a narrow passing window on 4K HDR
 
@@ -320,8 +362,8 @@ On Clip B, only q:v 65 passes. The window between "VT is 0.34 VMAF better than b
 |---|---|---|---|---|
 | `hdr10-hq` | hevc_videotoolbox | **70** | Clip B (4K HDR10) | libx265 CRF 17 slower |
 | `atv-directplay-hq` | hevc_videotoolbox | **70** | Clip B (4K HDR10) | libx265 CRF 17 slower |
-| `atv-directplay-animation` | hevc_videotoolbox | **70** | Clip B (4K HDR10) | libx265 CRF 16 slower |
-| `animation` | hevc_videotoolbox | **70** | Clip B (4K HDR10) | libx265 CRF 16 slower |
+| `atv-directplay-animation` | hevc_videotoolbox | **65** | Clip C (1080p SDR animation) | libx265 CRF 16 slower |
+| `animation` | hevc_videotoolbox | **65** | Clip C (1080p SDR animation) | libx265 CRF 16 slower |
 | `streaming-hevc` | hevc_videotoolbox | **65** | Both (agree) | libx265 CRF 20 medium |
 | `universal` | h264_videotoolbox | **70** | Both (agree) | libx264 CRF 22 slow |
 | `youtube-upload` | h264_videotoolbox | **75** | Clip A (1080p SDR) | libx264 CRF 16 slow |
@@ -350,7 +392,7 @@ If YouTube's ingestion pipeline ever demonstrates reliable HDR-from-8-bit-H.264 
 
 ## 6. Limitations
 
-- **Two source files, both 120 s clips.** *City of God* (high-motion 1080p SDR drama) and *Avatar: Fire and Ash* (CGI-heavy 4K HDR10). Animated content, live-action 4K SDR, HLG, and DV Profile 8.1 are not characterised. Additional content types could shift calibrated values by ±5 q:v.
+- **Three source clips, all 120 s.** *City of God* (1080p SDR drama), *Avatar: Fire and Ash* (4K HDR10), and *Arcane* S01E01 (1080p SDR CG animation). Live-action 4K SDR, HLG, DV Profile 8.1, and traditional hand-drawn animation are not characterised. Additional content types could shift calibrated values by ±5 q:v.
 - **Fixed HEVC preset (`slower`, `medium`).** The SW baselines use the presets specified in each profile. VT calibration is specific to these SW references; if SW preset changes, recalibration is needed.
 - **VMAF model `vmaf_v0.6.1` with `n_subsample=5`.** This model is calibrated for 1080p viewing distance. 4K HDR scores run conservative (absolute values lower than perceived quality on UHD displays). Scores within each test are internally consistent and valid for relative comparison, but should not be treated as absolute quality thresholds. Use `vmaf_4k` for production UHD quality gates.
 - **`atv-directplay-hq` and `atv-directplay-animation` copy path.** Both profiles have `COPY_IF_COMPLIANT=1` — VT calibration only applies when a re-encode is actually triggered. DV sources are explicitly excluded from the VT path for both profiles (DV conversion requires the libx265 path).

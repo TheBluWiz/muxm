@@ -1,6 +1,6 @@
 # Hardware Acceleration — Architecture
 
-**Status:** Phase 2 — VideoToolbox dispatch implemented; calibration in progress.
+**Status:** Phase 2 complete — VideoToolbox dispatch and calibration done (live-action + animation content, 2026-06-10/11).
 **Next:** Phase 3 adds NVIDIA NVENC dispatch in v1.6.0.
 
 ---
