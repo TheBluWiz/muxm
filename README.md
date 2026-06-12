@@ -220,6 +220,8 @@ If any stage fails, `muxm` logs the failure, cleans up incomplete temp files, an
 
 `muxm` requires Bash 4.3+ and runs on macOS (10.15 Catalina or later) and modern Linux distributions (Ubuntu 20.04+, Fedora 33+, Debian 11+, Arch). It is tested primarily on macOS with Homebrew-installed ffmpeg builds.
 
+**Hardware acceleration** is supported on **macOS (Apple VideoToolbox) only**. On Linux, `--hw-accel` is accepted but encoding always runs in software. See [`docs/HW_ACCEL.md`](docs/HW_ACCEL.md) for the full architecture and backend matrix.
+
 ### Homebrew (recommended — macOS)
 
 ```bash

@@ -72,7 +72,7 @@ shopt -s inherit_errexit 2>/dev/null || true
 #   - All =~ [0-9] ranges are POSIX-safe regardless of locale
 #   - The [a-zA-Z0-9] range in OCR tool sanitization is a security reject-list
 #     (conservative direction under exotic locales)
-#   - No sort, no locale-sensitive printf formatting
+#   - LC_NUMERIC=C guards all printf %.Nf calls that receive bc decimal output (M3)
 #   Validated by: LANG=C LC_ALL=C tests/test_muxm.sh --suite all
 
 # ---- Bash version guard ----
@@ -746,11 +746,11 @@ filesize_pretty(){
 
   # Human-readable formatting
   if (( bytes >= 1073741824 )); then
-    printf '%.2f GB (%s bytes)\n' "$(echo "scale=2; $bytes/1073741824" | bc)" "$bytes"
+    LC_NUMERIC=C printf '%.2f GB (%s bytes)\n' "$(echo "scale=2; $bytes/1073741824" | bc)" "$bytes"
   elif (( bytes >= 1048576 )); then
-    printf '%.1f MB (%s bytes)\n' "$(echo "scale=1; $bytes/1048576" | bc)" "$bytes"
+    LC_NUMERIC=C printf '%.1f MB (%s bytes)\n' "$(echo "scale=1; $bytes/1048576" | bc)" "$bytes"
   elif (( bytes >= 1024 )); then
-    printf '%.0f KB\n' "$(echo "scale=0; $bytes/1024" | bc)"
+    LC_NUMERIC=C printf '%.0f KB\n' "$(echo "scale=0; $bytes/1024" | bc)"
   else
     printf '%s bytes\n' "$bytes"
   fi
@@ -854,7 +854,7 @@ _check_disk_full() {
 # Returns: 0 if supported, 1 otherwise
 ffmpeg_has_muxer(){
   local mux="$1"
-  ffmpeg -hide_banner -muxers 2>/dev/null | awk '{print $1}' | grep -qx "$mux"
+  ffmpeg -hide_banner -muxers 2>/dev/null | awk -v m="$mux" '$1==m{f=1} END{exit !f}'
 }
 
 # Validate ffmpeg/ffprobe log level values.
@@ -1163,7 +1163,8 @@ _dep_check_only(){
     printf "  %-14s %-24s %-24s %s\n" "pgsrip"     "pipx install pgsrip"    "pipx install pgsrip"    "pipx install pgsrip"
     printf '\n'
     say "After installing, re-run: ${CLI_NAME} --install-dependencies"
-    exit 1
+    say "ℹ️  Advisory check — $missing tool(s) missing. No automatic install available on this platform."
+    exit 0  # Advisory: report only, not a failure (M8)
   fi
 
   say "✅ All tools found."
@@ -1281,10 +1282,10 @@ _dep_install_dependencies(){
   _ensure_ffmpeg_full(){
     total=$(( total + 1 ))
     printf "  %-14s" "ffmpeg"
+    local _current_formula="" _needs_av1_reinstall=0 _install_ok=0 _is_standard_build=0
     if command -v ffmpeg >/dev/null 2>&1; then
       # Check compiled-in build flags — most reliable across all install methods
       if ffmpeg -version 2>/dev/null | grep -q -- "--enable-libass"; then
-        local _needs_av1_reinstall=0
         ffmpeg -encoders 2>/dev/null | grep -q 'libsvtav1' || _needs_av1_reinstall=1
         if (( _needs_av1_reinstall )); then
           printf "⚠️  installed with libass but missing AV1 encoders — reinstalling with AV1 support...\n"
@@ -1294,13 +1295,17 @@ _dep_install_dependencies(){
           return
         fi
       else
-        printf "⚠️  installed but built without libass (needed for --sub-burn-forced)\n"
+        # Libass-only-missing: warn without touching the install (H7).
+        # A libass-less ffmpeg is fully functional except for --sub-burn-forced.
+        printf "⚠️  installed but built without libass (needed for --sub-burn-forced).\n"
+        printf "  %-14s   To enable subtitle burn-in, upgrade with:\n" ""
+        printf "  %-14s   brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass\n" ""
+        skipped=$(( skipped + 1 ))
+        return
       fi
 
       # Identify which Homebrew formula is currently providing ffmpeg so we
-      # uninstall the right one. Without this, `brew uninstall ffmpeg` may
-      # miss a tapped formula (e.g., homebrew-ffmpeg/ffmpeg/ffmpeg).
-      local _current_formula=""
+      # can remove it AFTER a successful upgrade (H7: install-before-uninstall).
       if brew ls --versions homebrew-ffmpeg/ffmpeg/ffmpeg >/dev/null 2>&1; then
         _current_formula="homebrew-ffmpeg/ffmpeg/ffmpeg"
       elif brew list 2>/dev/null | grep -q '^ffmpeg-full$'; then
@@ -1308,51 +1313,50 @@ _dep_install_dependencies(){
       elif brew ls --versions ffmpeg >/dev/null 2>&1; then
         _current_formula="ffmpeg"
       fi
-
-      if [[ -n "$_current_formula" ]]; then
-        printf "  %-14s⏳ removing %s before reinstall...\n" "" "$_current_formula"
-        brew uninstall --ignore-dependencies "$_current_formula" 2>&1 | sed 's/^/    /' || true
-      fi
     else
       printf "⏳ installing via homebrew-ffmpeg tap (--with-libass)...\n"
     fi
 
+    # Attempt install FIRST; only remove old formula after confirming success (H7).
     brew tap homebrew-ffmpeg/ffmpeg 2>&1 | sed 's/^/    /' || true
-    if ! brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass --with-svt-av1 --with-libaom 2>&1 | sed 's/^/    /'; then
-      # Fallback: if the tap fails, install standard ffmpeg so the tool is at least usable
+    if brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass --with-svt-av1 --with-libaom 2>&1 | sed 's/^/    /'; then
+      _install_ok=1
+    else
+      # Fallback: if the tap fails, try standard ffmpeg so the tool is at least usable
       printf "  %-14s⚠️  homebrew-ffmpeg tap failed — falling back to standard ffmpeg\n" ""
       if brew install ffmpeg 2>&1 | sed 's/^/    /'; then
-        printf "  %-14s✅ installed (standard build — --sub-burn-forced may not work)\n" "ffmpeg"
-        installed=$(( installed + 1 ))
-        if ! ffmpeg -encoders 2>/dev/null | grep -q 'libsvtav1'; then
-          printf "  %-14s⚠️  AV1 encoder (libsvtav1/SVT-AV1) not available in this ffmpeg build\n" ""
-        fi
-        if ! ffmpeg -encoders 2>/dev/null | grep -q 'libaom-av1'; then
-          printf "  %-14s⚠️  AV1 encoder (libaom-av1) not available in this ffmpeg build\n" ""
-        fi
-      else
-        printf "  %-14s❌ ffmpeg install failed\n" ""
-        failed=$(( failed + 1 ))
+        _install_ok=1
+        _is_standard_build=1
       fi
-      return
     fi
-    if ! command -v ffmpeg >/dev/null 2>&1; then
-      printf "  %-14s⚠️  install succeeded but ffmpeg not found in PATH\n" "ffmpeg"
-      failed=$(( failed + 1 ))
-      return
-    fi
-    if ffmpeg -version 2>/dev/null | grep -q -- "--enable-libass"; then
-      printf "  %-14s✅ installed with libass\n" "ffmpeg"
+
+    if (( _install_ok )) && command -v ffmpeg >/dev/null 2>&1; then
+      # Remove old formula only after confirming the new install is live (H7).
+      if [[ -n "$_current_formula" ]]; then
+        printf "  %-14s⏳ removing old formula %s...\n" "" "$_current_formula"
+        brew uninstall "$_current_formula" 2>&1 | sed 's/^/    /' || true
+      fi
+      if (( _is_standard_build )); then
+        printf "  %-14s✅ installed (standard build — --sub-burn-forced may not work)\n" "ffmpeg"
+      elif ffmpeg -version 2>/dev/null | grep -q -- "--enable-libass"; then
+        printf "  %-14s✅ installed with libass\n" "ffmpeg"
+      else
+        printf "  %-14s✅ installed (verify libass with: ffmpeg -version | grep enable-libass)\n" "ffmpeg"
+      fi
+      if ! ffmpeg -encoders 2>/dev/null | grep -q 'libsvtav1'; then
+        printf "  %-14s⚠️  AV1 encoder (libsvtav1/SVT-AV1) not available in this ffmpeg build\n" ""
+      fi
+      if ! ffmpeg -encoders 2>/dev/null | grep -q 'libaom-av1'; then
+        printf "  %-14s⚠️  AV1 encoder (libaom-av1) not available in this ffmpeg build\n" ""
+      fi
+      installed=$(( installed + 1 ))
     else
-      printf "  %-14s✅ installed (verify libass with: ffmpeg -version | grep enable-libass)\n" "ffmpeg"
+      # All install attempts failed — leave existing ffmpeg in place (H7).
+      printf "  %-14s❌ ffmpeg upgrade failed — existing install left in place\n" "ffmpeg"
+      warn "ffmpeg upgrade failed. Existing ffmpeg install was left untouched."
+      failed=$(( failed + 1 ))
+      return 1
     fi
-    if ! ffmpeg -encoders 2>/dev/null | grep -q 'libsvtav1'; then
-      printf "  %-14s⚠️  AV1 encoder (libsvtav1/SVT-AV1) not available in this ffmpeg build\n" ""
-    fi
-    if ! ffmpeg -encoders 2>/dev/null | grep -q 'libaom-av1'; then
-      printf "  %-14s⚠️  AV1 encoder (libaom-av1) not available in this ffmpeg build\n" ""
-    fi
-    installed=$(( installed + 1 ))
   }
 
   say "Core tools (required):"
@@ -4323,6 +4327,7 @@ Common options:
   --crf N                     Video quality (default: ${CRF_VALUE})
   -p, --preset NAME           x265 preset (default: ${PRESET_VALUE})
   --hw-accel BACKEND          Hardware acceleration: none | auto | videotoolbox | nvenc
+                              (macOS Apple VideoToolbox only; on Linux, software fallback)
                               (default: ${HW_ACCEL}; also accepted in .muxmrc as HW_ACCEL="...")
   --hw-accel-quality N        Override VT/NVENC quality knob (0-100, default: profile-calibrated)
   --no-hw-accel-allow-sw      Disallow VT's internal software fallback (default: allowed)
@@ -5287,6 +5292,7 @@ _cleanup_workdir() {
 # Globals read: FAILED, DRY_RUN, TMP_OUT, OUT, CHECKSUM, WORKDIR, DEBUG,
 #               KEEP_TEMP, KEEP_TEMP_ALWAYS, EXIT_CODE, FAIL_MSG, TERM_FD
 on_exit() {
+  trap '' INT TERM EXIT  # prevent re-entrancy: cleanup must run atomically (M10)
   # Clean up subtitle burn-in temp file (lives inside WORKDIR; explicit removal before workdir cleanup)
   [[ -n "${_BURN_SRT_FILTER:-}" && -f "$_BURN_SRT_FILTER" ]] && rm -f "$_BURN_SRT_FILTER"
 
@@ -5332,7 +5338,7 @@ on_exit() {
     printf "❌ Build FAILED. %s\n" "$FAIL_MSG"
 
     _print_completed_steps
-    echo "See log: $LOGFILE"
+    [[ -f "$LOGFILE" ]] && echo "See log: $LOGFILE"
 
     # Clean up temp output file on failure
     [[ -f "$TMP_OUT" ]] && rm -f "$TMP_OUT"
@@ -5511,7 +5517,7 @@ disk_free_warn() {
 
   # Format estimate as X.X GB for display
   local est_gb
-  est_gb="$(printf '%.1f' "$(echo "scale=2; $required / 1073741824" | bc 2>/dev/null)" 2>/dev/null)" || \
+  est_gb="$(LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; $required / 1073741824" | bc 2>/dev/null)" 2>/dev/null)" || \
     est_gb="$(( required / 1024 / 1024 / 1024 ))"
 
   log "Disk preflight: video_bytes=${est_video_bytes} audio_bytes=${est_audio_bytes}" \
@@ -5523,7 +5529,7 @@ disk_free_warn() {
   out_dev="$(df -Pk "$OUT_DIR" 2>/dev/null | awk 'NR==2{print $1}')"
   if [[ -n "$avail_kb" ]] && (( avail_kb * 1024 < required )); then
     local avail_gb
-    avail_gb="$(printf '%.1f' "$(echo "scale=2; $avail_kb / 1048576" | bc 2>/dev/null)" 2>/dev/null)" || \
+    avail_gb="$(LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; $avail_kb / 1048576" | bc 2>/dev/null)" 2>/dev/null)" || \
       avail_gb="$(( avail_kb / 1024 / 1024 ))"
     warn "Estimated output ~${est_gb}GB but only ${avail_gb}GB free on output volume ($OUT_DIR)."
     warn "Use --no-disk-check to suppress this warning."
@@ -5538,7 +5544,7 @@ disk_free_warn() {
   work_avail_kb="$(df -Pk "$WORKDIR" 2>/dev/null | awk 'NR==2{print $4}')"
   [[ -n "$work_avail_kb" ]] && (( work_avail_kb * 1024 < required )) || return 0
   local tmp_avail_gb
-  tmp_avail_gb="$(printf '%.1f' "$(echo "scale=2; $work_avail_kb / 1048576" | bc 2>/dev/null)" 2>/dev/null)" || \
+  tmp_avail_gb="$(LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; $work_avail_kb / 1048576" | bc 2>/dev/null)" 2>/dev/null)" || \
     tmp_avail_gb="$(( work_avail_kb / 1024 / 1024 ))"
   warn "Estimated output ~${est_gb}GB but only ${tmp_avail_gb}GB free on temp volume ($WORKDIR)."
   warn "Use --no-disk-check to suppress this warning."
@@ -6067,6 +6073,15 @@ resolve_video_encoder() {
     return 0
   fi
 
+  # OS guard: hardware acceleration is supported on macOS (Apple VideoToolbox) only.
+  # On Linux, fall back to software and warn exactly once here (H11).
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    warn "Hardware acceleration is currently supported on macOS (VideoToolbox) only. Falling back to software encoding."
+    HW_ACCEL_FALLBACK_REASON="Linux hardware acceleration is not supported in this release (software fallback)."
+    # VIDEO_ENCODER_FFMPEG is already the normalized software codec name from the top of this function.
+    return 0
+  fi
+
   # Backend-specific encoder selection.
   case "$HW_ACCEL_RESOLVED" in
     videotoolbox)
@@ -6076,10 +6091,10 @@ resolve_video_encoder() {
       esac
       ;;
     nvenc)
-      # Phase 3 fills in: libx265 → hevc_nvenc, libx264 → h264_nvenc,
-      # libsvt-av1 → av1_nvenc (when av1_nvenc is available).
-      HW_ACCEL_FALLBACK_REASON="NVENC dispatch pending (Phase 3 implementation)"
-      note "Hardware acceleration disabled for this encode: $HW_ACCEL_FALLBACK_REASON."
+      # NVENC dispatch not yet implemented; fall back to software.
+      HW_ACCEL_FALLBACK_REASON="NVENC encoder dispatch not yet implemented; software fallback."
+      warn "Hardware acceleration disabled for this encode: $HW_ACCEL_FALLBACK_REASON."
+      # VIDEO_ENCODER_FFMPEG is already set to the normalized software codec name.
       ;;
   esac
 }
@@ -6113,6 +6128,8 @@ apply_level_vbv() {
     X265_PARAMS="${X265_PARAMS}:level-idc=${lvl}:vbv-maxrate=${maxrate}:vbv-bufsize=${bufsize}"
     note "Applying VBV guardrails for level ${lvl} → maxrate=${maxrate}, bufsize=${bufsize}"
   else
+    (( CONSERVATIVE_VBV )) && [[ -n "$lvl" ]] && \
+      warn "No VBV guardrail table for level ${LEVEL_VALUE}; buffer compliance NOT enforced."
     [[ -n "$lvl" ]] && X265_PARAMS="${X265_PARAMS}:level-idc=${lvl}"
   fi
 }
@@ -7413,7 +7430,7 @@ _audio_is_commentary(){
   local title="${1,,}"
   [[ -z "$title" ]] && return 1
   # shellcheck disable=SC2254
-  [[ "$title" =~ (commentary|director.?s?.*commentary|director.?s?.*cut|comentario|kommentar|descriptive|audio.description|visually.impaired) ]] && return 0
+  [[ "$title" =~ (commentary|comentario|kommentar|descriptive|audio.description|visually.impaired) ]] && return 0
   return 1
 }
 
@@ -7425,7 +7442,7 @@ _audio_is_commentary(){
 _audio_stream_info(){
   local idx="$1"
   _jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$idx] |
-    \"\(.codec_name // \"unknown\")\t\(.channels // 0)\t\(.tags.language // \"\")\t\(.bit_rate // \"0\")\t\(.tags.title // \"\")\"" | head -n1 || printf 'unknown\t0\t\t0\t\n'
+    \"\(.codec_name // \"unknown\")\t\(.channels // 0)\t\(.tags.language // \"\")\t\(.bit_rate // \"0\")\t\(.tags.title // \"\" | gsub(\"[\\t\\n\\r]\";\" \"))\"" | head -n1 || printf 'unknown\t0\t\t0\t\n'
 }
 
 # Audio stream scoring algorithm for automatic track selection.
@@ -7594,11 +7611,7 @@ select_best_audio(){
 #   Any codec added here MUST have a valid ffmpeg muxer extension — if not,
 #   add a mapping in _audio_copy_ext().  See also: audio_is_lossless().
 audio_is_direct_play_copyable(){
-  local codec="$1"
-  case "$codec" in
-    aac|alac|ac3|eac3) return 0 ;;
-    *) return 1 ;;
-  esac
+  _sii_audio_is_container_safe "$1"
 }
 
 # Check if audio codec is lossless (for AUDIO_LOSSLESS_PASSTHROUGH)
@@ -7616,20 +7629,7 @@ audio_is_lossless(){
 
 # Check if lossless codec can be muxed into the target container
 audio_lossless_muxable(){
-  local codec="$1"
-  case "$MUX_FORMAT" in
-    matroska)
-      # MKV supports everything
-      return 0 ;;
-    mp4|mov)
-      # MP4/MOV support ALAC and FLAC but NOT TrueHD or DTS-HD
-      case "$codec" in
-        alac|flac) return 0 ;;
-        *) return 1 ;;
-      esac
-      ;;
-  esac
-  return 1
+  _sii_audio_is_container_safe "$1"
 }
 
 # Check if an audio codec can be muxed into the current target container.
@@ -7641,11 +7641,16 @@ audio_lossless_muxable(){
 _sii_audio_is_container_safe() {
   local codec="$1"
   [[ "$MUX_FORMAT" == "matroska" ]] && return 0
-  # MP4/MOV cannot mux TrueHD, DTS/DTS-HD MA, or raw PCM
-  case "$codec" in
-    truehd|dts|dca|pcm_*) return 1 ;;
-    *) return 0 ;;
+  # MP4/MOV/M4V: whitelist — only these codecs are safe to mux (M2)
+  case "$MUX_FORMAT" in
+    mp4|mov|m4v)
+      case "$codec" in
+        aac|ac3|eac3|alac) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
   esac
+  return 1
 }
 
 # Map ffprobe codec name to a file extension ffmpeg can mux when stream-copying.
@@ -8126,13 +8131,9 @@ run_audio_pipeline(){
       fi
     else
       note "[Audio] Native stereo track found (stream #${_native_si}, ${_native_sc} 2ch). Preferring over synthetic downmix."
-      # Copy if codec is compatible with the output container; otherwise transcode to AAC.
+      # Copy if codec is compatible with the output container; otherwise transcode to AAC (M2).
       local _ns_do_copy=0
-      case "$OUTPUT_EXT" in
-        mkv) _ns_do_copy=1 ;;
-        mp4|m4v|mov)
-          case "$_native_sc" in aac|ac3|eac3) _ns_do_copy=1 ;; esac ;;
-      esac
+      _sii_audio_is_container_safe "$_native_sc" && _ns_do_copy=1
       if (( ! _ns_do_copy )); then
         # shellcheck disable=SC2034  # used by name-reference in _ffmpeg_run_with_ui
         local -a stereo_cmd=("${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map "0:a:${_native_si}" \
@@ -8324,12 +8325,26 @@ _prepare_subtitle(){
     esac
   fi
 
+  # Compute PGS-preserve decision before the dry-run check so the dry-run branch
+  # can advertise the .sup path, matching the real run (H13).
+  local _preserve_pgs=0
+  if [[ "$codec" == "hdmv_pgs_subtitle" || "$codec" == "pgs" ]]; then
+    sup="$WORKDIR/sub.${idx}.sup"
+    if (( SUB_PRESERVE_BITMAP )) && _container_supports_bitmap_subs && (( ! SUB_BURN_FORCED )); then
+      _preserve_pgs=1
+    fi
+  fi
+
   if (( DRY_RUN )); then
     if (( _preserve_native )); then
       local dry_out="$WORKDIR/sub.${idx}.${codec}"
       printf "[Script Info]\n; dry-run\n" >"$dry_out" 2>/dev/null || true
       note "[Subs] DRY-RUN: would extract subtitle #${idx} as native ${codec} (preserving styling)"
       echo "$dry_out"
+    elif (( _preserve_pgs )); then
+      printf "" >"$sup" 2>/dev/null || true
+      note "[Subs] DRY-RUN: would stream-copy PGS subtitle #${idx} as .sup (bitmap preserved)"
+      echo "$sup"
     else
       printf "1\n00:00:00,000 --> 00:00:00,500\n(dry-run)\n" >"$srt" 2>/dev/null || true
       echo "$srt"
@@ -8375,19 +8390,8 @@ _prepare_subtitle(){
       ;;
       
     hdmv_pgs_subtitle|pgs)
-      local _preserve_pgs=0
-      if (( SUB_PRESERVE_BITMAP )) && _container_supports_bitmap_subs && (( ! SUB_BURN_FORCED )); then
-        _preserve_pgs=1
-      fi
-
-      sup="$WORKDIR/sub.${idx}.sup"
-
-      if (( DRY_RUN )) && (( _preserve_pgs )); then
-        printf "" >"$sup" 2>/dev/null || true
-        note "[Subs] DRY-RUN: would stream-copy PGS subtitle #${idx} as .sup (bitmap preserved)"
-        echo "$sup"
-        return 0
-      fi
+      # _preserve_pgs and sup already computed before the top-level DRY_RUN check (H13).
+      # sup is set to "$WORKDIR/sub.${idx}.sup" when codec is PGS.
 
       ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" -c:s copy "$sup" 2>"$WORKDIR/sub_${idx}_extract.err" &
       local sup_pid=$!
@@ -8412,6 +8416,14 @@ _prepare_subtitle(){
 
       local _ocr_ok=0
 
+      # Select language flag based on OCR tool (M14)
+      local -a _ocr_lang=()
+      case "$SUB_OCR_TOOL" in
+        pgsrip)  [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(--language "$SUB_OCR_LANG") ;;
+        sub2srt) ;;  # sub2srt does not support a language flag
+        *)       [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(-l "$SUB_OCR_LANG") ;;
+      esac
+
       # Try vobsub conversion if muxer is available
       if ffmpeg_has_muxer vobsub; then
         vob_base="$WORKDIR/sub.${idx}.vob"
@@ -8426,9 +8438,7 @@ _prepare_subtitle(){
 
         # Run OCR tool on VobSub .idx
         (
-          "$SUB_OCR_TOOL" "${vob_base}.idx" >"$WORKDIR/sub_${idx}_ocr.log" 2>&1 \
-            || "$SUB_OCR_TOOL" -l "$SUB_OCR_LANG" "${vob_base}.idx" >"$WORKDIR/sub_${idx}_ocr.log" 2>&1 \
-            || true
+          "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "${vob_base}.idx" >"$WORKDIR/sub_${idx}_ocr.log" 2>&1 || true
         ) &
         local ocr_pid=$!
         spinner "$ocr_pid" "Running OCR on subtitle #${idx}"
@@ -8447,9 +8457,7 @@ _prepare_subtitle(){
 
       # Fallback: try OCR tool directly on .sup
       (
-        "$SUB_OCR_TOOL" "$sup" >"$WORKDIR/sub_${idx}_ocr_sup.log" 2>&1 \
-          || "$SUB_OCR_TOOL" -l "$SUB_OCR_LANG" "$sup" >"$WORKDIR/sub_${idx}_ocr_sup.log" 2>&1 \
-          || true
+        "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "$sup" >"$WORKDIR/sub_${idx}_ocr_sup.log" 2>&1 || true
       ) &
       local ocr_sup_pid=$!
       spinner "$ocr_sup_pid" "Running OCR on subtitle #${idx} (SUP)"
@@ -8546,10 +8554,14 @@ _prepare_ext_subtitle(){
         return 0
       fi
 
+      local -a _ocr_lang=()
+      case "$SUB_OCR_TOOL" in
+        pgsrip)  [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(--language "$SUB_OCR_LANG") ;;
+        sub2srt) ;;
+        *)       [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(-l "$SUB_OCR_LANG") ;;
+      esac
       (
-        "$SUB_OCR_TOOL" "$ext_path" >"$WORKDIR/ext_ocr_sup.log" 2>&1 \
-          || "$SUB_OCR_TOOL" -l "$SUB_OCR_LANG" "$ext_path" >"$WORKDIR/ext_ocr_sup.log" 2>&1 \
-          || true
+        "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "$ext_path" >"$WORKDIR/ext_ocr_sup.log" 2>&1 || true
       ) &
       local ocr_pid=$!
       spinner "$ocr_pid" "OCR external PGS: $basename_label"
@@ -8587,10 +8599,14 @@ _prepare_ext_subtitle(){
         return 0
       fi
 
+      local -a _ocr_lang=()
+      case "$SUB_OCR_TOOL" in
+        pgsrip)  [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(--language "$SUB_OCR_LANG") ;;
+        sub2srt) ;;
+        *)       [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(-l "$SUB_OCR_LANG") ;;
+      esac
       (
-        "$SUB_OCR_TOOL" "$ext_path" >"$WORKDIR/ext_ocr_vobsub.log" 2>&1 \
-          || "$SUB_OCR_TOOL" -l "$SUB_OCR_LANG" "$ext_path" >"$WORKDIR/ext_ocr_vobsub.log" 2>&1 \
-          || true
+        "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "$ext_path" >"$WORKDIR/ext_ocr_vobsub.log" 2>&1 || true
       ) &
       local ocr_pid=$!
       spinner "$ocr_pid" "OCR external VobSub: $basename_label"
@@ -8959,7 +8975,11 @@ _build_subtitle_keep_list(){
 
     # Filter 3: container compatibility — bitmap subs can't go into MP4/MOV
     if [[ "$MUX_FORMAT" != "matroska" ]] && ! _is_text_sub_codec "$codec"; then
-      dropped_reasons+=("$src_label: ${codec} [$lang] — bitmap subtitle incompatible with ${OUTPUT_EXT} container")
+      if (( SUB_ENABLE_OCR )); then
+        dropped_reasons+=("$src_label: ${codec} [$lang] — bitmap subtitle dropped — OCR is not performed in multi-track mode; use single-track (default) to OCR into MP4.")
+      else
+        dropped_reasons+=("$src_label: ${codec} [$lang] — bitmap subtitle incompatible with ${OUTPUT_EXT} container")
+      fi
       continue
     fi
 
@@ -9550,6 +9570,9 @@ mux_final() {
         *)       echo "srt" ;;
       esac
     else
+      case "$ext" in
+        sup|idx) die 12 "PGS/VobSub subtitles cannot be muxed into MP4/MOV; use MKV output or enable OCR." ;;
+      esac
       echo "mov_text"
     fi
   }

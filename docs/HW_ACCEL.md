@@ -1,7 +1,10 @@
 # Hardware Acceleration — Architecture
 
+> **Platform support:** Hardware acceleration is supported on **macOS (Apple VideoToolbox) only**.
+> On Linux, encoding always runs in software regardless of `--hw-accel` setting.
+> NVENC dispatch is not yet implemented; passing `--hw-accel nvenc` falls back to software with a warning.
+
 **Status:** Phase 2 complete — VideoToolbox dispatch and calibration done (live-action + animation content, 2026-06-10/11).
-**Next:** Phase 3 adds NVIDIA NVENC dispatch in v1.6.0.
 
 ---
 
@@ -31,7 +34,7 @@ Precedence (last wins): script defaults → `/etc/.muxmrc` → `~/.muxmrc` → `
 |-----------------|------|-------|----------------------|--------------|
 | `none`          | ✅   | ✅    | ✅ (libsvt/libaom)   | ✅ (libx265) |
 | `videotoolbox`  | ✅ (hevc_videotoolbox) | ✅ (h264_videotoolbox) | ❌ (no HW encoder on Apple Silicon) | ❌ (DV RPU requires libx265) |
-| `nvenc`         | Phase 3 | Phase 3 | Phase 3 (RTX 40+ only) | ❌ (DV RPU requires libx265) |
+| `nvenc`         | ⚠️ not implemented (software fallback) | ⚠️ not implemented (software fallback) | ⚠️ not implemented (software fallback) | ❌ (DV RPU requires libx265) |
 
 Backends that cannot satisfy a request fall back to software and record the reason in `HW_ACCEL_FALLBACK_REASON`.
 
@@ -58,13 +61,13 @@ Backends that cannot satisfy a request fall back to software and record the reas
   4. `videotoolbox + libsvt-av1` → software (Apple Silicon has no AV1 hardware encode).
   5. `nvenc + libsvt-av1 + !av1_nvenc` → software (requires Ada Lovelace / RTX 40+).
 
-  In Phase 2, the VideoToolbox arm is fully implemented. Phase 3 will add the NVENC arm.
+  The VideoToolbox arm is fully implemented. NVENC dispatch is not yet implemented; the nvenc arm emits a warning and falls back to software.
 
 ---
 
 ## 4. Parameter builders
 
-Software encoders continue to use `build_x265_params` and `build_av1_params`. `build_video_encoder_params` is the single dispatch entry point — it routes to `build_videotoolbox_params()` for VideoToolbox encoders; Phase 3 will add `build_nvenc_params()` alongside.
+Software encoders continue to use `build_x265_params` and `build_av1_params`. `build_video_encoder_params` is the single dispatch entry point — it routes to `build_videotoolbox_params()` for VideoToolbox encoders. A future `build_nvenc_params()` will be added when NVENC dispatch is implemented.
 
 | Encoder             | Params global        | CLI surface                                   |
 |---------------------|----------------------|-----------------------------------------------|
@@ -73,9 +76,9 @@ Software encoders continue to use `build_x265_params` and `build_av1_params`. `b
 | `libsvtav1`         | `SVT_AV1_PARAMS`     | `--av1-params`                                |
 | `hevc_videotoolbox` | `VIDEOTOOLBOX_ARGS`  | Implemented — `build_videotoolbox_params()`   |
 | `h264_videotoolbox` | `VIDEOTOOLBOX_ARGS`  | Implemented — `build_videotoolbox_params()`   |
-| `hevc_nvenc`        | _(Phase 3)_          | _(Phase 3)_                                   |
+| `hevc_nvenc`        | _(not yet implemented)_ | _(not yet implemented)_                    |
 
-Hardware encoders do **not** accept `-x265-params`; `build_videotoolbox_params()` translates CRF/preset into `-q:v` (VideoToolbox's native quality knob). Phase 3 will add an analogous `build_nvenc_params()` using `-cq`/`-preset p7` for NVENC.
+Hardware encoders do **not** accept `-x265-params`; `build_videotoolbox_params()` translates CRF/preset into `-q:v` (VideoToolbox's native quality knob). A future `build_nvenc_params()` will use `-cq`/`-preset p7` for NVENC when implemented.
 
 ---
 

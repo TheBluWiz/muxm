@@ -4534,14 +4534,17 @@ _test_unit_audio_helpers() {
   # ---- audio_is_direct_play_copyable ----
   # Gatekeeper for the audio pipeline's biggest branch: copy vs transcode.
   # A regression (e.g., dropping eac3) silently forces unnecessary transcoding.
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('aac')=copyable"       0 audio_is_direct_play_copyable "" "aac"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('alac')=copyable"      0 audio_is_direct_play_copyable "" "alac"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('ac3')=copyable"       0 audio_is_direct_play_copyable "" "ac3"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('eac3')=copyable"      0 audio_is_direct_play_copyable "" "eac3"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('truehd')=not copyable" 1 audio_is_direct_play_copyable "" "truehd"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('dts')=not copyable"   1 audio_is_direct_play_copyable "" "dts"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('flac')=not copyable"  1 audio_is_direct_play_copyable "" "flac"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('opus')=not copyable"  1 audio_is_direct_play_copyable "" "opus"
+  # Since audio_is_direct_play_copyable now delegates to _sii_audio_is_container_safe (M2),
+  # tests must supply the stub and a container context (mp4 = most common direct-play target).
+  local _sii_stub='_sii_audio_is_container_safe(){ local c=$1; [[ $MUX_FORMAT == matroska ]] && return 0; case $MUX_FORMAT in mp4|mov|m4v) case $c in aac|ac3|eac3|alac) return 0;; *) return 1;; esac;; esac; return 1; }'
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('aac')=copyable"       0 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "aac"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('alac')=copyable"      0 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "alac"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('ac3')=copyable"       0 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "ac3"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('eac3')=copyable"      0 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "eac3"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('truehd')=not copyable" 1 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "truehd"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('dts')=not copyable"   1 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "dts"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('flac')=not copyable"  1 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "flac"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('opus')=not copyable"  1 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "opus"
 
   # ---- audio_is_lossless ----
   # Controls AUDIO_LOSSLESS_PASSTHROUGH path. If a codec is accidentally omitted,
@@ -4630,15 +4633,17 @@ _test_unit_audio_helpers() {
 
   # ---- audio_lossless_muxable ----
   # Tests container+codec compatibility matrix for lossless passthrough.
-  # Depends on MUX_FORMAT global.
-  assert_muxm_fn_exit "audio_lossless_muxable('truehd','matroska')=muxable"     0 audio_lossless_muxable 'MUX_FORMAT="matroska"' "truehd"
-  assert_muxm_fn_exit "audio_lossless_muxable('flac','matroska')=muxable"       0 audio_lossless_muxable 'MUX_FORMAT="matroska"' "flac"
-  assert_muxm_fn_exit "audio_lossless_muxable('alac','mp4')=muxable"            0 audio_lossless_muxable 'MUX_FORMAT="mp4"'      "alac"
-  assert_muxm_fn_exit "audio_lossless_muxable('flac','mp4')=muxable"            0 audio_lossless_muxable 'MUX_FORMAT="mp4"'      "flac"
-  assert_muxm_fn_exit "audio_lossless_muxable('truehd','mp4')=not muxable"      1 audio_lossless_muxable 'MUX_FORMAT="mp4"'      "truehd"
-  assert_muxm_fn_exit "audio_lossless_muxable('dts','mp4')=not muxable"         1 audio_lossless_muxable 'MUX_FORMAT="mp4"'      "dts"
-  assert_muxm_fn_exit "audio_lossless_muxable('alac','mov')=muxable"            0 audio_lossless_muxable 'MUX_FORMAT="mov"'      "alac"
-  assert_muxm_fn_exit "audio_lossless_muxable('truehd','mov')=not muxable"      1 audio_lossless_muxable 'MUX_FORMAT="mov"'      "truehd"
+  # Depends on MUX_FORMAT global. Since audio_lossless_muxable delegates to
+  # _sii_audio_is_container_safe (M2), stub must be in env_setup.
+  # Canonical mp4 set: {aac,ac3,eac3,alac}; flac is NOT muxable in mp4 (spec M2).
+  assert_muxm_fn_exit "audio_lossless_muxable('truehd','matroska')=muxable"     0 audio_lossless_muxable "${_sii_stub}; MUX_FORMAT=matroska" "truehd"
+  assert_muxm_fn_exit "audio_lossless_muxable('flac','matroska')=muxable"       0 audio_lossless_muxable "${_sii_stub}; MUX_FORMAT=matroska" "flac"
+  assert_muxm_fn_exit "audio_lossless_muxable('alac','mp4')=muxable"            0 audio_lossless_muxable "${_sii_stub}; MUX_FORMAT=mp4"      "alac"
+  assert_muxm_fn_exit "audio_lossless_muxable('flac','mp4')=not muxable"        1 audio_lossless_muxable "${_sii_stub}; MUX_FORMAT=mp4"      "flac"
+  assert_muxm_fn_exit "audio_lossless_muxable('truehd','mp4')=not muxable"      1 audio_lossless_muxable "${_sii_stub}; MUX_FORMAT=mp4"      "truehd"
+  assert_muxm_fn_exit "audio_lossless_muxable('dts','mp4')=not muxable"         1 audio_lossless_muxable "${_sii_stub}; MUX_FORMAT=mp4"      "dts"
+  assert_muxm_fn_exit "audio_lossless_muxable('alac','mov')=muxable"            0 audio_lossless_muxable "${_sii_stub}; MUX_FORMAT=mov"      "alac"
+  assert_muxm_fn_exit "audio_lossless_muxable('truehd','mov')=not muxable"      1 audio_lossless_muxable "${_sii_stub}; MUX_FORMAT=mov"      "truehd"
 
   # ---- _audio_copy_ext ----
   # Maps ffprobe codec names to file extensions that ffmpeg can mux when
@@ -4804,13 +4809,14 @@ _test_unit_sii_container_safety() {
   assert_muxm_fn_exit "_sii_audio_is_container_safe('aac','matroska')=safe"         0 _sii_audio_is_container_safe 'MUX_FORMAT="matroska"' "aac"
   assert_muxm_fn_exit "_sii_audio_is_container_safe('eac3','matroska')=safe"        0 _sii_audio_is_container_safe 'MUX_FORMAT="matroska"' "eac3"
 
-  # MP4 rejects TrueHD, DTS/DCA, raw PCM
+  # MP4 rejects TrueHD, DTS/DCA, raw PCM, FLAC (whitelist: aac/ac3/eac3/alac only)
   assert_muxm_fn_exit "_sii_audio_is_container_safe('truehd','mp4')=unsafe"         1 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "truehd"
   assert_muxm_fn_exit "_sii_audio_is_container_safe('dts','mp4')=unsafe"            1 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "dts"
   assert_muxm_fn_exit "_sii_audio_is_container_safe('dca','mp4')=unsafe"            1 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "dca"
   assert_muxm_fn_exit "_sii_audio_is_container_safe('pcm_s16le','mp4')=unsafe"      1 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "pcm_s16le"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('flac','mp4')=unsafe"           1 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "flac"
 
-  # MP4 accepts common lossy codecs + ALAC
+  # MP4 accepts canonical direct-play codecs: {aac, ac3, eac3, alac} (M2)
   assert_muxm_fn_exit "_sii_audio_is_container_safe('aac','mp4')=safe"              0 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "aac"
   assert_muxm_fn_exit "_sii_audio_is_container_safe('eac3','mp4')=safe"             0 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "eac3"
   assert_muxm_fn_exit "_sii_audio_is_container_safe('alac','mp4')=safe"             0 _sii_audio_is_container_safe 'MUX_FORMAT="mp4"' "alac"
@@ -4821,6 +4827,10 @@ _test_unit_sii_container_safety() {
   assert_muxm_fn_exit "_sii_audio_is_container_safe('dca','mov')=unsafe"            1 _sii_audio_is_container_safe 'MUX_FORMAT="mov"' "dca"
   assert_muxm_fn_exit "_sii_audio_is_container_safe('aac','mov')=safe"              0 _sii_audio_is_container_safe 'MUX_FORMAT="mov"' "aac"
   assert_muxm_fn_exit "_sii_audio_is_container_safe('alac','mov')=safe"             0 _sii_audio_is_container_safe 'MUX_FORMAT="mov"' "alac"
+
+  # M4V mirrors MP4 (M2: m4v added to the mp4 group)
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('aac','m4v')=safe"              0 _sii_audio_is_container_safe 'MUX_FORMAT="m4v"' "aac"
+  assert_muxm_fn_exit "_sii_audio_is_container_safe('truehd','m4v')=unsafe"         1 _sii_audio_is_container_safe 'MUX_FORMAT="m4v"' "truehd"
 }
 
 _test_unit_misc_helpers() {
