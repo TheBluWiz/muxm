@@ -101,6 +101,24 @@ _valid_profiles_display(){ echo "${VALID_PROFILES// /, }"; }
 # Also accepts deprecated aliases: 'dv-archival' (maps to 'archive'), 'streaming' (maps to 'streaming-hevc').
 _is_valid_profile(){ [[ " $VALID_PROFILES " == *" $1 "* ]] || [[ "$1" == "dv-archival" ]] || [[ "$1" == "streaming" ]]; }
 
+# L4: single source of truth for deprecated profile aliases.
+# All normalisation call sites must go through _normalize_profile instead of
+# maintaining their own warn+rename blocks.
+declare -A PROFILE_ALIASES=( [dv-archival]=archive [streaming]=streaming-hevc )
+
+# _normalize_profile — resolve a deprecated alias to its canonical name.
+# Emits a deprecation warning when a mapping is applied. Modifies the named variable in-place.
+# Args: $1 — name of the variable holding the profile string (nameref)
+_normalize_profile(){
+  local -n _np_profile=$1
+  local _np_canon
+  _np_canon="${PROFILE_ALIASES[$_np_profile]:-}"
+  if [[ -n "$_np_canon" ]]; then
+    warn "Profile '$_np_profile' is deprecated. Use '--profile $_np_canon' instead."
+    _np_profile="$_np_canon"
+  fi
+}
+
 # ===== Section 3: Globals =====================================================================
 declare -a COMPLETED_STEPS=()
 declare -a MUXM_CONFIG_LOADED=()
@@ -1021,37 +1039,43 @@ _muxm_try_source(){
   . "$f"
   MUXM_CONFIG_LOADED+=("$f")
 }
+# Structural (L4 root cause): single authoritative list of all .muxmrc-configurable variables.
+# _MUXM_PRE_CONFIG, _snap_vars, and the _create_config_emit _V calls all derive from this.
+# Add a new config variable here; the other three sites update automatically via the loops below.
+readonly CONFIG_TRACKED_VARS=(
+  VIDEO_CODEC CRF_VALUE PRESET_VALUE X265_PARAMS_BASE X264_PARAMS_BASE SVT_AV1_PARAMS_BASE
+  AV1_MAXRATE AV1_BUFSIZE
+  HW_ACCEL HW_ACCEL_QUALITY HW_ACCEL_ALLOW_SW
+  LEVEL_VALUE CONSERVATIVE_VBV
+  LEVEL_VBV_4_1_MAXRATE LEVEL_VBV_4_1_BUFSIZE
+  LEVEL_VBV_5_0_MAXRATE LEVEL_VBV_5_0_BUFSIZE
+  LEVEL_VBV_5_1_MAXRATE LEVEL_VBV_5_1_BUFSIZE
+  LEVEL_VBV_5_2_MAXRATE LEVEL_VBV_5_2_BUFSIZE
+  VIDEO_COPY_IF_COMPLIANT MAX_COPY_BITRATE
+  FORCE_CHROMA_420 SDR_USE_10BIT_IF_SRC_10BIT SDR_FORCE_10BIT HDR_TARGET_PIXFMT
+  TONEMAP_HDR_TO_SDR
+  THREADS
+  DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL
+  AUDIO_LANG_PREF AUDIO_CODEC_PREFERENCE
+  AUDIO_MULTI_TRACK AUDIO_KEEP_COMMENTARY
+  STEREO_BITRATE MAX_AUDIO_CHANNELS ADD_STEREO_IF_MULTICH AUDIO_PREFER_STEREO
+  EAC3_BITRATE_5_1 EAC3_BITRATE_7_1 AUDIO_FORCE_CODEC AUDIO_FORCE_BITRATE AUDIO_LOSSLESS_PASSTHROUGH
+  SUB_LANG_PREF SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_MAX_TRACKS
+  SUB_BURN_FORCED SUB_EXPORT_EXTERNAL SUB_PRESERVE_TEXT_FORMAT
+  SUB_MULTI_TRACK
+  SUB_PRESERVE_BITMAP SUB_OCR_LANG EXT_SUB_ENABLED DISK_CHECK FFPROBE_LOGLEVEL
+  SUB_ENABLE_OCR SUB_OCR_TOOL
+  OUTPUT_EXT KEEP_CHAPTERS STRIP_METADATA PROFILE_COMMENT INCLUDE_AUDIO_TITLES
+  CHECKSUM CHECKSUM_ALGO SKIP_IF_IDEAL REPORT_JSON
+  FFMPEG_LOGLEVEL
+)
+
 # Capture script-builtin defaults before any .muxmrc is sourced.
 # _create_config_emit diffs against this snapshot to identify which variables
 # a profile actually changes — so that config-file values that coincidentally
 # match the profile value don't suppress the uncommented output.
 declare -Ag _MUXM_PRE_CONFIG=()
-for _pcd_v in \
-  VIDEO_CODEC CRF_VALUE PRESET_VALUE X265_PARAMS_BASE X264_PARAMS_BASE SVT_AV1_PARAMS_BASE \
-  AV1_MAXRATE AV1_BUFSIZE \
-  HW_ACCEL HW_ACCEL_QUALITY HW_ACCEL_ALLOW_SW \
-  LEVEL_VALUE CONSERVATIVE_VBV \
-  LEVEL_VBV_4_1_MAXRATE LEVEL_VBV_4_1_BUFSIZE \
-  LEVEL_VBV_5_0_MAXRATE LEVEL_VBV_5_0_BUFSIZE \
-  LEVEL_VBV_5_1_MAXRATE LEVEL_VBV_5_1_BUFSIZE \
-  LEVEL_VBV_5_2_MAXRATE LEVEL_VBV_5_2_BUFSIZE \
-  VIDEO_COPY_IF_COMPLIANT MAX_COPY_BITRATE \
-  FORCE_CHROMA_420 SDR_USE_10BIT_IF_SRC_10BIT SDR_FORCE_10BIT HDR_TARGET_PIXFMT \
-  TONEMAP_HDR_TO_SDR \
-  THREADS \
-  DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL \
-  AUDIO_LANG_PREF AUDIO_CODEC_PREFERENCE \
-  AUDIO_MULTI_TRACK AUDIO_KEEP_COMMENTARY \
-  STEREO_BITRATE MAX_AUDIO_CHANNELS ADD_STEREO_IF_MULTICH AUDIO_PREFER_STEREO \
-  EAC3_BITRATE_5_1 EAC3_BITRATE_7_1 AUDIO_FORCE_CODEC AUDIO_FORCE_BITRATE AUDIO_LOSSLESS_PASSTHROUGH \
-  SUB_LANG_PREF SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_MAX_TRACKS \
-  SUB_BURN_FORCED SUB_EXPORT_EXTERNAL SUB_PRESERVE_TEXT_FORMAT \
-  SUB_MULTI_TRACK \
-  SUB_PRESERVE_BITMAP SUB_OCR_LANG EXT_SUB_ENABLED DISK_CHECK FFPROBE_LOGLEVEL \
-  SUB_ENABLE_OCR SUB_OCR_TOOL \
-  OUTPUT_EXT KEEP_CHAPTERS STRIP_METADATA PROFILE_COMMENT INCLUDE_AUDIO_TITLES \
-  CHECKSUM CHECKSUM_ALGO SKIP_IF_IDEAL REPORT_JSON \
-  FFMPEG_LOGLEVEL; do
+for _pcd_v in "${CONFIG_TRACKED_VARS[@]}"; do
   _MUXM_PRE_CONFIG[$_pcd_v]="${!_pcd_v}"
 done
 unset _pcd_v
@@ -1487,8 +1511,8 @@ _man_target_dir(){
 
 # <<< embedded man page >>>
 _man_emit(){
-  cat <<'MANPAGE_EOF'
-.TH MUXM 1 "2026-04-11" "MuxMaster v1.4.0" "User Commands"
+  sed "s/__VERSION__/$VERSION/" <<'MANPAGE_EOF'
+.TH MUXM 1 "2026-04-11" "MuxMaster __VERSION__" "User Commands"
 .SH NAME
 muxm \- Universal AV1/DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
@@ -2895,34 +2919,7 @@ _create_config_emit() {
   local _active=" "
   local _manually_adjusted=" "
 
-  # Snapshot all _V-tracked variables before applying the profile so we can
-  # detect which ones the profile changes (those become "active" = uncommented).
-  local _snap_vars=(
-    VIDEO_CODEC CRF_VALUE PRESET_VALUE X265_PARAMS_BASE X264_PARAMS_BASE SVT_AV1_PARAMS_BASE
-    AV1_MAXRATE AV1_BUFSIZE
-    LEVEL_VALUE CONSERVATIVE_VBV
-    LEVEL_VBV_4_1_MAXRATE LEVEL_VBV_4_1_BUFSIZE
-    LEVEL_VBV_5_0_MAXRATE LEVEL_VBV_5_0_BUFSIZE
-    LEVEL_VBV_5_1_MAXRATE LEVEL_VBV_5_1_BUFSIZE
-    LEVEL_VBV_5_2_MAXRATE LEVEL_VBV_5_2_BUFSIZE
-    VIDEO_COPY_IF_COMPLIANT MAX_COPY_BITRATE
-    FORCE_CHROMA_420 SDR_USE_10BIT_IF_SRC_10BIT SDR_FORCE_10BIT HDR_TARGET_PIXFMT
-    TONEMAP_HDR_TO_SDR
-    THREADS
-    DISABLE_DV ALLOW_DV_FALLBACK DV_CONVERT_TO_P81_IF_FAIL
-    AUDIO_LANG_PREF AUDIO_CODEC_PREFERENCE
-    AUDIO_MULTI_TRACK AUDIO_KEEP_COMMENTARY
-    STEREO_BITRATE MAX_AUDIO_CHANNELS ADD_STEREO_IF_MULTICH AUDIO_PREFER_STEREO
-    EAC3_BITRATE_5_1 EAC3_BITRATE_7_1 AUDIO_FORCE_CODEC AUDIO_FORCE_BITRATE AUDIO_LOSSLESS_PASSTHROUGH
-    SUB_LANG_PREF SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_MAX_TRACKS
-    SUB_BURN_FORCED SUB_EXPORT_EXTERNAL SUB_PRESERVE_TEXT_FORMAT
-    SUB_MULTI_TRACK
-    SUB_PRESERVE_BITMAP SUB_OCR_LANG EXT_SUB_ENABLED DISK_CHECK FFPROBE_LOGLEVEL
-    SUB_ENABLE_OCR SUB_OCR_TOOL
-    OUTPUT_EXT KEEP_CHAPTERS STRIP_METADATA PROFILE_COMMENT INCLUDE_AUDIO_TITLES
-    CHECKSUM CHECKSUM_ALGO SKIP_IF_IDEAL REPORT_JSON
-    FFMPEG_LOGLEVEL
-  )
+  # Derive from CONFIG_TRACKED_VARS so this list never diverges from _MUXM_PRE_CONFIG (Structural).
   local _sv
 
   # Apply the profile to populate variable values
@@ -2934,7 +2931,7 @@ _create_config_emit() {
   # We compare against _MUXM_PRE_CONFIG (captured before any .muxmrc was sourced)
   # rather than a runtime snapshot, so that config-file values that coincidentally
   # match the profile value don't suppress the uncommented output.
-  for _sv in "${_snap_vars[@]}"; do
+  for _sv in "${CONFIG_TRACKED_VARS[@]}"; do
     if [[ "${!_sv}" != "${_MUXM_PRE_CONFIG[$_sv]}" ]]; then
       [[ "$_active" != *" ${_sv} "* ]] && _active+="${_sv} "
     fi
@@ -3097,6 +3094,21 @@ HEADER
   printf '\n'
   echo "# Tone-map filter chain: advanced ffmpeg filter string for HDR→SDR conversion."
   printf "#TONEMAP_FILTER='zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p'\n"
+  printf '\n'
+
+  printf '\n'
+  echo "# ========================="
+  echo "# Hardware acceleration"
+  echo "# ========================="
+  printf '\n'
+  echo "# Backend: none | auto | videotoolbox | nvenc (macOS/VideoToolbox only in this release)"
+  _V HW_ACCEL quoted
+  printf '\n'
+  echo "# Quality knob for HW encoder (0–100; empty = use profile default)"
+  _V HW_ACCEL_QUALITY
+  printf '\n'
+  echo "# Allow software fallback when HW encoder unavailable: 1 = yes | 0 = hard-fail"
+  _V HW_ACCEL_ALLOW_SW
   printf '\n'
 
   printf '\n'
@@ -3524,14 +3536,8 @@ _create_config() {
     esac
   done
 
-  # Normalize deprecated aliases
-  if [[ "$profile" == "dv-archival" ]]; then
-    warn "Profile 'dv-archival' is deprecated. Using 'archive' instead."
-    profile="archive"
-  elif [[ "$profile" == "streaming" ]]; then
-    warn "Profile 'streaming' is deprecated. Use 'streaming-hevc' instead."
-    profile="streaming-hevc"
-  fi
+  # Normalize deprecated aliases (L4: single call site via _normalize_profile).
+  _normalize_profile profile
 
   # Validate scope → target path
   local target_path
@@ -3557,14 +3563,8 @@ _create_config() {
     IFS=',' read -ra _cc_mp_list <<< "$profile"
     for _cc_mp in "${_cc_mp_list[@]}"; do
       [[ -z "$_cc_mp" ]] && { printf '❌ ERROR: Empty profile name in list: %s\n' "$profile" >&2; exit 11; }
-      # Normalize deprecated aliases within each entry of a multi-profile list.
-      # The single-profile normalization above only fires when the whole string is an
-      # alias; for comma-separated lists each element must be checked individually so
-      # the config file is written with current canonical names, not deprecated ones.
-      case "$_cc_mp" in
-        dv-archival) warn "Profile 'dv-archival' is deprecated. Using 'archive' instead."; _cc_mp="archive" ;;
-        streaming)   warn "Profile 'streaming' is deprecated. Use 'streaming-hevc' instead."; _cc_mp="streaming-hevc" ;;
-      esac
+      # Normalize deprecated aliases per element (L4: single call site via _normalize_profile).
+      _normalize_profile _cc_mp
       if ! _is_valid_profile "$_cc_mp"; then
         printf '❌ ERROR: Unknown profile: %s\n' "$_cc_mp" >&2
         printf '   Valid profiles: %s\n' "$(_valid_profiles_display)" >&2
@@ -3749,13 +3749,6 @@ apply_profile_archive() {
   # Reporting: JSON + SHA-256 checksum (archival integrity)
   REPORT_JSON=1
   CHECKSUM=1
-}
-
-# DEPRECATED: 'dv-archival' is a backwards-compatibility alias for 'archive'.
-# Emits a deprecation notice and delegates to apply_profile_archive.
-apply_profile_dv_archival() {
-  warn "Profile 'dv-archival' is deprecated. Use '--profile archive' instead."
-  apply_profile_archive
 }
 
 apply_profile_hdr10_hq() {
@@ -4087,22 +4080,14 @@ _profile_comment() {
 # Dispatcher
 apply_profile() {
   [[ -z "${PROFILE_NAME:-}" ]] && return 0
+  # Resolve deprecated aliases before dispatch (L4: single normalisation path).
+  _normalize_profile PROFILE_NAME
   case "$PROFILE_NAME" in
     archive)                     apply_profile_archive ;;
-    dv-archival)
-      # Deprecated alias: normalise PROFILE_NAME so all downstream code sees 'archive'.
-      warn "Profile 'dv-archival' is deprecated. Use '--profile archive' instead."
-      PROFILE_NAME="archive"
-      apply_profile_archive ;;
     hdr10-hq)                    apply_profile_hdr10_hq ;;
     atv-directplay-hq)           apply_profile_atv_directplay_hq ;;
     atv-directplay-animation)    apply_profile_atv_directplay_animation ;;
     streaming-hevc)              apply_profile_streaming_hevc ;;
-    streaming)
-      # Deprecated alias: normalise PROFILE_NAME so all downstream code sees 'streaming-hevc'.
-      warn "Profile 'streaming' is deprecated. Use '--profile streaming-hevc' instead."
-      PROFILE_NAME="streaming-hevc"
-      apply_profile_streaming_hevc ;;
     av1-hq)                      apply_profile_av1_hq ;;
     streaming-av1)               apply_profile_streaming_av1 ;;
     animation)                   apply_profile_animation ;;
@@ -4354,6 +4339,14 @@ is_valid_preset(){
   esac
 }
 
+# L10: die clearly when a value-taking flag receives another flag as its value.
+# Empty-string values are allowed (some flags use "" as "no filter").
+_require_val(){
+  local _flag="$1" _val="${2:-}"
+  [[ "$_val" == -* ]] && die 11 "$_flag requires a value, not a flag (got: $_val)"
+  return 0
+}
+
 POSITIONALS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -4368,38 +4361,38 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --checksum) CHECKSUM=1; shift ;;
     --no-checksum) CHECKSUM=0; shift ;;
-    --checksum-algo) CHECKSUM_ALGO="${2:-}"; CHECKSUM=1; shift 2 ;;
+    --checksum-algo) _require_val "$1" "${2:-}"; CHECKSUM_ALGO="$2"; CHECKSUM=1; shift 2 ;;
     --disk-check) DISK_CHECK=1; shift ;;
     --no-disk-check) DISK_CHECK=0; shift ;;
 
     --ffmpeg-loglevel)
-      FFMPEG_LOGLEVEL="${2:-}"
+      _require_val "$1" "${2:-}"; FFMPEG_LOGLEVEL="$2"
       is_valid_loglevel "$FFMPEG_LOGLEVEL" || die 11 "Invalid --ffmpeg-loglevel: \"$FFMPEG_LOGLEVEL\". Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
       shift 2 ;;
     --no-hide-banner) FFMPEG_HIDE_BANNER=0; shift ;;
     --no-overwrite) FFMPEG_OVERWRITE=0; shift ;;
     --ffprobe-loglevel)
-      FFPROBE_LOGLEVEL="${2:-}"
+      _require_val "$1" "${2:-}"; FFPROBE_LOGLEVEL="$2"
       is_valid_loglevel "$FFPROBE_LOGLEVEL" || die 11 "Invalid --ffprobe-loglevel: \"$FFPROBE_LOGLEVEL\". Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
       shift 2 ;;
-    --threads) THREADS="${2:-}"; shift 2 ;;
+    --threads) _require_val "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
 
     --crf)
-      _crf_in="${2:-}"
+      _require_val "$1" "${2:-}"; _crf_in="$2"
       [[ "$_crf_in" =~ ^[0-9]+$ ]] && (( 10#$_crf_in <= 51 )) \
         || die 11 "Invalid --crf: integer 0–51 expected (got: ${_crf_in})"
       CRF_VALUE="$_crf_in"; _CLI_CRF_EXPLICIT=1; shift 2 ;;
     -p|--preset)
-      PRESET_VALUE="${2:-}"; _CLI_PRESET_EXPLICIT=1
+      _require_val "$1" "${2:-}"; PRESET_VALUE="$2"; _CLI_PRESET_EXPLICIT=1
       is_valid_preset "$PRESET_VALUE" || die 11 "Invalid preset: $PRESET_VALUE"
       shift 2
       ;;
-    --x265-params) X265_PARAMS_BASE="${2:-}"; shift 2 ;;
-    --x264-params) X264_PARAMS_BASE="${2:-}"; shift 2 ;;
-    --av1-params) SVT_AV1_PARAMS_BASE="${2:-}"; shift 2 ;;
-    --av1-maxrate) AV1_MAXRATE="${2:-}"; shift 2 ;;
-    --av1-bufsize) AV1_BUFSIZE="${2:-}"; shift 2 ;;
-    -l|--level) LEVEL_VALUE="${2:-}"; shift 2 ;;
+    --x265-params) _require_val "$1" "${2:-}"; X265_PARAMS_BASE="$2"; shift 2 ;;
+    --x264-params) _require_val "$1" "${2:-}"; X264_PARAMS_BASE="$2"; shift 2 ;;
+    --av1-params)  _require_val "$1" "${2:-}"; SVT_AV1_PARAMS_BASE="$2"; shift 2 ;;
+    --av1-maxrate) _require_val "$1" "${2:-}"; AV1_MAXRATE="$2"; shift 2 ;;
+    --av1-bufsize) _require_val "$1" "${2:-}"; AV1_BUFSIZE="$2"; shift 2 ;;
+    -l|--level)    _require_val "$1" "${2:-}"; LEVEL_VALUE="$2"; shift 2 ;;
     --conservative-vbv) CONSERVATIVE_VBV=1; shift ;;
     --no-conservative-vbv) CONSERVATIVE_VBV=0; shift ;;
     --dv) DISABLE_DV=0; shift ;;
@@ -4409,7 +4402,7 @@ while [[ $# -gt 0 ]]; do
     --dv-convert-p81) DV_CONVERT_TO_P81_IF_FAIL=1; shift ;;
     --no-dv-convert-p81) DV_CONVERT_TO_P81_IF_FAIL=0; shift ;;
     --video-codec)
-      VIDEO_CODEC="${2:-}"
+      _require_val "$1" "${2:-}"; VIDEO_CODEC="$2"
       case "$VIDEO_CODEC" in
         libx265|libx264|libsvt-av1|libaom-av1) ;;
         *) die 11 "Invalid --video-codec: must be libx265, libx264, libsvt-av1, or libaom-av1 (got: $VIDEO_CODEC)" ;;
@@ -4417,12 +4410,12 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --hw-accel)
-      HW_ACCEL="${2:-}"; _CLI_HW_ACCEL_EXPLICIT=1
+      _require_val "$1" "${2:-}"; HW_ACCEL="$2"; _CLI_HW_ACCEL_EXPLICIT=1
       is_valid_hw_accel "$HW_ACCEL" || die 11 "Invalid --hw-accel: \"$HW_ACCEL\". Valid values: none, auto, videotoolbox, nvenc"
       shift 2
       ;;
     --hw-accel-quality)
-      HW_ACCEL_QUALITY="${2:-}"; _CLI_HW_ACCEL_QUALITY_EXPLICIT=1
+      _require_val "$1" "${2:-}"; HW_ACCEL_QUALITY="$2"; _CLI_HW_ACCEL_QUALITY_EXPLICIT=1
       # Accept integer 0–100 (VT/NVENC quality scales both fit this range).
       if [[ ! "$HW_ACCEL_QUALITY" =~ ^[0-9]+$ ]] || (( HW_ACCEL_QUALITY < 0 )) || (( HW_ACCEL_QUALITY > 100 )); then
         die 11 "Invalid --hw-accel-quality: \"$HW_ACCEL_QUALITY\". Must be an integer between 0 and 100."
@@ -4437,28 +4430,28 @@ while [[ $# -gt 0 ]]; do
     --no-tonemap) TONEMAP_HDR_TO_SDR=0; shift ;;
     --sdr-force-10bit) SDR_FORCE_10BIT=1; shift ;;
     --no-sdr-force-10bit) SDR_FORCE_10BIT=0; shift ;;
-    --max-copy-bitrate) MAX_COPY_BITRATE="${2:-}"; shift 2 ;;
+    --max-copy-bitrate) _require_val "$1" "${2:-}"; MAX_COPY_BITRATE="$2"; shift 2 ;;
 
-    --audio-track) AUDIO_TRACK_OVERRIDE="${2:-}"; shift 2 ;;
-    --audio-lang-pref) AUDIO_LANG_PREF="${2:-}"; shift 2 ;;
-    --stereo-bitrate) STEREO_BITRATE="${2:-}"; shift 2 ;;
+    --audio-track)        _require_val "$1" "${2:-}"; AUDIO_TRACK_OVERRIDE="$2"; shift 2 ;;
+    --audio-lang-pref)    _require_val "$1" "${2:-}"; AUDIO_LANG_PREF="$2"; shift 2 ;;
+    --stereo-bitrate)     _require_val "$1" "${2:-}"; STEREO_BITRATE="$2"; shift 2 ;;
     --prefer-stereo) AUDIO_PREFER_STEREO=1; shift ;;
     --no-prefer-stereo) AUDIO_PREFER_STEREO=0; shift ;;
     --stereo-fallback) ADD_STEREO_IF_MULTICH=1; shift ;;
     --no-stereo-fallback) ADD_STEREO_IF_MULTICH=0; shift ;;
-    --audio-force-codec) AUDIO_FORCE_CODEC="${2:-}"; shift 2 ;;
-    --audio-force-bitrate) AUDIO_FORCE_BITRATE="${2:-}"; shift 2 ;;
+    --audio-force-codec)   _require_val "$1" "${2:-}"; AUDIO_FORCE_CODEC="$2"; shift 2 ;;
+    --audio-force-bitrate) _require_val "$1" "${2:-}"; AUDIO_FORCE_BITRATE="$2"; shift 2 ;;
     --audio-lossless-passthrough) AUDIO_LOSSLESS_PASSTHROUGH=1; shift ;;
     --no-audio-lossless-passthrough) AUDIO_LOSSLESS_PASSTHROUGH=0; shift ;;
     --audio-titles) INCLUDE_AUDIO_TITLES=1; shift ;;
     --no-audio-titles) INCLUDE_AUDIO_TITLES=0; shift ;;
 
     --no-subtitles) SUB_INCLUDE_FORCED=0; SUB_INCLUDE_FULL=0; SUB_INCLUDE_SDH=0; shift ;;
-    --sub-lang-pref) SUB_LANG_PREF="${2:-}"; shift 2 ;;
+    --sub-lang-pref) _require_val "$1" "${2:-}"; SUB_LANG_PREF="$2"; shift 2 ;;
     --no-sub-sdh) SUB_INCLUDE_SDH=0; shift ;;
-    --ocr-lang) SUB_OCR_LANG="${2:-}"; shift 2 ;;
+    --ocr-lang)  _require_val "$1" "${2:-}"; SUB_OCR_LANG="$2"; shift 2 ;;
     --no-ocr) SUB_ENABLE_OCR=0; shift ;;
-    --ocr-tool) SUB_OCR_TOOL="${2:-}"; shift 2 ;;
+    --ocr-tool)  _require_val "$1" "${2:-}"; SUB_OCR_TOOL="$2"; shift 2 ;;
     --sub-burn-forced) SUB_BURN_FORCED=1; _CLI_SUB_BURN_FORCED=1; shift ;;
     --no-sub-burn-forced) SUB_BURN_FORCED=0; shift ;;
     --sub-export-external) SUB_EXPORT_EXTERNAL=1; shift ;;
@@ -4473,15 +4466,15 @@ while [[ $# -gt 0 ]]; do
     --sub-sole-ext-fallback)    SUB_SOLE_EXT_FALLBACK=1; shift ;;
     --no-sub-sole-ext-fallback) SUB_SOLE_EXT_FALLBACK=0; shift ;;
     --ext-subs-dir)
-      EXT_SUB_DIR="${2:-}"
-      [[ -n "$EXT_SUB_DIR" && ! -d "$EXT_SUB_DIR" ]] && die 11 "--ext-subs-dir: directory not found: $EXT_SUB_DIR"
+      _require_val "$1" "${2:-}"; EXT_SUB_DIR="$2"
+      [[ ! -d "$EXT_SUB_DIR" ]] && die 11 "--ext-subs-dir: directory not found: $EXT_SUB_DIR"
       shift 2 ;;
 
     --skip-video) SKIP_VIDEO=1; shift ;;
     --skip-audio) SKIP_AUDIO=1; shift ;;
     --skip-subs)  SKIP_SUBS=1;  shift ;;
 
-    --output-ext) OUTPUT_EXT="${2:-}"; _OUTPUT_EXT_EXPLICIT=1; shift 2 ;;
+    --output-ext) _require_val "$1" "${2:-}"; OUTPUT_EXT="$2"; _OUTPUT_EXT_EXPLICIT=1; shift 2 ;;
     --keep-chapters) KEEP_CHAPTERS=1; shift ;;
     --no-keep-chapters) KEEP_CHAPTERS=0; shift ;;
     --strip-metadata) STRIP_METADATA=1; shift ;;
@@ -4522,6 +4515,39 @@ esac
 _warn_conflict() {
   local profile="$1" flag="$2" reason="$3"
   warn "Profile '$profile' + $flag: $reason"
+}
+
+# L5: shared helpers for near-verbatim Section 13 patterns.
+
+# Warn when SUB_MULTI_TRACK clashes with flags that force single-track behaviour.
+_warn_multitrack_sub_conflicts(){
+  local _p="$1"
+  (( SUB_MULTI_TRACK )) || return 0
+  (( SUB_BURN_FORCED )) && \
+    _warn_conflict "$_p" "--sub-burn-forced" \
+      "Multi-track subtitle mode copies all subs from source. --sub-burn-forced forces single-track."
+  (( SUB_EXPORT_EXTERNAL )) && \
+    _warn_conflict "$_p" "--sub-export-external" \
+      "Multi-track subtitle mode embeds all subs via stream-copy. External export is ignored."
+  return 0
+}
+
+# Warn when OUTPUT_EXT matches an unusual/unsupported container for a profile.
+# Args: profile ext msg [only_when_explicit]
+# only_when_explicit=1: skip unless _OUTPUT_EXT_EXPLICIT (e.g. ATV passthrough produces MKV legitimately).
+_warn_container_unusual(){
+  local _p="$1" _ext="$2" _msg="$3" _explicit="${4:-0}"
+  [[ "$OUTPUT_EXT" != "$_ext" ]] && return 0
+  (( _explicit )) && ! (( _OUTPUT_EXT_EXPLICIT )) && return 0
+  _warn_conflict "$_p" "--output-ext $_ext" "$_msg"
+  return 0
+}
+
+# Warn when libx264 is selected under a profile that relies on HDR metadata.
+# Args: profile msg
+_warn_h264_hdr(){
+  [[ "$VIDEO_CODEC" == "libx264" ]] && _warn_conflict "$1" "--video-codec libx264" "$2"
+  return 0
 }
 
 if [[ -n "${PROFILE_NAME:-}" ]]; then
@@ -4570,15 +4596,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       fi
 
       # Multi-track subtitle conflicts: flags that force single-track behavior
-      if (( SUB_MULTI_TRACK )); then
-        (( SUB_BURN_FORCED )) && \
-          _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
-            "Multi-track subtitle mode copies all subs from source. --sub-burn-forced forces single-track."
-
-        (( SUB_EXPORT_EXTERNAL )) && \
-          _warn_conflict "$PROFILE_NAME" "--sub-export-external" \
-            "Multi-track subtitle mode embeds all subs via stream-copy. External export is ignored."
-      fi
+      _warn_multitrack_sub_conflicts "$PROFILE_NAME"
       ;;
 
     hdr10-hq)
@@ -4593,35 +4611,25 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
           "Tone-mapping HDR to SDR conflicts with HDR10 output. Output will be SDR."
 
       # H.264 codec is wrong for HDR10
-      [[ "$VIDEO_CODEC" == "libx264" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--video-codec libx264" \
-          "H.264 cannot carry HDR10 metadata. Use libx265 for HDR10 output."
+      _warn_h264_hdr "$PROFILE_NAME" "H.264 cannot carry HDR10 metadata. Use libx265 for HDR10 output."
       ;;
 
     atv-directplay-hq)
       # Note: SUB_PRESERVE_TEXT_FORMAT for MKV output is set post-resolution (Section 15).
       # There is no conflict check here for it because OUTPUT_EXT is not yet resolved at this point.
 
-      # MKV won’t Direct Play on Apple TV
-      [[ "$OUTPUT_EXT" == "mkv" ]] && (( _OUTPUT_EXT_EXPLICIT )) && \
-        _warn_conflict "$PROFILE_NAME" "--output-ext mkv" \
-          "Forcing MKV output. MKV Direct Plays on ATV via Plex/Infuse but not the native TV app."
-
+      # MKV won’t Direct Play on Apple TV (only warn when user explicitly forced it)
+      _warn_container_unusual "$PROFILE_NAME" "mkv" \
+        "Forcing MKV output. MKV Direct Plays on ATV via Plex/Infuse but not the native TV app." 1
       # MOV is unusual but works
-      [[ "$OUTPUT_EXT" == "mov" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--output-ext mov" \
-          "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play."
-
+      _warn_container_unusual "$PROFILE_NAME" "mov" \
+        "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play."
       # Tone-mapping defeats HDR purpose
       (( TONEMAP_HDR_TO_SDR )) && \
         _warn_conflict "$PROFILE_NAME" "--tonemap" \
           "Tone-mapping to SDR removes HDR. Apple TV supports HDR natively."
-
       # H.264 loses HDR + DV
-      [[ "$VIDEO_CODEC" == "libx264" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--video-codec libx264" \
-          "H.264 cannot carry HDR10/DV. Apple TV supports HEVC; use libx265."
-
+      _warn_h264_hdr "$PROFILE_NAME" "H.264 cannot carry HDR10/DV. Apple TV supports HEVC; use libx265."
       # Lossless audio won’t Direct Play on ATV
       (( AUDIO_LOSSLESS_PASSTHROUGH )) && \
         _warn_conflict "$PROFILE_NAME" "--audio-lossless-passthrough" \
@@ -4630,24 +4638,17 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
 
     atv-directplay-animation)
       # MKV explicit override (passthrough may also produce MKV — that is intentional)
-      [[ "$OUTPUT_EXT" == "mkv" ]] && (( _OUTPUT_EXT_EXPLICIT )) && \
-        _warn_conflict "$PROFILE_NAME" "--output-ext mkv" \
-          "Forcing MKV output. MKV Direct Plays on ATV via Plex/Infuse but not the native TV app."
-
+      _warn_container_unusual "$PROFILE_NAME" "mkv" \
+        "Forcing MKV output. MKV Direct Plays on ATV via Plex/Infuse but not the native TV app." 1
       # MOV is unusual
-      [[ "$OUTPUT_EXT" == "mov" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--output-ext mov" \
-          "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play."
-
+      _warn_container_unusual "$PROFILE_NAME" "mov" \
+        "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play."
       # Tone-mapping defeats HDR purpose
       (( TONEMAP_HDR_TO_SDR )) && \
         _warn_conflict "$PROFILE_NAME" "--tonemap" \
           "Tone-mapping to SDR removes HDR. Apple TV supports HDR natively."
-
       # H.264 loses HDR + DV
-      [[ "$VIDEO_CODEC" == "libx264" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--video-codec libx264" \
-          "H.264 cannot carry HDR10/DV. Apple TV supports HEVC; use libx265."
+      _warn_h264_hdr "$PROFILE_NAME" "H.264 cannot carry HDR10/DV. Apple TV supports HEVC; use libx265."
 
       # Lossless audio won’t Direct Play on ATV
       (( AUDIO_LOSSLESS_PASSTHROUGH )) && \
@@ -4660,76 +4661,42 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
           "ASS/SSA subtitles will be converted to SRT, losing positioning and styling."
 
       # Multi-track subtitle conflicts
-      if (( SUB_MULTI_TRACK )); then
-        (( SUB_BURN_FORCED )) && \
-          _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
-            "Multi-track subtitle mode copies all subs from source. --sub-burn-forced forces single-track."
-
-        (( SUB_EXPORT_EXTERNAL )) && \
-          _warn_conflict "$PROFILE_NAME" "--sub-export-external" \
-            "Multi-track subtitle mode embeds all subs via stream-copy. External export is ignored."
-      fi
+      _warn_multitrack_sub_conflicts "$PROFILE_NAME"
       ;;
 
     streaming-hevc)
-      # MKV is unusual for streaming targets
-      [[ "$OUTPUT_EXT" == "mkv" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--output-ext mkv" \
-          "MKV is unusual for streaming targets. MP4 recommended for broadest client support."
-
-      # MOV is unusual for streaming targets
-      [[ "$OUTPUT_EXT" == "mov" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--output-ext mov" \
-          "MOV is unusual for streaming targets. MP4 recommended for broadest client support."
-
+      # Container choices unusual for streaming targets
+      _warn_container_unusual "$PROFILE_NAME" "mkv" \
+        "MKV is unusual for streaming targets. MP4 recommended for broadest client support."
+      _warn_container_unusual "$PROFILE_NAME" "mov" \
+        "MOV is unusual for streaming targets. MP4 recommended for broadest client support."
       # Lossless audio increases file size significantly
       (( AUDIO_LOSSLESS_PASSTHROUGH )) && \
         _warn_conflict "$PROFILE_NAME" "--audio-lossless-passthrough" \
           "Lossless audio increases file size significantly. E-AC-3/AAC recommended for streaming."
-
       # H.264 cannot carry HDR10
-      [[ "$VIDEO_CODEC" == "libx264" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--video-codec libx264" \
-          "H.264 cannot carry HDR10 metadata. HEVC recommended for streaming."
+      _warn_h264_hdr "$PROFILE_NAME" "H.264 cannot carry HDR10 metadata. HEVC recommended for streaming."
       ;;
 
     animation)
-      # MP4 cannot carry styled ASS/SSA or PGS bitmap subtitles
-      [[ "$OUTPUT_EXT" == "mp4" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--output-ext mp4" \
-          "MP4 cannot carry styled ASS/SSA or PGS bitmap subtitles. MKV recommended for animation."
-
-      # MOV has similar subtitle limitations
-      [[ "$OUTPUT_EXT" == "mov" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--output-ext mov" \
-          "MOV cannot carry styled ASS/SSA or PGS bitmap subtitles. MKV recommended for animation."
-
+      # Container choices that drop subtitle fidelity
+      _warn_container_unusual "$PROFILE_NAME" "mp4" \
+        "MP4 cannot carry styled ASS/SSA or PGS bitmap subtitles. MKV recommended for animation."
+      _warn_container_unusual "$PROFILE_NAME" "mov" \
+        "MOV cannot carry styled ASS/SSA or PGS bitmap subtitles. MKV recommended for animation."
       # Burning subs destroys ASS styling
       (( SUB_BURN_FORCED )) && \
         _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
           "Burning subs destroys ASS styling (typesetting, signs, karaoke). Soft subs recommended."
-
       # Multi-track subtitle conflicts: flags that force single-track behavior
-      if (( SUB_MULTI_TRACK )); then
-        (( SUB_BURN_FORCED )) && \
-          _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
-            "Multi-track subtitle mode copies all subs from source. --sub-burn-forced forces single-track."
-
-        (( SUB_EXPORT_EXTERNAL )) && \
-          _warn_conflict "$PROFILE_NAME" "--sub-export-external" \
-            "Multi-track subtitle mode embeds all subs via stream-copy. External export is ignored."
-      fi
+      _warn_multitrack_sub_conflicts "$PROFILE_NAME"
 
       # Disabling format preservation converts ASS to plain-text SRT
       (( ! SUB_PRESERVE_TEXT_FORMAT )) && \
         _warn_conflict "$PROFILE_NAME" "--no-sub-preserve-format" \
           "ASS/SSA subtitles will be converted to SRT, losing positioning and styling."
-
       # H.264 8-bit causes banding in animation
-      [[ "$VIDEO_CODEC" == "libx264" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--video-codec libx264" \
-          "H.264 8-bit causes visible banding in animation gradients. HEVC 10-bit recommended."
-
+      _warn_h264_hdr "$PROFILE_NAME" "H.264 8-bit causes visible banding in animation gradients. HEVC 10-bit recommended."
       # Transcoding lossless audio loses quality unnecessarily
       (( ! AUDIO_LOSSLESS_PASSTHROUGH )) && \
         _warn_conflict "$PROFILE_NAME" "--no-audio-lossless-passthrough" \
@@ -4737,26 +4704,19 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       ;;
 
     universal)
-      # MKV is unusual for max-compat
-      [[ "$OUTPUT_EXT" == "mkv" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--output-ext mkv" \
-          "MKV is unusual for max compatibility. MP4 recommended for widest device support."
-
-      # MOV is unusual for max-compat
-      [[ "$OUTPUT_EXT" == "mov" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--output-ext mov" \
-          "MOV is unusual for max compatibility. MP4 recommended for widest device support."
-
+      # Container choices unusual for max-compatibility targets
+      _warn_container_unusual "$PROFILE_NAME" "mkv" \
+        "MKV is unusual for max compatibility. MP4 recommended for widest device support."
+      _warn_container_unusual "$PROFILE_NAME" "mov" \
+        "MOV is unusual for max compatibility. MP4 recommended for widest device support."
       # Lossless passthrough defeats compatibility
       (( AUDIO_LOSSLESS_PASSTHROUGH )) && \
         _warn_conflict "$PROFILE_NAME" "--audio-lossless-passthrough" \
           "Lossless audio (TrueHD/DTS-HD MA) is not widely supported. AAC is recommended."
-
       # HEVC may not play everywhere
       [[ "$VIDEO_CODEC" == "libx265" ]] && \
         _warn_conflict "$PROFILE_NAME" "--video-codec libx265" \
           "HEVC is less widely supported than H.264 for universal playback."
-
       # Keeping DV enabled makes no sense for SDR universal output
       (( ! DISABLE_DV )) && \
         _warn_conflict "$PROFILE_NAME" "(DV enabled)" \
@@ -4765,10 +4725,8 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
 
     youtube-upload)
       # MKV won't ingest well on YouTube
-      [[ "$OUTPUT_EXT" == "mkv" ]] && \
-        _warn_conflict "$PROFILE_NAME" "--output-ext mkv" \
-          "YouTube requires MP4. MKV output may be rejected or not process correctly."
-
+      _warn_container_unusual "$PROFILE_NAME" "mkv" \
+        "YouTube requires MP4. MKV output may be rejected or not process correctly."
       # Lossless audio won't survive YouTube's transcode pipeline
       (( AUDIO_LOSSLESS_PASSTHROUGH )) && \
         _warn_conflict "$PROFILE_NAME" "--audio-lossless-passthrough" \
@@ -5524,9 +5482,8 @@ disk_free_warn() {
       "est_total=${est_total} required=${required} (~${est_gb}GB)"
 
   # ---- Check output volume ----
-  local avail_kb out_dev
+  local avail_kb
   avail_kb="$(df -Pk "$OUT_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
-  out_dev="$(df -Pk "$OUT_DIR" 2>/dev/null | awk 'NR==2{print $1}')"
   if [[ -n "$avail_kb" ]] && (( avail_kb * 1024 < required )); then
     local avail_gb
     avail_gb="$(LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; $avail_kb / 1048576" | bc 2>/dev/null)" 2>/dev/null)" || \
@@ -5534,20 +5491,6 @@ disk_free_warn() {
     warn "Estimated output ~${est_gb}GB but only ${avail_gb}GB free on output volume ($OUT_DIR)."
     warn "Use --no-disk-check to suppress this warning."
   fi
-
-  # ---- Check temp volume (only when on a different device than output) ----
-  [[ -n "${WORKDIR:-}" && -d "${WORKDIR:-}" ]] || return 0
-  local work_dev
-  work_dev="$(df -Pk "$WORKDIR" 2>/dev/null | awk 'NR==2{print $1}')"
-  [[ -n "${out_dev:-}" && -n "$work_dev" && "$out_dev" != "$work_dev" ]] || return 0
-  local work_avail_kb
-  work_avail_kb="$(df -Pk "$WORKDIR" 2>/dev/null | awk 'NR==2{print $4}')"
-  [[ -n "$work_avail_kb" ]] && (( work_avail_kb * 1024 < required )) || return 0
-  local tmp_avail_gb
-  tmp_avail_gb="$(LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; $work_avail_kb / 1048576" | bc 2>/dev/null)" 2>/dev/null)" || \
-    tmp_avail_gb="$(( work_avail_kb / 1024 / 1024 ))"
-  warn "Estimated output ~${est_gb}GB but only ${tmp_avail_gb}GB free on temp volume ($WORKDIR)."
-  warn "Use --no-disk-check to suppress this warning."
 }
 
 # ===== Section 20: Metadata caching & ffprobe helpers =========================================
@@ -5819,7 +5762,7 @@ decide_color_and_pixfmt() {
   pix="$(_lower "$pix")"
 
   local is_10bit=0 chroma="420"
-  [[ "$pix" =~ p10 ]] && is_10bit=1
+  [[ "$pix" =~ (p010le|p10|p12) ]] && is_10bit=1
   [[ "$pix" =~ 422 ]] && chroma="422"
   [[ "$pix" =~ 444 ]] && chroma="444"
 
@@ -7389,7 +7332,8 @@ _audio_descriptive_title() {
 # Args: $1 — codec name (lowercased)
 # Globals: AUDIO_CODEC_PREFERENCE (read), _AUDIO_CODEC_RANK_CACHE/_AUDIO_CODEC_RANK_PREF (r/w)
 _audio_codec_rank(){
-  declare -A _AUDIO_CODEC_RANK_CACHE 2>/dev/null || true
+  # Cache is per-subshell — each $(...) invocation starts fresh (L1).
+  declare -gA _AUDIO_CODEC_RANK_CACHE 2>/dev/null || true
   local codec="$1"
   if [[ "$AUDIO_CODEC_PREFERENCE" != "$_AUDIO_CODEC_RANK_PREF" ]]; then
     _AUDIO_CODEC_RANK_CACHE=()
@@ -7495,6 +7439,9 @@ _score_audio_stream(){
   (( inv < 0 )) && inv=0
   score=$(( score + inv ))
 
+  # Save raw bitrate before synthetic lossless floor (L2b: passed through to caller).
+  local raw_br="$br"
+
   # Lossless codecs (TrueHD, DTS-HD MA, FLAC, etc.) often report bit_rate=0
   # because they are VBR. Give them a synthetic floor so they are not penalised
   # relative to lossy codecs that do report bitrate.
@@ -7514,16 +7461,18 @@ _score_audio_stream(){
     score=$(( score - AUDIO_SCORE_COMMENTARY_PENALTY ))
   fi
 
-  printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$score" "$idx" "$codec" "$ch" "$lang" "${title:-}"
+  # Format: score\tidx\tcodec\tch\tlang\ttitle\traw_br (L2b: raw_br enables caller to
+  # destructure the full winning record without additional jq forks).
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$score" "$idx" "$codec" "$ch" "$lang" "${title:-}" "$raw_br"
 }
 
 # select_best_audio — Pick the best audio track using the scoring algorithm.
 #
 # Respects AUDIO_TRACK_OVERRIDE if set (with bounds validation).
 # Otherwise, scores all audio streams via _score_audio_stream and returns
-# the 0-based audio-relative index of the highest-scoring track.
+# the full winning record so the caller can destructure without extra jq forks (L2b).
 #
-# Returns: audio stream index on stdout ("" if no audio streams exist).
+# Returns: "idx\tcodec\tch\tlang\ttitle\traw_br" on stdout ("" if no audio streams exist).
 # Globals: AUDIO_TRACK_OVERRIDE (read), METADATA_CACHE (read)
 select_best_audio(){
   local n i best_line best_score=-999999
@@ -7533,7 +7482,15 @@ select_best_audio(){
   # Handle user override with validation
   if [[ -n "${AUDIO_TRACK_OVERRIDE:-}" ]]; then
     if [[ "$AUDIO_TRACK_OVERRIDE" =~ ^[0-9]+$ ]] && (( AUDIO_TRACK_OVERRIDE >= 0 && AUDIO_TRACK_OVERRIDE < n )); then
-      echo "$AUDIO_TRACK_OVERRIDE"
+      # Fetch full record for the overridden track so caller can destructure (L2b).
+      local _ov_info _ov_codec _ov_ch _ov_lang _ov_br _ov_title
+      _ov_info="$(_audio_stream_info "$AUDIO_TRACK_OVERRIDE")"
+      IFS=$'\t' read -r _ov_codec _ov_ch _ov_lang _ov_br _ov_title <<< "$_ov_info"
+      _normalize_codec_lang _ov_codec _ov_lang
+      [[ -z "$_ov_ch"  || ! "$_ov_ch"  =~ ^[0-9]+$ ]] && _ov_ch=0
+      [[ -z "$_ov_br"  || ! "$_ov_br"  =~ ^[0-9]+$ ]] && _ov_br=0
+      printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$AUDIO_TRACK_OVERRIDE" "$_ov_codec" "$_ov_ch" "$_ov_lang" "${_ov_title:-}" "$_ov_br"
       return 0
     fi
     warn "Requested --audio-track $AUDIO_TRACK_OVERRIDE is invalid (must be 0-$((n-1))). Using auto-selection."
@@ -7565,7 +7522,8 @@ select_best_audio(){
       local ps_idx
       ps_idx="${ps_best_line#*$'\t'}"; ps_idx="${ps_idx%%$'\t'*}"
       note "[Audio] AUDIO_PREFER_STEREO: native 2ch track found at stream #${ps_idx}. Selecting over scored best."
-      echo "$ps_idx"
+      # Output full record (score prefix stripped): idx\tcodec\tch\tlang\ttitle\traw_br (L2b).
+      printf '%s\n' "${ps_best_line#*$'\t'}"
       return 0
     fi
     note "[Audio] AUDIO_PREFER_STEREO: no qualifying native 2ch track found. Falling through to score-all pass."
@@ -7573,7 +7531,7 @@ select_best_audio(){
 
   # Score all tracks, select best, and collect summary in one pass
   local -a score_lines=()
-  local s_score s_idx s_codec s_ch s_lang s_title
+  local s_score s_idx s_codec s_ch s_lang s_title s_raw_br
   for (( i=0; i<n; i++ )); do
     local line score
     line="$(_score_audio_stream "$i")"
@@ -7591,8 +7549,8 @@ select_best_audio(){
     best_idx="${best_line#*$'\t'}"; best_idx="${best_idx%%$'\t'*}"
     for (( i=0; i<n; i++ )); do
       local marker=""
-      # shellcheck disable=SC2034  # s_title completes the IFS destructure
-      IFS=$'\t' read -r s_score s_idx s_codec s_ch s_lang s_title <<< "${score_lines[$i]}"
+      # shellcheck disable=SC2034  # s_title, s_raw_br complete the IFS destructure
+      IFS=$'\t' read -r s_score s_idx s_codec s_ch s_lang s_title s_raw_br <<< "${score_lines[$i]}"
       [[ "$s_idx" == "$best_idx" ]] && marker=" ★"
       score_summary+="#${s_idx}: ${s_codec} ${s_ch}ch [${s_lang}] = ${s_score}${marker}  "
     done
@@ -7600,10 +7558,20 @@ select_best_audio(){
   fi
 
   # Guard: if scoring produced no winner (all tracks failed), default to track 0 (M5).
-  [[ -n "$best_line" ]] || { warn "Audio scoring failed for all tracks; defaulting to track 0."; echo 0; return 0; }
+  if [[ -z "$best_line" ]]; then
+    warn "Audio scoring failed for all tracks; defaulting to track 0."
+    local _g_info _g_codec _g_ch _g_lang _g_br _g_title
+    _g_info="$(_audio_stream_info "0")"
+    IFS=$'\t' read -r _g_codec _g_ch _g_lang _g_br _g_title <<< "$_g_info"
+    _normalize_codec_lang _g_codec _g_lang
+    [[ -z "$_g_ch" || ! "$_g_ch" =~ ^[0-9]+$ ]] && _g_ch=0
+    [[ -z "$_g_br" || ! "$_g_br" =~ ^[0-9]+$ ]] && _g_br=0
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "0" "$_g_codec" "$_g_ch" "$_g_lang" "${_g_title:-}" "$_g_br"
+    return 0
+  fi
 
-  # Extract index from best_line (format: score\tidx\tcodec\tch\tlang\ttitle)
-  echo "${best_line#*$'\t'}" | cut -d$'\t' -f1
+  # Output full record (score prefix stripped): idx\tcodec\tch\tlang\ttitle\traw_br (L2b).
+  printf '%s\n' "${best_line#*$'\t'}"
 }
 
 # Check if audio codec can be direct-play copied to MP4
@@ -7914,14 +7882,11 @@ run_audio_pipeline(){
   fi
 
   # ---- Single-track mode (score, select, copy/transcode) ----
-  idx="$(select_best_audio)"
-  [[ -n "$idx" ]] || { HAS_AUDIO=0; return 0; }
-
-  codec="$(_audio_codec "$idx")"
-  ch="$(_audio_channels "$idx")"
-  lang="$(_audio_lang "$idx")"
-  br="$(_audio_bitrate "$idx")"
-  title="$(_audio_title "$idx")"
+  # Destructure the full winning record in one shot — avoids 5 extra jq forks (L2b).
+  local _best_record
+  _best_record="$(select_best_audio)"
+  [[ -n "$_best_record" ]] || { HAS_AUDIO=0; return 0; }
+  IFS=$'\t' read -r idx codec ch lang title br <<< "$_best_record"
 
   # SYNC: mirror of display loop in run_audio_pipeline_multi — keep both in sync
   log "• Detected audio streams:"
@@ -8446,7 +8411,7 @@ _prepare_subtitle(){
         if [[ -s "${vob_base}.srt" ]]; then
           mv -f "${vob_base}.srt" "$srt" || true
         fi
-        if [[ -s "$srt" ]]; then
+        if [[ -s "$srt" ]] && grep -q ' --> ' "$srt"; then
           echo "$srt"
           return 0
         fi
@@ -8470,7 +8435,7 @@ _prepare_subtitle(){
         mv -f "${sup}.srt" "$srt" || true
         _ocr_ok=1
       fi
-      if (( _ocr_ok )) && [[ -s "$srt" ]]; then
+      if (( _ocr_ok )) && [[ -s "$srt" ]] && grep -q ' --> ' "$srt"; then
         echo "$srt"
         return 0
       fi
@@ -8573,7 +8538,7 @@ _prepare_ext_subtitle(){
         mv -f "$sup_srt" "$srt_out" || true
       fi
 
-      if [[ -s "$srt_out" ]]; then
+      if [[ -s "$srt_out" ]] && grep -q ' --> ' "$srt_out"; then
         echo "$srt_out"
         return 0
       fi
@@ -8612,7 +8577,7 @@ _prepare_ext_subtitle(){
       spinner "$ocr_pid" "OCR external VobSub: $basename_label"
       wait "$ocr_pid" 2>/dev/null || true
 
-      if [[ -s "$srt_out" ]]; then
+      if [[ -s "$srt_out" ]] && grep -q ' --> ' "$srt_out"; then
         echo "$srt_out"
         return 0
       fi
@@ -8823,7 +8788,7 @@ discover_external_subtitles(){
   local ext fpath fname parsed lang stype codec
 
   for ext in "${sub_exts[@]}"; do
-    while IFS= read -r fpath; do
+    while IFS= read -r -d '' fpath; do
       [[ -z "$fpath" || ! -f "$fpath" ]] && continue
 
       # .idx requires a partner .sub file to form a valid VobSub pair
@@ -8844,7 +8809,7 @@ discover_external_subtitles(){
       note "[Subs] External subtitle found: $fname [$lang] ($stype)"
     done < <(find "$search_dir" -maxdepth 1 \
       \( -name "${src_stem}.${ext}" -o -name "${src_stem}.*.${ext}" \) \
-      -print 2>/dev/null | sort)
+      -print0 2>/dev/null | LC_ALL=C sort -z)
   done
 
   local n="${#EXT_SUB_PATHS[@]}"
@@ -10098,38 +10063,33 @@ main() {
       say "  Video : ${v_codec:-?} ${v_res:-?} @ ${v_fps:-?} fps"
 
       # Audio: rich per-track metadata (codec, channels, language, bitrate, title)
-      # Single jq call extracts all fields per track as tab-delimited lines.
-      local a_track_count
-      a_track_count="$(printf '%s\n' "$verify_json" | jq '[.streams[] | select(.codec_type=="audio")] | length' 2>/dev/null)"
-      if [[ "${a_track_count:-0}" != "0" ]]; then
-        local a_idx=0
-        while (( a_idx < a_track_count )); do
-          local a_codec a_ch a_lang a_br a_title a_layout a_line a_ch_label _vinfo
-          # Batch: fetch all audio fields in one jq call per track
-          _vinfo="$(printf '%s\n' "$verify_json" | jq -r "
-            [.streams[] | select(.codec_type==\"audio\")][$a_idx] |
-            \"\(.codec_name // \"?\")\t\(.channels // 0)\t\(.tags.language // \"und\")\t\(.bit_rate // \"\")\t\(.tags.title // \"\")\t\(.channel_layout // \"\")\"" 2>/dev/null)"
-          IFS=$'\t' read -r a_codec a_ch a_lang a_br a_title a_layout <<< "$_vinfo"
+      # Single jq call over all audio streams; iterate the newline-delimited output (L2c).
+      local a_raw_all a_idx=0 a_had_audio=0
+      a_raw_all="$(printf '%s\n' "$verify_json" | jq -r '
+        [.streams[] | select(.codec_type=="audio")] |
+        .[] |
+        "\(.codec_name // "?")\t\(.channels // 0)\t\(.tags.language // "und")\t\(.bit_rate // "")\t\(.tags.title // "")\t\(.channel_layout // "")"
+      ' 2>/dev/null)"
+      while IFS=$'\t' read -r a_codec a_ch a_lang a_br a_title a_layout; do
+        a_had_audio=1
+        local a_line a_ch_label
+        # Descriptive channel label
+        a_ch_label="$(_channel_label "${a_ch:-0}")"
+        # Prefer channel_layout if available and more descriptive
+        [[ -n "$a_layout" && "$a_layout" != "unknown" ]] && a_ch_label="$a_layout"
 
-          # Descriptive channel label
-          a_ch_label="$(_channel_label "${a_ch:-0}")"
-          # Prefer channel_layout if available and more descriptive
-          [[ -n "$a_layout" && "$a_layout" != "unknown" ]] && a_ch_label="$a_layout"
+        a_line="${a_codec} ${a_ch_label} [${a_lang}]"
+        [[ -n "$a_br" && "$a_br" =~ ^[0-9]+$ ]] && (( a_br > 0 )) && a_line+=" $(( a_br / 1000 ))kbps"
+        [[ -n "$a_title" ]] && a_line+=" — $a_title"
 
-          a_line="${a_codec} ${a_ch_label} [${a_lang}]"
-          [[ -n "$a_br" && "$a_br" =~ ^[0-9]+$ ]] && (( a_br > 0 )) && a_line+=" $(( a_br / 1000 ))kbps"
-          [[ -n "$a_title" ]] && a_line+=" — $a_title"
-
-          if (( a_idx == 0 )); then
-            say "  Audio : $a_line"
-          else
-            say "          $a_line"
-          fi
-          a_idx=$(( a_idx + 1 ))
-        done
-      else
-        say "  Audio : none"
-      fi
+        if (( a_idx == 0 )); then
+          say "  Audio : $a_line"
+        else
+          say "          $a_line"
+        fi
+        a_idx=$(( a_idx + 1 ))
+      done <<< "$a_raw_all"
+      (( a_had_audio )) || say "  Audio : none"
 
       [[ "${s_count:-0}" != "0" ]] && say "  Subs  : ${s_count} track(s)"
       (( OUTPUT_HAS_DV )) && say "  DV    : present"
