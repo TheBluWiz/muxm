@@ -106,6 +106,7 @@ declare -a COMPLETED_STEPS=()
 declare -a MUXM_CONFIG_LOADED=()
 WORKDIR=""
 LOGFILE=""
+TEE_PID=""            # PID of the tee logger process (Section 17); waited on in on_exit
 _BURN_SRT_FILTER=""   # temp file for subtitle burn-in (inside WORKDIR; cleaned in on_exit)
 FAILED=0
 FAIL_MSG=""
@@ -795,7 +796,13 @@ write_checksum(){
   "${cmd[@]}" "$file_path" > "${file_path}.${ext}" &
   local _cksum_pid=$!
   spinner "$_cksum_pid" "$spinner_msg"
-  wait "$_cksum_pid" 2>/dev/null
+  local _cksum_rc=0
+  wait "$_cksum_pid" 2>/dev/null || _cksum_rc=$?
+  if (( _cksum_rc != 0 )); then
+    warn "Checksum computation failed (exit ${_cksum_rc}); removing partial file."
+    rm -f "${file_path}.${ext}"
+    return 1
+  fi
 }
 
 # Validate that a media file exists, is non-empty, and is parseable by ffprobe.
@@ -1040,6 +1047,8 @@ for _pcd_v in \
   SUB_LANG_PREF SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_MAX_TRACKS \
   SUB_BURN_FORCED SUB_EXPORT_EXTERNAL SUB_PRESERVE_TEXT_FORMAT \
   SUB_MULTI_TRACK \
+  SUB_PRESERVE_BITMAP SUB_OCR_LANG EXT_SUB_ENABLED DISK_CHECK FFPROBE_LOGLEVEL \
+  SUB_ENABLE_OCR SUB_OCR_TOOL \
   OUTPUT_EXT KEEP_CHAPTERS STRIP_METADATA PROFILE_COMMENT INCLUDE_AUDIO_TITLES \
   CHECKSUM CHECKSUM_ALGO SKIP_IF_IDEAL REPORT_JSON \
   FFMPEG_LOGLEVEL; do
@@ -2904,6 +2913,8 @@ _create_config_emit() {
     SUB_LANG_PREF SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_MAX_TRACKS
     SUB_BURN_FORCED SUB_EXPORT_EXTERNAL SUB_PRESERVE_TEXT_FORMAT
     SUB_MULTI_TRACK
+    SUB_PRESERVE_BITMAP SUB_OCR_LANG EXT_SUB_ENABLED DISK_CHECK FFPROBE_LOGLEVEL
+    SUB_ENABLE_OCR SUB_OCR_TOOL
     OUTPUT_EXT KEEP_CHAPTERS STRIP_METADATA PROFILE_COMMENT INCLUDE_AUDIO_TITLES
     CHECKSUM CHECKSUM_ALGO SKIP_IF_IDEAL REPORT_JSON
     FFMPEG_LOGLEVEL
@@ -3231,7 +3242,9 @@ HEADER
   echo "# Enable OCR for bitmap subtitles (PGS/VobSub → SRT)"
   echo "# MP4 cannot carry PGS bitmaps; OCR converts them to text-based SRT."
   echo "#   1 = attempt OCR  |  0 = drop bitmap subtitles that can't be embedded"
-  if [[ -n "$_detected_ocr_tool" ]]; then
+  if [[ "$_active" == *" SUB_ENABLE_OCR "* ]]; then
+    _V SUB_ENABLE_OCR
+  elif [[ -n "$_detected_ocr_tool" ]]; then
     printf 'SUB_ENABLE_OCR=1\n'
   else
     printf '#SUB_ENABLE_OCR=1\n'
@@ -3240,7 +3253,9 @@ HEADER
   echo "# OCR tool for bitmap → text subtitle conversion"
   echo "# Supported: \"pgsrip\", \"sub2srt\""
   echo "# pgsrip requires: pgsrip (pipx) + tesseract. Install via --install-dependencies."
-  if [[ -n "$_detected_ocr_tool" ]]; then
+  if [[ "$_active" == *" SUB_OCR_TOOL "* ]]; then
+    _V SUB_OCR_TOOL quoted
+  elif [[ -n "$_detected_ocr_tool" ]]; then
     printf '# Auto-detected: %s found on this machine at config-generation time.\n' "$_detected_ocr_tool"
     printf 'SUB_OCR_TOOL=%s\n' "$_detected_ocr_tool"
   else
@@ -3249,7 +3264,7 @@ HEADER
   fi
   printf '\n'
   echo "# OCR language for Tesseract (ISO 639-3, e.g., eng, fra, deu)"
-  printf '#SUB_OCR_LANG=eng\n'
+  _V SUB_OCR_LANG quoted
   printf '\n'
   echo "# Preserve native text subtitle formats (ASS/SSA) instead of converting to SRT"
   echo "#   1 = keep ASS/SSA styling (positioning, fonts, typesetting)  |  0 = convert to SRT"
@@ -3285,7 +3300,7 @@ HEADER
   echo "# (e.g. Movie.en.srt, Movie.en.forced.srt next to Movie.mkv)."
   echo "# Matched files are muxed in as additional subtitle tracks."
   echo "#   1 = enabled (default)  |  0 = disable discovery entirely (--no-ext-subs)"
-  printf '#EXT_SUB_ENABLED=1\n'
+  _V EXT_SUB_ENABLED
   printf '\n'
   echo "# Override the directory searched for external subtitles"
   echo "# (default: same directory as the source file)"
@@ -3340,7 +3355,7 @@ HEADER
   printf '#DISK_FREE_WARN_GB=5\n'
   printf '\n'
   echo "# Enable smart disk space preflight estimation (1 = enabled, 0 = disable with --no-disk-check)"
-  printf '#DISK_CHECK=1\n'
+  _V DISK_CHECK
   printf '\n'
   echo "# Keep temporary workdir on failure (for debugging)"
   printf '#KEEP_TEMP=0\n'
@@ -3370,7 +3385,7 @@ HEADER
   printf '#FFMPEG_OVERWRITE=1\n'
   printf '\n'
   echo "# ffprobe log level"
-  printf '#FFPROBE_LOGLEVEL=error\n'
+  _V FFPROBE_LOGLEVEL quoted
 
   unset -f _V
 }
@@ -5218,6 +5233,7 @@ if [[ "${DEBUG:-0}" != "1" ]]; then
   exec 3>&2
   TERM_FD=3
   exec > >(tee -a "$LOGFILE") 2>&1
+  TEE_PID=$!
   note "Logging to $(realpath_fallback "$LOGFILE")"
 fi
 
@@ -5284,8 +5300,8 @@ on_exit() {
     have_result=1
   fi
 
-  # Close the raw-terminal FD now that spinner output is complete (Section 17)
-  [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
+  # Note: fd 3 (TERM_FD) is intentionally kept open here so the drain can restore
+  # stdout/stderr to it before waiting on the tee process (H6).
 
   if (( FAILED == 0 && have_result == 1 )); then
     if (( DRY_RUN )); then
@@ -5306,6 +5322,10 @@ on_exit() {
 
     _print_completed_steps
     _cleanup_workdir 0
+    # Drain the tee logger: restore stdout/stderr to terminal, wait for tee to flush (H6).
+    exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" 2>/dev/null || true
+    [[ -n "${TEE_PID:-}" ]] && wait "$TEE_PID" 2>/dev/null || true
+    [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
     exit 0
   else
     [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely earlier parse/runtime error)."
@@ -5318,6 +5338,10 @@ on_exit() {
     [[ -f "$TMP_OUT" ]] && rm -f "$TMP_OUT"
 
     _cleanup_workdir 1
+    # Drain the tee logger: restore stdout/stderr to terminal, wait for tee to flush (H6).
+    exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" 2>/dev/null || true
+    [[ -n "${TEE_PID:-}" ]] && wait "$TEE_PID" 2>/dev/null || true
+    [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
     exit "${EXIT_CODE:-1}"
   fi
 }
@@ -5816,10 +5840,14 @@ decide_color_and_pixfmt() {
     profile="HLG"
     tgt_pix="$HDR_TARGET_PIXFMT"
     COLOR_ARGS=(-color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc)
+    (( ! FORCE_CHROMA_420 )) && [[ "$chroma" != "420" ]] && \
+      note "FORCE_CHROMA_420=0 has no effect on HLG — 4:2:0 is enforced for Direct Play compatibility."
   elif [[ "$prim" == "bt2020" || "$cspace" == "bt2020nc" || "$trc" == "smpte2084" ]]; then
     profile="HDR10"
     tgt_pix="$HDR_TARGET_PIXFMT"
     COLOR_ARGS=(-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc)
+    (( ! FORCE_CHROMA_420 )) && [[ "$chroma" != "420" ]] && \
+      note "FORCE_CHROMA_420=0 has no effect on HDR — 4:2:0 is enforced for Direct Play compatibility."
   else
     profile="SDR"
     if (( SDR_FORCE_10BIT )); then
@@ -5828,6 +5856,16 @@ decide_color_and_pixfmt() {
       tgt_pix="yuv420p10le"
     else
       tgt_pix="yuv420p"
+    fi
+    # Honor FORCE_CHROMA_420=0 by preserving source chroma on the SDR path (H8).
+    if (( ! FORCE_CHROMA_420 )) && [[ "$chroma" != "420" ]]; then
+      local _cbit="p"
+      (( is_10bit )) && _cbit="p10le"
+      case "$chroma" in
+        444) tgt_pix="yuv444${_cbit}" ;;
+        422) tgt_pix="yuv422${_cbit}" ;;
+      esac
+      note "FORCE_CHROMA_420=0: preserving source 4:${chroma} chroma."
     fi
     [[ -z "$prim" ]] && prim="bt709"
     [[ -z "$trc" ]] && trc="bt709"
@@ -5850,18 +5888,29 @@ decide_color_and_pixfmt() {
 build_x265_params() {
   X265_PARAMS="$X265_PARAMS_BASE"
 
-  # Remove hdr-opt if not HDR10
   if [[ "$PROFILE_DESC" != "HDR10" ]]; then
-    X265_PARAMS="${X265_PARAMS/:hdr-opt=1/}"
-  fi
-
-  # Add HDR10-specific params if HDR10
-  if [[ "$PROFILE_DESC" == "HDR10" ]]; then
-    # Strip any instances already present in X265_PARAMS_BASE (some profiles
-    # bake these in) to avoid duplicate keys that confuse x265.
+    # Strip all baked HDR10/PQ keys from X265_PARAMS_BASE for non-HDR10 sources (H9).
+    # Some profiles bake hdr10=1, transfer=smpte2084, etc. into X265_PARAMS_BASE;
+    # these must be removed when the source is HLG or SDR to avoid signaling PQ
+    # metadata on non-PQ content.
     X265_PARAMS="$(printf '%s' "$X265_PARAMS" | sed \
       's/:hdr10=[^:]*//g; s/^hdr10=[^:]*://
        s/:hdr10-opt=[^:]*//g; s/^hdr10-opt=[^:]*://
+       s/:hdr-opt=[^:]*//g; s/^hdr-opt=[^:]*://
+       s/:colorprim=[^:]*//g; s/^colorprim=[^:]*://
+       s/:transfer=[^:]*//g; s/^transfer=[^:]*://
+       s/:colormatrix=[^:]*//g; s/^colormatrix=[^:]*://
+       s/:range=[^:]*//g; s/^range=[^:]*://')"
+    # For HLG sources, inject the correct HLG color signaling (H9).
+    if [[ "$PROFILE_DESC" == "HLG" ]]; then
+      X265_PARAMS="${X265_PARAMS}:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc"
+    fi
+  else
+    # HDR10: strip any baked-in instances first (avoid duplicates), then append.
+    X265_PARAMS="$(printf '%s' "$X265_PARAMS" | sed \
+      's/:hdr10=[^:]*//g; s/^hdr10=[^:]*://
+       s/:hdr10-opt=[^:]*//g; s/^hdr10-opt=[^:]*://
+       s/:hdr-opt=[^:]*//g; s/^hdr-opt=[^:]*://
        s/:colorprim=[^:]*//g; s/^colorprim=[^:]*://
        s/:transfer=[^:]*//g; s/^transfer=[^:]*://
        s/:colormatrix=[^:]*//g; s/^colormatrix=[^:]*://
@@ -6650,6 +6699,7 @@ run_video_pipeline() {
       ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy -bsf:v hevc_mp4toannexb -f hevc "$V_SRC_ES" 2>"$WORKDIR/demux.err" &
       local demux_pid=$!
       spinner "$demux_pid" "Demuxing video elementary stream"
+      local v_es_demux_failed=0
       if ! wait "$demux_pid" 2>/dev/null; then
         local codec
         codec="$(_probe_field codec_name)"
@@ -6657,8 +6707,9 @@ run_video_pipeline() {
         warn "  DV RPU extraction requires an HEVC source stream. Use --no-dv to skip DV processing."
         warn "  See: $WORKDIR/demux.err for details."
         : > "$V_SRC_ES" 2>/dev/null || true
+        v_es_demux_failed=1
       fi
-      mark_done "Demux raw ES → video_src.es"
+      (( v_es_demux_failed )) || mark_done "Demux raw ES → video_src.es"
     fi
   else
     note "Skipping ES demux (DV injection not applicable for this encode)."
@@ -7045,13 +7096,15 @@ run_video_pipeline() {
       report_add "dv_rpu_action" "converted P${DV_SRC_PROFILE} → P8.1"
     else
       warn "dovi_tool convert failed (P${DV_SRC_PROFILE} → P8.1). See: $WORKDIR/rpu_convert.log"
-      warn "  Using unconverted P${DV_SRC_PROFILE} HEVC — this is technically invalid for"
-      warn "  single-layer output. DV playback may be unpredictable or fail."
-      warn "  Reason: Profile ${DV_SRC_PROFILE} RPU references a dual-layer structure that"
-      warn "  doesn't exist in the re-encoded single-layer output."
-      report_add "dv_rpu_action" "convert failed — using raw P${DV_SRC_PROFILE} RPU (may be invalid)"
-      # Fall back to the unconverted injected file
-      V_MIXED="$V_INJECTED"
+      report_add "dv_rpu_action" "convert failed — P${DV_SRC_PROFILE} RPU cannot be used for single-layer output"
+      if (( ALLOW_DV_FALLBACK )); then
+        warn "  Falling back to base video without DV (ALLOW_DV_FALLBACK=1)."
+        V_MIXED="$V_BASE"
+        OUTPUT_HAS_DV=0
+        mark_done "Use base video (DV convert failed)"
+        return 0
+      fi
+      die 44 "dovi_tool convert failed (P${DV_SRC_PROFILE} → P8.1) and ALLOW_DV_FALLBACK=0 — refusing to ship invalid Dolby Vision"
     fi
   fi
 
@@ -7080,6 +7133,13 @@ run_video_pipeline() {
         warn "  Difference: ${frame_diff} frames. DV may flicker or desync on mismatched frames."
         warn "  This can occur when the re-encode changes frame count (e.g., framerate conversion)."
         report_add "dv_frame_count_match" "MISMATCH (video=$v_frames, rpu=$rpu_frames, diff=$frame_diff)"
+        if (( ! ALLOW_DV_FALLBACK )); then
+          die 44 "DV RPU/frame mismatch — refusing to ship desynced Dolby Vision (ALLOW_DV_FALLBACK=0)"
+        fi
+        warn "  Falling back to base video without DV (ALLOW_DV_FALLBACK=1)."
+        V_MIXED="$V_BASE"
+        OUTPUT_HAS_DV=0
+        mark_done "Use base video (DV frame mismatch)"
       else
         note "RPU frame count verified: video=$v_frames, rpu=$rpu_frames (within tolerance)."
         report_add "dv_frame_count_match" "ok (video=$v_frames, rpu=$rpu_frames)"
@@ -7521,6 +7581,9 @@ select_best_audio(){
     done
     log "• Score: ${score_summary% }"
   fi
+
+  # Guard: if scoring produced no winner (all tracks failed), default to track 0 (M5).
+  [[ -n "$best_line" ]] || { warn "Audio scoring failed for all tracks; defaulting to track 0."; echo 0; return 0; }
 
   # Extract index from best_line (format: score\tidx\tcodec\tch\tlang\ttitle)
   echo "${best_line#*$'\t'}" | cut -d$'\t' -f1
@@ -8601,7 +8664,10 @@ _export_or_embed_sub(){
   if (( SUB_EXPORT_EXTERNAL )); then
     local ext_sub="${OUT%."${OUTPUT_EXT}"}.${label}.${sub_ext}"
     if (( ! DRY_RUN )); then
-      cp -f "$sub_path" "$ext_sub" 2>/dev/null || true
+      if ! cp -f "$sub_path" "$ext_sub" 2>/dev/null; then
+        warn "[Subs] Failed to export $label subtitle to $ext_sub — skipping."
+        return 0
+      fi
     fi
     EXTERNAL_SRT_PATHS+=("$ext_sub")
     note "[Subs] Exported $label → external $ext_sub"
