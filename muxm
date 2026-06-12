@@ -580,7 +580,7 @@ _get_source_duration_secs() {
     '[.streams[] | select(.codec_type=="video")] | .[0].duration // empty' | head -n1)"
   if [[ "$dur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     log "Duration source: stream duration = ${dur}s"
-    result="$(printf '%.0f' "$dur")"
+    result="$(LC_NUMERIC=C printf '%.0f' "$dur")"
   fi
 
   # Tier 2: container/format-level duration (most containers)
@@ -589,7 +589,7 @@ _get_source_duration_secs() {
       '.format.duration // empty' | head -n1)"
     if [[ "$dur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
       log "Duration source: format duration = ${dur}s"
-      result="$(printf '%.0f' "$dur")"
+      result="$(LC_NUMERIC=C printf '%.0f' "$dur")"
     fi
   fi
 
@@ -2322,6 +2322,14 @@ Major variable groups:
 .BR SDR_USE_10BIT_IF_SRC_10BIT ", " SDR_FORCE_10BIT ", "
 .BR HDR_TARGET_PIXFMT ", " MAX_COPY_BITRATE ", "
 .BR TONEMAP_HDR_TO_SDR ", " TONEMAP_FILTER .
+.TP
+.B Hardware acceleration (macOS VideoToolbox only)
+.BR HW_ACCEL " (none | auto | videotoolbox | nvenc; default: none),"
+.BR HW_ACCEL_QUALITY " (0\(en100; quality knob for VT/NVENC),"
+.BR HW_ACCEL_ALLOW_SW " (1 = allow software fallback; 0 = hard\-fail)."
+.br
+Hardware acceleration is supported on \fBmacOS\fR (Apple VideoToolbox) only.
+On Linux, \fB\-\-hw\-accel\fR is accepted but encoding always runs in software.
 .TP
 .B Dolby Vision
 .BR DISABLE_DV ", " ALLOW_DV_FALLBACK ", " DV_CONVERT_TO_P81_IF_FAIL .

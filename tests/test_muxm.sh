@@ -79,6 +79,7 @@ show_help() {
       containers   MP4, MKV, MOV container handling
       metadata     Metadata stripping and preservation
       e2e          Full profile end-to-end encodes
+      regression_p5 Phase 5 regression tests (C1, M3, H9, H8, H10, H1, H11)
 
     all            Run every suite above (default when --suite given)
 
@@ -806,6 +807,41 @@ SRT
     -metadata:s:a:0 language=eng
   cp "$TESTDIR/_ext_srt.srt" "$TESTDIR/ext_only_source.en.srt"
   pass "ext_only_source.mkv + sidecar created"
+
+  # 10) HLG-tagged HEVC fixture for H9 regression test (P5.3)
+  log "Creating hevc_hlg_tagged.mkv (HEVC 10-bit with HLG color tags)"
+  gen_media "$TESTDIR/hevc_hlg_tagged.mkv" cyan 880 \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -x265-params "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc" \
+    -c:a aac -b:a 128k -ac 2 \
+    -metadata:s:a:0 language=eng
+  pass "hevc_hlg_tagged.mkv created"
+
+  # 11) 4:2:2 SDR fixture for H8 regression test (P5.3)
+  log "Creating h264_422p_sdr.mkv (H.264 4:2:2 SDR for FORCE_CHROMA_420 test)"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=orange:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv422p \
+    -c:a aac -b:a 128k -ac 2 \
+    -metadata:s:a:0 language=eng \
+    "$TESTDIR/h264_422p_sdr.mkv"
+  pass "h264_422p_sdr.mkv created"
+
+  # 12) DV-tagged fixture for H10 regression test (P5.3)
+  # Uses dvh1 codec tag so detect_dv() matches via ffprobe codec_tag_string.
+  # A mock ffprobe injects DV profile text for detect_dv_info(); a mock dovi_tool
+  # drives the DV pipeline to the convert-failure path.
+  log "Creating hevc_dv_p5_tagged.mp4 (HEVC with dvh1 tag for H10 DV mock test)"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=blue:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -tag:v dvh1 \
+    -c:a aac -b:a 128k -ac 2 \
+    -metadata:s:a:0 language=eng \
+    "$TESTDIR/hevc_dv_p5_tagged.mp4"
+  pass "hevc_dv_p5_tagged.mp4 created"
 
   log "All extended test media ready in $TESTDIR"
 }
@@ -6001,6 +6037,256 @@ test_multi_profile() {
     "multi-profile passthrough + user .mp4 hint: archive output path uses .mp4 (not .mkv)" "$out"
 }
 
+# === Suite: Phase 5 Regression Tests (P5.3) ===
+# Encodes the bugs fixed in the remediation plan so they can never silently regress.
+# C1: shell injection guard in --crf
+# M3: comma-decimal locale produces no printf warnings
+# H9: HLG source under HDR profile → no hdr10=1/smpte2084 in output
+# H8: 4:2:2 SDR + FORCE_CHROMA_420=0 → 4:2:2 target; FORCE_CHROMA_420=1 → 4:2:0 + warn
+# H10: DV convert failure + ALLOW_DV_FALLBACK=0 → die 44 (mock ffprobe + dovi_tool)
+# H1: config round-trip — HW_ACCEL change appears uncommented in created config
+# H11: non-Darwin OS with hw-accel → Linux fallback warning, software encoding
+test_regression_p5() {
+  section "Phase 5 Regression Tests (P5.3)"
+
+  local out
+
+  # ---- C1: shell injection in --crf ----
+  local canary="$TESTDIR/shell_injection_canary.txt"
+  rm -f "$canary"
+  assert_exit $EXIT_VALIDATION "C1: --crf with shell metacharacters rejected" \
+    --crf "x[\$(touch $canary)]" "$TESTDIR/basic_sdr_subs.mkv"
+  assert_no_file "$canary" "C1: shell injection in --crf does not create canary file"
+
+  # ---- M3: comma-decimal locale ----
+  # Collect locale list into a variable first (avoids grep -q SIGPIPE under set -o pipefail).
+  local _available_locales
+  _available_locales="$(locale -a 2>/dev/null || true)"
+  if [[ "$_available_locales" == *"de_DE.UTF-8"* ]] || [[ "$_available_locales" == *"de_DE.utf8"* ]]; then
+    out="$(LC_ALL="" LC_NUMERIC=de_DE.UTF-8 run_muxm --dry-run "$TESTDIR/basic_sdr_subs.mkv")"
+    assert_contains "DRY-RUN complete" "M3: comma-decimal locale: dry-run completes cleanly" "$out"
+    if echo "$out" | LC_ALL=C grep -qiE "printf.*invalid|invalid.*printf|cannot convert|bad number"; then
+      fail "M3: comma-decimal locale: printf format errors detected"
+    else
+      pass "M3: comma-decimal locale: no printf format errors"
+    fi
+  else
+    skip "M3: de_DE.UTF-8 locale not available on this host"
+  fi
+
+  # ---- H9: HLG source + HDR profile → arib-std-b67 output (not smpte2084) ----
+  if [[ -f "$TESTDIR/hevc_hlg_tagged.mkv" ]]; then
+    out="$(run_muxm --profile hdr10-hq --dry-run "$TESTDIR/hevc_hlg_tagged.mkv")"
+    assert_contains "Color profile: HLG" "H9: HLG source under hdr10-hq detected as HLG (not HDR10)" "$out"
+    local h9_out="$TESTDIR/h9_hlg_roundtrip.mkv"
+    local h9_encode_out
+    h9_encode_out="$(run_muxm --profile hdr10-hq --preset ultrafast --crf 28 \
+      "$TESTDIR/hevc_hlg_tagged.mkv" "$h9_out")"
+    if [[ -f "$h9_out" ]]; then
+      local h9_trc
+      h9_trc="$(probe_video "$h9_out" "color_transfer")"
+      if [[ "$h9_trc" == "arib-std-b67" ]]; then
+        pass "H9: HLG + hdr10-hq → color_transfer=arib-std-b67 (not smpte2084)"
+      else
+        fail "H9: HLG + hdr10-hq: expected arib-std-b67, got '$h9_trc'"
+      fi
+      # Verify build_x265_params strips hdr10=1/smpte2084 from x265 params for HLG (H9 fix).
+      # color_transfer in the container is set by COLOR_ARGS (not x265 params) so the
+      # container check above passes even if the strip regressed. The log check is the
+      # discriminating test for the build_x265_params fix.
+      local h9_workdir
+      h9_workdir="$(printf '%s\n' "$h9_encode_out" | grep 'Keeping workdir:' | awk '{print $NF}')"
+      if [[ -n "$h9_workdir" && -d "$h9_workdir" ]]; then
+        local h9_log
+        h9_log="$(ls "$h9_workdir"/muxm.*.log 2>/dev/null | head -1)"
+        if [[ -n "$h9_log" ]]; then
+          local h9_enc_cmd
+          h9_enc_cmd="$(grep 'ffmpeg encode command' "$h9_log" | head -1)"
+          if printf '%s\n' "$h9_enc_cmd" | grep -qE '(^|[^a-z])hdr10=1|transfer=smpte2084'; then
+            fail "H9: x265 params contain hdr10=1/smpte2084 for HLG source (build_x265_params strip regressed)"
+          else
+            pass "H9: x265 params: no hdr10=1/smpte2084 for HLG source (build_x265_params strip confirmed)"
+          fi
+        else
+          skip "H9: x265 params check skipped — log not found in $h9_workdir"
+        fi
+      else
+        skip "H9: x265 params check skipped — WORKDIR not found in encode output"
+      fi
+    else
+      fail "H9: HLG + hdr10-hq encode produced no output"
+    fi
+  else
+    skip "H9: hevc_hlg_tagged.mkv fixture not found"
+  fi
+
+  # ---- H8: 4:2:2 SDR — FORCE_CHROMA_420 controls chroma preservation ----
+  if [[ -f "$TESTDIR/h264_422p_sdr.mkv" ]]; then
+    # Default (FORCE_CHROMA_420=1): downsamples 4:2:2 → 4:2:0
+    out="$(run_muxm --dry-run "$TESTDIR/h264_422p_sdr.mkv")"
+    assert_contains "downsampling to 4:2:0" \
+      "H8: default FORCE_CHROMA_420=1 downsamples 4:2:2 source to 4:2:0" "$out"
+    assert_contains "Target pixel format: yuv420p" \
+      "H8: default FORCE_CHROMA_420=1 target pixel format is yuv420p" "$out"
+    # FORCE_CHROMA_420=0 via .muxmrc: preserves 4:2:2
+    local h8_home="$TESTDIR/h8_rc_home"
+    mkdir -p "$h8_home"
+    printf 'FORCE_CHROMA_420=0\n' > "$h8_home/.muxmrc"
+    out="$(MUXM_HOME="$h8_home" run_muxm_in "$TESTDIR" --dry-run "h264_422p_sdr.mkv")"
+    assert_contains "preserving source 4:422 chroma" \
+      "H8: FORCE_CHROMA_420=0 preserves 4:2:2 chroma" "$out"
+    assert_contains "Target pixel format: yuv422p" \
+      "H8: FORCE_CHROMA_420=0 target pixel format is yuv422p" "$out"
+  else
+    skip "H8: h264_422p_sdr.mkv fixture not found"
+  fi
+
+  # ---- H10: DV P5→P8 convert failure + ALLOW_DV_FALLBACK=0 → die 44 ----
+  # DV detection uses ffprobe codec_tag_string=dvh1 (from hevc_dv_p5_tagged.mp4).
+  # A mock ffprobe intercepts non-JSON calls for the fixture and appends DV profile
+  # text so detect_dv_info() text fallback sets DV_SRC_PROFILE=5 (triggers convert path).
+  # A mock dovi_tool succeeds for info/extract-rpu/inject-rpu and fails for convert.
+  # With --dv-convert-p81 and --no-allow-dv-fallback, muxm must exit 44.
+  if [[ -f "$TESTDIR/hevc_dv_p5_tagged.mp4" ]]; then
+    local h10_mock_bin="$TESTDIR/h10_mock_bin"
+    local h10_home="$TESTDIR/h10_rc_home"
+    mkdir -p "$h10_mock_bin" "$h10_home"
+    printf 'ALLOW_DV_FALLBACK=0\n' > "$h10_home/.muxmrc"
+
+    local real_ffprobe
+    real_ffprobe="$(type -P ffprobe)"
+    # Mock ffprobe: for the DV fixture, run real ffprobe and append DV profile
+    # text lines so detect_dv_info() text fallback parses DV_SRC_PROFILE=5.
+    # JSON calls (-of json) pass through unchanged to avoid corrupting METADATA_CACHE.
+    cat > "$h10_mock_bin/ffprobe" << FFPROBESCRIPT
+#!/bin/bash
+input_file=""
+for arg in "\$@"; do
+  [[ -f "\$arg" ]] && input_file="\$arg"
+done
+if [[ "\$(basename "\${input_file:-}")" != "hevc_dv_p5_tagged.mp4" ]]; then
+  exec "$real_ffprobe" "\$@"
+fi
+is_json=0; prev=""
+for arg in "\$@"; do
+  [[ "\$prev" == "-of" || "\$prev" == "-print_format" ]] && [[ "\$arg" == "json" ]] && { is_json=1; break; }
+  prev="\$arg"
+done
+(( is_json )) && exec "$real_ffprobe" "\$@"
+"$real_ffprobe" "\$@" 2>&1
+printf 'profile: 5\ncompatibility id: 1\nbl.flag: 1\nel.flag: 0\n'
+FFPROBESCRIPT
+    chmod +x "$h10_mock_bin/ffprobe"
+
+    # Mock dovi_tool: extract-rpu/inject-rpu succeed; convert intentionally fails
+    # to trigger die 44 when ALLOW_DV_FALLBACK=0.
+    cat > "$h10_mock_bin/dovi_tool" << 'DOVISCRIPT'
+#!/bin/bash
+cmd="${1:-}"
+shift
+case "$cmd" in
+  info)
+    printf 'Profile: 5\nCompatibility ID: 1\nBL flag: 1\nEL flag: 0\n1 RPU\n'
+    exit 0
+    ;;
+  extract-rpu)
+    out_path=""
+    args=("$@")
+    for (( i=0; i<${#args[@]}; i++ )); do
+      [[ "${args[$i]}" == "-o" ]] && out_path="${args[$((i+1))]}" && break
+    done
+    cat > /dev/null
+    [[ -n "$out_path" ]] && printf '\x00\x01\x02\x03\n' > "$out_path"
+    exit 0
+    ;;
+  inject-rpu)
+    in_path="" out_path=""
+    args=("$@")
+    for (( i=0; i<${#args[@]}; i++ )); do
+      [[ "${args[$i]}" == "-i" ]] && in_path="${args[$((i+1))]}"
+      [[ "${args[$i]}" == "-o" ]] && out_path="${args[$((i+1))]}"
+    done
+    [[ -n "$in_path" && -n "$out_path" && -s "$in_path" ]] && cp "$in_path" "$out_path"
+    exit 0
+    ;;
+  convert)
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+DOVISCRIPT
+    chmod +x "$h10_mock_bin/dovi_tool"
+
+    local h10_code=0
+    (cd "$TESTDIR" && HOME="$h10_home" PATH="$h10_mock_bin:$PATH" \
+      "$MUXM" -K --dv-convert-p81 --no-allow-dv-fallback \
+      --preset ultrafast --crf 28 "hevc_dv_p5_tagged.mp4" 2>&1) || h10_code=$?
+    if [[ "$h10_code" -eq 44 ]]; then
+      pass "H10: DV P5 convert failure + ALLOW_DV_FALLBACK=0 → exit 44"
+    else
+      fail "H10: expected exit 44 (DV convert failure), got $h10_code"
+    fi
+  else
+    skip "H10: hevc_dv_p5_tagged.mp4 fixture not found"
+  fi
+
+  # ---- H1: config round-trip — HW_ACCEL change appears uncommented ----
+  # If the user's .muxmrc sets HW_ACCEL, --create-config must emit it uncommented.
+  # Bug: HW_ACCEL was missing from _snap_vars so it always appeared commented-out.
+  local h1_dir="$TESTDIR/h1_config_roundtrip"
+  local h1_home="$TESTDIR/h1_config_home"
+  mkdir -p "$h1_dir" "$h1_home"
+  printf 'HW_ACCEL="videotoolbox"\n' > "$h1_home/.muxmrc"
+  MUXM_HOME="$h1_home" run_muxm_in "$h1_dir" --create-config project >/dev/null 2>&1
+  if [[ -f "$h1_dir/.muxmrc" ]]; then
+    local h1_content
+    h1_content="$(cat "$h1_dir/.muxmrc")"
+    if echo "$h1_content" | grep -qE '^HW_ACCEL="videotoolbox"'; then
+      pass "H1: config round-trip — HW_ACCEL uncommented in created .muxmrc"
+    else
+      fail "H1: config round-trip — HW_ACCEL not found uncommented (got: $(echo "$h1_content" | grep "HW_ACCEL" | head -3 || echo '<not present>'))"
+    fi
+  else
+    fail "H1: config round-trip — no .muxmrc created"
+  fi
+
+  # ---- H11: non-Darwin OS + --hw-accel → Linux fallback warning, software encoding ----
+  # Strategy: stateful uname mock returns Darwin/arm64 for detect_hw_accel (so
+  # videotoolbox is added to HW_ACCEL_AVAILABLE), then Linux for resolve_video_encoder
+  # (triggering the OS guard at Section 22). Requires hevc_videotoolbox in this ffmpeg.
+  if [[ "$(uname -s)" == "Darwin" ]] \
+      && ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}' | grep -qx hevc_videotoolbox; then
+    local h11_mock="$TESTDIR/mock_uname_linux"
+    local h11_count="$TESTDIR/uname_call_count.txt"
+    mkdir -p "$h11_mock"
+    printf '0\n' > "$h11_count"
+    cat > "$h11_mock/uname" << UNAMESCRIPT
+#!/bin/bash
+cnt=\$(cat "$h11_count" 2>/dev/null || echo 0)
+cnt=\$((cnt + 1))
+printf '%s\n' "\$cnt" > "$h11_count"
+if (( cnt == 1 )); then
+  printf 'Darwin\n'   # is_apple_silicon call 1: uname -s
+elif (( cnt == 2 )); then
+  printf 'arm64\n'    # is_apple_silicon call 2: uname -m
+else
+  printf 'Linux\n'    # resolve_video_encoder OS guard
+fi
+UNAMESCRIPT
+    chmod +x "$h11_mock/uname"
+    out="$(PATH="$h11_mock:$PATH" run_muxm --hw-accel videotoolbox --no-skip-if-ideal \
+      --dry-run "$TESTDIR/basic_sdr_subs.mkv")"
+    assert_contains "macOS (VideoToolbox) only" \
+      "H11: non-Darwin OS + --hw-accel videotoolbox: Linux fallback warning emitted" "$out"
+    assert_contains "DRY-RUN complete" \
+      "H11: non-Darwin OS + --hw-accel: encode completes (software fallback)" "$out"
+  else
+    skip "H11: Linux hw-accel guard test requires Darwin + hevc_videotoolbox (not met on this host)"
+  fi
+}
+
 # ---- Run Suites ----
 # NOTE: Suite names are listed in three places that must stay in sync:
 #   1. File header comment (top of file)
@@ -6031,6 +6317,7 @@ run_suites() {
       test_edge
       test_profile_e2e
       test_multi_profile
+      test_regression_p5
       ;;
     cli)           test_cli ;;
     toggles)       test_toggles ;;
@@ -6053,7 +6340,8 @@ run_suites() {
     metadata)      test_metadata ;;
     edge)          test_edge ;;
     e2e)           test_profile_e2e ;;
-    multi_profile) test_multi_profile ;;
+    multi_profile)   test_multi_profile ;;
+    regression_p5)   test_regression_p5 ;;
     *)
       echo "Unknown suite: $SUITE (run with --help to see available suites)"
       exit 1
@@ -6119,7 +6407,7 @@ summary() {
 # Core media: basic_sdr_subs.mkv only — needed by cli, dryrun, edge, etc. (~3s to generate).
 # EXTENDED_SUITES: Full fixture set (multi-track, HDR, chapters, metadata) (~15s to generate).
 readonly MEDIA_FREE_SUITES="^(toggles|completions|setup|config|profiles|conflicts|hw_accel|unit)$"
-readonly EXTENDED_SUITES="^(collision|dryrun|video|hdr|audio|subs|ext_subs|output|containers|metadata|edge|e2e|multi_profile|all)$"
+readonly EXTENDED_SUITES="^(collision|dryrun|video|hdr|audio|subs|ext_subs|output|containers|metadata|edge|e2e|multi_profile|regression_p5|all)$"
 
 auto_cleanup_test_dirs
 preflight
