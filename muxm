@@ -59,7 +59,7 @@
 
 # ===== Section 1: Strict mode & bash version guard =============================================
 set -eEuo pipefail
-if shopt -q inherit_errexit 2>/dev/null; then shopt -s inherit_errexit; fi
+shopt -s inherit_errexit 2>/dev/null || true
 [[ "${DEBUG:-0}" == "1" ]] && set -x
 # Note: noclobber is deliberately omitted. The script intentionally overwrites
 # intermediate temp files using > redirection throughout the pipeline stages.
@@ -645,7 +645,7 @@ die()  {
 on_error(){
   local lineno="$1" cmd="$2" status="$3"
   FAILED=1
-  EXIT_CODE="${EXIT_CODE:-$status}"
+  EXIT_CODE="$status"
   FAIL_MSG="Command failed at line $lineno: $cmd (exit $status)"
   printf "❌ ERROR: %s\n" "$FAIL_MSG" >&2
   # Note: This trap does not call exit directly. Under set -e, the shell
@@ -4157,7 +4157,7 @@ apply_profile
 # Runs in an isolated local scope so the caller's OUTPUT_EXT is never mutated.
 _probe_profile_ext() {
   local OUTPUT_EXT="mp4"
-  "apply_profile_${1//-/_}" 2>/dev/null
+  "apply_profile_${1//-/_}" 2>/dev/null || true
   echo "${OUTPUT_EXT}"
 }
 
@@ -4364,7 +4364,11 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     --threads) THREADS="${2:-}"; shift 2 ;;
 
-    --crf) CRF_VALUE="${2:-}"; _CLI_CRF_EXPLICIT=1; shift 2 ;;
+    --crf)
+      _crf_in="${2:-}"
+      [[ "$_crf_in" =~ ^[0-9]+$ ]] && (( 10#$_crf_in <= 51 )) \
+        || die 11 "Invalid --crf: integer 0–51 expected (got: ${_crf_in})"
+      CRF_VALUE="$_crf_in"; _CLI_CRF_EXPLICIT=1; shift 2 ;;
     -p|--preset)
       PRESET_VALUE="${2:-}"; _CLI_PRESET_EXPLICIT=1
       is_valid_preset "$PRESET_VALUE" || die 11 "Invalid preset: $PRESET_VALUE"
@@ -5012,6 +5016,11 @@ case "$OUTPUT_EXT" in
   *) die 11 "Invalid OUTPUT_EXT: must be mp4, m4v, mov, or mkv (got: $OUTPUT_EXT)" ;;
 esac
 
+# Re-validate CRF_VALUE after config load: a sourced config can assign directly to the
+# declare -i variable, bypassing the CLI parser guard (C1).
+[[ "$CRF_VALUE" =~ ^[0-9]+$ ]] && (( CRF_VALUE <= 51 )) \
+  || die 11 "Invalid CRF_VALUE from config: integer 0–51 expected (got: ${CRF_VALUE})"
+
 # Resolve and validate source file
 SRC_ABS="$(realpath_fallback "$SRC")"
 [[ -f "$SRC_ABS" ]] || die 11 "Source file not found: $SRC_ABS"
@@ -5423,8 +5432,8 @@ disk_free_warn() {
         libsvt-av1|libaom-av1) preset_mult="$(_av1_preset_multiplier "$PRESET_VALUE")" ;;
         *)                     preset_mult="$(_preset_multiplier "$PRESET_VALUE")" ;;
       esac
-      # All multiplications before any division to avoid integer truncation (SC2017); safe for practical bitrates
-      est_video_bytes=$(( vbr * dur * ratio * preset_mult / 8000000 ))
+      # Rescale to avoid signed-64-bit overflow on long 4K sources (H5).
+      est_video_bytes=$(( vbr / 8 * dur / 1000 * ratio / 1000 * preset_mult ))
     fi
   fi
 
