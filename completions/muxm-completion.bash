@@ -15,6 +15,9 @@ _muxm_completions() {
         --video-codec)
             COMPREPLY=( $(compgen -W "libx265 libx264 libsvt-av1 libaom-av1" -- "$cur") )
             return ;;
+        --hw-accel)
+            COMPREPLY=( $(compgen -W "none auto videotoolbox nvenc" -- "$cur") )
+            return ;;
         --output-ext)
             COMPREPLY=( $(compgen -W "mp4 mkv m4v mov" -- "$cur") )
             return ;;
@@ -36,7 +39,7 @@ _muxm_completions() {
 
         # Flags that take a free-form value — offer no completion, fall through to files
         --crf|--stereo-bitrate|--threads|-l|--level|--x265-params|--x264-params|\
-        --av1-params|--av1-maxrate|--av1-bufsize|\
+        --av1-params|--av1-maxrate|--av1-bufsize|--hw-accel-quality|\
         --audio-track|--audio-lang-pref|--audio-force-codec|--audio-force-bitrate|\
         --max-copy-bitrate|--sub-lang-pref|--ocr-lang|--ext-subs-dir)
             COMPREPLY=()
@@ -64,6 +67,7 @@ _muxm_completions() {
 
             --crf -p --preset --x265-params --x264-params -l --level
             --av1-params --av1-maxrate --av1-bufsize
+            --hw-accel --hw-accel-quality --hw-accel-allow-sw --no-hw-accel-allow-sw
             --video-codec --tonemap --no-tonemap
             --sdr-force-10bit --no-sdr-force-10bit
             --conservative-vbv --no-conservative-vbv
@@ -73,7 +77,7 @@ _muxm_completions() {
             --max-copy-bitrate
 
             --audio-track --audio-lang-pref
-            --stereo-fallback --no-stereo-fallback --stereo-bitrate
+            --prefer-stereo --no-prefer-stereo --stereo-fallback --no-stereo-fallback --stereo-bitrate
             --audio-force-codec --audio-force-bitrate
             --audio-lossless-passthrough --no-audio-lossless-passthrough
             --audio-titles --no-audio-titles
