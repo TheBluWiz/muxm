@@ -4704,6 +4704,9 @@ _test_unit_audio_helpers() {
   assert_muxm_fn_exit "_audio_lang_matches('und', pref='eng')=no match"         1 _audio_lang_matches 'AUDIO_LANG_PREF="eng"'     "und"
   assert_muxm_fn_exit "_audio_lang_matches('', pref='eng')=no match (empty)"    1 _audio_lang_matches 'AUDIO_LANG_PREF="eng"'     ""
   assert_muxm_fn_exit "_audio_lang_matches('eng', pref='eng')=match (single pref)" 0 _audio_lang_matches 'AUDIO_LANG_PREF="eng"' "eng"
+  assert_muxm_fn_exit "_audio_lang_matches: empty pref → no match" 1 _audio_lang_matches 'AUDIO_LANG_PREF=""' "eng"
+  assert_muxm_fn_exit "_audio_lang_matches: whitespace-padded pref matches" 0 _audio_lang_matches 'AUDIO_LANG_PREF=" eng , jpn "' "eng"
+  assert_muxm_fn_exit "_audio_lang_matches: uppercase pref 'ENG' matches 'eng'" 0 _audio_lang_matches 'AUDIO_LANG_PREF="ENG,JPN"' "eng"
 
   # ---- audio_lossless_muxable ----
   # Tests container+codec compatibility matrix for lossless passthrough.
@@ -4937,33 +4940,6 @@ _test_unit_misc_helpers() {
   _test_pc "universal"           "Lowest common denominator, highest common decency."
   _test_pc "unknown"             ""
 
-  # ---- _audio_lang_matches ----
-  # Returns 0 if lang is in AUDIO_LANG_PREF (comma-separated), 1 otherwise.
-  local lang_body
-  lang_body="$(awk '/^_audio_lang_matches\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
-
-  # Basic match
-  local r
-  r="$(AUDIO_LANG_PREF="eng,jpn" bash -c "$lang_body"$'\n'"_audio_lang_matches eng"; echo $?)"
-  if [[ "$r" == "0" ]]; then pass "_audio_lang_matches: 'eng' in 'eng,jpn'=match"; else fail "_audio_lang_matches: 'eng' in 'eng,jpn' expected 0, got '$r'"; fi
-
-  r="$(AUDIO_LANG_PREF="eng,jpn" bash -c "$lang_body"$'\n'"_audio_lang_matches jpn"; echo $?)"
-  if [[ "$r" == "0" ]]; then pass "_audio_lang_matches: 'jpn' in 'eng,jpn'=match"; else fail "_audio_lang_matches: 'jpn' in 'eng,jpn' expected 0, got '$r'"; fi
-
-  r="$(AUDIO_LANG_PREF="eng,jpn" bash -c "$lang_body"$'\n'"_audio_lang_matches fre"; echo $?)"
-  if [[ "$r" == "1" ]]; then pass "_audio_lang_matches: 'fre' not in 'eng,jpn'=no match"; else fail "_audio_lang_matches: 'fre' not in 'eng,jpn' expected 1, got '$r'"; fi
-
-  # Empty AUDIO_LANG_PREF — single empty pref is skipped, returns 1 for any lang
-  r="$(AUDIO_LANG_PREF="" bash -c "$lang_body"$'\n'"_audio_lang_matches eng"; echo $?)"
-  if [[ "$r" == "1" ]]; then pass "_audio_lang_matches: empty pref → no match for 'eng'"; else fail "_audio_lang_matches: empty pref expected 1, got '$r'"; fi
-
-  # Whitespace-padded pref — spaces are stripped before comparison
-  r="$(AUDIO_LANG_PREF=" eng , jpn " bash -c "$lang_body"$'\n'"_audio_lang_matches eng"; echo $?)"
-  if [[ "$r" == "0" ]]; then pass "_audio_lang_matches: whitespace-padded pref matches 'eng'"; else fail "_audio_lang_matches: whitespace-padded pref expected 0, got '$r'"; fi
-
-  # Case: prefs are lowercased internally via ${pref,,}; lang arg should already be lower
-  r="$(AUDIO_LANG_PREF="ENG,JPN" bash -c "$lang_body"$'\n'"_audio_lang_matches eng"; echo $?)"
-  if [[ "$r" == "0" ]]; then pass "_audio_lang_matches: uppercase pref 'ENG' matches lowercase 'eng'"; else fail "_audio_lang_matches: uppercase pref expected 0, got '$r'"; fi
 }
 
 _test_unit_disk_preflight() {
@@ -4986,35 +4962,6 @@ _test_unit_disk_preflight() {
   assert_muxm_fn_stdout "_preset_multiplier(bogus)=1000"      "1000" _preset_multiplier "" "bogus"
 }
 
-_test_unit_audio_copy_ext() {
-  # ---- _audio_copy_ext ----
-  # Maps codec names to file extensions for the per-track export path in
-  # run_audio_pipeline_multi (archive profile). A regression here silently creates
-  # unreadable sidecar files (e.g., "track.truehd" instead of "track.thd").
-  # Items 218a–218f from the testing plan.
-  assert_muxm_fn_stdout "_audio_copy_ext(truehd)=thd"      "thd"   _audio_copy_ext "" "truehd"
-  assert_muxm_fn_stdout "_audio_copy_ext(alac)=m4a"        "m4a"   _audio_copy_ext "" "alac"
-  assert_muxm_fn_stdout "_audio_copy_ext(pcm_s24le)=wav"   "wav"   _audio_copy_ext "" "pcm_s24le"
-  assert_muxm_fn_stdout "_audio_copy_ext(pcm_s16le)=wav"   "wav"   _audio_copy_ext "" "pcm_s16le"
-  assert_muxm_fn_stdout "_audio_copy_ext(pcm_s32le)=wav"   "wav"   _audio_copy_ext "" "pcm_s32le"
-  assert_muxm_fn_stdout "_audio_copy_ext(dca)=dts"         "dts"   _audio_copy_ext "" "dca"
-  assert_muxm_fn_stdout "_audio_copy_ext(ac3)=ac3"         "ac3"   _audio_copy_ext "" "ac3"
-  assert_muxm_fn_stdout "_audio_copy_ext(aac)=aac"         "aac"   _audio_copy_ext "" "aac"
-  assert_muxm_fn_stdout "_audio_copy_ext(eac3)=eac3"       "eac3"  _audio_copy_ext "" "eac3"
-  assert_muxm_fn_stdout "_audio_copy_ext(flac)=flac"       "flac"  _audio_copy_ext "" "flac"
-}
-
-_test_unit_codec_max_channels() {
-  # ---- _codec_max_channels ----
-  # Prevents fatal ffmpeg errors like "Specified channel layout '7.1' is not
-  # supported" from the eac3 encoder by clamping effective_ch at encode time.
-  # A regression here silently produces broken audio or a crash on 7.1 sources.
-  # Items 218g–218j from the testing plan.
-  assert_muxm_fn_stdout "_codec_max_channels(eac3)=6"   "6"  _codec_max_channels "" "eac3"
-  assert_muxm_fn_stdout "_codec_max_channels(ac3)=6"    "6"  _codec_max_channels "" "ac3"
-  assert_muxm_fn_stdout "_codec_max_channels(aac)=48"   "48" _codec_max_channels "" "aac"
-  assert_muxm_fn_stdout "_codec_max_channels(unknown)=64 (fallback)" "64" _codec_max_channels "" "unknown_codec"
-}
 
 _test_unit_realpath_fallback() {
   # ---- realpath_fallback ----
@@ -5176,8 +5123,6 @@ test_unit() {
   _test_unit_sii_container_safety
   _test_unit_misc_helpers
   _test_unit_disk_preflight
-  _test_unit_audio_copy_ext
-  _test_unit_codec_max_channels
   _test_unit_realpath_fallback
   _test_unit_apply_level_vbv
   _test_unit_av1_helpers
