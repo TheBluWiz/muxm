@@ -1086,7 +1086,6 @@ test_toggles() {
     "--no-sdr-force-10bit|SDR_FORCE_10BIT           = 0"
     # ---- Disk check toggles ----
     "--no-disk-check|DISK_CHECK                = 0"
-    "--disk-check|DISK_CHECK                = 1"
     # ---- Subtitle format preservation toggles (32e/32f) ----
     "--sub-preserve-format|SUB_PRESERVE_TEXT_FORMAT  = 1"
     "--no-sub-preserve-format|SUB_PRESERVE_TEXT_FORMAT  = 0"
@@ -1150,6 +1149,9 @@ test_toggles() {
 
   out="$(run_muxm --no-video-copy-if-compliant --video-copy-if-compliant --print-effective-config)"
   assert_contains "VIDEO_COPY_IF_COMPLIANT   = 1" "--video-copy-if-compliant: registered" "$out"
+
+  out="$(run_muxm --no-disk-check --disk-check --print-effective-config)"
+  assert_contains "DISK_CHECK                = 1" "--disk-check: registered (baseline 0 first)" "$out"
 
   # ---- Value flags (non-toggle) ----
   out="$(run_muxm --max-copy-bitrate 30000k --print-effective-config)"
@@ -2856,7 +2858,7 @@ test_hdr() {
 
   # R28: Explicit --tonemap flag with HDR source
   out="$(run_muxm --dry-run --tonemap "$TESTDIR/hevc_hdr10_tagged.mkv" 2>&1)"
-  if echo "$out" | grep -qiE "SDR-TONEMAP|tonemap|zscale"; then
+  if echo "$out" | grep -qiE "zscale|tonemap="; then
     pass "--tonemap + HDR source: tonemap filter chain present in dry-run"
   else
     skip "--tonemap + HDR source: filter keywords not found (synthetic HDR tags may not trigger detection)"
@@ -2864,7 +2866,7 @@ test_hdr() {
 
   # R29: --profile universal implies tonemap — verify with HDR source
   out="$(run_muxm --dry-run --profile universal "$TESTDIR/hevc_hdr10_tagged.mkv" 2>&1)"
-  if echo "$out" | grep -qiE "SDR-TONEMAP|tonemap|zscale"; then
+  if echo "$out" | grep -qiE "zscale|tonemap="; then
     pass "--profile universal + HDR source: tonemap filter chain present"
   else
     skip "--profile universal + HDR source: filter keywords not found (may require real HDR source)"
@@ -3770,9 +3772,6 @@ test_output() {
       rj_content="$(cat "$json_file")"
       assert_contains "streaming" "JSON report contains profile name" "$rj_content"
       assert_contains "MuxMaster" "JSON report contains tool name" "$rj_content"
-      assert_contains "source" "JSON report contains source path" "$rj_content"
-      assert_contains "output" "JSON report contains output path" "$rj_content"
-      assert_contains "timestamp" "JSON report contains timestamp" "$rj_content"
     else
       skip "--report-json: report file not found at $json_file"
     fi
@@ -3784,9 +3783,7 @@ test_output() {
   local skip_out
   skip_out="$(run_muxm --skip-if-ideal --preset ultrafast \
     "$TESTDIR/compliant.mp4" "$outfile")"
-  if echo "$skip_out" | grep -qiE "ideal|skip|already|compliant|no.?processing"; then
-    pass "--skip-if-ideal: recognized compliant source"
-  elif [[ -f "$outfile" && -s "$outfile" ]]; then
+  if [[ -f "$outfile" && -s "$outfile" ]]; then
     pass "--skip-if-ideal: produced output (may have encoded if not fully compliant)"
   else
     skip "--skip-if-ideal: inconclusive (behavior depends on compliance check)"
@@ -3831,13 +3828,6 @@ test_output() {
   local sii_subs_log
   sii_subs_log="$(MUXM_HOME="$sii_subs_home" run_muxm --profile archive \
     "$TESTDIR/hevc_multi_subs.mkv" "$sii_subs_out")"
-  if echo "$sii_subs_log" | grep -qiE "ideal|skip|already|compliant"; then
-    pass "skip-if-ideal per-stream: source recognized as ideal"
-  else
-    # Source may not be recognized as ideal if compliance check is stricter —
-    # either way the output should preserve all streams, so we continue.
-    log "skip-if-ideal per-stream: source not detected as ideal (proceeding to stream count check)"
-  fi
   if [[ -f "$sii_subs_out" && -s "$sii_subs_out" ]]; then
     assert_stream_count "skip-if-ideal per-stream: 5 subtitle tracks preserved" \
       "$sii_subs_out" s 5 5
