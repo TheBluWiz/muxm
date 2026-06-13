@@ -1069,7 +1069,9 @@ _test_cli_robustness() {
   local old_bash="" cand vmaj vmin
   for cand in /bin/bash /usr/bin/bash /usr/local/bin/bash; do
     [[ -x "$cand" ]] || continue
+    # shellcheck disable=SC2016  # must expand in the candidate bash ($cand), not here
     vmaj="$("$cand" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" || continue
+    # shellcheck disable=SC2016  # must expand in the candidate bash ($cand), not here
     vmin="$("$cand" -c 'echo "${BASH_VERSINFO[1]}"' 2>/dev/null)" || continue
     [[ "$vmaj" =~ ^[0-9]+$ && "$vmin" =~ ^[0-9]+$ ]] || continue
     if (( vmaj < 4 || (vmaj == 4 && vmin < 3) )); then old_bash="$cand"; break; fi
@@ -4357,6 +4359,7 @@ test_edge() {
   # unambiguous. Complements the empty-file (exit) and non-readable cases.
   local vmf_body vmf_stubs vonly aonly vmf_rc
   vmf_body="$(awk '/^_validate_media_file\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  # shellcheck disable=SC2016  # stub bodies; $1/$2 must expand in the child bash -c, not here
   vmf_stubs='die(){ printf "DIE %s: %s\n" "$1" "$2" >&2; exit "$1"; }; log(){ :; }; filesize_pretty(){ echo "1 KB"; }; _check_disk_full(){ :; }'
   vonly="$TESTDIR/vmf_video_only.mkv"; aonly="$TESTDIR/vmf_audio_only.m4a"
   ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=red:s=160x120:r=24:d=1" \
