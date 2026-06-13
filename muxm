@@ -7145,7 +7145,23 @@ run_video_pipeline() {
   # mp4box natively parses RPU NAL units and writes the correct dvcC/dvvC box.
   # The dvp= hint tells mp4box the exact DV profile and cross-compatibility ID.
   # ffmpeg-based approaches are kept as fallbacks for environments without mp4box.
+  #
+  # The pre-wrap is required for TWO distinct reasons:
+  #   (a) MP4/MOV output needs the dvcC/dvvC box (ffmpeg cannot synthesise it
+  #       from a raw HEVC ES), and
+  #   (b) MKV output fed a raw HEVC Annex B ES needs PACKET TIMESTAMPS — a raw ES
+  #       has none, and the Matroska final muxer rejects timestamp-less packets
+  #       with "Can't write packet with unknown timestamp", aborting the whole
+  #       encode (this is why DV+MKV runs failed before this guard existed).
+  # The DV RPU NALs live in-band in the HEVC bitstream, so wrapping into any
+  # timestamped container preserves DV regardless of the container's own DV box.
+  local _need_prewrap=0
   if [[ "$MUX_FORMAT" != "matroska" ]]; then
+    _need_prewrap=1                       # (a) MP4/MOV: dvcC box required
+  elif [[ "$V_MIXED" == *.hevc ]]; then
+    _need_prewrap=1                       # (b) MKV + raw ES: timestamps required
+  fi
+  if (( _need_prewrap )); then
     local dv_prewrap="$WORKDIR/video_dv_prewrap.mp4"
     note "→ Pre-wrapping DV video into MP4 with dvcC signaling…"
 
@@ -7213,11 +7229,38 @@ run_video_pipeline() {
     fi
 
     if (( ! prewrap_ok )); then
-      warn "DV pre-wrap could not produce dvcC box."
-      [[ -n "${MP4BOX_CMD:-}" ]] || warn "  mp4box (GPAC) is not installed — this is the recommended tool for DV container signaling."
-      warn "  Final mux will use raw HEVC ES — dvcC box may be missing in output."
-      warn "  Impact: Players may not activate DV rendering and fall back to HDR10/HLG."
-      report_add "dv_prewrap" "failed"
+      if [[ "$MUX_FORMAT" != "matroska" ]]; then
+        warn "DV pre-wrap could not produce dvcC box."
+        [[ -n "${MP4BOX_CMD:-}" ]] || warn "  mp4box (GPAC) is not installed — this is the recommended tool for DV container signaling."
+        warn "  Final mux will use raw HEVC ES — dvcC box may be missing in output."
+        warn "  Impact: Players may not activate DV rendering and fall back to HDR10/HLG."
+        report_add "dv_prewrap" "failed"
+      else
+        # MKV output does not need the dvcC box (DV is signalled natively in
+        # Matroska and the RPU is in-band), but the final mux DOES need packet
+        # timestamps that the raw HEVC ES lacks. Wrap the ES into a timestamped
+        # MP4 and accept it regardless of dvcC detection — without this the
+        # Matroska mux fails with "Can't write packet with unknown timestamp".
+        warn "DV pre-wrap did not yield a dvcC box; wrapping raw ES into a timestamped MP4 for the MKV mux."
+        rm -f "$dv_prewrap" 2>/dev/null || true
+        ffmpeg "${FFMPEG_FLAGS[@]}" \
+             -i "$V_MIXED" \
+             -c:v copy \
+             -strict unofficial \
+             -tag:v dvh1 \
+             -movflags +faststart \
+             -f mp4 "$dv_prewrap" >"$WORKDIR/dv_prewrap.log" 2>&1 &
+        local pw_ts_pid=$!
+        spinner "$pw_ts_pid" "Wrapping DV video for MKV mux (timestamps)"
+        if wait "$pw_ts_pid" 2>/dev/null && [[ -s "$dv_prewrap" ]]; then
+          V_DV_MP4="$dv_prewrap"
+          note "✅ DV video wrapped into timestamped MP4 for MKV mux (RPU preserved in-band)."
+          report_add "dv_prewrap" "timestamped wrap (mkv)"
+        else
+          warn "Could not wrap DV video into a timestamped container — the MKV final mux may fail."
+          report_add "dv_prewrap" "failed (mkv timestamp wrap)"
+        fi
+      fi
     fi
   fi
 
@@ -9731,6 +9774,21 @@ mux_final() {
     ff_codec+=( -strict unofficial -tag:v dvh1 )
     note "Adding DV container signalling: -strict unofficial -tag:v dvh1"
     report_add "dv_mux_flags" "strict unofficial + dvh1 tag"
+  elif (( OUTPUT_HAS_DV )) && [[ "$MUX_FORMAT" == "matroska" ]] && [[ -n "${V_DV_MP4:-}" ]]; then
+    # The DV video is sourced from a pre-wrapped MP4 (needed to give the raw HEVC
+    # ES the packet timestamps the Matroska muxer requires). That MP4 carries an
+    # 'dvh1'/'dvhe' fourcc tag which the Matroska muxer rejects outright:
+    #   "Tag dvh1 incompatible with output codec id".
+    # Override with 'hvc1' so the mux succeeds. DV fidelity then depends on how the
+    # pre-wrap was produced: the DV RPU is ALWAYS preserved in-band (carried in the
+    # HEVC bitstream by -c copy); container-level DV signalling (dvcC → Matroska
+    # BlockAdditionMapping) is additionally carried only when the pre-wrap wrote a
+    # dvcC box — i.e. via mp4box (Method 1). The ffmpeg-only fallback yields
+    # in-band RPU without the dvcC box. -strict unofficial allows ffmpeg to emit
+    # the DV side data when present.
+    ff_codec+=( -strict unofficial -tag:v hvc1 )
+    note "Matroska DV mux: overriding video tag → hvc1 (dvh1 is MP4-only and rejected by MKV)."
+    report_add "dv_mux_flags" "matroska: strict unofficial + hvc1 tag"
   fi
 
   # Chapter handling

@@ -83,7 +83,7 @@ show_help() {
       containers   MP4, MKV, MOV container handling
       metadata     Metadata stripping and preservation
       e2e          Full profile end-to-end encodes
-      regression_p5 Phase 5 regression tests (C1, M3, H9, H8, H10, H1, H11)
+      regression_p5 Phase 5 regression tests (C1, M3, H9, H8, H10, DVMKV, H1, H11)
 
     all            Run every suite above (default when --suite given)
 
@@ -1068,6 +1068,7 @@ _test_cli_flag_drift() {
       | grep -oE '^[[:space:]]+--?[a-zA-Z][a-zA-Z0-9-]*(\|--?[a-zA-Z][a-zA-Z0-9-]*)*\)'
   } | sed -E 's/^[[:space:]]+//; s/\)$//' | tr '|' '\n' > "$wd/raw.txt"
   # (c) [[ "$_arg" == "--flag" ]] if-style dispatch (install-dependencies, setup)
+  # shellcheck disable=SC2016  # intentional: grep matches the literal text "$_arg" in $src, no expansion wanted
   grep -oE '"\$_arg" == "--[a-z][a-z-]*"' "$src" | grep -oE '\-\-[a-z-]+' >> "$wd/raw.txt"
   grep -vxE '\-\-|\-\*|\*' "$wd/raw.txt" | sort -u > "$parser"
 
@@ -1082,7 +1083,7 @@ _test_cli_flag_drift() {
     return
   fi
   awk '/[[:space:]]flags="/{f=1;next} f&&/"/{exit} f' "$comp_file" \
-    | tr ' \t' '\n\n' | grep -E '^-{1,2}[a-zA-Z]' | sort -u > "$comp"
+    | tr ' \t' '\n' | grep -E '^-{1,2}[a-zA-Z]' | sort -u > "$comp"
 
   # ---- Assertion A: parser <-> completion, both directions ----
   local missing_in_comp missing_in_parser
@@ -1091,12 +1092,12 @@ _test_cli_flag_drift() {
   if [[ -z "$missing_in_comp" ]]; then
     pass "Every CLI flag is offered by tab-completion"
   else
-    fail "Flags accepted by parser but missing from completion: $(echo $missing_in_comp)"
+    fail "Flags accepted by parser but missing from completion: ${missing_in_comp//$'\n'/ }"
   fi
   if [[ -z "$missing_in_parser" ]]; then
     pass "Every completion flag is a real CLI flag"
   else
-    fail "Flags offered by completion but not accepted by parser: $(echo $missing_in_parser)"
+    fail "Flags offered by completion but not accepted by parser: ${missing_in_parser//$'\n'/ }"
   fi
 
   # ---- Assertion B: every --create-config override var is tracked (else silently dropped) ----
@@ -1108,7 +1109,7 @@ _test_cli_flag_drift() {
   if [[ -z "$untracked" ]]; then
     pass "Every --create-config override maps to a CONFIG_TRACKED_VARS entry"
   else
-    fail "--create-config overrides not in CONFIG_TRACKED_VARS (silently dropped): $(echo $untracked)"
+    fail "--create-config overrides not in CONFIG_TRACKED_VARS (silently dropped): ${untracked//$'\n'/ }"
   fi
 }
 
@@ -6508,6 +6509,80 @@ DOVISCRIPT
     fi
   else
     skip "H10: hevc_dv_p5_tagged.mp4 fixture not found"
+  fi
+
+  # ---- DVMKV: DV source → MKV must wrap the raw HEVC ES for the Matroska mux ----
+  # Regression for the DV+MKV final-mux failure. DV sources are forced to a raw
+  # HEVC Annex B elementary stream (dovi_tool needs Annex B), but the pre-wrap that
+  # gives that stream packet timestamps was gated to MP4/MOV output only. For MKV
+  # output the raw ES (no pts/dts) reached the final ffmpeg mux and aborted with
+  #   "Can't write packet with unknown timestamp".
+  # The fix also overrides the pre-wrapped MP4's 'dvh1' fourcc (which Matroska
+  # rejects: "Tag dvh1 incompatible with output codec id") with 'hvc1'.
+  #
+  # detect_dv() fires from the real 'dvh1' codec tag, so ffprobe is NOT mocked —
+  # the pre-wrap's dvcC probe and the output validation must see reality. Only
+  # dovi_tool is mocked, as a cp-passthrough so V_MIXED is a real HEVC ES and the
+  # pipeline reaches the real Matroska mux (the path under test).
+  if [[ -f "$TESTDIR/hevc_dv_p5_tagged.mp4" ]]; then
+    local dvmkv_bin="$TESTDIR/dvmkv_mock_bin"
+    local dvmkv_home="$TESTDIR/dvmkv_home"
+    mkdir -p "$dvmkv_bin" "$dvmkv_home"
+    cat > "$dvmkv_bin/dovi_tool" << 'DVMKVSCRIPT'
+#!/bin/bash
+# cp-passthrough mock: every stage "succeeds" and emits a valid HEVC ES.
+cmd="${1:-}"; shift
+case "$cmd" in
+  info)
+    printf 'Profile: 8\nCompatibility ID: 1\nBL flag: 1\nEL flag: 0\n1 RPU\n'; exit 0 ;;
+  extract-rpu)
+    out_path=""; args=("$@")
+    for (( i=0; i<${#args[@]}; i++ )); do
+      [[ "${args[$i]}" == "-o" ]] && out_path="${args[$((i+1))]}" && break
+    done
+    cat > /dev/null
+    [[ -n "$out_path" ]] && printf '\x00\x01\x02\x03\n' > "$out_path"
+    exit 0 ;;
+  inject-rpu|convert)
+    in_path=""; out_path=""; args=("$@")
+    for (( i=0; i<${#args[@]}; i++ )); do
+      [[ "${args[$i]}" == "-i" ]] && in_path="${args[$((i+1))]}"
+      [[ "${args[$i]}" == "-o" ]] && out_path="${args[$((i+1))]}"
+    done
+    [[ -n "$in_path" && -n "$out_path" && -s "$in_path" ]] && cp "$in_path" "$out_path"
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+DVMKVSCRIPT
+    chmod +x "$dvmkv_bin/dovi_tool"
+
+    local dvmkv_out="$TESTDIR/dv_to_mkv.mkv"
+    rm -f "$dvmkv_out"
+    local dvmkv_log
+    dvmkv_log="$(cd "$TESTDIR" && HOME="$dvmkv_home" PATH="$dvmkv_bin:$PATH" \
+      "$MUXM" -K --preset ultrafast --crf 28 \
+      "hevc_dv_p5_tagged.mp4" "$dvmkv_out" 2>&1)" || true
+
+    if [[ -f "$dvmkv_out" && -s "$dvmkv_out" ]]; then
+      pass "DVMKV: DV source → MKV produced (raw ES wrapped for Matroska mux)"
+      assert_probe        "DVMKV: output video codec is hevc" "$dvmkv_out" codec_name hevc
+      assert_stream_count "DVMKV: one video stream"           "$dvmkv_out" v 1 1
+      assert_stream_count "DVMKV: one audio stream"           "$dvmkv_out" a 1 1
+      local dvmkv_fmt
+      dvmkv_fmt="$(ffprobe -v error -show_entries format=format_name -of default=nw=1:nk=1 "$dvmkv_out" 2>/dev/null || true)"
+      if printf '%s' "$dvmkv_fmt" | grep -q matroska; then
+        pass "DVMKV: container is Matroska"
+      else
+        fail "DVMKV: expected matroska container, got '$dvmkv_fmt'"
+      fi
+    else
+      fail "DVMKV: no output — DV raw-ES Matroska mux failed (regression: 'unknown timestamp')"
+    fi
+    # Env-independent guard: the hvc1 tag override fires whenever a DV MKV mux runs,
+    # regardless of whether mp4box produced a dvcC box (mp4box-dependent, not asserted).
+    assert_contains "overriding video tag" "DVMKV: hvc1 tag override applied for Matroska DV mux" "$dvmkv_log"
+  else
+    skip "DVMKV: hevc_dv_p5_tagged.mp4 fixture not found"
   fi
 
   # ---- H1: config round-trip — HW_ACCEL change appears uncommented ----
