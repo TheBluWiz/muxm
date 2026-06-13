@@ -2899,7 +2899,7 @@ test_audio() {
     assert_stream_count "Multi-audio: audio tracks present" "$outfile" a 1
     # The 5.1 EAC3 should be preferred by the scoring algorithm
     ch="$(probe_audio "$outfile" channels 0)"
-    if [[ "$ch" -ge 6 ]]; then
+    if [[ "$ch" =~ ^[0-9]+$ && "$ch" -ge 6 ]]; then
       pass "Multi-audio: primary track is surround (${ch}ch)"
     else
       skip "Multi-audio: primary track has ${ch}ch (5.1 preference may vary)"
@@ -2914,7 +2914,7 @@ test_audio() {
        "$TESTDIR/multi_audio.mkv"; then
     # Track 0 is stereo AAC, so output should have ≤2ch
     ch="$(probe_audio "$outfile" channels 0)"
-    if [[ "$ch" -le 2 ]]; then
+    if [[ "$ch" =~ ^[0-9]+$ && "$ch" -le 2 ]]; then
       pass "--audio-track 0: stereo track selected (${ch}ch)"
     else
       skip "--audio-track 0: got ${ch}ch (expected stereo from track 0)"
@@ -2959,7 +2959,7 @@ test_audio() {
   if assert_encode "7.1→eac3: encode succeeds (channel cap)" "$outfile" \
        --no-stereo-fallback --crf 28 --preset ultrafast "$TESTDIR/hevc_sdr_71.mkv"; then
     ch="$(probe_audio "$outfile" channels 0)"
-    if [[ "$ch" -le 6 ]]; then
+    if [[ "$ch" =~ ^[0-9]+$ && "$ch" -le 6 ]]; then
       pass "7.1→eac3: output capped to ${ch}ch (encoder limit respected)"
     else
       fail "7.1→eac3: output has ${ch}ch — expected ≤6 (eac3 encoder max)"
@@ -2979,7 +2979,7 @@ test_audio() {
        --audio-force-codec eac3 --no-stereo-fallback --crf 28 --preset ultrafast \
        "$TESTDIR/hevc_sdr_71.mkv"; then
     ch="$(probe_audio "$outfile" channels 0)"
-    if [[ "$ch" -le 6 ]]; then
+    if [[ "$ch" =~ ^[0-9]+$ && "$ch" -le 6 ]]; then
       pass "--audio-force-codec eac3 + 8ch: capped to ${ch}ch"
     else
       fail "--audio-force-codec eac3 + 8ch: output has ${ch}ch — expected ≤6"
@@ -4221,10 +4221,12 @@ test_collision() {
     local new_size
     new_size="$(stat -c%s "$frs_src" 2>/dev/null || stat -f%z "$frs_src" 2>/dev/null || echo 0)"
     # The re-encoded file should exist; size will differ from original
-    if [[ "$new_size" != "$original_size" || "$new_size" -gt 0 ]]; then
-      pass "--force-replace-source: source file was replaced (size changed: $original_size → $new_size)"
+    local frs_codec
+    frs_codec="$(probe_video "$frs_src" codec_name)"
+    if [[ -n "$frs_codec" ]]; then
+      pass "--force-replace-source: source replaced with valid video ($frs_codec, ${original_size} → ${new_size} bytes)"
     else
-      fail "--force-replace-source: source file unchanged (size: $original_size → $new_size)"
+      fail "--force-replace-source: replaced file is not a decodable video (size: $original_size → $new_size)"
     fi
   else
     fail "--force-replace-source: source file missing after encode"
@@ -4459,11 +4461,20 @@ muxm_fn() {
 assert_muxm_fn_exit() {
   local label="$1" expected="$2" fn="$3" env_setup="$4"
   shift 4
-  local body actual
+  local body actual=0
   body="$(awk "/^${fn}\\(\\)[[:space:]]*\\{/,/^\\}/" "$MUXM")"
   if [[ -z "$body" ]]; then skip "Function $fn not found in muxm"; return; fi
-  bash -c "${env_setup}"$'\n'"$body"$'\n'"$fn \"\$@\"" -- "$@" && actual=0 || actual=1
-  if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected $expected, got $actual"; fi
+  # Capture the REAL exit code (|| actual=$? leaves $? intact from the failing cmd).
+  bash -c "${env_setup}"$'\n'"$body"$'\n'"$fn \"\$@\"" -- "$@" || actual=$?
+  # 0 = predicate true; 1–125 = clean predicate false; >=126 = crash/not-found/signal.
+  # A crash must NOT be accepted as a clean "returned nonzero".
+  local ok=0
+  if [[ "$expected" -eq 0 ]]; then
+    [[ "$actual" -eq 0 ]] && ok=1
+  else
+    [[ "$actual" -ge 1 && "$actual" -le 125 ]] && ok=1
+  fi
+  if [[ "$ok" -eq 1 ]]; then pass "$label"; else fail "$label — expected exit-class $expected, got $actual"; fi
 }
 
 # Assert a muxm function's stdout output matches an expected value.
