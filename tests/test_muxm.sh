@@ -3780,9 +3780,8 @@ test_output() {
   # --skip-if-ideal with compliant source (#26, #51)
   outfile="$TESTDIR/out_skip_ideal.mp4"
   log "Testing --skip-if-ideal with compliant.mp4..."
-  local skip_out
-  skip_out="$(run_muxm --skip-if-ideal --preset ultrafast \
-    "$TESTDIR/compliant.mp4" "$outfile")"
+  run_muxm --skip-if-ideal --preset ultrafast \
+    "$TESTDIR/compliant.mp4" "$outfile" >/dev/null
   if [[ -f "$outfile" && -s "$outfile" ]]; then
     pass "--skip-if-ideal: produced output (may have encoded if not fully compliant)"
   else
@@ -3825,9 +3824,8 @@ test_output() {
   mkdir -p "$sii_subs_home"
   local sii_subs_out="$TESTDIR/out_sii_subs.mkv"
   log "Testing skip-if-ideal per-stream gating (multi-sub, all pass)..."
-  local sii_subs_log
-  sii_subs_log="$(MUXM_HOME="$sii_subs_home" run_muxm --profile archive \
-    "$TESTDIR/hevc_multi_subs.mkv" "$sii_subs_out")"
+  MUXM_HOME="$sii_subs_home" run_muxm --profile archive \
+    "$TESTDIR/hevc_multi_subs.mkv" "$sii_subs_out" >/dev/null
   if [[ -f "$sii_subs_out" && -s "$sii_subs_out" ]]; then
     assert_stream_count "skip-if-ideal per-stream: 5 subtitle tracks preserved" \
       "$sii_subs_out" s 5 5
