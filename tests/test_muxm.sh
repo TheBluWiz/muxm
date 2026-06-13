@@ -162,8 +162,8 @@ auto_cleanup_test_dirs() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --muxm)        MUXM="$2"; shift 2 ;;
-    --suite)       SUITE="$2"; shift 2 ;;
+    --muxm)        [[ $# -ge 2 ]] || { echo "Error: --muxm requires a PATH argument (try --help)" >&2; exit 1; }; MUXM="$2"; shift 2 ;;
+    --suite)       [[ $# -ge 2 ]] || { echo "Error: --suite requires a SUITE name (try --help)" >&2; exit 1; }; SUITE="$2"; shift 2 ;;
     --verbose)     VERBOSE=1; shift ;;
     -h|--help)  show_help ;;
     --cleanup)  do_cleanup ;;
@@ -220,6 +220,19 @@ assert_contains() {
     pass "$label"
   else
     fail "$label — output missing: '$needle'"
+    (( VERBOSE )) && echo "    Output: ${haystack:0:300}" || true
+  fi
+}
+
+# Assert output matches an extended regex (for anchored / exact-value checks
+# that fixed-string assert_contains cannot express, e.g. an empty config value).
+# Usage: assert_matches REGEX LABEL HAYSTACK
+assert_matches() {
+  local regex="$1" label="$2" haystack="$3"
+  if printf '%s\n' "$haystack" | grep -qE -- "$regex"; then
+    pass "$label"
+  else
+    fail "$label — output did not match regex: '$regex'"
     (( VERBOSE )) && echo "    Output: ${haystack:0:300}" || true
   fi
 }
@@ -282,6 +295,16 @@ probe_format() {
 count_streams() {
   local file="$1" type="$2"
   ffprobe -v error -select_streams "$type" -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null | wc -l | tr -d ' '
+}
+
+# True if the current ffmpeg build lists ENCODER. Collects the encoder list into
+# a variable first to avoid `grep -q` SIGPIPE-ing the pipeline under set -o pipefail
+# (which can make a capability guard return 141 and silently skip a capable host).
+# The $'\n'…$'\n' wrapping gives an exact whole-token match (like grep -qx).
+ffmpeg_has_encoder() {
+  local enc="$1" list
+  list="$(ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}' || true)"
+  [[ $'\n'"$list"$'\n' == *$'\n'"$enc"$'\n'* ]]
 }
 
 # Run muxm and assert the output file exists and is non-empty.
@@ -1776,7 +1799,7 @@ test_profiles() {
   assert_contains "SKIP_IF_IDEAL             = 1" "archive: skip-if-ideal on" "$out"
   assert_contains "REPORT_JSON               = 1" "archive: JSON report on" "$out"
   assert_contains "AUDIO_LOSSLESS_PASSTHROUGH = 1" "archive: lossless audio on" "$out"
-  assert_contains "OUTPUT_EXT                = " "archive: passthrough container (empty = resolve from source)" "$out"
+  assert_matches '^[[:space:]]*OUTPUT_EXT[[:space:]]+=[[:space:]]*$' "archive: passthrough container (empty = resolve from source)" "$out"
   assert_contains "truehd,dts,flac" "archive: lossless-first codec preference" "$out"
   assert_contains "AUDIO_MULTI_TRACK         = 1" "archive: multi-track audio enabled" "$out"
   assert_contains "AUDIO_KEEP_COMMENTARY     = 0" "archive: commentary excluded by default" "$out"
@@ -1797,7 +1820,7 @@ test_profiles() {
 
   # atv-directplay-hq specifics
   out="$(run_muxm --profile atv-directplay-hq --print-effective-config)"
-  assert_contains "OUTPUT_EXT                = " "atv-directplay: passthrough container (empty = resolve from source)" "$out"
+  assert_matches '^[[:space:]]*OUTPUT_EXT[[:space:]]+=[[:space:]]*$' "atv-directplay: passthrough container (empty = resolve from source)" "$out"
   assert_contains "SUB_BURN_FORCED           = 0" "atv-directplay: soft forced subs (not burned)" "$out"
   assert_contains "SKIP_IF_IDEAL             = 1" "atv-directplay: skip-if-ideal on" "$out"
   assert_contains "MAX_COPY_BITRATE          = 50000k" "atv-directplay: bitrate ceiling" "$out"
@@ -1806,7 +1829,7 @@ test_profiles() {
 
   # atv-directplay-animation specifics
   out="$(run_muxm --profile atv-directplay-animation --print-effective-config)"
-  assert_contains "OUTPUT_EXT                = "    "atv-directplay-animation: passthrough container (empty = resolve from source)" "$out"
+  assert_matches '^[[:space:]]*OUTPUT_EXT[[:space:]]+=[[:space:]]*$' "atv-directplay-animation: passthrough container (empty = resolve from source)" "$out"
   assert_contains "CRF_VALUE                 = 16"  "atv-directplay-animation: CRF 16 (animation quality)" "$out"
   assert_contains "AUDIO_LOSSLESS_PASSTHROUGH = 0"  "atv-directplay-animation: lossless passthrough disabled (EAC3 for ATV)" "$out"
   assert_contains "EAC3_BITRATE_5_1          = 640k" "atv-directplay-animation: EAC3 5.1 bitrate" "$out"
@@ -2066,7 +2089,7 @@ test_conflicts() {
   assert_contains "SUB_EXPORT_EXTERNAL with MKV" "Cross: sub-export + mkv warns (#42)" "$out"
 
   out="$(run_muxm --profile streaming --sub-burn-forced --no-subtitles --print-effective-config 2>&1)" || true
-  assert_contains "SUB_BURN_FORCED" "Cross: burn-forced + no-forced warns (#43)" "$out"
+  assert_contains "no forced subtitles to burn" "Cross: burn-forced + no-forced warns (#43)" "$out"
 
   # --- archive + --crf conflict ---
   # archive is copy-only; specifying --crf from CLI with a value ≠18 triggers a warning
@@ -2077,7 +2100,7 @@ test_conflicts() {
   # --- hdr10-hq + --dv (101f): DV re-enabled on an HDR10 profile ---
   out="$(run_muxm --profile hdr10-hq --dv --print-effective-config)"
   assert_contains "⚠" "hdr10-hq + --dv warns (101f)" "$out"
-  assert_contains "DV" "hdr10-hq + --dv: warning mentions DV" "$out"
+  assert_contains "expects DV to be stripped" "hdr10-hq + --dv: warning explains DV will be stripped" "$out"
 
   # --- atv-directplay-hq + --output-ext mov (101g) ---
   out="$(run_muxm --profile atv-directplay-hq --output-ext mov --print-effective-config)"
@@ -2099,7 +2122,7 @@ test_conflicts() {
   # universal sets DISABLE_DV=1; passing --dv re-enables it and fires the conflict check.
   out="$(run_muxm --profile universal --dv --print-effective-config)"
   assert_contains "⚠" "universal + --dv warns (101m)" "$out"
-  assert_contains "DV" "universal + --dv: warning mentions DV" "$out"
+  assert_contains "DV will be stripped" "universal + --dv: warning says DV will be stripped" "$out"
 
   # --- Cross: --tonemap + --video-codec libx265 (101n): SDR in HEVC is unusual ---
   # Cross-profile checks only run when a profile is active (inside `if [[ -n PROFILE_NAME ]]`).
@@ -2110,8 +2133,8 @@ test_conflicts() {
   # --- Cross: --sub-burn-forced + --no-sub-sdh (101o): SUB_INCLUDE_FORCED=0 with burn ---
   # --no-sub-sdh sets SUB_INCLUDE_SDH=0. To reproduce "no forced subs to burn", pair
   # --sub-burn-forced with --no-subtitles which sets SUB_INCLUDE_FORCED=0.
-  out="$(run_muxm --sub-burn-forced --no-subtitles --print-effective-config 2>&1)" || true
-  assert_contains "SUB_BURN_FORCED" "cross: --sub-burn-forced + --no-subtitles warns (101o)" "$out"
+  out="$(run_muxm --profile streaming --sub-burn-forced --no-subtitles --print-effective-config 2>&1)" || true
+  assert_contains "no forced subtitles to burn" "cross: --sub-burn-forced + --no-subtitles warns (101o)" "$out"
 
   # --- AV1 conflicts ---
 
@@ -2121,7 +2144,7 @@ test_conflicts() {
 
   # --video-codec libsvt-av1 with --dv should emit an informational note about DV being disabled
   out="$(run_muxm --video-codec libsvt-av1 --dv --print-effective-config 2>&1)"
-  assert_contains "AV1" "libsvt-av1 + --dv: note mentions AV1" "$out"
+  assert_contains "does not support Dolby Vision" "libsvt-av1 + --dv: note explains AV1 cannot carry DV" "$out"
 
   # --- Container passthrough: atv passthrough mode does NOT warn about MKV container ---
   # atv-directplay-hq sets OUTPUT_EXT="" (passthrough); without explicit --output-ext,
@@ -2190,7 +2213,7 @@ test_hw_accel() {
   assert_contains "HW_ACCEL_RESOLVED" "--hw-accel auto: resolved field present" "$out"
 
   if [[ "$(uname -s 2>/dev/null)" == "Darwin" && "$(uname -m 2>/dev/null)" == "arm64" ]] \
-      && ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}' | grep -qx hevc_videotoolbox; then
+      && ffmpeg_has_encoder hevc_videotoolbox; then
     assert_contains "HW_ACCEL_RESOLVED         = videotoolbox" \
       "--hw-accel auto: prefers videotoolbox on Apple Silicon" "$out"
   else
@@ -2246,7 +2269,7 @@ EOF
   # A real encode path (even without a valid source) goes through Section 14.
   # Use a nonexistent source to trigger Section 14 processing fast without
   # actually encoding. Exit code 10 indicates missing encoder.
-  if ! ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}' | grep -qx hevc_nvenc; then
+  if ! ffmpeg_has_encoder hevc_nvenc; then
     out="$(cd "$TESTDIR" && "$MUXM" --hw-accel nvenc /does/not/exist.mkv 2>&1)" && code=$? || code=$?
     if [[ "$code" -eq 10 ]]; then
       pass "--hw-accel nvenc (unavailable): strict check dies with exit 10"
@@ -2291,7 +2314,7 @@ EOF
   # "Hardware acceleration disabled" note from the encode path is covered.
   # hw_accel is media-free; create a minimal probeable source inside the guard.
   if [[ "$(uname -s 2>/dev/null)" == "Darwin" && "$(uname -m 2>/dev/null)" == "arm64" ]] \
-      && ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}' | grep -qx hevc_videotoolbox; then
+      && ffmpeg_has_encoder hevc_videotoolbox; then
     local vt_dry_src="$TESTDIR/vt_av1_probe.mkv"
     ffmpeg -f lavfi -i "color=c=black:s=64x64:r=1" -t 1 -c:v libx264 -an \
       -y "$vt_dry_src" >/dev/null 2>&1
@@ -2307,7 +2330,7 @@ EOF
   # --- NVENC stub fallback reason logged to stderr ---
   # resolve_video_encoder() is only reachable when hevc_nvenc is present;
   # without it, the Section 14 strict check fires at exit 10 first.
-  if ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}' | grep -qx hevc_nvenc; then
+  if ffmpeg_has_encoder hevc_nvenc; then
     local nvenc_dry_src="$TESTDIR/nvenc_probe.mkv"
     ffmpeg -f lavfi -i "color=c=black:s=64x64:r=1" -t 1 -c:v libx264 -an \
       -y "$nvenc_dry_src" >/dev/null 2>&1
@@ -6282,7 +6305,7 @@ DOVISCRIPT
   # videotoolbox is added to HW_ACCEL_AVAILABLE), then Linux for resolve_video_encoder
   # (triggering the OS guard at Section 22). Requires hevc_videotoolbox in this ffmpeg.
   if [[ "$(uname -s)" == "Darwin" ]] \
-      && ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}' | grep -qx hevc_videotoolbox; then
+      && ffmpeg_has_encoder hevc_videotoolbox; then
     local h11_mock="$TESTDIR/mock_uname_linux"
     local h11_count="$TESTDIR/uname_call_count.txt"
     mkdir -p "$h11_mock"
@@ -6317,32 +6340,46 @@ UNAMESCRIPT
 #   1. File header comment (top of file)
 #   2. show_help() function
 #   3. This function's case statement
+
+# Run one suite function and record a per-suite PASS/FAIL for the summary.
+# A suite FAILs if it adds any failing assertions; otherwise it PASSes.
+# Used only by the `all` path so the per-suite table reflects a full run.
+run_suite_tracked() {
+  local name="$1" fn="$2" fail_before=$FAIL
+  "$fn"
+  if (( FAIL > fail_before )); then
+    SUITE_STATUS+=("$name:FAIL")
+  else
+    SUITE_STATUS+=("$name:PASS")
+  fi
+}
+
 run_suites() {
   case "$SUITE" in
     all)
-      test_cli
-      test_toggles
-      test_unit
-      test_completions
-      test_setup
-      test_config
-      test_profiles
-      test_conflicts
-      test_hw_accel
-      test_collision
-      test_dryrun
-      test_video
-      test_hdr
-      test_audio
-      test_subs
-      test_ext_subs
-      test_output
-      test_containers
-      test_metadata
-      test_edge
-      test_profile_e2e
-      test_multi_profile
-      test_regression_p5
+      run_suite_tracked cli           test_cli
+      run_suite_tracked toggles       test_toggles
+      run_suite_tracked unit          test_unit
+      run_suite_tracked completions   test_completions
+      run_suite_tracked setup         test_setup
+      run_suite_tracked config        test_config
+      run_suite_tracked profiles      test_profiles
+      run_suite_tracked conflicts     test_conflicts
+      run_suite_tracked hw_accel      test_hw_accel
+      run_suite_tracked collision     test_collision
+      run_suite_tracked dryrun        test_dryrun
+      run_suite_tracked video         test_video
+      run_suite_tracked hdr           test_hdr
+      run_suite_tracked audio         test_audio
+      run_suite_tracked subs          test_subs
+      run_suite_tracked ext_subs      test_ext_subs
+      run_suite_tracked output        test_output
+      run_suite_tracked containers    test_containers
+      run_suite_tracked metadata      test_metadata
+      run_suite_tracked edge          test_edge
+      run_suite_tracked e2e           test_profile_e2e
+      run_suite_tracked multi_profile test_multi_profile
+      run_suite_tracked regression_p5 test_regression_p5
       ;;
     cli)           test_cli ;;
     toggles)       test_toggles ;;
