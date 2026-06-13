@@ -872,7 +872,10 @@ _check_disk_full() {
 # Returns: 0 if supported, 1 otherwise
 ffmpeg_has_muxer(){
   local mux="$1"
-  ffmpeg -hide_banner -muxers 2>/dev/null | awk -v m="$mux" '$1==m{f=1} END{exit !f}'
+  # Muxer name is the 2nd field; $1 is the D./.E capability-flag column.
+  # (Matching $1 made this always return false, so the vobsub PGS fast-path
+  # below was never taken and a spurious "lacks vobsub muxer" warning fired.)
+  ffmpeg -hide_banner -muxers 2>/dev/null | awk -v m="$mux" '$2==m{f=1} END{exit !f}'
 }
 
 # Validate ffmpeg/ffprobe log level values.

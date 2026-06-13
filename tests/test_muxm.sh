@@ -1037,12 +1037,66 @@ _test_cli_profile_crossref() {
   fi
 }
 
+_test_cli_robustness() {
+  # ---- DEBUG=1 trace mode does not break the run (#smoke) ----
+  # muxm runs `set -x` when DEBUG=1, sending an execution trace to stderr.
+  # A regression that puts a side-effecting command on the traced path would
+  # break the run; one that misroutes the trace onto stdout would corrupt
+  # captured values. We verify (a) the run still exits 0 with tracing on, and
+  # (b) the trace actually lands on stderr (so the DEBUG feature is exercised,
+  # not just any successful run). stderr is grepped from a file to avoid passing
+  # the large trace through echo|grep.
+  local dbg_trace="$TESTDIR/_debug_trace.err" dbg_rc=0
+  # `|| dbg_rc=$?` keeps the capture set -e-safe (the harness runs under set -e).
+  ( cd "$TESTDIR" && DEBUG=1 "$MUXM" --dry-run basic_sdr_subs.mkv >/dev/null 2>"$dbg_trace" ) || dbg_rc=$?
+  if [[ "$dbg_rc" -eq 0 ]]; then
+    pass "DEBUG=1: dry-run exits 0 with tracing enabled"
+  else
+    fail "DEBUG=1: dry-run exited $dbg_rc (tracing may have broken the run)"
+  fi
+  if grep -qE '^\+' "$dbg_trace" 2>/dev/null; then
+    pass "DEBUG=1: set -x execution trace emitted to stderr"
+  else
+    fail "DEBUG=1: no set -x trace found on stderr (DEBUG mode not engaged?)"
+  fi
+  rm -f "$dbg_trace"
+
+  # ---- bash 4.3+ version guard ----
+  # muxm uses namerefs (local -n) and requires bash 4.3+. The guard at the top of
+  # muxm must reject older interpreters with a clear message and a nonzero exit.
+  # macOS ships bash 3.2 at /bin/bash, which makes this testable; on hosts whose
+  # only bash is modern, skip (we can't synthesize an old interpreter).
+  local old_bash="" cand vmaj vmin
+  for cand in /bin/bash /usr/bin/bash /usr/local/bin/bash; do
+    [[ -x "$cand" ]] || continue
+    vmaj="$("$cand" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" || continue
+    vmin="$("$cand" -c 'echo "${BASH_VERSINFO[1]}"' 2>/dev/null)" || continue
+    [[ "$vmaj" =~ ^[0-9]+$ && "$vmin" =~ ^[0-9]+$ ]] || continue
+    if (( vmaj < 4 || (vmaj == 4 && vmin < 3) )); then old_bash="$cand"; break; fi
+  done
+  if [[ -n "$old_bash" ]]; then
+    local guard_out guard_rc=0
+    # set -e-safe capture: the guard makes muxm exit nonzero, which would
+    # otherwise abort the whole harness on the assignment.
+    guard_out="$("$old_bash" "$MUXM" --version 2>&1)" || guard_rc=$?
+    if [[ "$guard_rc" -ne 0 ]]; then
+      pass "bash version guard: old bash ($old_bash) rejected with nonzero exit ($guard_rc)"
+    else
+      fail "bash version guard: old bash ($old_bash) was NOT rejected (exit 0)"
+    fi
+    assert_contains "requires bash 4.3+" "bash version guard: emits a clear 'requires bash 4.3+' message" "$guard_out"
+  else
+    skip "bash version guard — no bash < 4.3 available to exercise the guard"
+  fi
+}
+
 test_cli() {
   section "CLI Parsing & Help"
   _test_cli_help_version
   _test_cli_error_codes
   _test_cli_short_aliases
   _test_cli_profile_crossref
+  _test_cli_robustness
 }
 
 # === Suite: Toggle Flag Coverage ===
@@ -1072,6 +1126,7 @@ test_toggles() {
     "--prefer-stereo|AUDIO_PREFER_STEREO       = 1"
     "--no-prefer-stereo|AUDIO_PREFER_STEREO       = 0"
     "--stereo-fallback|ADD_STEREO_IF_MULTICH     = 1"
+    "--no-stereo-fallback|ADD_STEREO_IF_MULTICH     = 0"
     "--no-conservative-vbv|CONSERVATIVE_VBV          = 0"
     # ---- DV policy toggles ----
     "--allow-dv-fallback|ALLOW_DV_FALLBACK         = 1"
@@ -2816,6 +2871,27 @@ test_video() {
       (( VERBOSE )) && echo "    Output: ${out:0:500}" || true
     fi
   fi
+
+  # --sdr-force-10bit pixel-format verification (M71–M74).
+  # basic_sdr_subs.mkv is an 8-bit (yuv420p) H.264 source, so any HEVC target
+  # re-encodes. With --sdr-force-10bit the output must be yuv420p10le; with
+  # --no-sdr-force-10bit the 8-bit format is preserved. This pins down the
+  # SDR_FORCE_10BIT pixel-format decision that was previously manual-only.
+  local sdr10_out="$TESTDIR/vid_sdr_force10.mp4"
+  log "Encoding 8-bit SDR source with --sdr-force-10bit..."
+  if assert_encode "--sdr-force-10bit: output produced" "$sdr10_out" \
+       --sdr-force-10bit --crf 28 --preset ultrafast "$src"; then
+    assert_probe "--sdr-force-10bit: 8-bit SDR source encoded as 10-bit (yuv420p10le)" \
+      "$sdr10_out" pix_fmt yuv420p10le
+  fi
+
+  local sdr8_out="$TESTDIR/vid_sdr_no_force10.mp4"
+  log "Encoding 8-bit SDR source with --no-sdr-force-10bit (baseline)..."
+  if assert_encode "--no-sdr-force-10bit: output produced" "$sdr8_out" \
+       --no-sdr-force-10bit --crf 28 --preset ultrafast "$src"; then
+    assert_probe "--no-sdr-force-10bit: 8-bit SDR source stays 8-bit (yuv420p)" \
+      "$sdr8_out" pix_fmt yuv420p
+  fi
 }
 
 # === Suite: HDR Pipeline ===
@@ -4274,6 +4350,34 @@ test_edge() {
   out="$(run_muxm "$TESTDIR/empty.mkv")"
   assert_contains "empty" "Empty file rejected" "$out"
 
+  # ---- _validate_media_file: stream-layout handling ----
+  # _validate_media_file requires a video stream (it validates encode output).
+  # A video-only file passes; an audio-only file is rejected with "no video
+  # stream". Tested directly with stubbed die/log helpers so the exit class is
+  # unambiguous. Complements the empty-file (exit) and non-readable cases.
+  local vmf_body vmf_stubs vonly aonly vmf_rc
+  vmf_body="$(awk '/^_validate_media_file\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  vmf_stubs='die(){ printf "DIE %s: %s\n" "$1" "$2" >&2; exit "$1"; }; log(){ :; }; filesize_pretty(){ echo "1 KB"; }; _check_disk_full(){ :; }'
+  vonly="$TESTDIR/vmf_video_only.mkv"; aonly="$TESTDIR/vmf_audio_only.m4a"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=red:s=160x120:r=24:d=1" \
+    -c:v libx264 -preset ultrafast -crf 30 "$vonly" 2>/dev/null
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "sine=frequency=440:duration=1" \
+    -c:a aac -b:a 64k "$aonly" 2>/dev/null
+  if [[ -s "$vonly" ]]; then
+    vmf_rc=0
+    bash -c "$vmf_stubs"$'\n'"$vmf_body"$'\n'"_validate_media_file \"\$1\" video-only" -- "$vonly" >/dev/null 2>&1 || vmf_rc=$?
+    if [[ "$vmf_rc" -eq 0 ]]; then pass "_validate_media_file: video-only file accepted"; else fail "_validate_media_file: video-only rejected (rc=$vmf_rc)"; fi
+  else
+    skip "_validate_media_file: video-only fixture not created"
+  fi
+  if [[ -s "$aonly" ]]; then
+    vmf_rc=0
+    bash -c "$vmf_stubs"$'\n'"$vmf_body"$'\n'"_validate_media_file \"\$1\" audio-only" -- "$aonly" >/dev/null 2>&1 || vmf_rc=$?
+    if [[ "$vmf_rc" -eq 41 ]]; then pass "_validate_media_file: audio-only file rejected (no video stream, exit 41)"; else fail "_validate_media_file: audio-only expected exit 41, got $vmf_rc"; fi
+  else
+    skip "_validate_media_file: audio-only fixture not created"
+  fi
+
   # File with spaces in name
   cp "$TESTDIR/basic_sdr_subs.mkv" "$TESTDIR/file with spaces.mkv"
   out="$(run_muxm --dry-run "$TESTDIR/file with spaces.mkv")"
@@ -5050,6 +5154,119 @@ note() { :; }'
   if echo "$out" | grep -qF "level-idc=5.1"; then pass "apply_level_vbv(5.1, CONSERVATIVE_VBV=0): level-idc still injected"; else fail "apply_level_vbv(5.1, CONSERVATIVE_VBV=0): expected level-idc=5.1, got '$out'"; fi
 }
 
+_test_unit_mapping_helpers() {
+  # Pure codec/extension/language mapping helpers. These are tiny lookup tables
+  # whose only failure mode is a wrong/dropped case arm — exactly what a direct
+  # unit test pins down. A bad mapping surfaces downstream as cryptic ffmpeg
+  # "Unable to choose output format" / "Unknown encoder" errors.
+
+  # ---- _audio_codec_ext (encoder name → intermediate-file extension) ----
+  assert_muxm_fn_stdout "_audio_codec_ext(libopus)=opus"     "opus" _audio_codec_ext "" "libopus"
+  assert_muxm_fn_stdout "_audio_codec_ext(libmp3lame)=mp3"   "mp3"  _audio_codec_ext "" "libmp3lame"
+  assert_muxm_fn_stdout "_audio_codec_ext(libvorbis)=ogg"    "ogg"  _audio_codec_ext "" "libvorbis"
+  assert_muxm_fn_stdout "_audio_codec_ext(aac)=aac"          "aac"  _audio_codec_ext "" "aac"
+  assert_muxm_fn_stdout "_audio_codec_ext(eac3)=eac3"        "eac3" _audio_codec_ext "" "eac3"
+  assert_muxm_fn_stdout "_audio_codec_ext(flac)=flac"        "flac" _audio_codec_ext "" "flac"
+  # Fallback: unknown encoder name is echoed back unchanged.
+  assert_muxm_fn_stdout "_audio_codec_ext(libfdk_aac)=passthrough" "libfdk_aac" _audio_codec_ext "" "libfdk_aac"
+
+  # ---- _ext_sub_codec_from_ext (subtitle file extension → ffprobe codec name) ----
+  assert_muxm_fn_stdout "_ext_sub_codec_from_ext(srt)=subrip"        "subrip"            _ext_sub_codec_from_ext "" "srt"
+  assert_muxm_fn_stdout "_ext_sub_codec_from_ext(ass)=ass"           "ass"               _ext_sub_codec_from_ext "" "ass"
+  assert_muxm_fn_stdout "_ext_sub_codec_from_ext(ssa)=ssa"           "ssa"               _ext_sub_codec_from_ext "" "ssa"
+  assert_muxm_fn_stdout "_ext_sub_codec_from_ext(vtt)=webvtt"        "webvtt"            _ext_sub_codec_from_ext "" "vtt"
+  assert_muxm_fn_stdout "_ext_sub_codec_from_ext(sup)=hdmv_pgs"      "hdmv_pgs_subtitle" _ext_sub_codec_from_ext "" "sup"
+  assert_muxm_fn_stdout "_ext_sub_codec_from_ext(idx)=dvd_subtitle"  "dvd_subtitle"      _ext_sub_codec_from_ext "" "idx"
+  assert_muxm_fn_stdout "_ext_sub_codec_from_ext(SRT)=subrip (case-insensitive)" "subrip" _ext_sub_codec_from_ext "" "SRT"
+  assert_muxm_fn_stdout "_ext_sub_codec_from_ext(xyz)=unknown"       "unknown"           _ext_sub_codec_from_ext "" "xyz"
+
+  # ---- _norm_lang_code (ISO 639-1 → ISO 639-2/T) ----
+  assert_muxm_fn_stdout "_norm_lang_code(en)=eng"  "eng" _norm_lang_code "" "en"
+  assert_muxm_fn_stdout "_norm_lang_code(es)=spa"  "spa" _norm_lang_code "" "es"
+  assert_muxm_fn_stdout "_norm_lang_code(fr)=fra"  "fra" _norm_lang_code "" "fr"
+  assert_muxm_fn_stdout "_norm_lang_code(ja)=jpn"  "jpn" _norm_lang_code "" "ja"
+  assert_muxm_fn_stdout "_norm_lang_code(EN)=eng (case-insensitive)" "eng" _norm_lang_code "" "EN"
+  # Already-3-letter code falls through unchanged (lowercased).
+  assert_muxm_fn_stdout "_norm_lang_code(eng)=eng (passthrough)" "eng" _norm_lang_code "" "eng"
+  assert_muxm_fn_stdout "_norm_lang_code(zz)=zz (unknown passthrough)" "zz" _norm_lang_code "" "zz"
+
+  # ---- _container_supports_bitmap_subs (only Matroska carries PGS/VobSub) ----
+  assert_muxm_fn_exit "_container_supports_bitmap_subs(matroska)=yes" 0 _container_supports_bitmap_subs 'MUX_FORMAT=matroska'
+  assert_muxm_fn_exit "_container_supports_bitmap_subs(mp4)=no"       1 _container_supports_bitmap_subs 'MUX_FORMAT=mp4'
+  assert_muxm_fn_exit "_container_supports_bitmap_subs(mov)=no"       1 _container_supports_bitmap_subs 'MUX_FORMAT=mov'
+
+  # ---- ffmpeg_has_muxer (capability probe; muxer name is field 2 of -muxers) ----
+  # Regression guard for the awk-field bug that made this always return false
+  # (broke the PGS→vobsub fast-path). matroska/mp4 are present in every build.
+  assert_muxm_fn_exit "ffmpeg_has_muxer(matroska)=present" 0 ffmpeg_has_muxer "" "matroska"
+  assert_muxm_fn_exit "ffmpeg_has_muxer(mp4)=present"      0 ffmpeg_has_muxer "" "mp4"
+  assert_muxm_fn_exit "ffmpeg_has_muxer(mov)=present"      0 ffmpeg_has_muxer "" "mov"
+  assert_muxm_fn_exit "ffmpeg_has_muxer(definitelynotamuxer)=absent" 1 ffmpeg_has_muxer "" "definitelynotamuxer"
+
+  # ---- _normalize_codec_lang (lowercases codec+lang via nameref; empty lang
+  #      defaults to TAG_LANGUAGE_DEFAULT). Uses `local -n`, so run it directly. ----
+  local ncl_body
+  ncl_body="$(awk '/^_normalize_codec_lang\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  local ncl_out
+  # Mixed-case codec + empty lang → codec lowercased, lang filled from default.
+  ncl_out="$(bash -c 'TAG_LANGUAGE_DEFAULT=und; c="EAC3"; l=""'"
+$ncl_body"'
+_normalize_codec_lang c l; printf "%s|%s" "$c" "$l"')"
+  if [[ "$ncl_out" == "eac3|und" ]]; then pass "_normalize_codec_lang(EAC3,'')=eac3|und (default-filled)"; else fail "_normalize_codec_lang(EAC3,'') expected 'eac3|und', got '$ncl_out'"; fi
+  # Present lang is only lowercased, never re-mapped to a 3-letter code.
+  ncl_out="$(bash -c 'TAG_LANGUAGE_DEFAULT=und; c="AAC"; l="EN"'"
+$ncl_body"'
+_normalize_codec_lang c l; printf "%s|%s" "$c" "$l"')"
+  if [[ "$ncl_out" == "aac|en" ]]; then pass "_normalize_codec_lang(AAC,EN)=aac|en (lowercase only)"; else fail "_normalize_codec_lang(AAC,EN) expected 'aac|en', got '$ncl_out'"; fi
+
+  # ---- _parse_ext_sub_filename (external-sub filename → "lang<TAB>type").
+  #      Calls _norm_lang_code, so extract both bodies. ----
+  local pes_body norm_body pes_combined
+  pes_body="$(awk '/^_parse_ext_sub_filename\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  norm_body="$(awk '/^_norm_lang_code\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  pes_combined="TAG_LANGUAGE_DEFAULT=und"$'\n'"$norm_body"$'\n'"$pes_body"
+  _test_pes() {
+    local stem="$1" fname="$2" expect="$3" label="$4" got
+    got="$(bash -c "$pes_combined"$'\n'"_parse_ext_sub_filename \"\$1\" \"\$2\"" -- "$stem" "$fname")"
+    if [[ "$got" == "$expect" ]]; then pass "$label"; else fail "$label — expected '$expect', got '$got'"; fi
+  }
+  _test_pes "movie" "movie.srt"            "und"$'\t'"full"   "_parse_ext_sub_filename(movie.srt)=und/full (no qualifier)"
+  _test_pes "movie" "movie.en.srt"         "eng"$'\t'"full"   "_parse_ext_sub_filename(movie.en.srt)=eng/full"
+  _test_pes "movie" "movie.spa.srt"        "spa"$'\t'"full"   "_parse_ext_sub_filename(movie.spa.srt)=spa/full"
+  _test_pes "movie" "movie.forced.en.srt"  "eng"$'\t'"forced" "_parse_ext_sub_filename(movie.forced.en.srt)=eng/forced"
+  _test_pes "movie" "movie.en.sdh.srt"     "eng"$'\t'"sdh"    "_parse_ext_sub_filename(movie.en.sdh.srt)=eng/sdh"
+
+  # ---- _detect_mp4box (cross-platform: MP4Box on macOS, mp4box on Linux) ----
+  # Resolves which DV-muxing binary is on PATH. We mock PATH with fake
+  # executables so the test is deterministic regardless of what's installed.
+  local mp4_body mp4_dir
+  mp4_body="$(awk '/^_detect_mp4box\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  mp4_dir="$TESTDIR/mp4box_mock"; mkdir -p "$mp4_dir"
+  # PATH is set INSIDE the bash -c (via $1) so `command -v` resolves only against
+  # the mock dir — setting it on the `bash` invocation itself would break locating
+  # the bash binary. Case 1: MP4Box (capitalized) present → MP4BOX_CMD=MP4Box.
+  printf '#!/bin/sh\n' > "$mp4_dir/MP4Box"; chmod +x "$mp4_dir/MP4Box"
+  local mp4_out
+  mp4_out="$(bash -c "$mp4_body"$'\n''PATH="$1"; _detect_mp4box && printf "%s" "$MP4BOX_CMD"' -- "$mp4_dir")"
+  if [[ "$mp4_out" == "MP4Box" ]]; then pass "_detect_mp4box: MP4Box on PATH → MP4BOX_CMD=MP4Box"; else fail "_detect_mp4box: expected 'MP4Box', got '$mp4_out'"; fi
+  # Case 2: only lowercase mp4box present → MP4BOX_CMD=mp4box.
+  # Only meaningful on a case-SENSITIVE filesystem; on macOS's default
+  # case-insensitive APFS/HFS+, `command -v MP4Box` resolves the lowercase file
+  # and the fallback branch is unreachable — so probe and skip there.
+  rm -f "$mp4_dir/MP4Box" "$mp4_dir/mp4box"
+  printf '#!/bin/sh\n' > "$mp4_dir/mp4box"; chmod +x "$mp4_dir/mp4box"
+  if [[ -e "$mp4_dir/MP4Box" ]]; then
+    skip "_detect_mp4box: lowercase fallback — case-insensitive filesystem (Linux-only assertion)"
+  else
+    mp4_out="$(bash -c "$mp4_body"$'\n''PATH="$1"; _detect_mp4box && printf "%s" "$MP4BOX_CMD"' -- "$mp4_dir")"
+    if [[ "$mp4_out" == "mp4box" ]]; then pass "_detect_mp4box: mp4box on PATH → MP4BOX_CMD=mp4box"; else fail "_detect_mp4box: expected 'mp4box', got '$mp4_out'"; fi
+  fi
+  # Case 3: neither present → rc 1, MP4BOX_CMD empty
+  rm -f "$mp4_dir/mp4box" "$mp4_dir/MP4Box"
+  mp4_out="$(bash -c "$mp4_body"$'\n''PATH="$1"; _detect_mp4box; printf "rc=%s|%s" "$?" "$MP4BOX_CMD"' -- "$mp4_dir")" || true
+  if [[ "$mp4_out" == "rc=1|" ]]; then pass "_detect_mp4box: neither binary → rc 1, MP4BOX_CMD empty"; else fail "_detect_mp4box: expected 'rc=1|', got '$mp4_out'"; fi
+}
+
 _test_unit_av1_helpers() {
   # ---- _av1_preset_multiplier ----
   # AV1 uses numeric presets (0=slowest/best, 13=fastest/worst).
@@ -5123,6 +5340,7 @@ test_unit() {
   _test_unit_disk_preflight
   _test_unit_realpath_fallback
   _test_unit_apply_level_vbv
+  _test_unit_mapping_helpers
   _test_unit_av1_helpers
 }
 

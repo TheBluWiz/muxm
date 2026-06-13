@@ -71,6 +71,8 @@ The test harness (`test_muxm.sh`) generates synthetic test media — short 2-sec
 | 17 | `-K` alias | `-K` → KEEP_TEMP_ALWAYS = 1 in effective config | ✅ |
 | 17a | VALID_PROFILES ↔ `--help` | Every profile in VALID_PROFILES constant appears in `--help` output | ✅ |
 | 17b | VALID_PROFILES ↔ completions | Every profile in VALID_PROFILES appears in installed completion script | ✅ |
+| 18 | `DEBUG=1` dry-run | Exits 0 with tracing on; `set -x` trace lands on stderr (not stdout) | ✅ |
+| 19 | bash 4.3+ version guard | Under macOS `/bin/bash` (3.2): "requires bash 4.3+", nonzero exit (skips if only modern bash present) | ✅ |
 
 ### 1.2 Toggle Flag Coverage (suite: `toggles`)
 
@@ -277,6 +279,8 @@ Validates filename collision auto-versioning and source replacement flags. Uses 
 | 112 | `--video-copy-if-compliant` | HEVC source copied without re-encode | ✅ |
 | 113 | `--level 5.1` config acceptance | LEVEL_VALUE = 5.1 in effective config | ✅ |
 | 114 | `--level 5.1` VBV injection | Dry-run with HDR source includes vbv-maxrate/vbv-bufsize in x265 params | ✅ |
+| 115 | `--sdr-force-10bit` | 8-bit SDR source → output `pix_fmt` = yuv420p10le (probe) | ✅ |
+| 116 | `--no-sdr-force-10bit` | 8-bit SDR source → output `pix_fmt` stays yuv420p (probe) | ✅ |
 
 ### 1.11 HDR Pipeline (suite: `hdr`)
 
@@ -375,6 +379,8 @@ Validates filename collision auto-versioning and source replacement flags. Uses 
 | # | Test | Assertion | Auto |
 |---|------|-----------|------|
 | 164 | Empty source file | Rejected with error | ✅ |
+| 164a | `_validate_media_file` video-only | File with a video stream and no audio → accepted (exit 0) | ✅ |
+| 164b | `_validate_media_file` audio-only | File with audio and no video stream → rejected, exit 41 "no video stream" | ✅ |
 | 165 | Filename with spaces | Handled correctly | ✅ |
 | 166 | Control character in filename | Tab in source filename → exit 11, "control characters" error | ✅ |
 | 167 | Source/output collision (explicit) | Same file as source and output → exit 11, "same file" error | ✅ |
@@ -518,6 +524,14 @@ Direct tests for deterministic helper functions extracted from muxm and run in i
 | 218t | `apply_level_vbv 5.2` | x265-params includes vbv-maxrate=60000k and vbv-bufsize=120000k | ✅ |
 | 218u | `apply_level_vbv` unknown level | level-idc appended but no vbv-maxrate | ✅ |
 | 218v | `apply_level_vbv` with CONSERVATIVE_VBV=0 | No vbv-maxrate injected; level-idc still appended | ✅ |
+| 219a | `_audio_codec_ext` | encoder → intermediate-file ext (libopus→opus, aac→aac, flac→flac, unknown→passthrough) | ✅ |
+| 219b | `_ext_sub_codec_from_ext` | sub ext → ffprobe codec (srt→subrip, sup→hdmv_pgs_subtitle, idx→dvd_subtitle, case-insensitive) | ✅ |
+| 219c | `_norm_lang_code` | ISO 639-1 → 639-2/T (en→eng, ja→jpn), 3-letter + unknown passthrough, case-insensitive | ✅ |
+| 219d | `_normalize_codec_lang` | lowercases codec+lang via nameref; empty lang → TAG_LANGUAGE_DEFAULT | ✅ |
+| 219e | `_container_supports_bitmap_subs` | matroska → true; mp4/mov → false | ✅ |
+| 219f | `_parse_ext_sub_filename` | filename → lang/type (bare→und/full, .en→eng/full, .forced.en→eng/forced, .en.sdh→eng/sdh) | ✅ |
+| 219g | `ffmpeg_has_muxer` | matroska/mp4/mov → present; bogus → absent (regression guard for the `$1`→`$2` field fix) | ✅ |
+| 219h | `_detect_mp4box` | PATH mock: MP4Box → MP4Box, none → rc 1/empty; lowercase `mp4box` fallback skipped on case-insensitive FS | ✅ |
 
 ---
 
@@ -837,16 +851,44 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 
 ## 6. Coverage Gap Analysis
 
+> **Coverage audit — 2026-06-12.** The harness grew substantially since this
+> table was first written; most items previously marked ❌/⚠️ are now covered.
+> This pass cross-referenced every muxm flag and helper against the *current*
+> `tests/test_muxm.sh` and closed the remaining automatable gaps. Full suite:
+> **1097 passed / 0 failed / 2 skipped** (skips: the bash-version guard on hosts
+> whose only bash is ≥ 4.3, and the `_detect_mp4box` lowercase-fallback assertion
+> on case-insensitive filesystems). Newly added automated coverage:
+>
+> - **Pure mapping/parse helpers (unit suite, `_test_unit_mapping_helpers`):**
+>   `_audio_codec_ext`, `_ext_sub_codec_from_ext`, `_norm_lang_code`,
+>   `_normalize_codec_lang`, `_container_supports_bitmap_subs`,
+>   `_parse_ext_sub_filename`, and `ffmpeg_has_muxer` (36 assertions).
+> - **`--sdr-force-10bit` pixel-format verification (video suite):** an 8-bit
+>   SDR source is encoded to `yuv420p10le` with the flag and stays `yuv420p`
+>   with `--no-sdr-force-10bit` — promotes M71–M74 from manual to automated.
+> - **`DEBUG=1` trace smoke (cli suite):** dry-run still exits 0 and the
+>   `set -x` trace lands on stderr (closes candidate #17).
+> - **bash 4.3+ version guard (cli suite):** running muxm under macOS `/bin/bash`
+>   (3.2) is rejected with the expected message and a nonzero exit (candidate #24).
+>
+> **Product bug found and fixed during this audit:** `ffmpeg_has_muxer()` matched
+> `awk '$1==m'` (the `D./.E` capability-flag column) instead of `$2` (the muxer
+> name), so it returned **false for every muxer**. Live impact: the PGS→VobSub
+> subtitle fast-path (`muxm:8403`) was never taken and a spurious "ffmpeg lacks
+> the 'vobsub' muxer" warning (`muxm:8454`) could fire on builds that *do* have
+> it. Fixed to `$2==m`; the new `ffmpeg_has_muxer(matroska)=present` assertion is
+> the regression guard.
+
 | Area | Automated | Manual Required | Notes |
 |------|-----------|-----------------|-------|
 | CLI parsing | ✅ Full | — | Includes --no-overwrite, short aliases (-h, -V, -p, -l, -k, -K), control char rejection, enhanced error messages |
-| Toggle flags | ⚠️ Partial | — | 15 toggle pairs validated; 20+ toggles missing (sdr-force-10bit, sub-preserve-format, dv, tonemap, replace-source, and positive sides of existing negatives) |
-| Pure-function unit tests | ⚠️ Partial | — | Audio helpers, subtitle helpers, validation helpers, filesize utility tested; missing: `_audio_copy_ext` (lossless copy exts), `_audio_codec_ext` (encoder→format exts), `_codec_max_channels`, `_sii_audio_is_container_safe`, `realpath_fallback`, `apply_level_vbv` per-level, VBV level mapping |
+| Toggle flags | ✅ Full | — | ~40 toggles validated across both polarities via the data-driven `TOGGLE_CASES` table, incl. sdr-force-10bit, sub-preserve-format, dv, tonemap, skip-if-ideal, report-json, checksum, strip-metadata, keep-chapters, sub-burn-forced/export-external, video-copy-if-compliant, force-replace-source. `--no-overwrite`/`--no-hide-banner` covered in cli/metadata suites |
+| Pure-function unit tests | ✅ Full | — | Audio helpers, subtitle helpers, validation helpers, filesize, `_sii_audio_is_container_safe`, `realpath_fallback`, `apply_level_vbv` (per-level VBV), `_audio_copy_ext`, `_codec_max_channels`, AV1 helpers — all tested. **Added 2026-06-12:** `_audio_codec_ext`, `_ext_sub_codec_from_ext`, `_norm_lang_code`, `_normalize_codec_lang`, `_container_supports_bitmap_subs`, `_parse_ext_sub_filename`, `ffmpeg_has_muxer` |
 | Completions installer | ✅ Full | — | Install, idempotency, uninstall, safe-when-absent |
 | Setup combined installer | ✅ Full | — | All three sub-installers + standalone deps/man |
 | Config precedence | ✅ Full | — | Single-layer, multi-layer (user+project+CLI), all --create-config profiles, loglevel validation, deprecated variable migration |
 | Profile defaults | ✅ Full | — | All 6 profiles validated |
-| Conflict warnings | ⚠️ Partial | — | 23 combinations tested; ~15 missing (dv-archival multi-track conflicts, MOV container warnings, hdr10-hq+DV re-enabled, animation+no-sub-preserve-format, universal+DV, cross: tonemap+libx265) |
+| Conflict warnings | ✅ Full | — | 40+ combinations tested, incl. archive/animation multi-track audio+sub conflicts (--audio-track, --audio-force-codec, --stereo-fallback, --sub-burn-forced, --sub-export-external), hdr10-hq+DV, universal+DV, AV1+DV, and burn-forced+no-subtitles. Warning *text* (not just presence) asserted after the Phase 8 needle hardening |
 | Dry-run mode | ✅ Full | — | Includes HDR source dry-run |
 | Video encode (SDR) | ✅ Full | — | Includes x265-params, threads, video-copy-if-compliant, --level VBV |
 | Video encode (HDR) | ⚠️ Tagged only | Real HDR quality (M8–M15) | Synthetic clips have HDR tags but no real HDR content; tonemap filter chain verified in dry-run |
@@ -854,10 +896,10 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 | Metadata stripping | ✅ Full | — | Strip and preserve verified with ffprobe; --ffprobe-loglevel tested |
 | Audio titles | ✅ Full | — | --audio-titles and --no-audio-titles both tested with real encodes |
 | Subtitle track limiting | ✅ Full | — | SUB_MAX_TRACKS=1 via config file and --sub-lang-pref multilang tested |
-| SDR 10-bit forcing | ❌ None | Visual/probe (M71–M74) | --sdr-force-10bit and SDR_USE_10BIT_IF_SRC_10BIT untested |
+| SDR 10-bit forcing | ✅ Automated (probe) | Visual only (M71–M74) | **Added 2026-06-12:** video suite encodes an 8-bit SDR source and probes `pix_fmt` — `yuv420p10le` with `--sdr-force-10bit`, `yuv420p` with `--no-sdr-force-10bit`. `SDR_USE_10BIT_IF_SRC_10BIT` (src-10bit auto path) still relies on the HDR/10-bit encode fixtures |
 | Max copy bitrate | ❌ None | Bitrate-gated copy (M75–M77) | --max-copy-bitrate ceiling logic untested |
-| Multi-track audio (dv-archival) | ❌ None | Multi-track filter (M49–M53) | AUDIO_MULTI_TRACK, AUDIO_KEEP_COMMENTARY, language filtering untested |
-| Multi-track subtitles (archival/animation) | ❌ None | Multi-track filter (M54–M58) | SUB_MULTI_TRACK, language filtering, SUB_MAX_TRACKS cap untested |
+| Multi-track audio (dv-archival) | ✅ Full | — | `hevc_multi_audio.mkv` fixture (eng main + eng commentary + spa) drives dry-run keep-list assertions ("keeping 2 of 3", ✗ drop marker, commentary dropped), AUDIO_MULTI_TRACK/AUDIO_KEEP_COMMENTARY profile defaults, --stereo-fallback interaction, and e2e archive encodes |
+| Multi-track subtitles (archival/animation) | ✅ Full | — | `hevc_multi_subs.mkv` fixture (5 subs: eng forced/full/SDH, spa, fra) drives multi-track announce, SUB_MULTI_TRACK defaults, language/type filtering, demotion-on-conflict, and e2e encodes |
 | Source replacement & collision | ✅ Full | Interactive prompt (M59–M60) | Auto-versioning, --force-replace-source, non-TTY rejection, --help/config registration all tested; interactive --replace-source confirmation requires TTY |
 | Dolby Vision | ❌ None | Full DV pipeline (M1–M7, M64–M70) | Requires real DV source + dovi_tool + MP4Box |
 | DV container verification | ❌ None | dvcC box checks (M64–M68) | verify_dv_container_record, pre-wrap, mp4box fallback untested |
@@ -876,8 +918,11 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 | E2E profiles | ✅ Full | — | All 6 profiles validated with real encodes |
 | VALID_PROFILES drift | ✅ Full | — | Cross-reference test verifies --help and installed completions match canonical constant |
 | Locale regression | ✅ Full | — | Static audit complete; CI step: `LANG=C LC_ALL=C ./test_muxm.sh` |
-| Duration detection | ❌ None | M82 | Three-tier duration lookup (_get_source_duration_secs) untested |
-| Progress bar / spinner | ❌ None | Visual | ffmpeg_progress_bar, spinner, run_with_spinner — UI functions |
+| Duration detection | ⚠️ Indirect | M82 (tier 3) | `_get_source_duration_secs` tiers 1–2 (stream / format duration) are exercised by every encode's progress path; tier 3 (Matroska `DURATION` tag) still lacks a dedicated fixture |
+| `ffmpeg_has_muxer` | ✅ Full | — | **Added 2026-06-12:** matroska/mp4/mov → present, bogus name → absent. Doubles as the regression guard for the `$1`→`$2` awk-field fix |
+| `DEBUG=1` trace mode | ✅ Full | — | **Added 2026-06-12:** cli suite — dry-run exits 0 with `set -x` on, trace lands on stderr (does not corrupt stdout) |
+| bash 4.3+ version guard | ✅ Automated (macOS) | Linux w/ old bash | **Added 2026-06-12:** rejects macOS `/bin/bash` 3.2 with "requires bash 4.3+" and nonzero exit; skips when only a modern bash is present |
+| Progress bar / spinner | ❌ None | Visual | ffmpeg_progress_bar, spinner, run_with_spinner — UI functions requiring a TTY |
 | Disk space preflight | ❌ None | M78–M79 | DISK_FREE_WARN_GB threshold and warning untested |
 | macOS APFS hidden flag | ❌ None | M81 | chflags nohidden after atomic move untested |
 | Error recovery | ❌ None | SIGINT, disk full (M33–M38) | Requires manual intervention |
@@ -886,71 +931,43 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 
 ### Untested Areas — Candidates for New Tests
 
-The following areas are present in muxm but have no or incomplete automated test coverage. Items are ranked by risk (impact of a silent regression):
+This list is split into items **resolved** by the 2026-06-12 audit and the
+items that **genuinely remain** open. Remaining items are ranked by risk.
 
-**Critical Priority (new features with zero coverage):**
+#### ✅ Resolved (now have automated coverage)
 
-1. **Toggle flag completeness** — 20+ toggles lack the positive or negative counterpart in the toggle suite. Adding `--sdr-force-10bit`, `--no-sdr-force-10bit`, `--sub-preserve-format`, `--no-sub-preserve-format`, `--dv`, `--no-dv`, `--tonemap`, `--no-tonemap`, `--skip-if-ideal`, `--report-json`, `--checksum`, `--strip-metadata`, `--keep-chapters`, `--sub-burn-forced`, `--sub-export-external`, `--video-copy-if-compliant`, `--replace-source`, and `--force-replace-source` would make the toggle suite truly exhaustive.
+These were open in earlier revisions and are now covered (see the §6 audit note
+for the assertions added on 2026-06-12; the rest were closed by prior work):
 
-2. **Multi-track audio filtering (dv-archival)** — `_build_audio_keep_list()`, `run_audio_pipeline_multi()`, `AUDIO_MULTI_TRACK`, `AUDIO_KEEP_COMMENTARY`, and language-based filtering have no automated coverage. A synthetic multi-audio fixture could enable automated filter verification.
+- **Toggle flag completeness** — ~40 toggles, both polarities, via `TOGGLE_CASES`.
+- **Multi-track audio filtering** — `hevc_multi_audio.mkv` + dry-run keep-list + e2e.
+- **Multi-track subtitle filtering** — `hevc_multi_subs.mkv` + dry-run + e2e.
+- **Conflict warnings (multi-track + cross-profile)** — text asserted, not just presence.
+- **`_audio_copy_ext` / `_audio_codec_ext`** unit tests.
+- **`_codec_max_channels`**, **`_sii_audio_is_container_safe`**, **`realpath_fallback`** unit tests.
+- **`apply_level_vbv` per-level** (4.1 / 5.0 / 5.1 / 5.2) unit tests.
+- **`_ext_sub_codec_from_ext`, `_norm_lang_code`, `_normalize_codec_lang`, `_container_supports_bitmap_subs`, `_parse_ext_sub_filename`** unit tests *(added 2026-06-12)*.
+- **`ffmpeg_has_muxer`** unit tests *(added 2026-06-12; also fixed the underlying bug)*.
+- **`DEBUG=1` smoke**, **bash 4.3+ version guard**, **`--sdr-force-10bit` pixel-format** *(added 2026-06-12)*.
+- **`_detect_mp4box`** PATH-mock (MP4Box / mp4box / neither) and **`_validate_media_file`** stream-layout (video-only accepted, audio-only rejected with exit 41) *(added 2026-06-12)*.
+- **`--no-stereo-fallback`** toggle *(added 2026-06-12)*; **`--preset bogus` rejection** (cli suite), **`--create-config user`** (config suite), **`AUDIO_CODEC_PREFERENCE` custom ordering** (via `_audio_codec_rank` env).
 
-3. **Multi-track subtitle filtering (dv-archival/animation)** — `_build_subtitle_keep_list()`, `SUB_MULTI_TRACK`, language/type filtering, and `SUB_MAX_TRACKS` cap in multi-track mode have no automated coverage.
+#### ❌ Remaining — automatable (fixture or mock needed)
 
-4. **Conflict warnings: remaining ~15 combinations** — dv-archival multi-track conflicts (--audio-track, --audio-force-codec, --stereo-fallback, --sub-export-external), MOV container warnings for all profiles, hdr10-hq + DV re-enabled, animation + --no-sub-preserve-format, universal + --dv, and cross-profile tonemap+libx265 are all untested.
+1. **`_get_source_duration_secs()` tier 3** — a synthetic MKV carrying *only* a Matroska `DURATION` tag (no stream/format duration) would exercise the tier-3 `HH:MM:SS` parse specifically. Tiers 1–2 are covered indirectly.
+2. **`check_skip_if_ideal()` multi-track path** — needs an "ideal" multi-track source (compliant codecs + multiple audio/sub tracks) to hit the multi-track branch of the ideal check.
+3. **`select_best_audio()` / `build_subtitle_plan()` / `decide_color_and_pixfmt()` direct unit tests** — currently covered *indirectly* by the audio/subs/hdr e2e suites; direct unit tests with mock probe input would pinpoint regressions but are lower-value given the integration coverage.
+4. **Disk-space preflight threshold (`disk_free_warn` / `DISK_FREE_WARN_GB`)** — the size-estimation helpers (`_crf_ratio`, `_preset_multiplier`) are unit-tested, but the warning threshold itself needs a mocked `df`/free-space value.
+5. **Multi-pass config layering with profile conflicts** — user config sets a profile, project config overrides a conflicting variable, CLI adds a third; assert every expected warning.
 
-**High Priority:**
+#### ❌ Remaining — genuinely manual (real content / hardware / human judgment)
 
-5. **`_audio_copy_ext()` / `_audio_codec_ext()` unit tests** — Maps codec/encoder names to ffmpeg-compatible file extensions for intermediate files. `_audio_copy_ext` handles lossless copy codecs (truehd→thd, alac→m4a, pcm→wav, dca→dts); `_audio_codec_ext` handles encoder-to-format mapping for transcode targets (libopus→ogg, libfdk_aac→aac). Incorrect mapping causes "Unable to choose output format" errors.
-
-6. **`_codec_max_channels()` unit tests** — Returns encoder channel limits (eac3→6, ac3→6). If this returns wrong values, ffmpeg fatally errors with "channel layout not supported."
-
-7. **`_sii_audio_is_container_safe()` unit tests** — Container compatibility gate for skip-if-ideal remux. truehd+mp4→reject, aac+mp4→accept. Wrong results cause mux failures on the "ideal" fast path.
-
-8. **`apply_level_vbv()` per-level unit tests** — VBV parameter injection for levels 4.1, 5.0, 5.1, 5.2. Currently only 5.1 tested via a real encode; a unit test confirming exact maxrate/bufsize values for each level would be deterministic.
-
-9. **`--install-man` standalone** — Only tested indirectly via `--setup`. A standalone invocation test would catch regressions in the man page generator.
-
-10. **`--create-config user` and `--create-config system` scopes** — Only the `project` scope is explicitly tested. The `user` scope writes to `~/.muxmrc` (testable with isolated HOME).
-
-**Medium Priority:**
-
-11. **`select_best_audio()` scoring integration** — Unit tests cover individual scoring helpers but not the top-level function that combines them. A unit test with mock multi-track probe output would verify the complete scoring pipeline.
-
-12. **`decide_color_and_pixfmt()` unit tests** — Determines HDR color metadata and pixel format. Currently only tested indirectly via HDR encode outputs.
-
-13. **`check_skip_if_ideal()` multi-track path** — The skip-if-ideal function has a multi-track audio/subtitle code path that is untested (requires ideal multi-track source).
-
-14. **`build_subtitle_plan()` unit tests** — Complex subtitle selection (forced detection, SDH filtering, language preference, max-tracks limiting).
-
-15. **`realpath_fallback()` unit tests** — Cross-platform path resolution. A direct test with symlinks, relative paths, and non-existent files would improve portability confidence.
-
-16. **`_validate_media_file()` unit tests** — Beyond empty-file and non-readable tests, validate behavior with video-only, audio-only, and other unusual layouts.
-
-17. **`DEBUG=1` mode** — Running a fast suite with `DEBUG=1` as a smoke test would catch cases where debug tracing breaks parsing or output.
-
-18. **`AUDIO_CODEC_PREFERENCE` custom ordering** — A config-file override of `AUDIO_CODEC_PREFERENCE` is not tested to verify user-customized rankings propagate correctly.
-
-19. **`--preset` validation boundary** — CLI parser rejection of `--preset bogus` with proper error message could use an explicit test.
-
-20. **`ffmpeg_has_muxer()` unit tests** — Container format support detection with known-good and known-bad muxer names.
-
-21. **`_get_source_duration_secs()` three-tier lookup** — Duration detection from stream, format, and Matroska tags. A synthetic MKV with only Matroska DURATION tags would test tier 3 specifically.
-
-22. **`_check_hdr10_static_metadata()` unit tests** — Detection of mastering display and content light level data. Currently only exercised via real DV sources.
-
-**Lower Priority:**
-
-23. **Multi-pass config layering with profile conflicts** — Test where user config sets a profile, project config overrides a conflicting variable, and CLI adds another conflict. Verify all expected warnings.
-
-24. **Bash version guard** — Verify running under bash 3.2 produces the expected error message and exit.
-
-25. **Progress bar / spinner functions** — `ffmpeg_progress_bar()`, `run_with_spinner()`, and `spinner()` are UI functions. Smoke-test coverage (verify no error when called) would help.
-
-26. **Disk space preflight (`disk_free_warn`)** — Difficult to automate (requires a nearly-full volume) but could be mocked.
-
-27. **macOS APFS hidden flag** — `chflags nohidden` after atomic move. Only testable on macOS with APFS.
-
-28. **`_detect_mp4box()` cross-platform** — Detect MP4Box (macOS) vs mp4box (Linux). Could be tested by mocking PATH.
+8. **`--create-config system` scope** — writes to `/etc/.muxmrc`; needs root and pollutes the system, so left manual.
+9. **`--install-man` standalone** — resolves its target via `brew --prefix` (writes to the real `share/man`), so it cannot be cleanly isolated; the man installer is exercised via `--setup`.
+10. **`_check_hdr10_static_metadata()`** — needs a real DV/HDR source with mastering-display / MaxCLL side data (manual M7).
+11. **Progress bar / spinner** (`ffmpeg_progress_bar`, `run_with_spinner`, `spinner`) — TTY/UI; visual only.
+12. **macOS APFS hidden flag** (`chflags nohidden`) — macOS + APFS only (M81).
+13. Everything already filed under §2 manual procedures: full DV pipeline, tone-mapping quality, OCR, subtitle burn-in, ASS styling, audio listening tests, SIGINT/disk-full recovery, cross-platform, and device playback.
 
 ---
 
