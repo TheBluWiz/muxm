@@ -2846,18 +2846,21 @@ test_audio() {
 
   local outfile out acount ch acodec alang
 
-  # Basic encode — check audio present + stereo fallback
+  # Basic encode — check audio present + stereo fallback.
+  # --stereo-fallback is explicit so the test is deterministic regardless of
+  # what ADD_STEREO_IF_MULTICH the user's ~/.muxmrc or default profile sets.
+  # (CLI flags parsed after apply_profile, so they always win.)
   outfile="$TESTDIR/audio_test1.mp4"
   log "Testing audio pipeline..."
   if assert_encode "Audio test encode" "$outfile" \
-       --crf 28 --preset ultrafast "$TESTDIR/hevc_sdr_51.mkv"; then
+       --crf 28 --preset ultrafast --stereo-fallback "$TESTDIR/hevc_sdr_51.mkv"; then
     assert_stream_count "Audio track present in output" "$outfile" a 1
-    # Soft check: stereo fallback may add a second track
+    # Hard assert: 6ch source + --stereo-fallback must produce a second stereo track
     acount="$(count_streams "$outfile" a)"
     if [[ "$acount" -ge 2 ]]; then
-      pass "Stereo fallback track added"
+      pass "Stereo fallback: 6ch source + --stereo-fallback → stereo AAC track added"
     else
-      skip "Stereo fallback: only 1 audio track (may not have been needed)"
+      fail "Stereo fallback: expected ≥2 audio tracks with --stereo-fallback on 6ch source, got $acount"
     fi
   fi
 
