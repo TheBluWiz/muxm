@@ -4572,6 +4572,7 @@ _test_unit_audio_helpers() {
   # A regression (e.g., dropping eac3) silently forces unnecessary transcoding.
   # Since audio_is_direct_play_copyable now delegates to _sii_audio_is_container_safe (M2),
   # tests must supply the stub and a container context (mp4 = most common direct-play target).
+  # shellcheck disable=SC2016 # $MUX_FORMAT/$c must NOT expand here; they expand at eval time inside bash -c.
   local _sii_stub='_sii_audio_is_container_safe(){ local c=$1; [[ $MUX_FORMAT == matroska ]] && return 0; case $MUX_FORMAT in mp4|mov|m4v) case $c in aac|ac3|eac3|alac) return 0;; *) return 1;; esac;; esac; return 1; }'
   assert_muxm_fn_exit "audio_is_direct_play_copyable('aac')=copyable"       0 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "aac"
   assert_muxm_fn_exit "audio_is_direct_play_copyable('alac')=copyable"      0 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "alac"
@@ -6098,7 +6099,7 @@ test_regression_p5() {
       h9_workdir="$(printf '%s\n' "$h9_encode_out" | grep 'Keeping workdir:' | awk '{print $NF}')"
       if [[ -n "$h9_workdir" && -d "$h9_workdir" ]]; then
         local h9_log
-        h9_log="$(ls "$h9_workdir"/muxm.*.log 2>/dev/null | head -1)"
+        h9_log="$(find "$h9_workdir" -maxdepth 1 -name 'muxm.*.log' 2>/dev/null | head -1)"
         if [[ -n "$h9_log" ]]; then
           local h9_enc_cmd
           h9_enc_cmd="$(grep 'ffmpeg encode command' "$h9_log" | head -1)"

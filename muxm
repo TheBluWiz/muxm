@@ -4387,8 +4387,9 @@ while [[ $# -gt 0 ]]; do
 
     --crf)
       _require_val "$1" "${2:-}"; _crf_in="$2"
-      [[ "$_crf_in" =~ ^[0-9]+$ ]] && (( 10#$_crf_in <= 51 )) \
-        || die 11 "Invalid --crf: integer 0–51 expected (got: ${_crf_in})"
+      if [[ ! "$_crf_in" =~ ^[0-9]+$ ]] || (( 10#$_crf_in > 51 )); then
+        die 11 "Invalid --crf: integer 0–51 expected (got: ${_crf_in})"
+      fi
       CRF_VALUE="$_crf_in"; _CLI_CRF_EXPLICIT=1; shift 2 ;;
     -p|--preset)
       _require_val "$1" "${2:-}"; PRESET_VALUE="$2"; _CLI_PRESET_EXPLICIT=1
@@ -5004,8 +5005,9 @@ esac
 
 # Re-validate CRF_VALUE after config load: a sourced config can assign directly to the
 # declare -i variable, bypassing the CLI parser guard (C1).
-[[ "$CRF_VALUE" =~ ^[0-9]+$ ]] && (( CRF_VALUE <= 51 )) \
-  || die 11 "Invalid CRF_VALUE from config: integer 0–51 expected (got: ${CRF_VALUE})"
+if [[ ! "$CRF_VALUE" =~ ^[0-9]+$ ]] || (( CRF_VALUE > 51 )); then
+  die 11 "Invalid CRF_VALUE from config: integer 0–51 expected (got: ${CRF_VALUE})"
+fi
 
 # Resolve and validate source file
 SRC_ABS="$(realpath_fallback "$SRC")"
@@ -5295,7 +5297,7 @@ on_exit() {
     _print_completed_steps
     _cleanup_workdir 0
     # Drain the tee logger: restore stdout/stderr to terminal, wait for tee to flush (H6).
-    exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" 2>/dev/null || true
+    exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" || true
     [[ -n "${TEE_PID:-}" ]] && wait "$TEE_PID" 2>/dev/null || true
     [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
     exit 0
@@ -5311,7 +5313,7 @@ on_exit() {
 
     _cleanup_workdir 1
     # Drain the tee logger: restore stdout/stderr to terminal, wait for tee to flush (H6).
-    exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" 2>/dev/null || true
+    exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" || true
     [[ -n "${TEE_PID:-}" ]] && wait "$TEE_PID" 2>/dev/null || true
     [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
     exit "${EXIT_CODE:-1}"
@@ -5428,7 +5430,7 @@ disk_free_warn() {
         libsvt-av1|libaom-av1) preset_mult="$(_av1_preset_multiplier "$PRESET_VALUE")" ;;
         *)                     preset_mult="$(_preset_multiplier "$PRESET_VALUE")" ;;
       esac
-      # Rescale to avoid signed-64-bit overflow on long 4K sources (H5).
+      # shellcheck disable=SC2017 # Early division order is intentional: prevents signed-64-bit overflow on long 4K sources (H5).
       est_video_bytes=$(( vbr / 8 * dur / 1000 * ratio / 1000 * preset_mult ))
     fi
   fi
