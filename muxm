@@ -1066,7 +1066,7 @@ readonly CONFIG_TRACKED_VARS=(
   SUB_LANG_PREF SUB_INCLUDE_FORCED SUB_INCLUDE_FULL SUB_INCLUDE_SDH SUB_MAX_TRACKS
   SUB_BURN_FORCED SUB_EXPORT_EXTERNAL SUB_PRESERVE_TEXT_FORMAT
   SUB_MULTI_TRACK
-  SUB_PRESERVE_BITMAP SUB_OCR_LANG EXT_SUB_ENABLED DISK_CHECK FFPROBE_LOGLEVEL
+  SUB_PRESERVE_BITMAP SUB_OCR_LANG EXT_SUB_ENABLED SUB_SOLE_EXT_FALLBACK DISK_CHECK FFPROBE_LOGLEVEL
   SUB_ENABLE_OCR SUB_OCR_TOOL
   OUTPUT_EXT KEEP_CHAPTERS STRIP_METADATA PROFILE_COMMENT INCLUDE_AUDIO_TITLES
   CHECKSUM CHECKSUM_ALGO SKIP_IF_IDEAL REPORT_JSON
@@ -3332,6 +3332,11 @@ HEADER
   echo "# Matched files are muxed in as additional subtitle tracks."
   echo "#   1 = enabled (default)  |  0 = disable discovery entirely (--no-ext-subs)"
   _V EXT_SUB_ENABLED
+  printf '\n'
+  echo "# Sole-sidecar language-filter bypass: when the only subtitle present is a"
+  echo "# single external sidecar, include it even if it fails the SUB_LANG_PREF filter."
+  echo "#   1 = bypass language filter for a lone sidecar (default)  |  0 = enforce filter (--no-sub-sole-ext-fallback)"
+  _V SUB_SOLE_EXT_FALLBACK
   printf '\n'
   echo "# Override the directory searched for external subtitles"
   echo "# (default: same directory as the source file)"

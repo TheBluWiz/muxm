@@ -1037,6 +1037,81 @@ _test_cli_profile_crossref() {
   fi
 }
 
+_test_cli_flag_drift() {
+  # Guards the hand-maintained CLI flag surfaces against drift:
+  #   A. parser (every flag muxm accepts)  <->  installed tab-completion flag list
+  #   B. every flag --create-config accepts as an override (_CC_OVERRIDES) must map to a
+  #      variable in CONFIG_TRACKED_VARS — otherwise the override is silently dropped from
+  #      the generated .muxmrc (the SUB_SOLE_EXT_FALLBACK class of bug).
+  # Extraction is anchored on stable code structure (not line numbers) so it survives edits.
+  local src="$MUXM"
+  if [[ ! -r "$src" ]]; then
+    skip "muxm source not readable — flag drift guard skipped"
+    return
+  fi
+
+  local wd="$TESTDIR/flag_drift"
+  mkdir -p "$wd"
+  local parser="$wd/parser.txt" comp="$wd/comp.txt"
+  local ccvars="$wd/cc.txt" tracked="$wd/tracked.txt"
+
+  # ---- Parser flag set: union of all four dispatch forms ----
+  {
+    # (a) main argument loop:  while [[ $# -gt 0 ]]; do ... case "$1" in ... done
+    awk '/while \[\[ \$# -gt 0 \]\]; do/{f=1} f; /^done$/{if(f)exit}' "$src" \
+      | grep -oE '^[[:space:]]+--?[a-zA-Z][a-zA-Z0-9-]*(\|--?[a-zA-Z][a-zA-Z0-9-]*)*\)'
+    # (b) pre-scan dispatch:  case "$_arg" in ... esac  (install-man/-completions, etc.)
+    awk '/case "\$_arg" in/{f=1} f{print} f&&/esac/{f=0}' "$src" \
+      | grep -oE '^[[:space:]]+--?[a-zA-Z][a-zA-Z0-9-]*(\|--?[a-zA-Z][a-zA-Z0-9-]*)*\)'
+    # (d) --create-config pre-scan function
+    awk '/_create_config_prescan\(\)/{f=1} f{print} f&&/^}/{exit}' "$src" \
+      | grep -oE '^[[:space:]]+--?[a-zA-Z][a-zA-Z0-9-]*(\|--?[a-zA-Z][a-zA-Z0-9-]*)*\)'
+  } | sed -E 's/^[[:space:]]+//; s/\)$//' | tr '|' '\n' > "$wd/raw.txt"
+  # (c) [[ "$_arg" == "--flag" ]] if-style dispatch (install-dependencies, setup)
+  grep -oE '"\$_arg" == "--[a-z][a-z-]*"' "$src" | grep -oE '\-\-[a-z-]+' >> "$wd/raw.txt"
+  grep -vxE '\-\-|\-\*|\*' "$wd/raw.txt" | sort -u > "$parser"
+
+  # ---- Completion flag set: the `flags="..."` block of the installed script ----
+  local fake_home="$TESTDIR/fake_home_flagdrift"
+  mkdir -p "$fake_home"
+  touch "$fake_home/.bashrc" "$fake_home/.zshrc"
+  HOME="$fake_home" "$MUXM" --install-completions >/dev/null 2>&1 || true
+  local comp_file="$fake_home/.muxm/muxm-completion.bash"
+  if [[ ! -f "$comp_file" ]]; then
+    skip "Completion file not generated — flag drift guard skipped"
+    return
+  fi
+  awk '/[[:space:]]flags="/{f=1;next} f&&/"/{exit} f' "$comp_file" \
+    | tr ' \t' '\n\n' | grep -E '^-{1,2}[a-zA-Z]' | sort -u > "$comp"
+
+  # ---- Assertion A: parser <-> completion, both directions ----
+  local missing_in_comp missing_in_parser
+  missing_in_comp="$(comm -23 "$parser" "$comp")"
+  missing_in_parser="$(comm -13 "$parser" "$comp")"
+  if [[ -z "$missing_in_comp" ]]; then
+    pass "Every CLI flag is offered by tab-completion"
+  else
+    fail "Flags accepted by parser but missing from completion: $(echo $missing_in_comp)"
+  fi
+  if [[ -z "$missing_in_parser" ]]; then
+    pass "Every completion flag is a real CLI flag"
+  else
+    fail "Flags offered by completion but not accepted by parser: $(echo $missing_in_parser)"
+  fi
+
+  # ---- Assertion B: every --create-config override var is tracked (else silently dropped) ----
+  grep -oE '_CC_OVERRIDES\[[A-Z0-9_]+\]' "$src" | sed -E 's/.*\[//; s/\]//' | sort -u > "$ccvars"
+  awk '/^readonly CONFIG_TRACKED_VARS=\(/{f=1;next} f&&/^\)/{exit} f' "$src" \
+    | grep -oE '\b[A-Z][A-Z0-9_]+\b' | sort -u > "$tracked"
+  local untracked
+  untracked="$(comm -23 "$ccvars" "$tracked")"
+  if [[ -z "$untracked" ]]; then
+    pass "Every --create-config override maps to a CONFIG_TRACKED_VARS entry"
+  else
+    fail "--create-config overrides not in CONFIG_TRACKED_VARS (silently dropped): $(echo $untracked)"
+  fi
+}
+
 _test_cli_robustness() {
   # ---- DEBUG=1 trace mode does not break the run (#smoke) ----
   # muxm runs `set -x` when DEBUG=1, sending an execution trace to stderr.
@@ -1098,6 +1173,7 @@ test_cli() {
   _test_cli_error_codes
   _test_cli_short_aliases
   _test_cli_profile_crossref
+  _test_cli_flag_drift
   _test_cli_robustness
 }
 
