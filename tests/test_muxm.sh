@@ -18,6 +18,10 @@ set -euo pipefail
 # ---- Configuration ----
 MUXM="${MUXM:-./muxm}"
 SUITE="${SUITE:-all}"
+# Canonical temp base — used for BOTH creation (preflight) and cleanup so they
+# never diverge. Honors $TMPDIR (macOS sets a per-user dir under /var/folders);
+# trailing slash stripped so globs don't produce "//".
+TMP_BASE="${TMPDIR:-/tmp}"; TMP_BASE="${TMP_BASE%/}"
 VERBOSE=0
 TESTDIR=""
 PASS=0
@@ -107,7 +111,7 @@ _cleanup_format_kb() {
 }
 
 do_cleanup() {
-  local tmpbase="${TMPDIR:-/tmp}"
+  local tmpbase="$TMP_BASE"
   local dirs=()
   for d in "$tmpbase"/muxm-test.*; do
     [[ -d "$d" ]] && dirs+=("$d")
@@ -136,7 +140,7 @@ do_cleanup() {
 }
 
 auto_cleanup_test_dirs() {
-  local tmpbase="${TMPDIR:-/tmp}"
+  local tmpbase="$TMP_BASE"
   local dirs=()
   for d in "$tmpbase"/muxm-test.*; do
     [[ -d "$d" ]] && dirs+=("$d")
@@ -205,7 +209,7 @@ assert_exit() {
     pass "$label (exit $code)"
   else
     fail "$label — expected exit $expected, got $code"
-    (( VERBOSE )) && echo || true "    Output: ${output:0:200}"
+    (( VERBOSE )) && echo "    Output: ${output:0:200}" || true
   fi
 }
 
@@ -216,7 +220,7 @@ assert_contains() {
     pass "$label"
   else
     fail "$label — output missing: '$needle'"
-    (( VERBOSE )) && echo || true "    Output: ${haystack:0:300}"
+    (( VERBOSE )) && echo "    Output: ${haystack:0:300}" || true
   fi
 }
 
@@ -374,8 +378,14 @@ preflight() {
   fi
 
   # Create test directory
-  TESTDIR="$(mktemp -d /tmp/muxm-test.XXXXXXXX)"
+  TESTDIR="$(mktemp -d "$TMP_BASE/muxm-test.XXXXXXXX")"
+  # Isolate HOME for the entire run so muxm never sources the developer's real
+  # ~/.muxmrc (muxm sources $HOME/.muxmrc). Kept separate from the fixture dir so
+  # muxm writing ~/.muxm (completions) doesn't litter $TESTDIR's media files.
+  export HOME="$TESTDIR/home"
+  mkdir -p "$HOME"
   log "Test directory: $TESTDIR"
+  log "Isolated HOME:  $HOME"
 }
 
 # ---- Generate Synthetic Test Media ----
@@ -2777,8 +2787,8 @@ test_video() {
       pass "--level 5.1: VBV params found in workdir log"
     else
       fail "--level 5.1: VBV keywords not found in output or workdir log"
-      (( VERBOSE )) && echo || true "    Log: ${vbv_log:-not found}"
-      (( VERBOSE )) && echo || true "    Output: ${out:0:500}"
+      (( VERBOSE )) && echo "    Log: ${vbv_log:-not found}" || true
+      (( VERBOSE )) && echo "    Output: ${out:0:500}" || true
     fi
   fi
 }
@@ -5343,7 +5353,7 @@ MOCK_EOF
 
   local mt_e2e_out="$TESTDIR/e2e_archive_multi.mkv"
   log "Full encode: archive profile multi-track audio..."
-  if MUXM_HOME="$mt_e2e_home" assert_encode "archive multi-track: e2e output produced" "$mt_e2e_out" \
+  if assert_encode "archive multi-track: e2e output produced" "$mt_e2e_out" \
        --profile archive "$TESTDIR/hevc_multi_audio.mkv"; then
     # Should have 2 audio tracks (commentary dropped)
     local mt_e2e_acount
@@ -5401,7 +5411,7 @@ MOCK_EOF
   local mt_sub_e2e_out="$TESTDIR/e2e_archive_multi_subs.mkv"
   log "Full encode: archive profile multi-track subtitles..."
   # --no-skip-if-ideal: fixture is fully compliant; without this, muxm skips processing.
-  if MUXM_HOME="$mt_sub_e2e_home" assert_encode "archive multi-track subs: e2e output produced" "$mt_sub_e2e_out" \
+  if assert_encode "archive multi-track subs: e2e output produced" "$mt_sub_e2e_out" \
        --no-skip-if-ideal --profile archive "$TESTDIR/hevc_multi_subs.mkv"; then
     # Should have 5 subtitle tracks (all kept)
     local mt_sub_e2e_scount
@@ -5451,7 +5461,7 @@ MOCK_EOF
   # --sub-lang-pref eng should keep only eng tracks (3 of 5)
   local mt_sub_lang_e2e_out="$TESTDIR/e2e_archive_multi_subs_eng.mkv"
   log "Full encode: archive multi-track subs with --sub-lang-pref eng..."
-  if MUXM_HOME="$mt_sub_e2e_home" assert_encode "archive multi-track subs eng: e2e output produced" "$mt_sub_lang_e2e_out" \
+  if assert_encode "archive multi-track subs eng: e2e output produced" "$mt_sub_lang_e2e_out" \
        --profile archive --sub-lang-pref eng "$TESTDIR/hevc_multi_subs.mkv"; then
     local mt_sub_lang_scount
     mt_sub_lang_scount="$(count_streams "$mt_sub_lang_e2e_out" s)"
@@ -5506,7 +5516,7 @@ MOCK_EOF
   # Fixture: hevc_multi_audio.mkv — eng main + eng commentary + spa (3 audio tracks).
   local mt_audio_lang_e2e_out="$TESTDIR/e2e_archive_mt_audio_eng.mkv"
   log "Full encode: archive multi-track audio with --audio-lang-pref eng..."
-  if MUXM_HOME="$mt_e2e_home" assert_encode "archive multi-track audio eng: e2e output produced" "$mt_audio_lang_e2e_out" \
+  if assert_encode "archive multi-track audio eng: e2e output produced" "$mt_audio_lang_e2e_out" \
        --profile archive --audio-lang-pref eng "$TESTDIR/hevc_multi_audio.mkv"; then
     assert_stream_count "archive multi-track audio eng e2e: 1 audio track (eng main only)" \
       "$mt_audio_lang_e2e_out" a 1 1
