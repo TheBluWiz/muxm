@@ -2958,15 +2958,28 @@ _create_config_emit() {
   # Derive from CONFIG_TRACKED_VARS so this list never diverges from _MUXM_PRE_CONFIG (Structural).
   local _sv
 
+  # H1: reset every tracked variable to its script-builtin default (_MUXM_PRE_CONFIG)
+  # BEFORE applying the profile. At this point the live values still carry whatever the
+  # user/system/project .muxmrc layers set at startup (sourced in Section 6). Without
+  # this reset, the diff below would flag a profile-UNTOUCHED variable that a .muxmrc
+  # merely happened to change — leaking that user value into the generated config as if
+  # the profile owned it (emitted uncommented). Resetting to the defaults first isolates
+  # the diff to the profile's own changes. Mutating live state here is safe: a
+  # --create-config run exits immediately after emit (see _create_config), so nothing
+  # downstream reads these. Same printf -v mechanism as the CLI-override loop below.
+  for _sv in "${CONFIG_TRACKED_VARS[@]}"; do
+    printf -v "$_sv" '%s' "${_MUXM_PRE_CONFIG[$_sv]}"
+  done
+
   # Apply the profile to populate variable values
   PROFILE_NAME="$profile"
   "apply_profile_${profile//-/_}"
 
   # Diff: mark any variable the profile changed from the script's built-in defaults
-  # as active (will be emitted uncommented).
-  # We compare against _MUXM_PRE_CONFIG (captured before any .muxmrc was sourced)
-  # rather than a runtime snapshot, so that config-file values that coincidentally
-  # match the profile value don't suppress the uncommented output.
+  # as active (will be emitted uncommented). Because the loop above reset every tracked
+  # var to its _MUXM_PRE_CONFIG default, the live value now differs from the snapshot
+  # only where the profile itself wrote it — so this captures exactly the profile-owned
+  # changes, free of the sourced user/system/project .muxmrc layers.
   for _sv in "${CONFIG_TRACKED_VARS[@]}"; do
     if [[ "${!_sv}" != "${_MUXM_PRE_CONFIG[$_sv]}" ]]; then
       [[ "$_active" != *" ${_sv} "* ]] && _active+="${_sv} "
@@ -7302,6 +7315,10 @@ run_video_pipeline() {
         V_MIXED="$V_BASE"
         OUTPUT_HAS_DV=0
         mark_done "Use base video (DV frame mismatch)"
+        # Give up like the three sibling fallback branches above (RPU validation,
+        # inject failure, convert failure): return now so we do NOT pre-wrap the
+        # base video with dvcC/dvh1 signaling and re-set OUTPUT_HAS_DV=1 below.
+        return 0
       else
         note "RPU frame count verified: video=$v_frames, rpu=$rpu_frames (within tolerance)."
         report_add "dv_frame_count_match" "ok (video=$v_frames, rpu=$rpu_frames)"

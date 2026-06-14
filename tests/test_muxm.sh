@@ -1612,6 +1612,49 @@ _test_config_create_overrides() {
   fi
   rm -f "$cfg_nooverride_dir/.muxmrc"
 
+  # ---- H1: --create-config must NOT leak the user's .muxmrc into the generated config ----
+  # Regression for the snapshot diff leaking sourced layers (muxm:_create_config_emit).
+  # _create_config_emit applies the profile on top of the LIVE config vars, which already
+  # carry whatever the user/system/project .muxmrc set at startup. Pre-fix, the diff
+  # (live vs _MUXM_PRE_CONFIG) flagged any var that differed from the script default —
+  # including a profile-UNTOUCHED var the user's .muxmrc happened to change — and emitted
+  # it uncommented, as if the profile owned it. The fix resets every tracked var to its
+  # script default before applying the profile, so only profile-owned changes are active.
+  #
+  # Setup: a populated user HOME whose .muxmrc sets MAX_AUDIO_CHANNELS=4 — a var that
+  # streaming-hevc does NOT touch (built-in default 8). The profile DOES set
+  # EAC3_BITRATE_5_1=448k (built-in default 640k).
+  local cfg_leak_dir="$TESTDIR/config_create_leak"
+  local cfg_leak_home="$TESTDIR/config_create_leak_home"
+  mkdir -p "$cfg_leak_dir" "$cfg_leak_home"
+  printf 'MAX_AUDIO_CHANNELS=4\n' > "$cfg_leak_home/.muxmrc"
+  MUXM_HOME="$cfg_leak_home" run_muxm_in "$cfg_leak_dir" \
+    --create-config project streaming-hevc >/dev/null 2>&1
+  if [[ -f "$cfg_leak_dir/.muxmrc" ]]; then
+    content="$(cat "$cfg_leak_dir/.muxmrc")"
+    # Profile-untouched var: must appear as the COMMENTED default (#MAX_AUDIO_CHANNELS=8),
+    # never as the user's leaked value uncommented.
+    if echo "$content" | grep -qE '^MAX_AUDIO_CHANNELS='; then
+      fail "H1: user .muxmrc value leaked — MAX_AUDIO_CHANNELS emitted uncommented (got: $(echo "$content" | grep -E '^MAX_AUDIO_CHANNELS=' ))"
+    else
+      pass "H1: profile-untouched MAX_AUDIO_CHANNELS not emitted uncommented (no user-config leak)"
+    fi
+    if echo "$content" | grep -qE '^#MAX_AUDIO_CHANNELS=8$'; then
+      pass "H1: profile-untouched MAX_AUDIO_CHANNELS stays commented at the script default (#=8)"
+    else
+      fail "H1: expected '#MAX_AUDIO_CHANNELS=8' (commented default), got: $(echo "$content" | grep -E 'MAX_AUDIO_CHANNELS' || echo '<not present>')"
+    fi
+    # Profile-owned var: must stay uncommented at the profile value (448k, != default 640k).
+    if echo "$content" | grep -qE '^EAC3_BITRATE_5_1="?448k"?'; then
+      pass "H1: profile-owned EAC3_BITRATE_5_1=448k stays uncommented"
+    else
+      fail "H1: expected uncommented EAC3_BITRATE_5_1=448k (profile-owned), got: $(echo "$content" | grep -E 'EAC3_BITRATE_5_1' || echo '<not present>')"
+    fi
+  else
+    fail "H1: --create-config (leak guard) did not create .muxmrc"
+  fi
+  rm -f "$cfg_leak_dir/.muxmrc"
+
   # Unknown flag: --bogus-flag should produce an error and exit non-zero
   local bogus_dir="$TESTDIR/config_create_bogus"
   mkdir -p "$bogus_dir"
@@ -6379,7 +6422,7 @@ test_multi_profile() {
 # H9: HLG source under HDR profile → no hdr10=1/smpte2084 in output
 # H8: 4:2:2 SDR + FORCE_CHROMA_420=0 → 4:2:2 target; FORCE_CHROMA_420=1 → 4:2:0 + warn
 # H10: DV convert failure + ALLOW_DV_FALLBACK=0 → die 44 (mock ffprobe + dovi_tool)
-# H1: config round-trip — HW_ACCEL change appears uncommented in created config
+# CFGGEN: HW_ACCEL is tracked, emitted as a commented default (not leaked from local .muxmrc)
 # H11: non-Darwin OS with hw-accel → Linux fallback warning, software encoding
 test_regression_p5() {
   section "Phase 5 Regression Tests (P5.3)"
@@ -6666,6 +6709,95 @@ DVMKVSCRIPT
     skip "DVMKV: hevc_dv_p5_tagged.mp4 fixture not found"
   fi
 
+  # ---- H2: DV frame-count mismatch fallback must NOT mislabel output as Dolby Vision ----
+  # Regression for the missing `return 0` in mix_dv_layers' frame-count-mismatch
+  # fallback (muxm:7301-7305). On a mismatch with ALLOW_DV_FALLBACK=1 the code sets
+  # V_MIXED=V_BASE and OUTPUT_HAS_DV=0, but (pre-fix) fell through to the dvcC/dvh1
+  # pre-wrap and re-set OUTPUT_HAS_DV=1 — shipping base video tagged as Dolby Vision.
+  #
+  # Drive the real DV pipeline (P8, no convert) with a cp-passthrough dovi_tool whose
+  # `info` reports a deliberately bogus, huge RPU frame count. The real encoded clip is
+  # ~48 frames, so the frame-count check trips its >2-frame mismatch and falls back.
+  # MP4 output is used: it's the dvh1/Apple path DV actually targets, and the raw base
+  # ES muxes cleanly there (MKV+raw-ES needs the timestamp pre-wrap and is a separate
+  # concern shared by all four DV-give-up branches — out of scope here).
+  if [[ -f "$TESTDIR/hevc_dv_p5_tagged.mp4" ]]; then
+    local h2_bin="$TESTDIR/h2_mock_bin"
+    local h2_home="$TESTDIR/h2_home"
+    mkdir -p "$h2_bin" "$h2_home"
+    # cp-passthrough dovi_tool, but `info` emits a bogus "999999 RPU" so the
+    # frame-count check (dovi_tool info --summary | grep 'N RPU') sees a wild
+    # mismatch vs. the real ~48-frame video and triggers the fallback.
+    cat > "$h2_bin/dovi_tool" << 'H2DOVISCRIPT'
+#!/bin/bash
+cmd="${1:-}"; shift
+case "$cmd" in
+  info)
+    printf 'Profile: 8\nCompatibility ID: 1\nBL flag: 1\nEL flag: 0\n999999 RPU\n'; exit 0 ;;
+  extract-rpu)
+    out_path=""; args=("$@")
+    for (( i=0; i<${#args[@]}; i++ )); do
+      [[ "${args[$i]}" == "-o" ]] && out_path="${args[$((i+1))]}" && break
+    done
+    cat > /dev/null
+    [[ -n "$out_path" ]] && printf '\x00\x01\x02\x03\n' > "$out_path"
+    exit 0 ;;
+  inject-rpu|convert)
+    in_path=""; out_path=""; args=("$@")
+    for (( i=0; i<${#args[@]}; i++ )); do
+      [[ "${args[$i]}" == "-i" ]] && in_path="${args[$((i+1))]}"
+      [[ "${args[$i]}" == "-o" ]] && out_path="${args[$((i+1))]}"
+    done
+    [[ -n "$in_path" && -n "$out_path" && -s "$in_path" ]] && cp "$in_path" "$out_path"
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+H2DOVISCRIPT
+    chmod +x "$h2_bin/dovi_tool"
+
+    local h2_out="$TESTDIR/h2_dv_mismatch.mp4"
+    rm -f "$h2_out"
+    local h2_log h2_code=0
+    h2_log="$(cd "$TESTDIR" && HOME="$h2_home" PATH="$h2_bin:$PATH" \
+      "$MUXM" -K --preset ultrafast --crf 28 \
+      "hevc_dv_p5_tagged.mp4" "$h2_out" 2>&1)" || h2_code=$?
+
+    # Guard: the test only proves anything if the frame-count mismatch actually fired.
+    # (If _count_video_frames ever returns 0 the check is skipped and DV proceeds — a
+    # silent false-pass without this assertion.)
+    assert_contains "RPU frame count mismatch" \
+      "H2: frame-count mismatch path was exercised" "$h2_log"
+
+    if [[ "$h2_code" -eq 0 && -f "$h2_out" && -s "$h2_out" ]]; then
+      pass "H2: frame-mismatch fallback still produces a (non-DV) output"
+      # OUTPUT_HAS_DV=0 → final summary must NOT advertise DV.
+      if printf '%s\n' "$h2_log" | grep -qE 'DV[[:space:]]*: present'; then
+        fail "H2: output mislabeled as Dolby Vision (summary says 'DV: present' on the fallback path)"
+      else
+        pass "H2: output not labeled Dolby Vision (no 'DV: present' in summary)"
+      fi
+      # The dvcC/dvh1 pre-wrap must be skipped entirely on the give-up path.
+      if printf '%s\n' "$h2_log" | grep -qiF 'Pre-wrapping DV video'; then
+        fail "H2: base video was DV pre-wrapped on the frame-mismatch fallback (missing return 0)"
+      else
+        pass "H2: no DV pre-wrap on the frame-mismatch fallback"
+      fi
+      # The MP4 codec tag must be the plain HEVC tag, not Apple's DV 'dvh1'.
+      local h2_tag
+      h2_tag="$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_tag_string -of default=nw=1:nk=1 "$h2_out" 2>/dev/null || true)"
+      if [[ "$h2_tag" == "dvh1" ]]; then
+        fail "H2: output video codec tag is 'dvh1' (mislabeled DV); expected a plain HEVC tag"
+      else
+        pass "H2: output video codec tag is '$h2_tag' (not dvh1)"
+      fi
+    else
+      fail "H2: frame-mismatch fallback did not produce output (exit $h2_code) — expected a clean non-DV MP4"
+    fi
+  else
+    skip "H2: hevc_dv_p5_tagged.mp4 fixture not found"
+  fi
+
   # ---- DISKSTOP: disk preflight is a HARD STOP when space is insufficient ----
   # Force the estimate above any real free space via a huge DISK_FREE_WARN_GB floor
   # in a scoped .muxmrc; muxm must die before encoding rather than fail mid-run.
@@ -6719,9 +6851,18 @@ DVMKVSCRIPT
     skip "WORKDIR: hevc_sdr_51.mkv fixture not found"
   fi
 
-  # ---- H1: config round-trip — HW_ACCEL change appears uncommented ----
-  # If the user's .muxmrc sets HW_ACCEL, --create-config must emit it uncommented.
-  # Bug: HW_ACCEL was missing from _snap_vars so it always appeared commented-out.
+  # ---- CFGGEN: HW_ACCEL is tracked, emitted as a commented default (not leaked) ----
+  # HW_ACCEL must be part of CONFIG_TRACKED_VARS so --create-config emits it at all (it
+  # was once omitted entirely). Because no built-in profile sets HW_ACCEL, it is
+  # profile-untouched and must appear COMMENTED at its script default — it must NOT carry
+  # the invoking machine's ~/.muxmrc value into the generated file.
+  #
+  # NOTE: pre-remediation this test asserted the opposite (the user's HW_ACCEL leaked
+  # through uncommented). That leak is exactly the H1 ship-blocker fixed in
+  # _create_config_emit (see the config-suite "H1 leak guard" test). Baking a
+  # machine-specific setting like HW_ACCEL="videotoolbox" into a shared/committed config
+  # is precisely the personal-settings leak the fix prevents — a generated config is a
+  # profile template, not a snapshot of the local environment. Corrected accordingly.
   local h1_dir="$TESTDIR/h1_config_roundtrip"
   local h1_home="$TESTDIR/h1_config_home"
   mkdir -p "$h1_dir" "$h1_home"
@@ -6730,13 +6871,20 @@ DVMKVSCRIPT
   if [[ -f "$h1_dir/.muxmrc" ]]; then
     local h1_content
     h1_content="$(cat "$h1_dir/.muxmrc")"
-    if echo "$h1_content" | grep -qE '^HW_ACCEL="videotoolbox"'; then
-      pass "H1: config round-trip — HW_ACCEL uncommented in created .muxmrc"
+    # Tracked + emitted as the commented script default (atv-directplay-hq does not set it).
+    if echo "$h1_content" | grep -qE '^#HW_ACCEL="none"$'; then
+      pass "CFGGEN: HW_ACCEL emitted as commented default (#HW_ACCEL=\"none\") via SSOT"
     else
-      fail "H1: config round-trip — HW_ACCEL not found uncommented (got: $(echo "$h1_content" | grep "HW_ACCEL" | head -3 || echo '<not present>'))"
+      fail "CFGGEN: expected '#HW_ACCEL=\"none\"' (commented default), got: $(echo "$h1_content" | grep 'HW_ACCEL' | head -3 || echo '<not present>')"
+    fi
+    # The invoking machine's ~/.muxmrc value must NOT leak into the generated config (H1).
+    if echo "$h1_content" | grep -qE '^HW_ACCEL='; then
+      fail "CFGGEN: local ~/.muxmrc HW_ACCEL leaked uncommented into generated config (H1 regression)"
+    else
+      pass "CFGGEN: local ~/.muxmrc HW_ACCEL did not leak uncommented into generated config"
     fi
   else
-    fail "H1: config round-trip — no .muxmrc created"
+    fail "CFGGEN: --create-config (HW_ACCEL tracking) — no .muxmrc created"
   fi
 
   # ---- H11: non-Darwin OS + --hw-accel → Linux fallback warning, software encoding ----

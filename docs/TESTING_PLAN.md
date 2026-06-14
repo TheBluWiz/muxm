@@ -179,6 +179,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 71 | `--ocr-tool` sets config | `--ocr-tool pgsrip` → SUB_OCR_TOOL = pgsrip in effective config | ✅ |
 | 71a | `--create-config user av1-hq` | `SVT_AV1_PARAMS_BASE` line uncommented in generated `.muxmrc` | ✅ |
 | 71b | `--create-config user streaming-av1` | Creates valid `.muxmrc` with `streaming-av1` profile name | ✅ |
+| 71c | `--create-config` does not leak local `.muxmrc` (H1) | User `~/.muxmrc` `MAX_AUDIO_CHANNELS=4` + `--create-config project streaming-hevc` → profile-untouched var stays commented at script default (`#MAX_AUDIO_CHANNELS=8`), profile-owned `EAC3_BITRATE_5_1=448k` stays uncommented | ✅ |
 
 ### 1.6 Profile Variable Assignment (suite: `profiles`)
 
