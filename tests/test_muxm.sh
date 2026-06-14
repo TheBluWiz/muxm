@@ -2971,6 +2971,44 @@ test_video() {
     assert_probe "--no-sdr-force-10bit: 8-bit SDR source stays 8-bit (yuv420p)" \
       "$sdr8_out" pix_fmt yuv420p
   fi
+
+  # Frame-rate preservation (regression: 23.976→25 desync bug). A 24000/1001
+  # (NTSC-film) source must produce a 24000/1001 output, never a rounded 25fps.
+  # Guards init_src_fps + the post-mux fps integrity check end-to-end. Generated
+  # inline because the shared gen_media fixture is hardcoded to integer r=24.
+  local fps_src="$TESTDIR/fps_2398_src.mkv" fps_out="$TESTDIR/fps_2398_out.mkv"
+  # Use a lavfi color source (bt709 yuv, like the shared fixtures) rather than
+  # testsrc — testsrc tags colorspace=gbr, which libx265 rejects when muxm
+  # propagates the source color metadata. Only the frame rate differs here.
+  ffmpeg -y -f lavfi -i "color=c=blue:s=320x240:r=24000/1001:d=2" \
+         -f lavfi -i "sine=frequency=440:duration=2" \
+         -c:v libx265 -x265-params log-level=none -c:a ac3 "$fps_src" >/dev/null 2>&1
+  if [[ -s "$fps_src" ]]; then
+    log "Encoding 23.976fps (24000/1001) source — output must preserve fps..."
+    if assert_encode "fps preservation: output produced" "$fps_out" \
+         --output-ext mkv --crf 28 --preset ultrafast "$fps_src"; then
+      assert_probe "fps preservation: 24000/1001 source stays 24000/1001 (no 25fps desync)" \
+        "$fps_out" r_frame_rate "24000/1001"
+      # Direct sync metric: video and audio stream end-times must align. A wrong
+      # fps would shorten the video track while audio stays full-length. MKV omits
+      # per-stream duration, so derive end time from the last packet PTS.
+      local _vend _aend _sync_delta
+      _vend="$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 "$fps_out" 2>/dev/null | grep -E '^[0-9]' | sort -n | tail -1)"
+      _aend="$(ffprobe -v error -select_streams a:0 -show_entries packet=pts_time -of csv=p=0 "$fps_out" 2>/dev/null | grep -E '^[0-9]' | sort -n | tail -1)"
+      if [[ -n "$_vend" && -n "$_aend" ]]; then
+        _sync_delta="$(awk -v v="$_vend" -v a="$_aend" 'BEGIN{d=v-a; if(d<0)d=-d; print (d<=0.5)?"ok":"desync"}')"
+        if [[ "$_sync_delta" == "ok" ]]; then
+          pass "fps preservation: video/audio stream end-times aligned (in sync)"
+        else
+          fail "fps preservation: video ends ${_vend}s but audio ends ${_aend}s — streams desynced"
+        fi
+      else
+        skip "fps preservation: could not read per-stream end times for sync check"
+      fi
+    fi
+  else
+    skip "fps preservation: could not generate fractional-fps fixture"
+  fi
 }
 
 # === Suite: HDR Pipeline ===
@@ -5409,6 +5447,23 @@ build_av1_params; echo "$SVT_AV1_PARAMS"')"
   fi
 }
 
+_test_unit_fps_helpers() {
+  # ---- _fps_to_decimal ----
+  # Converts a frame rate (exact rational "num/den" or a plain decimal) to a
+  # 4-dp decimal string. Underpins the DV raw-ES fps stamping (SRC_FPS) and the
+  # post-mux frame-rate integrity guard. Invalid/zero input must echo nothing so
+  # callers skip fps enforcement rather than stamp a bogus rate.
+  assert_muxm_fn_stdout "_fps_to_decimal(24000/1001)=23.9760" "23.9760" _fps_to_decimal "" "24000/1001"
+  assert_muxm_fn_stdout "_fps_to_decimal(30000/1001)=29.9700" "29.9700" _fps_to_decimal "" "30000/1001"
+  assert_muxm_fn_stdout "_fps_to_decimal(25/1)=25.0000"       "25.0000" _fps_to_decimal "" "25/1"
+  assert_muxm_fn_stdout "_fps_to_decimal(24)=24.0000"         "24.0000" _fps_to_decimal "" "24"
+  assert_muxm_fn_stdout "_fps_to_decimal(23.976)=23.9760"     "23.9760" _fps_to_decimal "" "23.976"
+  assert_muxm_fn_stdout "_fps_to_decimal(0/0)=empty"          ""        _fps_to_decimal "" "0/0"
+  assert_muxm_fn_stdout "_fps_to_decimal(0)=empty"            ""        _fps_to_decimal "" "0"
+  assert_muxm_fn_stdout "_fps_to_decimal('')=empty"           ""        _fps_to_decimal "" ""
+  assert_muxm_fn_stdout "_fps_to_decimal(abc)=empty"          ""        _fps_to_decimal "" "abc"
+}
+
 test_unit() {
   section "Pure-Function Unit Tests"
   _test_unit_audio_helpers
@@ -5422,6 +5477,7 @@ test_unit() {
   _test_unit_apply_level_vbv
   _test_unit_mapping_helpers
   _test_unit_av1_helpers
+  _test_unit_fps_helpers
 }
 
 # === Suite: Profile End-to-End (real encodes with profiles) ===

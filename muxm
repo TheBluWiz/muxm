@@ -142,6 +142,10 @@ declare -a _ORIG_FILTERED_ARGS=()
 # Metadata cache for performance optimization
 METADATA_CACHE=""
 _CACHED_SRC_DURATION_SECS=""   # Populated on first call to _get_source_duration_secs
+SRC_FPS=""                     # Source video frame rate as exact rational (e.g. 24000/1001).
+                               # Populated by init_src_fps() after cache_stream_metadata.
+                               # Empty when undeterminable (e.g. r_frame_rate="0/0") — callers
+                               # must skip fps enforcement rather than pass a bogus value.
 
 # Tracks whether DV actually made it into the output (not just detected in source)
 declare -i OUTPUT_HAS_DV=0
@@ -5849,6 +5853,43 @@ _has_stream(){
   _jq_cache -e "[.streams[] | select(.codec_type==\"$1\")] | length > 0" >/dev/null
 }
 
+# Convert a frame rate (exact rational "num/den" or a plain decimal) to a decimal
+# string. Echoes nothing on invalid/zero input. Used for fps comparison/logging.
+# Args: $1 — rate string (e.g. "24000/1001", "25", "23.976")
+_fps_to_decimal(){
+  local r="${1:-}"
+  case "$r" in
+    */*)
+      local num="${r%%/*}" den="${r##*/}"
+      [[ "$num" =~ ^[0-9]+$ && "$den" =~ ^[0-9]+$ ]] || return 0
+      (( den == 0 || num == 0 )) && return 0
+      LC_NUMERIC=C awk -v n="$num" -v d="$den" 'BEGIN{ printf "%.4f", n/d }'
+      ;;
+    *)
+      [[ "$r" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 0
+      LC_NUMERIC=C awk -v n="$r" 'BEGIN{ if (n+0 == 0) exit; printf "%.4f", n }'
+      ;;
+  esac
+}
+
+# Populate the SRC_FPS global from the cached source metadata (r_frame_rate).
+# Keeps the exact rational so downstream wrap steps (mp4box -fps, ffmpeg -r) can
+# stamp the precise rate with zero rounding drift. Leaves SRC_FPS empty when the
+# source advertises no usable rate (e.g. "0/0"), so callers skip fps enforcement.
+# Globals: SRC_FPS (write). Must run AFTER cache_stream_metadata().
+init_src_fps(){
+  local raw dec
+  raw="$(_probe_field r_frame_rate)"
+  dec="$(_fps_to_decimal "$raw")"
+  if [[ -n "$dec" ]]; then
+    SRC_FPS="$raw"
+    log "[init_src_fps] source frame rate: $SRC_FPS (${dec} fps)"
+  else
+    SRC_FPS=""
+    warn "Could not determine source frame rate (r_frame_rate='${raw:-unset}'); fps will not be enforced on the DV wrap. Output fps should be verified manually."
+  fi
+}
+
 # ===== Section 22: Color space & pixel format decision ========================================
 declare -i IS_DV=0
 PROFILE_DESC="SDR"
@@ -6382,7 +6423,11 @@ verify_dv_container_record() {
         dvp_hint=":dvp=${DV_SRC_PROFILE}.${DV_SRC_COMPAT_ID}"
       fi
 
-      "$MP4BOX_CMD" -add "${V_MIXED}${dvp_hint}" \
+      # Force source frame rate (mp4box defaults headerless ES to 25fps). See the
+      # pre-wrap path for the full rationale.
+      local -a fps_arg=()
+      [[ -n "$SRC_FPS" ]] && fps_arg=(-fps "$SRC_FPS")
+      "$MP4BOX_CMD" "${fps_arg[@]}" -add "${V_MIXED}${dvp_hint}" \
            -new "$dv_video_mp4" >"$WORKDIR/dovi_mux_mp4box.log" 2>&1 &
       local mp4box_fb_pid=$!
       spinner "$mp4box_fb_pid" "DV fallback: muxing with mp4box"
@@ -7273,7 +7318,13 @@ run_video_pipeline() {
         dvp_hint=":dvp=${DV_SRC_PROFILE}.${DV_SRC_COMPAT_ID}"
       fi
 
-      "$MP4BOX_CMD" -add "${V_MIXED}${dvp_hint}" \
+      # Force the source frame rate: raw HEVC ES carries no container timing, and
+      # mp4box defaults headerless ES (e.g. from hevc_videotoolbox, which omits VUI
+      # timing) to 25fps — corrupting timing on 23.976/24/30 content. Skipped only
+      # when SRC_FPS is undeterminable.
+      local -a fps_arg=()
+      [[ -n "$SRC_FPS" ]] && fps_arg=(-fps "$SRC_FPS")
+      "$MP4BOX_CMD" "${fps_arg[@]}" -add "${V_MIXED}${dvp_hint}" \
            -new "$dv_prewrap" >"$WORKDIR/dv_prewrap_mp4box.log" 2>&1 &
       local pw_mp4box_pid=$!
       spinner "$pw_mp4box_pid" "Pre-wrapping DV video (mp4box)"
@@ -7302,7 +7353,12 @@ run_video_pipeline() {
     # would corrupt the stream.
     if (( ! prewrap_ok )); then
       rm -f "$dv_prewrap" 2>/dev/null || true
+      # Stamp source fps as an INPUT option — ffmpeg's raw-hevc demuxer also
+      # defaults headerless ES to 25fps (and can field-double to 50fps).
+      local -a fps_in=()
+      [[ -n "$SRC_FPS" ]] && fps_in=(-r "$SRC_FPS")
       ffmpeg "${FFMPEG_FLAGS[@]}" \
+           "${fps_in[@]}" \
            -i "$V_MIXED" \
            -c:v copy \
            -strict unofficial \
@@ -7340,7 +7396,11 @@ run_video_pipeline() {
         # Matroska mux fails with "Can't write packet with unknown timestamp".
         warn "DV pre-wrap did not yield a dvcC box; wrapping raw ES into a timestamped MP4 for the MKV mux."
         rm -f "$dv_prewrap" 2>/dev/null || true
+        # Stamp source fps as an INPUT option (raw-hevc demuxer defaults to 25/50fps).
+        local -a fps_in2=()
+        [[ -n "$SRC_FPS" ]] && fps_in2=(-r "$SRC_FPS")
         ffmpeg "${FFMPEG_FLAGS[@]}" \
+             "${fps_in2[@]}" \
              -i "$V_MIXED" \
              -c:v copy \
              -strict unofficial \
@@ -9540,6 +9600,12 @@ mux_final() {
     if ! ffprobe -v error "$V_MIXED" >/dev/null 2>&1; then
       die 42 "Encoded video exists but is invalid/corrupt"
     fi
+    # Raw HEVC ES carries no container timing; stamp source fps as an input option
+    # so the mux doesn't inherit ffmpeg's 25fps raw-demuxer default. (.mkv/.mp4
+    # intermediates already carry timing — only raw .hevc needs this.)
+    if [[ "$V_MIXED" == *.hevc && -n "$SRC_FPS" ]]; then
+      ff_in+=( -r "$SRC_FPS" )
+    fi
     ff_in+=( -i "$V_MIXED" )
     vid_idx=$next_idx
     next_idx=$(( next_idx + 1 ))
@@ -9961,6 +10027,10 @@ main() {
   # Cache metadata once for all operations
   cache_stream_metadata
 
+  # Capture the source frame rate so the DV raw-ES wrap steps (mp4box / ffmpeg)
+  # stamp the correct rate instead of mp4box's 25fps default for headerless ES.
+  init_src_fps
+
   # Smart disk space preflight — runs here so METADATA_CACHE is available for estimation
   disk_free_warn
 
@@ -10248,6 +10318,28 @@ main() {
       fi
 
       say "  Video : ${v_codec:-?} ${v_res:-?} @ ${v_fps:-?} fps"
+
+      # Frame-rate integrity guard (hard-fail backstop). The DV raw-ES wrap steps
+      # stamp SRC_FPS explicitly, so output fps MUST match the source. A mismatch
+      # means a wrap path slipped through unstamped (e.g. a future regression) and
+      # the audio would progressively desync — reject the encode rather than ship a
+      # broken file. End users should never see this; it guards against the very
+      # bug it was written for. Compared with a 1% relative tolerance to absorb
+      # rational↔decimal rounding (23.976 vs 23.976023976). Skipped when either
+      # side is unknown or the video was stream-copied (fps preserved by the copy).
+      if [[ -n "$SRC_FPS" && -n "${v_fps:-}" && "$v_fps" != "?" ]] && (( ! VIDEO_COPY_FROM_SOURCE )); then
+        local _src_fps_dec
+        _src_fps_dec="$(_fps_to_decimal "$SRC_FPS")"
+        if [[ -n "$_src_fps_dec" ]]; then
+          local _fps_ok
+          _fps_ok="$(LC_NUMERIC=C awk -v s="$_src_fps_dec" -v o="$v_fps" \
+            'BEGIN{ d=s-o; if (d<0) d=-d; print (s>0 && d/s <= 0.01) ? 1 : 0 }')"
+          if [[ "$_fps_ok" != "1" ]]; then
+            die 45 "Frame-rate integrity check failed: source ${_src_fps_dec} fps but output ${v_fps} fps. This would cause progressive audio desync; refusing to ship a desynced encode. See log: $LOGFILE"
+          fi
+          log "[verify] fps integrity OK: source ${_src_fps_dec} ≈ output ${v_fps} fps"
+        fi
+      fi
 
       # Audio: rich per-track metadata (codec, channels, language, bitrate, title)
       # Single jq call over all audio streams; iterate the newline-delimited output (L2c).
