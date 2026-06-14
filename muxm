@@ -128,6 +128,7 @@ WORKDIR_BASE=""        # --workdir DIR: parent dir for the .muxm.tmp.* workdir.
                        # volume to keep multi-GB intermediates off the output disk.
 LOGFILE=""
 TEE_PID=""            # PID of the tee logger process (Section 17); waited on in on_exit
+_ACTIVE_FFMPEG_PID="" # PID of the current backgrounded ffmpeg or long-running subprocess; SIGKILL'd in on_exit to release the tee pipe
 _BURN_SRT_FILTER=""   # temp file for subtitle burn-in (inside WORKDIR; cleaned in on_exit)
 FAILED=0
 FAIL_MSG=""
@@ -549,17 +550,21 @@ _ffmpeg_run_with_ui() {
   if _make_progress_pipe "$_ffui_pipe"; then
     ffmpeg "${_ffui_cmd[@]}" -progress "$_ffui_pipe" 2>"$_ffui_err" &
     local _ffui_pid=$!
-    # ffmpeg_progress_bar calls wait internally and returns ffmpeg's exit status
+    _ACTIVE_FFMPEG_PID=$_ffui_pid
     ffmpeg_progress_bar "$_ffui_pid" "$_ffui_pipe" "$_ffui_secs" "$_ffui_label"
     local _ffui_rc=$?
+    _ACTIVE_FFMPEG_PID=""
     rm -f "$_ffui_pipe" 2>/dev/null || true
     return $_ffui_rc
   else
     ffmpeg "${_ffui_cmd[@]}" 2>"$_ffui_err" &
     local _ffui_pid=$!
+    _ACTIVE_FFMPEG_PID=$_ffui_pid
     spinner "$_ffui_pid" "$_ffui_label"
     wait "$_ffui_pid" 2>/dev/null
-    return $?
+    local _ffui_rc=$?
+    _ACTIVE_FFMPEG_PID=""
+    return $_ffui_rc
   fi
 }
 
@@ -5317,8 +5322,10 @@ _ensure_src_es() {
   [[ -s "$V_SRC_ES" ]] && return 0
   ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy -bsf:v hevc_mp4toannexb -f hevc "$V_SRC_ES" 2>"$WORKDIR/demux.err" &
   local _es_pid=$!
+  _ACTIVE_FFMPEG_PID=$_es_pid
   spinner "$_es_pid" "Demuxing video elementary stream (on demand)"
   if ! wait "$_es_pid" 2>/dev/null; then
+    _ACTIVE_FFMPEG_PID=""
     local codec; codec="$(_probe_field codec_name)"
     warn "Could not demux raw HEVC ES (source codec: ${codec:-unknown})."
     warn "  DV RPU extraction requires an HEVC source stream. Use --no-dv to skip DV processing."
@@ -5326,6 +5333,7 @@ _ensure_src_es() {
     : > "$V_SRC_ES" 2>/dev/null || true
     return 1
   fi
+  _ACTIVE_FFMPEG_PID=""
   return 0
 }
 
@@ -5378,7 +5386,15 @@ on_exit() {
     _cleanup_workdir 0
     # Drain the tee logger: restore stdout/stderr to terminal, wait for tee to flush (H6).
     exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" || true
-    [[ -n "${TEE_PID:-}" ]] && wait "$TEE_PID" 2>/dev/null || true
+    if [[ -n "${TEE_PID:-}" ]]; then
+      # Backstop: if any child still holds the tee pipe write end, kill tee after 5s
+      # so we never block forever. FDs are already restored to terminal, so this
+      # watchdog does not itself hold the pipe.
+      ( sleep 5; kill "$TEE_PID" 2>/dev/null ) &
+      local _tee_wd=$!
+      wait "$TEE_PID" 2>/dev/null || true
+      kill "$_tee_wd" 2>/dev/null; wait "$_tee_wd" 2>/dev/null || true
+    fi
     [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
     exit 0
   else
@@ -5391,10 +5407,25 @@ on_exit() {
     # Clean up temp output file on failure
     [[ -f "$TMP_OUT" ]] && rm -f "$TMP_OUT"
 
+    # SIGKILL any still-running ffmpeg before cleanup so it releases the tee pipe's
+    # write end; otherwise wait "$TEE_PID" blocks until ffmpeg exits on its own.
+    if [[ -n "${_ACTIVE_FFMPEG_PID:-}" ]]; then
+      kill -KILL "$_ACTIVE_FFMPEG_PID" 2>/dev/null || true
+      wait "$_ACTIVE_FFMPEG_PID" 2>/dev/null || true
+      _ACTIVE_FFMPEG_PID=""
+    fi
     _cleanup_workdir 1
     # Drain the tee logger: restore stdout/stderr to terminal, wait for tee to flush (H6).
     exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" || true
-    [[ -n "${TEE_PID:-}" ]] && wait "$TEE_PID" 2>/dev/null || true
+    if [[ -n "${TEE_PID:-}" ]]; then
+      # Backstop: if any child still holds the tee pipe write end, kill tee after 5s
+      # so we never block forever. FDs are already restored to terminal, so this
+      # watchdog does not itself hold the pipe.
+      ( sleep 5; kill "$TEE_PID" 2>/dev/null ) &
+      local _tee_wd=$!
+      wait "$TEE_PID" 2>/dev/null || true
+      kill "$_tee_wd" 2>/dev/null; wait "$_tee_wd" 2>/dev/null || true
+    fi
     [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
     exit "${EXIT_CODE:-1}"
   fi
@@ -6461,8 +6492,11 @@ verify_dv_container_record() {
 
       ffmpeg "${remux_cmd[@]}" 2>"$WORKDIR/dv_remux.err" &
       local remux_fb_pid=$!
+      _ACTIVE_FFMPEG_PID=$remux_fb_pid
       spinner "$remux_fb_pid" "DV fallback: remuxing with dvcC"
-      if wait "$remux_fb_pid" 2>/dev/null && [[ -s "$dv_final" ]]; then
+      local _remux_fb_rc; wait "$remux_fb_pid" 2>/dev/null && _remux_fb_rc=0 || _remux_fb_rc=$?
+      _ACTIVE_FFMPEG_PID=""
+      if (( _remux_fb_rc == 0 )) && [[ -s "$dv_final" ]]; then
         local final_probe
         final_probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
                        stream_side_data -select_streams v:0 "$dv_final" 2>&1)" || true
@@ -6756,7 +6790,9 @@ run_video_pipeline() {
                | dovi_tool extract-rpu - -o "$rpu_check" >/dev/null 2>&1
           ) &
           local rpu_val_pid=$!
+          _ACTIVE_FFMPEG_PID=$rpu_val_pid
           spinner "$rpu_val_pid" "Validating DV RPU integrity"
+          _ACTIVE_FFMPEG_PID=""
           if wait "$rpu_val_pid" 2>/dev/null && [[ -s "$rpu_check" ]]; then
             if _validate_dv_rpu "$rpu_check"; then
               note "DV RPU integrity verified for copy path."
@@ -7035,7 +7071,9 @@ run_video_pipeline() {
          | dovi_tool extract-rpu - -o "$RPU_P7" >"$WORKDIR/rpu_pipe.log" 2>&1
     ) &
     local rpu_pipe_pid=$!
+    _ACTIVE_FFMPEG_PID=$rpu_pipe_pid
     spinner "$rpu_pipe_pid" "Extracting DV RPU (piped)"
+    _ACTIVE_FFMPEG_PID=""
     if wait "$rpu_pipe_pid" 2>/dev/null; then
       if [[ -s "$RPU_P7" ]]; then
         rpu_extracted=1
@@ -8246,8 +8284,11 @@ run_audio_pipeline(){
   if (( do_copy )); then
     ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$idx" -c copy "$A_PRIMARY" 2>"$WORKDIR/audio_primary.err" &
     local acopy_pid=$!
+    _ACTIVE_FFMPEG_PID=$acopy_pid
     spinner "$acopy_pid" "Copying audio stream"
-    if ! wait "$acopy_pid" 2>/dev/null; then
+    local _acopy_rc; wait "$acopy_pid" 2>/dev/null || _acopy_rc=$?
+    _ACTIVE_FFMPEG_PID=""
+    if (( ${_acopy_rc:-0} != 0 )); then
       die 43 "Audio copy failed. See: $WORKDIR/audio_primary.err"
     fi
   else
@@ -8351,7 +8392,9 @@ run_audio_pipeline(){
         ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map "0:a:${_native_si}" -c copy "$AAC_STEREO" \
           2>"$WORKDIR/audio_stereo.err" &
         local _ns_pid=$!
+        _ACTIVE_FFMPEG_PID=$_ns_pid
         spinner "$_ns_pid" "Copying native stereo track"
+        _ACTIVE_FFMPEG_PID=""
         if ! wait "$_ns_pid" 2>/dev/null; then
           warn "Native stereo copy failed - continuing without it. See: $WORKDIR/audio_stereo.err"
           AAC_STEREO=""
@@ -8553,22 +8596,26 @@ _prepare_subtitle(){
     subrip|srt)
       ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" -c copy "$srt" 2>"$WORKDIR/sub_${idx}.err" &
       local sub_pid=$!
+      _ACTIVE_FFMPEG_PID=$sub_pid
       spinner "$sub_pid" "Extracting subtitle #${idx} (SRT copy)"
-      if wait "$sub_pid" 2>/dev/null; then
+      wait "$sub_pid" 2>/dev/null; local _sub_ok=$?; _ACTIVE_FFMPEG_PID=""
+      if (( _sub_ok == 0 )); then
         echo "$srt"
         return 0
       fi
       warn "Failed to extract SRT subtitle #$idx. See: $WORKDIR/sub_${idx}.err"
       ;;
-      
+
     ass|ssa|webvtt|vtt)
       if (( _preserve_native )); then
         # Extract in native format (copy, no conversion)
         local native_out="$WORKDIR/sub.${idx}.${codec}"
         ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" -c:s copy "$native_out" 2>"$WORKDIR/sub_${idx}.err" &
         local sub_pid=$!
+        _ACTIVE_FFMPEG_PID=$sub_pid
         spinner "$sub_pid" "Extracting subtitle #${idx} (${codec} native copy)"
-        if wait "$sub_pid" 2>/dev/null; then
+        wait "$sub_pid" 2>/dev/null; local _sub_ok=$?; _ACTIVE_FFMPEG_PID=""
+        if (( _sub_ok == 0 )); then
           echo "$native_out"
           return 0
         fi
@@ -8577,23 +8624,27 @@ _prepare_subtitle(){
         # Convert to SRT (legacy behavior)
         ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" "$srt" 2>"$WORKDIR/sub_${idx}.err" &
         local sub_pid=$!
+        _ACTIVE_FFMPEG_PID=$sub_pid
         spinner "$sub_pid" "Converting subtitle #${idx} (${codec} → SRT)"
-        if wait "$sub_pid" 2>/dev/null; then
+        wait "$sub_pid" 2>/dev/null; local _sub_ok=$?; _ACTIVE_FFMPEG_PID=""
+        if (( _sub_ok == 0 )); then
           echo "$srt"
           return 0
         fi
         warn "Failed to convert subtitle #$idx to SRT. See: $WORKDIR/sub_${idx}.err"
       fi
       ;;
-      
+
     hdmv_pgs_subtitle|pgs)
       # _preserve_pgs and sup already computed before the top-level DRY_RUN check (H13).
       # sup is set to "$WORKDIR/sub.${idx}.sup" when codec is PGS.
 
       ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" -c:s copy "$sup" 2>"$WORKDIR/sub_${idx}_extract.err" &
       local sup_pid=$!
+      _ACTIVE_FFMPEG_PID=$sup_pid
       spinner "$sup_pid" "Extracting PGS subtitle #${idx} to SUP"
-      if ! wait "$sup_pid" 2>/dev/null; then
+      wait "$sup_pid" 2>/dev/null; local _sup_ok=$?; _ACTIVE_FFMPEG_PID=""
+      if (( _sup_ok != 0 )); then
         warn "Failed extracting PGS #$idx to .sup — skipping. See: $WORKDIR/sub_${idx}_extract.err"
         echo ""
         return 0
@@ -8626,8 +8677,10 @@ _prepare_subtitle(){
         vob_base="$WORKDIR/sub.${idx}.vob"
         ffmpeg "${FFMPEG_FLAGS[@]}" -i "$sup" -map 0:s:0 -c:s dvdsub -f vobsub "$vob_base" 2>"$WORKDIR/sub_${idx}_vobsub.err" &
         local vob_pid=$!
+        _ACTIVE_FFMPEG_PID=$vob_pid
         spinner "$vob_pid" "Converting PGS #${idx} to VobSub"
-        if ! wait "$vob_pid" 2>/dev/null; then
+        wait "$vob_pid" 2>/dev/null; local _vob_ok=$?; _ACTIVE_FFMPEG_PID=""
+        if (( _vob_ok != 0 )); then
           warn "PGS→VobSub conversion failed for #$idx. See: $WORKDIR/sub_${idx}_vobsub.err"
           echo ""
           return 0
@@ -8638,8 +8691,10 @@ _prepare_subtitle(){
           "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "${vob_base}.idx" >"$WORKDIR/sub_${idx}_ocr.log" 2>&1 || true
         ) &
         local ocr_pid=$!
+        _ACTIVE_FFMPEG_PID=$ocr_pid
         spinner "$ocr_pid" "Running OCR on subtitle #${idx}"
         wait "$ocr_pid" 2>/dev/null || true
+        _ACTIVE_FFMPEG_PID=""
         if [[ -s "${vob_base}.srt" ]]; then
           mv -f "${vob_base}.srt" "$srt" || true
         fi
@@ -8657,7 +8712,9 @@ _prepare_subtitle(){
         "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "$sup" >"$WORKDIR/sub_${idx}_ocr_sup.log" 2>&1 || true
       ) &
       local ocr_sup_pid=$!
+      _ACTIVE_FFMPEG_PID=$ocr_sup_pid
       spinner "$ocr_sup_pid" "Running OCR on subtitle #${idx} (SUP)"
+      _ACTIVE_FFMPEG_PID=""
       wait "$ocr_sup_pid" 2>/dev/null || true
       # Check common output locations for the SRT
       if [[ -s "${sup%.sup}.srt" ]]; then
@@ -8761,7 +8818,9 @@ _prepare_ext_subtitle(){
         "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "$ext_path" >"$WORKDIR/ext_ocr_sup.log" 2>&1 || true
       ) &
       local ocr_pid=$!
+      _ACTIVE_FFMPEG_PID=$ocr_pid
       spinner "$ocr_pid" "OCR external PGS: $basename_label"
+      _ACTIVE_FFMPEG_PID=""
       wait "$ocr_pid" 2>/dev/null || true
 
       # Some OCR tools write .srt next to source file; relocate to workdir
@@ -8806,7 +8865,9 @@ _prepare_ext_subtitle(){
         "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "$ext_path" >"$WORKDIR/ext_ocr_vobsub.log" 2>&1 || true
       ) &
       local ocr_pid=$!
+      _ACTIVE_FFMPEG_PID=$ocr_pid
       spinner "$ocr_pid" "OCR external VobSub: $basename_label"
+      _ACTIVE_FFMPEG_PID=""
       wait "$ocr_pid" 2>/dev/null || true
 
       if [[ -s "$srt_out" ]] && grep -q ' --> ' "$srt_out"; then
@@ -9997,8 +10058,10 @@ mux_final() {
   # Execute final mux
   ffmpeg "${ff_in[@]}" "${ff_map[@]}" "${ff_codec[@]}" -f "$MUX_FORMAT" "$TMP_OUT" 2>"$WORKDIR/mux.err" &
   local mux_pid=$!
+  _ACTIVE_FFMPEG_PID=$mux_pid
   spinner "$mux_pid" "Muxing final ${OUTPUT_EXT^^}"
-  if ! wait "$mux_pid" 2>/dev/null; then
+  wait "$mux_pid" 2>/dev/null; local _mux_ok=$?; _ACTIVE_FFMPEG_PID=""
+  if (( _mux_ok != 0 )); then
     _check_disk_full "$WORKDIR/mux.err"
     die 41 "ffmpeg final mux failed. See: $WORKDIR/mux.err"
   fi
@@ -10101,8 +10164,10 @@ main() {
           _sii_meta+=( -f "$MUX_FORMAT" "$TMP_OUT" )
           ffmpeg "${_sii_meta[@]}" 2>"$WORKDIR/skip_ideal_remux.err" &
           local _sii_pid=$!
+          _ACTIVE_FFMPEG_PID=$_sii_pid
           spinner "$_sii_pid" "Applying metadata (copy-remux)"
-          if ! wait "$_sii_pid" 2>/dev/null; then
+          wait "$_sii_pid" 2>/dev/null; local _sii_ok=$?; _ACTIVE_FFMPEG_PID=""
+          if (( _sii_ok != 0 )); then
             _check_disk_full "$WORKDIR/skip_ideal_remux.err"
             die 41 "Skip-if-ideal metadata remux failed. See: $WORKDIR/skip_ideal_remux.err"
           fi
@@ -10118,7 +10183,9 @@ main() {
           if ! ln -f "$SRC_ABS" "$TMP_OUT" 2>/dev/null; then
             cp -f "$SRC_ABS" "$TMP_OUT" &
             local _sii_cp_pid=$!
+            _ACTIVE_FFMPEG_PID=$_sii_cp_pid
             spinner "$_sii_cp_pid" "Copying source to output"
+            _ACTIVE_FFMPEG_PID=""
             wait "$_sii_cp_pid" 2>/dev/null \
               || die 41 "Failed to copy source to output (skip-if-ideal)"
           fi
