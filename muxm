@@ -6779,6 +6779,58 @@ _video_is_copy_compliant() {
 #
 # Sets: V_BASE, V_MIXED, V_DV_MP4, VIDEO_COPY_FROM_SOURCE, OUTPUT_HAS_DV
 # Dies on: encode failure, DV failure with fallback disabled
+
+# Give the fallback base video the packet timestamps the Matroska muxer requires.
+# When DV processing gives up and aliases V_MIXED to the raw HEVC Annex B base ES
+# (V_BASE is `*.hevc` whenever v_needs_raw_es=1 — i.e. an HEVC re-encode of a DV
+# source), MKV output would abort the final mux with "Can't write packet with unknown
+# timestamp": a raw ES carries no container timing and the Matroska muxer — unlike the
+# mp4 muxer, which reconstructs pts/dts from HEVC VUI/SPS — rejects timestamp-less
+# packets. This wraps the raw ES into a timestamped MP4 (HEVC stream-copied losslessly,
+# NO Dolby Vision signalling — OUTPUT_HAS_DV is already 0 on every give-up path) and
+# repoints V_MIXED at it. The MP4 carries an `hvc1` tag, which the Matroska muxer accepts
+# (the rejected `dvh1` tag is only used on the live-DV path). No-op when not needed:
+# MP4/MOV output (mux_final stamps -r SRC_FPS on the raw ES and muxes it directly),
+# non-raw-ES V_MIXED (already a timestamped .mkv intermediate), and dry runs. Fail-soft:
+# on any wrap error, leave V_MIXED as the raw ES so mux_final can still try (and surface
+# the existing error) rather than aborting the give-up path.
+_dv_fallback_timestamp_wrap() {
+  [[ "$MUX_FORMAT" == "matroska" ]] || return 0
+  [[ "$V_MIXED" == *.hevc ]] || return 0
+  (( DRY_RUN )) && return 0
+  [[ -s "$V_MIXED" ]] || return 0
+
+  # The raw base ES we're about to wrap is dead once V_MIXED points at the MP4 — capture
+  # it now so we can reclaim it mid-run (mirrors the success-path pre-wrap at the
+  # `_reclaim "$V_MIXED" "wrapped into V_DV_MP4 for mux"` site). On the give-up path this
+  # is V_BASE, which the success-path reclaims (7384/7539) intentionally skip while
+  # V_MIXED==V_BASE; once we repoint V_MIXED below it is genuinely dead.
+  local _superseded_es="$V_MIXED"
+  local _ts_wrap="$WORKDIR/video_base_timestamped.mp4"
+  local -a _ts_fps=()
+  # Raw-hevc demuxer defaults headerless ES to 25fps; stamp the real source fps.
+  [[ -n "$SRC_FPS" ]] && _ts_fps=(-r "$SRC_FPS")
+  ffmpeg "${FFMPEG_FLAGS[@]}" "${_ts_fps[@]}" -i "$V_MIXED" \
+       -c:v copy -tag:v hvc1 -movflags +faststart \
+       -f mp4 "$_ts_wrap" >"$WORKDIR/base_timestamp_wrap.log" 2>&1 &
+  local _ts_pid=$!
+  _ACTIVE_FFMPEG_PID=$_ts_pid
+  spinner "$_ts_pid" "Wrapping base video for MKV mux (timestamps)"
+  if wait "$_ts_pid" 2>/dev/null && [[ -s "$_ts_wrap" ]]; then
+    _ACTIVE_FFMPEG_PID=""
+    note "✅ Base video wrapped into timestamped MP4 for the MKV mux (no Dolby Vision)."
+    report_add "dv_fallback_wrap" "timestamped wrap (mkv, no dv)"
+    V_MIXED="$_ts_wrap"
+    # The raw base ES is now superseded by the timestamped MP4 mux input — reclaim it
+    # (no-op in dry-run / outside WORKDIR; runs even under -k/-K, like every _reclaim).
+    _reclaim "$_superseded_es" "wrapped into timestamped MP4 for MKV mux"
+  else
+    _ACTIVE_FFMPEG_PID=""
+    warn "Could not wrap base video into a timestamped container — the MKV final mux may fail."
+    report_add "dv_fallback_wrap" "failed (mkv timestamp wrap)"
+  fi
+}
+
 run_video_pipeline() {
   # Check copy-if-compliant first
   if (( VIDEO_COPY_IF_COMPLIANT )); then
@@ -7135,6 +7187,7 @@ run_video_pipeline() {
     warn "All DV RPU extraction methods failed; using base video."
     if (( ALLOW_DV_FALLBACK )); then
       V_MIXED="$V_BASE"
+      _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
       mark_done "Use base video (DV extract failed)"
       return 0
     fi
@@ -7215,6 +7268,7 @@ run_video_pipeline() {
     if (( ALLOW_DV_FALLBACK )); then
       warn "Falling back to base video without DV."
       V_MIXED="$V_BASE"
+      _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
       mark_done "Use base video (RPU validation failed)"
       return 0
     fi
@@ -7237,6 +7291,7 @@ run_video_pipeline() {
     if (( ALLOW_DV_FALLBACK )); then
       warn "Falling back to base video without DV."
       V_MIXED="$V_BASE"
+      _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
       mark_done "Use base video (DV inject failed)"
       return 0
     fi
@@ -7249,6 +7304,7 @@ run_video_pipeline() {
     if (( ALLOW_DV_FALLBACK )); then
       warn "Falling back to base video without DV."
       V_MIXED="$V_BASE"
+      _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
       mark_done "Use base video (DV inject empty)"
       return 0
     fi
@@ -7276,6 +7332,7 @@ run_video_pipeline() {
         V_MIXED="$V_BASE"
         OUTPUT_HAS_DV=0
         _reclaim "$V_INJECTED" "convert failed — using base"
+        _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
         mark_done "Use base video (DV convert failed)"
         return 0
       fi
@@ -7312,8 +7369,16 @@ run_video_pipeline() {
           die 44 "DV RPU/frame mismatch — refusing to ship desynced Dolby Vision (ALLOW_DV_FALLBACK=0)"
         fi
         warn "  Falling back to base video without DV (ALLOW_DV_FALLBACK=1)."
+        # The fully injected/converted DV video (the current V_MIXED, e.g.
+        # video_mixed.hevc — full-size on a real title) is dead now that we're reverting
+        # to the base encode. Reclaim it BEFORE aliasing V_MIXED to V_BASE, so we don't
+        # carry an orphaned multi-GB intermediate to end-of-run (same _reclaim convention;
+        # only this give-up branch holds a *completed* injected video — the earlier
+        # branches fail during/before injection, leaving at most a partial/empty file).
+        _reclaim "$V_MIXED" "DV abandoned on frame mismatch — injected video superseded by base"
         V_MIXED="$V_BASE"
         OUTPUT_HAS_DV=0
+        _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
         mark_done "Use base video (DV frame mismatch)"
         # Give up like the three sibling fallback branches above (RPU validation,
         # inject failure, convert failure): return now so we do NOT pre-wrap the

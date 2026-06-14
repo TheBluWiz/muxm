@@ -6798,6 +6798,116 @@ H2DOVISCRIPT
     skip "H2: hevc_dv_p5_tagged.mp4 fixture not found"
   fi
 
+  # ---- DVMKVFB: DV give-up fallback → MKV must wrap the raw base ES (no "unknown timestamp") ----
+  # When DV processing gives up and aliases V_MIXED to the raw HEVC Annex B base ES, MKV
+  # output used to abort the final mux with "Can't write packet with unknown timestamp"
+  # (exit 234, no file): the raw ES has no container timestamps and all DV give-up
+  # branches `return 0` before the pre-wrap that would supply them. _dv_fallback_timestamp_wrap
+  # now wraps the base ES into a timestamped MP4 (plain HEVC, no DV) on those paths.
+  #
+  # Same bogus-RPU dovi_tool mock as H2 (forces the frame-mismatch give-up), but MKV
+  # output — the path that previously hard-failed. Assert a VALID, non-DV MKV is produced.
+  if [[ -f "$TESTDIR/hevc_dv_p5_tagged.mp4" ]]; then
+    local fb_bin="$TESTDIR/dvmkvfb_mock_bin"
+    local fb_home="$TESTDIR/dvmkvfb_home"
+    mkdir -p "$fb_bin" "$fb_home"
+    cat > "$fb_bin/dovi_tool" << 'FBDOVISCRIPT'
+#!/bin/bash
+cmd="${1:-}"; shift
+case "$cmd" in
+  info)
+    printf 'Profile: 8\nCompatibility ID: 1\nBL flag: 1\nEL flag: 0\n999999 RPU\n'; exit 0 ;;
+  extract-rpu)
+    out_path=""; args=("$@")
+    for (( i=0; i<${#args[@]}; i++ )); do
+      [[ "${args[$i]}" == "-o" ]] && out_path="${args[$((i+1))]}" && break
+    done
+    cat > /dev/null
+    [[ -n "$out_path" ]] && printf '\x00\x01\x02\x03\n' > "$out_path"
+    exit 0 ;;
+  inject-rpu|convert)
+    in_path=""; out_path=""; args=("$@")
+    for (( i=0; i<${#args[@]}; i++ )); do
+      [[ "${args[$i]}" == "-i" ]] && in_path="${args[$((i+1))]}"
+      [[ "${args[$i]}" == "-o" ]] && out_path="${args[$((i+1))]}"
+    done
+    [[ -n "$in_path" && -n "$out_path" && -s "$in_path" ]] && cp "$in_path" "$out_path"
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+FBDOVISCRIPT
+    chmod +x "$fb_bin/dovi_tool"
+
+    local fb_out="$TESTDIR/dvmkvfb_out.mkv"
+    rm -f "$fb_out"
+    local fb_log fb_code=0
+    fb_log="$(cd "$TESTDIR" && HOME="$fb_home" PATH="$fb_bin:$PATH" \
+      "$MUXM" -K --preset ultrafast --crf 28 \
+      "hevc_dv_p5_tagged.mp4" "$fb_out" 2>&1)" || fb_code=$?
+
+    # Guard: confirm the give-up path was actually exercised.
+    assert_contains "RPU frame count mismatch" \
+      "DVMKVFB: frame-count mismatch (DV give-up) path was exercised" "$fb_log"
+
+    if [[ "$fb_code" -eq 0 && -f "$fb_out" && -s "$fb_out" ]]; then
+      pass "DVMKVFB: DV give-up → MKV produced output (no 'unknown timestamp' mux abort)"
+      # Valid MKV: real HEVC video stream with frames, in a Matroska container.
+      assert_probe        "DVMKVFB: output video codec is hevc" "$fb_out" codec_name hevc
+      assert_stream_count "DVMKVFB: one video stream"           "$fb_out" v 1 1
+      local fb_fmt fb_frames
+      fb_fmt="$(ffprobe -v error -show_entries format=format_name -of default=nw=1:nk=1 "$fb_out" 2>/dev/null || true)"
+      if printf '%s' "$fb_fmt" | grep -q matroska; then
+        pass "DVMKVFB: container is Matroska"
+      else
+        fail "DVMKVFB: expected matroska container, got '$fb_fmt'"
+      fi
+      fb_frames="$(ffprobe -v error -count_packets -select_streams v:0 \
+        -show_entries stream=nb_read_packets -of default=nw=1:nk=1 "$fb_out" 2>/dev/null || true)"
+      if [[ "$fb_frames" =~ ^[0-9]+$ ]] && (( fb_frames > 0 )); then
+        pass "DVMKVFB: output has a non-empty video stream ($fb_frames frames)"
+      else
+        fail "DVMKVFB: output video stream has no decodable frames (got '$fb_frames')"
+      fi
+      # Prove the timestamp wrap actually ran (else a future regression false-passes).
+      if printf '%s\n' "$fb_log" | grep -qiF 'wrapped into timestamped MP4'; then
+        pass "DVMKVFB: base ES was wrapped into a timestamped container for the MKV mux"
+      else
+        fail "DVMKVFB: timestamp wrap did not run — MKV mux only succeeded by accident"
+      fi
+      # Peak-disk hygiene (matches the pipeline's _reclaim convention): once the wrap
+      # repoints V_MIXED at the timestamped MP4, the superseded raw base ES is dead and
+      # must be reclaimed mid-run — even under -K, which keeps the workdir + logs but not
+      # the multi-GB video intermediates. The wrapped MP4 (the actual mux input) survives.
+      local fb_wd
+      fb_wd="$(printf '%s\n' "$fb_log" | sed -n 's/^=== Workdir[[:space:]]*: //p' | head -1)"
+      if [[ -n "$fb_wd" && -d "$fb_wd" ]]; then
+        assert_no_file "$fb_wd/video_base.hevc" \
+          "DVMKVFB: superseded raw base ES reclaimed mid-run despite -K"
+        # The fully injected DV video, orphaned when the give-up aliases V_MIXED→V_BASE,
+        # is reclaimed before the alias — so no dead .hevc intermediate survives.
+        assert_no_file "$fb_wd/video_mixed.hevc" \
+          "DVMKVFB: orphaned injected DV video reclaimed mid-run despite -K"
+        if [[ -f "$fb_wd/video_base_timestamped.mp4" ]]; then
+          pass "DVMKVFB: timestamped wrap retained as the mux input"
+        else
+          fail "DVMKVFB: timestamped wrap (video_base_timestamped.mp4) missing"
+        fi
+      else
+        skip "DVMKVFB: could not locate workdir to verify reclaim"
+      fi
+      # Fallback must stay non-DV: no DV signalling reintroduced by the wrap.
+      if printf '%s\n' "$fb_log" | grep -qE 'DV[[:space:]]*: present'; then
+        fail "DVMKVFB: output mislabeled as Dolby Vision on the give-up path"
+      else
+        pass "DVMKVFB: output not labeled Dolby Vision (give-up path stays non-DV)"
+      fi
+    else
+      fail "DVMKVFB: DV give-up → MKV did not produce output (exit $fb_code) — 'unknown timestamp' regression"
+    fi
+  else
+    skip "DVMKVFB: hevc_dv_p5_tagged.mp4 fixture not found"
+  fi
+
   # ---- DISKSTOP: disk preflight is a HARD STOP when space is insufficient ----
   # Force the estimate above any real free space via a huge DISK_FREE_WARN_GB floor
   # in a scoped .muxmrc; muxm must die before encoding rather than fail mid-run.
