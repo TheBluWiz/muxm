@@ -505,6 +505,10 @@ ffmpeg_progress_bar() {
   fi
 
   local -i cols=40
+  # Suppress ERR trap for the read loop: SIGINT-interrupted read returns exit 1,
+  # which fires on_error spuriously (as a "command failed") before the INT trap runs.
+  # Restore ERR before wait "$pid" so real ffmpeg failures still trigger it.
+  trap '' ERR
   while IFS='=' read -r key val 2>/dev/null; do
     case "$key" in
       out_time_us)
@@ -527,6 +531,7 @@ ffmpeg_progress_bar() {
         ;;
     esac
   done < "$pipe"
+  trap 'on_error $LINENO "$BASH_COMMAND" "$?"' ERR
 
   # Ensure the bar reaches 100% visually
   bar="$(_repeat_char '█' "$cols")"
