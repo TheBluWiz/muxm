@@ -83,7 +83,7 @@ show_help() {
       containers   MP4, MKV, MOV container handling
       metadata     Metadata stripping and preservation
       e2e          Full profile end-to-end encodes
-      regression_p5 Phase 5 regression tests (C1, M3, H9, H8, H10, DVMKV, H1, H11)
+      regression_p5 Phase 5 regression tests (C1, M3, H9, H8, H10, DVMKV, DISKSTOP, WORKDIR, H1, H11)
 
     all            Run every suite above (default when --suite given)
 
@@ -6534,7 +6534,11 @@ DOVISCRIPT
 cmd="${1:-}"; shift
 case "$cmd" in
   info)
-    printf 'Profile: 8\nCompatibility ID: 1\nBL flag: 1\nEL flag: 0\n1 RPU\n'; exit 0 ;;
+    # Report a valid profile but NO parseable RPU frame count: a cp-passthrough
+    # mock cannot match the real encoded clip's frame count, and emitting a bogus
+    # "N RPU" would trip muxm's frame-count mismatch fallback (orphaning V_MIXED).
+    # Real RPUs match the video, so omitting the count models the no-fallback path.
+    printf 'Profile: 8\nCompatibility ID: 1\nBL flag: 1\nEL flag: 0\n'; exit 0 ;;
   extract-rpu)
     out_path=""; args=("$@")
     for (( i=0; i<${#args[@]}; i++ )); do
@@ -6581,8 +6585,82 @@ DVMKVSCRIPT
     # Env-independent guard: the hvc1 tag override fires whenever a DV MKV mux runs,
     # regardless of whether mp4box produced a dvcC box (mp4box-dependent, not asserted).
     assert_contains "overriding video tag" "DVMKV: hvc1 tag override applied for Matroska DV mux" "$dvmkv_log"
+
+    # ---- Disk-streamlining guards (Options 1 & 2) ----
+    # Option 1: the multi-GB source ES must be demuxed lazily, never eagerly.
+    assert_contains "Raw ES demux deferred" "DVMKV: source ES demux deferred, not eager (Option 1)" "$dvmkv_log"
+    # Option 2: dead intermediates are reclaimed mid-run — even though -K was passed.
+    # -K keeps the workdir, so the proof is direct: the big intermediates are gone
+    # while the actual mux input + final output survive. (assert_no_file is PATH LABEL.)
+    local dvmkv_wd
+    dvmkv_wd="$(printf '%s\n' "$dvmkv_log" | sed -n 's/^=== Workdir[[:space:]]*: //p' | head -1)"
+    if [[ -n "$dvmkv_wd" && -d "$dvmkv_wd" ]]; then
+      assert_no_file "$dvmkv_wd/video_base.hevc"  "DVMKV: video_base.hevc reclaimed mid-run despite -K (Option 2)"
+      assert_no_file "$dvmkv_wd/video_mixed.hevc" "DVMKV: video_mixed.hevc reclaimed mid-run despite -K (Option 2)"
+      assert_no_file "$dvmkv_wd/video_src.es"     "DVMKV: video_src.es never materialized (Option 1)"
+      if [[ -f "$dvmkv_wd/video_dv_prewrap.mp4" ]]; then
+        pass "DVMKV: wrapped mux input retained for final mux"
+      else
+        fail "DVMKV: wrapped mux input (video_dv_prewrap.mp4) missing"
+      fi
+    else
+      fail "DVMKV: could not locate workdir to verify reclaim"
+    fi
   else
     skip "DVMKV: hevc_dv_p5_tagged.mp4 fixture not found"
+  fi
+
+  # ---- DISKSTOP: disk preflight is a HARD STOP when space is insufficient ----
+  # Force the estimate above any real free space via a huge DISK_FREE_WARN_GB floor
+  # in a scoped .muxmrc; muxm must die before encoding rather than fail mid-run.
+  if [[ -f "$TESTDIR/hevc_sdr_51.mkv" ]]; then
+    local ds_home="$TESTDIR/diskstop_home"; mkdir -p "$ds_home"
+    printf 'DISK_FREE_WARN_GB=900000\n' > "$ds_home/.muxmrc"
+    local ds_out="$TESTDIR/diskstop_out.mkv" ds_log ds_code=0
+    ds_log="$(cd "$TESTDIR" && HOME="$ds_home" "$MUXM" -K --crf 28 --preset ultrafast "hevc_sdr_51.mkv" "$ds_out" 2>&1)" || ds_code=$?
+    if (( ds_code == 11 )) && printf '%s' "$ds_log" | grep -qiE 'disk space'; then
+      pass "DISKSTOP: insufficient space is a hard stop (exit 11)"
+    else
+      fail "DISKSTOP: expected hard stop exit 11 with disk message, got exit $ds_code"
+    fi
+    assert_no_file "DISKSTOP: no output produced when the space check fails" "$ds_out"
+    # Override: --no-disk-check must bypass the guard and let the encode proceed.
+    local ds_out2="$TESTDIR/diskstop_override.mkv" ds_code2=0
+    (cd "$TESTDIR" && HOME="$ds_home" "$MUXM" -K --no-disk-check --crf 28 --preset ultrafast "hevc_sdr_51.mkv" "$ds_out2" >/dev/null 2>&1) || ds_code2=$?
+    if [[ -f "$ds_out2" && -s "$ds_out2" ]]; then
+      pass "DISKSTOP: --no-disk-check overrides the hard stop"
+    else
+      fail "DISKSTOP: --no-disk-check should bypass the guard and produce output (exit $ds_code2)"
+    fi
+  else
+    skip "DISKSTOP: hevc_sdr_51.mkv fixture not found"
+  fi
+
+  # ---- WORKDIR: --workdir relocates the .muxm.tmp workdir to another directory ----
+  if [[ -f "$TESTDIR/hevc_sdr_51.mkv" ]]; then
+    local wd_alt="$TESTDIR/alt_workdir"; mkdir -p "$wd_alt"
+    local wd_out="$TESTDIR/workdir_out.mkv" wd_code=0
+    (cd "$TESTDIR" && "$MUXM" -K --workdir "$wd_alt" --no-disk-check --crf 28 --preset ultrafast "hevc_sdr_51.mkv" "$wd_out" >/dev/null 2>&1) || wd_code=$?
+    if [[ -f "$wd_out" && -s "$wd_out" ]]; then
+      pass "WORKDIR: --workdir run produced output"
+    else
+      fail "WORKDIR: --workdir run failed (exit $wd_code)"
+    fi
+    if [[ -n "$(ls -d "$wd_alt"/.muxm.tmp.* 2>/dev/null)" ]]; then
+      pass "WORKDIR: intermediates staged under the --workdir directory"
+    else
+      fail "WORKDIR: no .muxm.tmp workdir created under --workdir directory"
+    fi
+    # A nonexistent --workdir must hard-fail (exit 11), not silently fall back.
+    local wd_bad_code=0
+    (cd "$TESTDIR" && "$MUXM" -K --workdir "$TESTDIR/nonexistent_workdir_xyz" --crf 28 "hevc_sdr_51.mkv" "$TESTDIR/wd_bad.mkv" >/dev/null 2>&1) || wd_bad_code=$?
+    if (( wd_bad_code == 11 )); then
+      pass "WORKDIR: nonexistent --workdir is rejected (exit 11)"
+    else
+      fail "WORKDIR: nonexistent --workdir should exit 11, got $wd_bad_code"
+    fi
+  else
+    skip "WORKDIR: hevc_sdr_51.mkv fixture not found"
   fi
 
   # ---- H1: config round-trip — HW_ACCEL change appears uncommented ----

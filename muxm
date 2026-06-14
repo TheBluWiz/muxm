@@ -123,6 +123,9 @@ _normalize_profile(){
 declare -a COMPLETED_STEPS=()
 declare -a MUXM_CONFIG_LOADED=()
 WORKDIR=""
+WORKDIR_BASE=""        # --workdir DIR: parent dir for the .muxm.tmp.* workdir.
+                       # Defaults to the output directory. Set this to a roomier
+                       # volume to keep multi-GB intermediates off the output disk.
 LOGFILE=""
 TEE_PID=""            # PID of the tee logger process (Section 17); waited on in on_exit
 _BURN_SRT_FILTER=""   # temp file for subtitle burn-in (inside WORKDIR; cleaned in on_exit)
@@ -324,7 +327,11 @@ CHECKSUM_ALGO="sha256"  # Checksum algorithm: sha256 | blake2b | auto (auto pref
 declare -i DRY_RUN=0
 declare -i KEEP_TEMP=0
 declare -i KEEP_TEMP_ALWAYS=0
-declare -i DISK_FREE_WARN_GB=5
+declare -i DISK_FREE_WARN_GB=5   # Minimum free-space floor (GB) for the preflight.
+                                 # Now a HARD minimum for re-encodes: the preflight
+                                 # aborts (exit 11) if a volume has less than the
+                                 # larger of the estimate or this floor. Pure
+                                 # stream-copies ignore the floor. Override: --no-disk-check.
 declare -i DISK_CHECK=1          # Set to 0 via --no-disk-check to suppress preflight estimation
 
 # ---- ffmpeg/ffprobe UX
@@ -2684,7 +2691,7 @@ _muxm_completions() {
 
             -k --keep-temp -K --keep-temp-always
             --ffmpeg-loglevel --ffprobe-loglevel --no-hide-banner
-            --threads
+            --threads --workdir
         "
         COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
         return
@@ -4396,6 +4403,7 @@ while [[ $# -gt 0 ]]; do
       is_valid_loglevel "$FFPROBE_LOGLEVEL" || die 11 "Invalid --ffprobe-loglevel: \"$FFPROBE_LOGLEVEL\". Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
       shift 2 ;;
     --threads) _require_val "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
+    --workdir) _require_val "$1" "${2:-}"; WORKDIR_BASE="$2"; shift 2 ;;
 
     --crf)
       _require_val "$1" "${2:-}"; _crf_in="$2"
@@ -5191,9 +5199,20 @@ FFMPEG_FLAGS+=("${PROBE_OPTS[@]}")
 FFPROBE_FLAGS+=("${PROBE_OPTS[@]}")
 
 # ===== Section 17: Workdir & logging ==========================================================
+# Workdir holds all multi-GB intermediates. By default it lives next to the output
+# (OUT_DIR); --workdir DIR relocates it to a roomier volume so intermediates don't
+# fill the output disk. The final output temp (TMP_OUT) always stays in OUT_DIR so
+# the closing rename to the final path is atomic (same volume).
+WORKDIR_PARENT="$OUT_DIR"
+if [[ -n "$WORKDIR_BASE" ]]; then
+  [[ -d "$WORKDIR_BASE" ]] || die 11 "--workdir directory does not exist: $WORKDIR_BASE"
+  [[ -w "$WORKDIR_BASE" ]] || die 11 "--workdir directory is not writable: $WORKDIR_BASE"
+  WORKDIR_PARENT="$WORKDIR_BASE"
+fi
 WORKDIR="$(
-  mktemp -d "${OUT_DIR}/.muxm.tmp.XXXXXXXX"
-)" || die 11 "Cannot create working directory under: $OUT_DIR"
+  mktemp -d "${WORKDIR_PARENT}/.muxm.tmp.XXXXXXXX"
+)" || die 11 "Cannot create working directory under: $WORKDIR_PARENT"
+[[ -n "$WORKDIR_BASE" ]] && note "Workdir relocated to: $WORKDIR (intermediates kept off the output volume)"
 LOGFILE="$WORKDIR/muxm.$(date +%Y%m%d-%H%M%S).log"
 
 # ---- Begin logging to file ----
@@ -5259,6 +5278,51 @@ _cleanup_workdir() {
       note "Keeping workdir: $WORKDIR"
     fi
   fi
+}
+
+# _reclaim — Delete a large, provably-dead intermediate mid-run to cap peak disk
+# usage. Runs regardless of -k/-K: those flags preserve the workdir and the small
+# logs/.err/RPU files needed for post-mortem, but the multi-GB video intermediates
+# are never useful for debugging and are the disk hogs. No-op in dry-run, and only
+# ever removes paths inside WORKDIR.
+# Args: $1 = file path; $2 = short reason (logged)
+# Globals: WORKDIR, DRY_RUN
+_reclaim() {
+  local f="${1:-}" reason="${2:-}"
+  (( DRY_RUN )) && return 0
+  [[ -n "$f" && -e "$f" ]] || return 0
+  case "$f" in
+    "$WORKDIR"/*) ;;
+    *) warn "Refusing to reclaim path outside workdir: $f"; return 0 ;;
+  esac
+  local sz_mb
+  sz_mb="$(du -m "$f" 2>/dev/null | awk 'NR==1{print $1}')" || true
+  rm -f "$f" 2>/dev/null || true
+  [[ -n "$sz_mb" ]] && note "Reclaimed ${sz_mb} MB intermediate: $(basename "$f")${reason:+ ($reason)}"
+  return 0
+}
+
+# _ensure_src_es — Demux the source video to a raw HEVC Annex B elementary stream
+# at $V_SRC_ES, on demand. Idempotent: returns 0 immediately if already present.
+# Only needed as the FILE fallback for DV RPU extraction when the piped extraction
+# (ffmpeg → dovi_tool) fails; demuxing it eagerly wrote a full source-sized copy
+# that was usually never read (peak-disk waste).
+# Returns: 0 on success (file present & non-empty), 1 on failure.
+# Globals: V_SRC_ES, SRC_ABS, WORKDIR, FFMPEG_FLAGS
+_ensure_src_es() {
+  [[ -s "$V_SRC_ES" ]] && return 0
+  ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy -bsf:v hevc_mp4toannexb -f hevc "$V_SRC_ES" 2>"$WORKDIR/demux.err" &
+  local _es_pid=$!
+  spinner "$_es_pid" "Demuxing video elementary stream (on demand)"
+  if ! wait "$_es_pid" 2>/dev/null; then
+    local codec; codec="$(_probe_field codec_name)"
+    warn "Could not demux raw HEVC ES (source codec: ${codec:-unknown})."
+    warn "  DV RPU extraction requires an HEVC source stream. Use --no-dv to skip DV processing."
+    warn "  See: $WORKDIR/demux.err for details."
+    : > "$V_SRC_ES" 2>/dev/null || true
+    return 1
+  fi
+  return 0
 }
 
 # on_exit — EXIT trap handler. Performs all end-of-run cleanup and reporting.
@@ -5403,6 +5467,9 @@ _av1_preset_multiplier() {
   esac
 }
 
+# _gb — format a byte count as "X.X" for GiB display (integer fallback).
+_gb() { LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; ${1:-0} / 1073741824" | bc 2>/dev/null)" 2>/dev/null || echo "$(( ${1:-0} / 1073741824 ))"; }
+
 # disk_free_warn — smart disk space preflight
 # Estimates output size from source bitrate + CRF/preset tables, then warns
 # if estimated required space exceeds available space on the output (or temp) volume.
@@ -5487,31 +5554,62 @@ disk_free_warn() {
     done
   fi
 
-  # ---- Total with 25% safety margin and 5 MB subtitle overhead ----
+  # ---- Estimates (25% safety margin, 5 MB subtitle overhead) ----
   local -i sub_overhead=$(( 5 * 1024 * 1024 ))
-  local -i est_total=$(( (est_video_bytes + est_audio_bytes + sub_overhead) * 125 / 100 ))
+  # Output file (lands in OUT_DIR):
+  local -i est_output=$(( (est_video_bytes + est_audio_bytes + sub_overhead) * 125 / 100 ))
 
-  # Floor: always require at least DISK_FREE_WARN_GB to be free
-  local -i floor_bytes=$(( DISK_FREE_WARN_GB * 1024 * 1024 * 1024 ))
-  local -i required=$(( est_total > floor_bytes ? est_total : floor_bytes ))
+  # Peak working set (intermediates live in WORKDIR). The DV re-encode pipeline
+  # holds up to ~3 full-size video copies at its busiest point (base+injected+mixed)
+  # even with eager mid-run reclaim; non-DV re-encode ~2; stream-copy ~1. The
+  # transient raw-ES demux fallback is reclaimed immediately and not sized here.
+  local -i peak_factor=1
+  if (( ! VIDEO_COPY_IF_COMPLIANT )); then
+    peak_factor=2
+    if (( ! DISABLE_DV )); then
+      if _source_has_dv_metadata \
+         || [[ "$METADATA_CACHE" == *dovi* || "$METADATA_CACHE" == *dolby_vision* \
+               || "$METADATA_CACHE" == *dvhe* || "$METADATA_CACHE" == *dvh1* ]]; then
+        peak_factor=3
+      fi
+    fi
+  fi
+  local -i est_peak=$(( (est_video_bytes * peak_factor + est_audio_bytes + sub_overhead) * 125 / 100 ))
 
-  # Format estimate as X.X GB for display
-  local est_gb
-  est_gb="$(LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; $required / 1073741824" | bc 2>/dev/null)" 2>/dev/null)" || \
-    est_gb="$(( required / 1024 / 1024 / 1024 ))"
+  # Floor: require at least DISK_FREE_WARN_GB free — but only for re-encodes
+  # (peak_factor > 1), which stage multi-GB scratch. A pure stream-copy/remux
+  # (peak_factor == 1) needs no scratch, so it is gated by its own (small)
+  # estimate alone and isn't blocked on a near-full disk by the floor.
+  local -i floor_bytes=0
+  (( peak_factor > 1 )) && floor_bytes=$(( DISK_FREE_WARN_GB * 1024 * 1024 * 1024 ))
+  local -i need_workdir=$(( est_peak   > floor_bytes ? est_peak   : floor_bytes ))
+  local -i need_output=$((  est_output > floor_bytes ? est_output : floor_bytes ))
 
-  log "Disk preflight: video_bytes=${est_video_bytes} audio_bytes=${est_audio_bytes}" \
-      "est_total=${est_total} required=${required} (~${est_gb}GB)"
+  log "Disk preflight: video_bytes=${est_video_bytes} audio_bytes=${est_audio_bytes} peak_factor=${peak_factor}" \
+      "est_output=${est_output} est_peak=${est_peak} need_workdir=${need_workdir} need_output=${need_output} (~$(_gb "$need_workdir")GB peak)"
 
-  # ---- Check output volume ----
-  local avail_kb
-  avail_kb="$(df -Pk "$OUT_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
-  if [[ -n "$avail_kb" ]] && (( avail_kb * 1024 < required )); then
-    local avail_gb
-    avail_gb="$(LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; $avail_kb / 1048576" | bc 2>/dev/null)" 2>/dev/null)" || \
-      avail_gb="$(( avail_kb / 1024 / 1024 ))"
-    warn "Estimated output ~${est_gb}GB but only ${avail_gb}GB free on output volume ($OUT_DIR)."
-    warn "Use --no-disk-check to suppress this warning."
+  # ---- Enforce per-volume (hard stop; override with --no-disk-check) ----
+  # WORKDIR holds the large intermediates; OUT_DIR holds the final file. Check
+  # each, skipping the duplicate check when both resolve to the same volume.
+  local wd_dev od_dev
+  wd_dev="$(df -Pk "$WORKDIR" 2>/dev/null | awk 'NR==2{print $1}')"
+  od_dev="$(df -Pk "$OUT_DIR"  2>/dev/null | awk 'NR==2{print $1}')"
+
+  local wd_avail_kb
+  wd_avail_kb="$(df -Pk "$WORKDIR" 2>/dev/null | awk 'NR==2{print $4}')"
+  if [[ -n "$wd_avail_kb" ]] && (( wd_avail_kb * 1024 < need_workdir )); then
+    die 11 "Not enough disk space for working files: ~$(_gb "$need_workdir")GB needed but only ~$(_gb "$(( wd_avail_kb * 1024 ))")GB free on the workdir volume ($WORKDIR).
+   muxm stages large video intermediates here (peak ≈ ${peak_factor}× the encoded video). Free space,
+   use --workdir DIR to stage on a roomier volume, or pass --no-disk-check to override this guard."
+  fi
+
+  if [[ -n "$od_dev" && "$od_dev" != "$wd_dev" ]]; then
+    local od_avail_kb
+    od_avail_kb="$(df -Pk "$OUT_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+    if [[ -n "$od_avail_kb" ]] && (( od_avail_kb * 1024 < need_output )); then
+      die 11 "Not enough disk space for the output file: ~$(_gb "$need_output")GB needed but only ~$(_gb "$(( od_avail_kb * 1024 ))")GB free on the output volume ($OUT_DIR).
+   Free space, choose an output path on a roomier volume, or pass --no-disk-check to override this guard."
+    fi
   fi
 }
 
@@ -6668,30 +6766,16 @@ run_video_pipeline() {
   # Skipped for non-HEVC sources and when DV is disabled — the ES is only consumed
   # by dovi_tool extract-rpu later in the pipeline.
   if (( v_needs_raw_es )); then
-    log "→ Preparing raw video elementary stream…"
-
+    # Lazy ES demux: the raw HEVC elementary stream is now produced on demand
+    # (via _ensure_src_es) ONLY if the piped DV RPU extraction later fails and the
+    # file-based fallback is needed. Eager demux here wrote a full source-sized
+    # copy (often tens of GB) that the piped extraction made redundant — it was
+    # usually created and never read. See run_dv_inject's RPU extraction path.
     if (( DRY_RUN )); then
       : > "$V_SRC_ES" 2>/dev/null || true
       mark_done "Demux raw ES → video_src.es (dry-run)"
     else
-      # Extract HEVC elementary stream for DV RPU extraction.
-      # -bsf:v hevc_mp4toannexb ensures proper conversion from hvc1/hev1
-      # length-prefixed NAL units to Annex B start codes, which preserves
-      # DV RPU NAL units that dovi_tool requires for extraction.
-      ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy -bsf:v hevc_mp4toannexb -f hevc "$V_SRC_ES" 2>"$WORKDIR/demux.err" &
-      local demux_pid=$!
-      spinner "$demux_pid" "Demuxing video elementary stream"
-      local v_es_demux_failed=0
-      if ! wait "$demux_pid" 2>/dev/null; then
-        local codec
-        codec="$(_probe_field codec_name)"
-        warn "Could not demux raw HEVC ES (source codec: ${codec:-unknown})."
-        warn "  DV RPU extraction requires an HEVC source stream. Use --no-dv to skip DV processing."
-        warn "  See: $WORKDIR/demux.err for details."
-        : > "$V_SRC_ES" 2>/dev/null || true
-        v_es_demux_failed=1
-      fi
-      (( v_es_demux_failed )) || mark_done "Demux raw ES → video_src.es"
+      note "Raw ES demux deferred — produced on demand only if piped DV RPU extraction fails."
     fi
   else
     note "Skipping ES demux (DV injection not applicable for this encode)."
@@ -6920,9 +7004,10 @@ run_video_pipeline() {
     fi
   fi
 
-  # Fallback: file-based extraction from demuxed ES
+  # Fallback: file-based extraction from a demuxed ES (produced on demand here).
   if (( ! rpu_extracted && ! DRY_RUN )); then
-    if [[ -s "$V_SRC_ES" ]]; then
+    log "→ Piped RPU extraction unavailable — falling back to on-demand ES demux…"
+    if _ensure_src_es; then
       log "→ Extracting DV RPU from demuxed ES file (fallback)…"
       dovi_tool extract-rpu -i "$V_SRC_ES" -o "$RPU_P7" >"$WORKDIR/rpu_file.log" 2>&1 &
       local rpu_file_pid=$!
@@ -6937,9 +7022,13 @@ run_video_pipeline() {
         log "See: $WORKDIR/rpu_file.log"
       fi
     else
-      warn "No demuxed ES file available for fallback RPU extraction."
+      warn "Could not produce a demuxed ES for fallback RPU extraction."
     fi
   fi
+
+  # RPU is now in hand (RPU_P7) — the source ES, if it was demuxed for the
+  # fallback, is dead. Reclaim it immediately (it can be ~source-sized).
+  (( rpu_extracted )) && _reclaim "$V_SRC_ES" "RPU extracted"
 
   if (( ! rpu_extracted && ! DRY_RUN )); then
     warn "All DV RPU extraction methods failed; using base video."
@@ -7076,6 +7165,8 @@ run_video_pipeline() {
     if wait "$conv_pid" 2>/dev/null && [[ -s "$V_MIXED" ]]; then
       note "DV profile converted (P${DV_SRC_PROFILE} → P8.1)"
       report_add "dv_rpu_action" "converted P${DV_SRC_PROFILE} → P8.1"
+      # video_injected is now superseded by the converted V_MIXED — reclaim it.
+      _reclaim "$V_INJECTED" "P${DV_SRC_PROFILE}→P8 convert done"
     else
       warn "dovi_tool convert failed (P${DV_SRC_PROFILE} → P8.1). See: $WORKDIR/rpu_convert.log"
       report_add "dv_rpu_action" "convert failed — P${DV_SRC_PROFILE} RPU cannot be used for single-layer output"
@@ -7083,6 +7174,7 @@ run_video_pipeline() {
         warn "  Falling back to base video without DV (ALLOW_DV_FALLBACK=1)."
         V_MIXED="$V_BASE"
         OUTPUT_HAS_DV=0
+        _reclaim "$V_INJECTED" "convert failed — using base"
         mark_done "Use base video (DV convert failed)"
         return 0
       fi
@@ -7131,6 +7223,11 @@ run_video_pipeline() {
     note "Could not verify RPU/video frame count alignment (counting unavailable)."
     report_add "dv_frame_count_match" "unverified"
   fi
+
+  # The base encode is no longer needed once the DV video (V_MIXED) is finalized
+  # and every DV-fallback decision point (which aliases V_MIXED→V_BASE) is past.
+  # The guard skips reclaim on the fallback path where V_MIXED *is* V_BASE.
+  [[ "$V_MIXED" != "$V_BASE" ]] && _reclaim "$V_BASE" "DV video finalized"
 
   # Pre-wrap the DV-injected HEVC ES into an MP4 with proper dvcC/dvvC signaling.
   #
@@ -7262,6 +7359,16 @@ run_video_pipeline() {
         fi
       fi
     fi
+  fi
+
+  # If the video was wrapped into a timestamped container (V_DV_MP4), the raw
+  # V_MIXED ES is now dead — mux_final reads V_DV_MP4 instead. Reclaim it, but
+  # only for Matroska output: MP4/MOV keep V_MIXED as input for the post-mux
+  # dvcC container fallback (verify_dv_container_record). Guards also skip the
+  # DV-fallback alias (V_MIXED==V_BASE) and the wrap-is-mixed degenerate case.
+  if [[ -n "${V_DV_MP4:-}" && "$MUX_FORMAT" == "matroska" \
+        && "$V_MIXED" != "$V_BASE" && "$V_MIXED" != "$V_DV_MP4" ]]; then
+    _reclaim "$V_MIXED" "wrapped into V_DV_MP4 for mux"
   fi
 
   OUTPUT_HAS_DV=1
