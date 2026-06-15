@@ -189,6 +189,14 @@ SVT_AV1_PARAMS_BASE=""
 AV1_MAXRATE=""
 AV1_BUFSIZE=""
 LEVEL_VALUE=""                 # e.g., 5.1 (blank = encoder decides)
+# Explicit-tracking for the advanced encode-param flags (mirrors _CLI_CRF_EXPLICIT):
+# 1 when the user typed the flag on the CLI, 0 when the value came from a profile/config
+# default. Set at parse time; recorded for the upcoming ignored-knob conflict warnings
+# (WI-1b/Section 13b) — currently set but not yet read, so no behavior change.
+declare -i _CLI_X265_PARAMS_EXPLICIT=0   # --x265-params
+declare -i _CLI_X264_PARAMS_EXPLICIT=0   # --x264-params
+declare -i _CLI_AV1_PARAMS_EXPLICIT=0    # --av1-params
+declare -i _CLI_LEVEL_EXPLICIT=0         # --level / -l
 declare -i CONSERVATIVE_VBV=1
 LEVEL_VBV_4_1_MAXRATE=10000k; LEVEL_VBV_4_1_BUFSIZE=20000k
 LEVEL_VBV_5_0_MAXRATE=25000k; LEVEL_VBV_5_0_BUFSIZE=50000k
@@ -4560,12 +4568,12 @@ while [[ $# -gt 0 ]]; do
       is_valid_preset "$PRESET_VALUE" || die 11 "Invalid preset: $PRESET_VALUE"
       shift 2
       ;;
-    --x265-params) _require_val "$1" "$#" "${2:-}"; X265_PARAMS_BASE="$2"; shift 2 ;;
-    --x264-params) _require_val "$1" "$#" "${2:-}"; X264_PARAMS_BASE="$2"; shift 2 ;;
-    --av1-params)  _require_val "$1" "$#" "${2:-}"; SVT_AV1_PARAMS_BASE="$2"; shift 2 ;;
+    --x265-params) _require_val "$1" "$#" "${2:-}"; X265_PARAMS_BASE="$2"; _CLI_X265_PARAMS_EXPLICIT=1; shift 2 ;;
+    --x264-params) _require_val "$1" "$#" "${2:-}"; X264_PARAMS_BASE="$2"; _CLI_X264_PARAMS_EXPLICIT=1; shift 2 ;;
+    --av1-params)  _require_val "$1" "$#" "${2:-}"; SVT_AV1_PARAMS_BASE="$2"; _CLI_AV1_PARAMS_EXPLICIT=1; shift 2 ;;
     --av1-maxrate) _require_val "$1" "$#" "${2:-}"; AV1_MAXRATE="$2"; shift 2 ;;
     --av1-bufsize) _require_val "$1" "$#" "${2:-}"; AV1_BUFSIZE="$2"; shift 2 ;;
-    -l|--level)    _require_val "$1" "$#" "${2:-}"; LEVEL_VALUE="$2"; shift 2 ;;
+    -l|--level)    _require_val "$1" "$#" "${2:-}"; LEVEL_VALUE="$2"; _CLI_LEVEL_EXPLICIT=1; shift 2 ;;
     --conservative-vbv) CONSERVATIVE_VBV=1; shift ;;
     --no-conservative-vbv) CONSERVATIVE_VBV=0; shift ;;
     --dv) DISABLE_DV=0; shift ;;
@@ -5081,6 +5089,17 @@ Effective config (post config-files + profile + CLI):
   [Toolchain]
   FFMPEG_LOGLEVEL           = $FFMPEG_LOGLEVEL
   FFPROBE_LOGLEVEL          = $FFPROBE_LOGLEVEL
+
+  [CLI — Explicit Flags]   (1 = user-typed on CLI; 0 = from profile/config/default)
+  _CLI_CRF_EXPLICIT              = $_CLI_CRF_EXPLICIT
+  _CLI_PRESET_EXPLICIT          = $_CLI_PRESET_EXPLICIT
+  _CLI_X265_PARAMS_EXPLICIT     = $_CLI_X265_PARAMS_EXPLICIT
+  _CLI_X264_PARAMS_EXPLICIT     = $_CLI_X264_PARAMS_EXPLICIT
+  _CLI_AV1_PARAMS_EXPLICIT      = $_CLI_AV1_PARAMS_EXPLICIT
+  _CLI_LEVEL_EXPLICIT           = $_CLI_LEVEL_EXPLICIT
+  _CLI_HW_ACCEL_EXPLICIT        = $_CLI_HW_ACCEL_EXPLICIT
+  _CLI_HW_ACCEL_QUALITY_EXPLICIT = $_CLI_HW_ACCEL_QUALITY_EXPLICIT
+  _OUTPUT_EXT_EXPLICIT          = $_OUTPUT_EXT_EXPLICIT
 EOF
   exit 0
 }

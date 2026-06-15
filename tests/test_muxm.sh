@@ -1354,6 +1354,42 @@ test_toggles() {
   out="$(run_muxm --x264-params "profile=high:aq-mode=2" --print-effective-config)"
   assert_contains "X264_PARAMS_BASE          = profile=high:aq-mode=2" "--x264-params: value registered" "$out"
 
+  # ---- WI-1a: _CLI_*_EXPLICIT tracking for the advanced encode-param flags ----
+  # Each flag, when typed on the CLI, must set its companion _CLI_*_EXPLICIT=1; when the flag
+  # is absent (or the value comes from a profile/config), the tracker stays 0. This records
+  # *intent*, not value — the prerequisite for the ignored-knob conflict warnings (WI-1b).
+
+  # Defaults: every tracker is 0 (no flag typed). Use av1-hq, whose profile *sets*
+  # SVT_AV1_PARAMS_BASE, to confirm a profile-supplied value does NOT flip the tracker.
+  out="$(run_muxm --profile av1-hq --print-effective-config)"
+  assert_contains "_CLI_X265_PARAMS_EXPLICIT     = 0" "explicit-track default: x265-params=0" "$out"
+  assert_contains "_CLI_X264_PARAMS_EXPLICIT     = 0" "explicit-track default: x264-params=0" "$out"
+  assert_contains "_CLI_AV1_PARAMS_EXPLICIT      = 0" "explicit-track default: av1-params=0 (profile value doesn't flip it)" "$out"
+  assert_contains "_CLI_LEVEL_EXPLICIT           = 0" "explicit-track default: level=0" "$out"
+
+  # Each flag typed → its tracker flips to 1 (and only its own).
+  out="$(run_muxm --x265-params "aq-mode=2" --print-effective-config)"
+  assert_contains "_CLI_X265_PARAMS_EXPLICIT     = 1" "--x265-params: sets _CLI_X265_PARAMS_EXPLICIT=1" "$out"
+  assert_contains "_CLI_X264_PARAMS_EXPLICIT     = 0" "--x265-params: does not flip x264 tracker" "$out"
+
+  out="$(run_muxm --x264-params "profile=high" --print-effective-config)"
+  assert_contains "_CLI_X264_PARAMS_EXPLICIT     = 1" "--x264-params: sets _CLI_X264_PARAMS_EXPLICIT=1" "$out"
+
+  out="$(run_muxm --av1-params "scd=1" --print-effective-config)"
+  assert_contains "_CLI_AV1_PARAMS_EXPLICIT      = 1" "--av1-params: sets _CLI_AV1_PARAMS_EXPLICIT=1" "$out"
+
+  out="$(run_muxm --level 5.1 --print-effective-config)"
+  assert_contains "_CLI_LEVEL_EXPLICIT           = 1" "--level: sets _CLI_LEVEL_EXPLICIT=1" "$out"
+
+  out="$(run_muxm -l 5.0 --print-effective-config)"
+  assert_contains "_CLI_LEVEL_EXPLICIT           = 1" "-l (alias): sets _CLI_LEVEL_EXPLICIT=1" "$out"
+
+  # A value supplied via config (not the CLI) must NOT flip the tracker (records intent).
+  local _expl_home="$TESTDIR/explicit_track_home"; mkdir -p "$_expl_home"
+  printf 'X265_PARAMS_BASE="aq-mode=2"\n' > "$_expl_home/.muxmrc"
+  out="$(MUXM_HOME="$_expl_home" run_muxm_in "$TESTDIR" --print-effective-config)"
+  assert_contains "_CLI_X265_PARAMS_EXPLICIT     = 0" "config-set X265_PARAMS_BASE: tracker stays 0 (intent, not value)" "$out"
+
   # ---- Default DISK_CHECK = 1 ----
   out="$(run_muxm --print-effective-config)"
   assert_contains "DISK_CHECK                = 1" "DISK_CHECK defaults to 1" "$out"
