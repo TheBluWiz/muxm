@@ -2487,6 +2487,91 @@ test_conflicts() {
       pass "atv passthrough mode: no MKV container warning (other warnings unrelated)"
     fi
   fi
+
+  # ---- WI-1b/1d: silently-ignored CLI flags (C1–C5, C7–C10) ----
+  # Config-time warnings, surfaced before --print-effective-config exits. Each fires only
+  # when the flag is explicitly typed AND silently ignored; gated on _CLI_*_EXPLICIT.
+
+  # C5: --hw-accel-quality without a hardware backend (resolves to none on any host).
+  out="$(run_muxm --hw-accel-quality 60 --print-effective-config)"
+  assert_contains "hw-accel-quality has no effect" "C5: --hw-accel-quality + no HW backend warns" "$out"
+  # C5 negative: not passed → no warning.
+  out="$(run_muxm --print-effective-config)"
+  if echo "$out" | grep -qi "hw-accel-quality has no effect"; then
+    fail "C5 neg: hw-accel-quality warning fired without the flag"
+  else
+    pass "C5 neg: no hw-accel-quality warning when the flag is absent"
+  fi
+
+  # C7: --av1-params on a non-AV1 encode (default codec is libx265).
+  out="$(run_muxm --av1-params "scd=1" --print-effective-config)"
+  assert_contains "av1-params" "C7: --av1-params on non-AV1 codec warns" "$out"
+  assert_contains "apply only to AV1" "C7: warning explains AV1-only" "$out"
+  # C7 negative: an AV1 profile honors --av1-params → no warning.
+  out="$(run_muxm --profile av1-hq --av1-params "scd=1" --print-effective-config)"
+  if echo "$out" | grep -qi "av1-params.*apply only to AV1"; then
+    fail "C7 neg: av1-params warning fired on an AV1 profile"
+  else
+    pass "C7 neg: --av1-params honored on av1-hq (no warning)"
+  fi
+
+  # C8: param flags only apply to their own codec.
+  out="$(run_muxm --video-codec libx264 --x265-params "aq-mode=2" --print-effective-config)"
+  assert_contains "x265-params applies only to the libx265" "C8: --x265-params on libx264 warns" "$out"
+  out="$(run_muxm --profile av1-hq --x264-params "profile=high" --print-effective-config)"
+  assert_contains "x264-params applies only to the libx264" "C8: --x264-params on libsvt-av1 warns" "$out"
+  # C8 negative: --x265-params on the default libx265 is honored → no warning.
+  out="$(run_muxm --x265-params "aq-mode=2" --print-effective-config)"
+  if echo "$out" | grep -qi "x265-params applies only"; then
+    fail "C8 neg: x265-params warning fired when codec matches"
+  else
+    pass "C8 neg: --x265-params on libx265 honored (no warning)"
+  fi
+
+  # C9: --level has no effect on AV1.
+  out="$(run_muxm --profile av1-hq --level 5.1 --print-effective-config)"
+  assert_contains "level has no effect on AV1" "C9: --level on AV1 warns" "$out"
+  # C9 negative: --level on the default libx265 is honored.
+  out="$(run_muxm --level 5.1 --print-effective-config)"
+  if echo "$out" | grep -qi "level has no effect"; then
+    fail "C9 neg: level warning fired on a non-AV1 codec"
+  else
+    pass "C9 neg: --level on libx265 honored (no warning)"
+  fi
+
+  # C10: av1-hq / streaming-av1 profile-specific conflict arms.
+  out="$(run_muxm --profile av1-hq --output-ext mp4 --print-effective-config)"
+  assert_contains "limited AV1+HDR10 support" "C10: av1-hq + --output-ext mp4 warns" "$out"
+  out="$(run_muxm --profile av1-hq --video-codec libx265 --print-effective-config)"
+  assert_contains "overrides its whole purpose" "C10: av1-hq + --video-codec libx265 warns" "$out"
+  out="$(run_muxm --profile av1-hq --no-audio-lossless-passthrough --print-effective-config)"
+  assert_contains "Transcoding lossless audio loses quality" "C10: av1-hq + --no-audio-lossless-passthrough warns" "$out"
+  out="$(run_muxm --profile streaming-av1 --output-ext mkv --print-effective-config)"
+  assert_contains "unusual for streaming targets" "C10: streaming-av1 + --output-ext mkv warns" "$out"
+  out="$(run_muxm --profile streaming-av1 --video-codec libx265 --print-effective-config)"
+  assert_contains "overrides the profile" "C10: streaming-av1 + --video-codec libx265 warns" "$out"
+  # C10 negative: the profiles' own defaults must not warn.
+  out="$(run_muxm --profile av1-hq --print-effective-config)"
+  if echo "$out" | grep -qiE "av1-hq.*(overrides|limited AV1|Transcoding lossless)"; then
+    fail "C10 neg: av1-hq emitted a self-conflict warning at its own defaults"
+  else
+    pass "C10 neg: av1-hq at default settings emits no self-conflict warning"
+  fi
+
+  # C1–C4 (VideoToolbox software-knob conflicts) need the VT backend to resolve, which only
+  # happens on macOS with hevc_videotoolbox. The unit suite covers them deterministically.
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] && ffmpeg_has_encoder hevc_videotoolbox; then
+    out="$(run_muxm --hw-accel videotoolbox --crf 18 --print-effective-config)"
+    assert_contains "--crf 18 is ignored" "C1: VT + --crf warns (e2e)" "$out"
+    out="$(run_muxm --hw-accel videotoolbox --preset slow --print-effective-config)"
+    assert_contains "does not accept x265/x264 presets" "C2: VT + --preset warns (e2e)" "$out"
+    out="$(run_muxm --hw-accel videotoolbox --x265-params "aq-mode=2" --print-effective-config)"
+    assert_contains "does not accept --x265-params" "C3: VT + --x265-params warns (e2e)" "$out"
+    out="$(run_muxm --hw-accel videotoolbox --video-codec libx264 --x264-params "profile=high" --print-effective-config)"
+    assert_contains "honors only profile=high" "C4: VT + --x264-params warns (e2e)" "$out"
+  else
+    skip "C1–C4 (VideoToolbox software-knob conflicts): VT backend unavailable on this host (unit suite covers them)"
+  fi
 }
 
 # === Suite: Hardware Acceleration (Phase 1 foundation) ===
@@ -5769,6 +5854,81 @@ _test_unit_av1_resolution_crf() {
 }
 
 
+_test_unit_ignored_knobs() {
+  # WI-1b: _warn_ignored_knobs warns when an explicitly-typed CLI flag is silently ignored
+  # by the resolved backend/codec (C1–C5, C7–C9). Source the helper with a `warn` stub that
+  # prints to stdout, set the relevant globals, and assert on the emitted text. Deterministic
+  # — exercises the VideoToolbox cases (C1–C4) that can't resolve on non-macOS CI hosts.
+  local body
+  body="$(awk '/^_warn_ignored_knobs\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ -z "$body" ]]; then skip "_warn_ignored_knobs not found in muxm"; return; fi
+
+  # $1 = extra global assignments (override the safe defaults below).
+  _wik() {
+    bash -c 'warn(){ printf "%s\n" "$*"; }
+      HW_ACCEL_RESOLVED=none; VIDEO_CODEC=libx265
+      _CLI_CRF_EXPLICIT=0; _CLI_PRESET_EXPLICIT=0; _CLI_X265_PARAMS_EXPLICIT=0
+      _CLI_X264_PARAMS_EXPLICIT=0; _CLI_HW_ACCEL_QUALITY_EXPLICIT=0
+      _CLI_AV1_PARAMS_EXPLICIT=0; _CLI_LEVEL_EXPLICIT=0
+      CRF_VALUE=18; PRESET_VALUE=slower; AV1_MAXRATE=""; AV1_BUFSIZE=""
+      '"$1"'
+      '"$body"'
+      _warn_ignored_knobs'
+  }
+  local out
+  _has() { echo "$2" | grep -qiE "$1"; }   # _has REGEX OUTPUT
+
+  # ---- C1–C4: VideoToolbox ignores the x265/x264 software knobs ----
+  out="$(_wik 'HW_ACCEL_RESOLVED=videotoolbox; _CLI_CRF_EXPLICIT=1')"
+  _has 'VideoToolbox.*-q:v.*--crf 18 is ignored' "$out" && pass "C1: VT + --crf → warns -q:v" || fail "C1: expected --crf-ignored warning, got: $out"
+
+  out="$(_wik 'HW_ACCEL_RESOLVED=videotoolbox; VIDEO_CODEC=libx264; _CLI_PRESET_EXPLICIT=1; PRESET_VALUE=slow')"
+  _has 'does not accept x265/x264 presets.*--preset slow' "$out" && pass "C2: VT + --preset → warns preset ignored" || fail "C2: expected --preset-ignored warning, got: $out"
+
+  out="$(_wik 'HW_ACCEL_RESOLVED=videotoolbox; _CLI_X265_PARAMS_EXPLICIT=1')"
+  _has 'does not accept --x265-params' "$out" && pass "C3: VT + libx265 + --x265-params → warns" || fail "C3: expected --x265-params-ignored warning, got: $out"
+
+  out="$(_wik 'HW_ACCEL_RESOLVED=videotoolbox; VIDEO_CODEC=libx264; _CLI_X264_PARAMS_EXPLICIT=1')"
+  _has 'honors only profile=high from --x264-params' "$out" && pass "C4: VT + libx264 + --x264-params → warns" || fail "C4: expected --x264-params-ignored warning, got: $out"
+
+  # C1–C4 negatives: not explicit, or software backend → no warning.
+  out="$(_wik 'HW_ACCEL_RESOLVED=videotoolbox; _CLI_CRF_EXPLICIT=0')"
+  _has 'q:v' "$out" && fail "C1 neg: warned even though --crf not explicit" || pass "C1 neg: profile/default --crf does not warn under VT"
+  out="$(_wik 'HW_ACCEL_RESOLVED=none; _CLI_X265_PARAMS_EXPLICIT=1')"
+  [[ -z "$out" ]] && pass "C3 neg: software backend honors --x265-params (no warning)" || fail "C3 neg: unexpected warning on software backend: $out"
+
+  # ---- C5: --hw-accel-quality only affects hardware encoders ----
+  out="$(_wik '_CLI_HW_ACCEL_QUALITY_EXPLICIT=1; HW_ACCEL_RESOLVED=none')"
+  _has 'hw-accel-quality has no effect' "$out" && pass "C5: --hw-accel-quality + no HW backend → warns" || fail "C5: expected hw-accel-quality warning, got: $out"
+  out="$(_wik '_CLI_HW_ACCEL_QUALITY_EXPLICIT=1; HW_ACCEL_RESOLVED=videotoolbox')"
+  _has 'hw-accel-quality has no effect' "$out" && fail "C5 neg: warned even with a HW backend" || pass "C5 neg: --hw-accel-quality with HW backend does not warn"
+
+  # ---- C7: --av1-params / --av1-maxrate / --av1-bufsize only for AV1 ----
+  out="$(_wik '_CLI_AV1_PARAMS_EXPLICIT=1')"   # codec libx265
+  _has 'av1-params.*apply only to AV1' "$out" && pass "C7: --av1-params on non-AV1 → warns" || fail "C7: expected av1-params warning, got: $out"
+  out="$(_wik 'AV1_MAXRATE=8000k')"
+  _has 'apply only to AV1' "$out" && pass "C7: --av1-maxrate on non-AV1 → warns" || fail "C7: expected av1 rate warning, got: $out"
+  out="$(_wik 'VIDEO_CODEC=libsvt-av1; _CLI_AV1_PARAMS_EXPLICIT=1')"
+  _has 'apply only to AV1' "$out" && fail "C7 neg: warned for an AV1 codec" || pass "C7 neg: --av1-params honored on AV1 (no warning)"
+
+  # ---- C8: --x265-params / --x264-params only for their own codec ----
+  out="$(_wik 'VIDEO_CODEC=libx264; _CLI_X265_PARAMS_EXPLICIT=1')"
+  _has 'x265-params applies only to the libx265' "$out" && pass "C8: --x265-params on libx264 → warns" || fail "C8: expected x265-params codec warning, got: $out"
+  out="$(_wik 'VIDEO_CODEC=libsvt-av1; _CLI_X264_PARAMS_EXPLICIT=1')"
+  _has 'x264-params applies only to the libx264' "$out" && pass "C8: --x264-params on non-libx264 → warns" || fail "C8: expected x264-params codec warning, got: $out"
+  out="$(_wik '_CLI_X265_PARAMS_EXPLICIT=1')"   # codec libx265 (matches)
+  _has 'x265-params applies only' "$out" && fail "C8 neg: warned when codec matches" || pass "C8 neg: --x265-params on libx265 honored (no warning)"
+
+  # ---- C9: --level has no effect on AV1 ----
+  out="$(_wik 'VIDEO_CODEC=libsvt-av1; _CLI_LEVEL_EXPLICIT=1')"
+  _has 'level has no effect on AV1' "$out" && pass "C9: --level on AV1 → warns" || fail "C9: expected level warning, got: $out"
+  out="$(_wik '_CLI_LEVEL_EXPLICIT=1')"   # libx265, level honored
+  _has 'level has no effect' "$out" && fail "C9 neg: warned on a non-AV1 codec" || pass "C9 neg: --level on libx265 honored (no warning)"
+
+  unset -f _wik _has
+}
+
+
 _test_unit_realpath_fallback() {
   # ---- realpath_fallback ----
   # Cross-platform path resolver used throughout muxm for SRC_ABS, LOGFILE, etc.
@@ -6061,6 +6221,7 @@ test_unit() {
   _test_unit_disk_preflight
   _test_unit_disk_fallback
   _test_unit_av1_resolution_crf
+  _test_unit_ignored_knobs
   _test_unit_realpath_fallback
   _test_unit_apply_level_vbv
   _test_unit_mapping_helpers

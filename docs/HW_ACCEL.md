@@ -79,6 +79,8 @@ Software encoders continue to use `build_x265_params` and `build_av1_params`. `b
 
 Hardware encoders do **not** accept `-x265-params`; `build_videotoolbox_params()` translates CRF/preset into `-q:v` (VideoToolbox's native quality knob). A future `build_nvenc_params()` will use `-cq`/`-preset p7` for NVENC when implemented.
 
+Because the VideoToolbox backend silently drops the software encode knobs, muxm warns at config time (before `--print-effective-config` exits) when a user **explicitly** types a flag that the resolved backend or codec ignores — never blocking, just surfacing. These warnings are gated on the `_CLI_*_EXPLICIT` trackers, so a value supplied by a profile or config file never warns. Covered cases: `--crf`/`--preset`/`--x265-params`/`--x264-params` under the VideoToolbox backend; `--hw-accel-quality` without any hardware backend; `--av1-params`/`--av1-maxrate`/`--av1-bufsize` on a non-AV1 codec; `--x265-params`/`--x264-params` on the wrong codec; and `--level` on an AV1 encode.
+
 ---
 
 ## 5. Quality parity protocol

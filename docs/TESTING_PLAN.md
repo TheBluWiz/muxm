@@ -903,7 +903,7 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 | Setup combined installer | ✅ Full | — | All three sub-installers + standalone deps/man |
 | Config precedence | ✅ Full | — | Single-layer, multi-layer (user+project+CLI), all --create-config profiles, loglevel validation, deprecated variable migration |
 | Profile defaults | ✅ Full | — | All 6 profiles validated |
-| Conflict warnings | ✅ Full | — | 40+ combinations tested, incl. archive/animation multi-track audio+sub conflicts (--audio-track, --audio-force-codec, --stereo-fallback, --sub-burn-forced, --sub-export-external), hdr10-hq+DV, universal+DV, AV1+DV, and burn-forced+no-subtitles. Warning *text* (not just presence) asserted after the Phase 8 needle hardening |
+| Conflict warnings | ✅ Full | — | 40+ combinations tested, incl. archive/animation multi-track audio+sub conflicts (--audio-track, --audio-force-codec, --stereo-fallback, --sub-burn-forced, --sub-export-external), hdr10-hq+DV, universal+DV, AV1+DV, and burn-forced+no-subtitles. Warning *text* (not just presence) asserted after the Phase 8 needle hardening. Plus the silently-ignored-flag warnings C1–C5,C7–C10 (`_warn_ignored_knobs` + av1-hq/streaming-av1 profile arms): C5/C7/C8/C9/C10 e2e in `--suite conflicts`; C1–C4 (VideoToolbox-only) deterministically in `--suite unit` (`_test_unit_ignored_knobs`) and e2e-gated on a VT host |
 | Dry-run mode | ✅ Full | — | Includes HDR source dry-run |
 | Video encode (SDR) | ✅ Full | — | Includes x265-params, threads, video-copy-if-compliant, --level VBV |
 | Video encode (HDR) | ⚠️ Tagged only | Real HDR quality (M8–M15) | Synthetic clips have HDR tags but no real HDR content; tonemap filter chain verified in dry-run |

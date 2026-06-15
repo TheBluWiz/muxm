@@ -4730,6 +4730,62 @@ _warn_h264_hdr(){
   return 0
 }
 
+# WI-1b: warn when an explicitly-typed CLI flag is silently ignored by the resolved
+# backend/codec. Every check is gated on a _CLI_*_EXPLICIT tracker (or, for AV1 rate
+# control, on a non-empty value that no profile sets), so a value supplied by a profile or
+# config never warns. Must be called AFTER detect_hw_accel so HW_ACCEL_RESOLVED and
+# VIDEO_CODEC are known, and before print_effective_config so the warnings are visible
+# (and unit-testable) there.
+# Phrasing note (C1–C4): VideoToolbox can fall back to its software path per-frame
+# (allow_sw), in which case the software knobs *would* apply — hence "When the VideoToolbox
+# backend is used". The config-time emission is correct for the overwhelmingly common case.
+_warn_ignored_knobs() {
+  local _vt=0;    [[ "$HW_ACCEL_RESOLVED" == "videotoolbox" ]] && _vt=1
+  local _is_x26x=0; [[ "$VIDEO_CODEC" == "libx265" || "$VIDEO_CODEC" == "libx264" ]] && _is_x26x=1
+  local _is_av1=0;  [[ "$VIDEO_CODEC" == "libsvt-av1" || "$VIDEO_CODEC" == "libaom-av1" ]] && _is_av1=1
+
+  # C1–C4: VideoToolbox ignores the x265/x264 software encode knobs.
+  if (( _vt && _is_x26x )); then
+    (( _CLI_CRF_EXPLICIT )) && \
+      warn "When the VideoToolbox backend is used it controls quality via -q:v; --crf $CRF_VALUE is ignored. Use --hw-accel-quality to set VideoToolbox quality."
+    (( _CLI_PRESET_EXPLICIT )) && \
+      warn "When the VideoToolbox backend is used it does not accept x265/x264 presets; --preset $PRESET_VALUE is ignored."
+    if [[ "$VIDEO_CODEC" == "libx265" ]] && (( _CLI_X265_PARAMS_EXPLICIT )); then
+      warn "When the VideoToolbox backend is used it does not accept --x265-params; the parameter string is ignored."
+    fi
+    if [[ "$VIDEO_CODEC" == "libx264" ]] && (( _CLI_X264_PARAMS_EXPLICIT )); then
+      warn "When the VideoToolbox backend is used it honors only profile=high from --x264-params; other keys are ignored."
+    fi
+  fi
+
+  # C5: --hw-accel-quality only affects hardware encoders.
+  if (( _CLI_HW_ACCEL_QUALITY_EXPLICIT )) \
+     && [[ "$HW_ACCEL_RESOLVED" != "videotoolbox" && "$HW_ACCEL_RESOLVED" != "nvenc" ]]; then
+    warn "--hw-accel-quality has no effect without a hardware backend (current backend: ${HW_ACCEL_RESOLVED:-none})."
+  fi
+
+  # C7: --av1-params / --av1-maxrate / --av1-bufsize apply only to AV1 encodes.
+  if (( ! _is_av1 )); then
+    if (( _CLI_AV1_PARAMS_EXPLICIT )) || [[ -n "$AV1_MAXRATE" || -n "$AV1_BUFSIZE" ]]; then
+      warn "--av1-params/--av1-maxrate/--av1-bufsize apply only to AV1 encodes; ignored for $VIDEO_CODEC."
+    fi
+  fi
+
+  # C8: --x265-params / --x264-params apply only to their own codec.
+  if (( _CLI_X265_PARAMS_EXPLICIT )) && [[ "$VIDEO_CODEC" != "libx265" ]]; then
+    warn "--x265-params applies only to the libx265 encoder; ignored for $VIDEO_CODEC."
+  fi
+  if (( _CLI_X264_PARAMS_EXPLICIT )) && [[ "$VIDEO_CODEC" != "libx264" ]]; then
+    warn "--x264-params applies only to the libx264 encoder; ignored for $VIDEO_CODEC."
+  fi
+
+  # C9: --level has no effect on AV1 encodes.
+  if (( _CLI_LEVEL_EXPLICIT )) && (( _is_av1 )); then
+    warn "--level has no effect on AV1 encodes."
+  fi
+  return 0
+}
+
 if [[ -n "${PROFILE_NAME:-}" ]]; then
   case "$PROFILE_NAME" in
 
@@ -4859,6 +4915,43 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       _warn_h264_hdr "$PROFILE_NAME" "H.264 cannot carry HDR10 metadata. HEVC recommended for streaming."
       ;;
 
+    av1-hq)
+      # C10: av1-hq has no dedicated conflict arm. MP4/MOV have limited AV1+HDR10 support;
+      # the profile forces MKV.
+      _warn_container_unusual "$PROFILE_NAME" "mp4" \
+        "MP4 has limited AV1+HDR10 support. av1-hq uses MKV to preserve HDR10."
+      _warn_container_unusual "$PROFILE_NAME" "mov" \
+        "MOV has limited AV1+HDR10 support. av1-hq uses MKV to preserve HDR10."
+      # Switching off AV1 defeats the entire purpose of an AV1 archival profile.
+      if [[ "$VIDEO_CODEC" != "libsvt-av1" && "$VIDEO_CODEC" != "libaom-av1" ]]; then
+        _warn_conflict "$PROFILE_NAME" "--video-codec $VIDEO_CODEC" \
+          "av1-hq is an AV1 archival profile; selecting $VIDEO_CODEC overrides its whole purpose."
+      fi
+      # Transcoding lossless audio loses quality unnecessarily — MKV carries it natively.
+      (( ! AUDIO_LOSSLESS_PASSTHROUGH )) && \
+        _warn_conflict "$PROFILE_NAME" "--no-audio-lossless-passthrough" \
+          "Transcoding lossless audio loses quality. av1-hq archives lossless natively in MKV."
+      # Tone-mapping defeats the HDR10 archival intent.
+      (( TONEMAP_HDR_TO_SDR )) && \
+        _warn_conflict "$PROFILE_NAME" "--tonemap" \
+          "Tone-mapping to SDR removes HDR10. av1-hq preserves HDR10 for archival."
+      ;;
+
+    streaming-av1)
+      # C10: streaming-av1 has no dedicated conflict arm. Switching off AV1 defeats the profile.
+      if [[ "$VIDEO_CODEC" != "libsvt-av1" && "$VIDEO_CODEC" != "libaom-av1" ]]; then
+        _warn_conflict "$PROFILE_NAME" "--video-codec $VIDEO_CODEC" \
+          "streaming-av1 targets AV1-capable platforms; selecting $VIDEO_CODEC overrides the profile."
+      fi
+      # MKV is unusual for streaming targets (the profile uses MP4).
+      _warn_container_unusual "$PROFILE_NAME" "mkv" \
+        "MKV is unusual for streaming targets. streaming-av1 uses MP4 for broadest client support."
+      # Tone-mapping defeats HDR streaming intent.
+      (( TONEMAP_HDR_TO_SDR )) && \
+        _warn_conflict "$PROFILE_NAME" "--tonemap" \
+          "Tone-mapping to SDR removes HDR. streaming-av1 preserves HDR."
+      ;;
+
     animation)
       # Container choices that drop subtitle fidelity
       _warn_container_unusual "$PROFILE_NAME" "mp4" \
@@ -4980,6 +5073,11 @@ if [[ -n "${PROFILE_NAME:-}" ]] && [[ "$HW_ACCEL_RESOLVED" != "none" ]]; then
       ;;
   esac
 fi
+
+# WI-1b: surface explicitly-typed CLI flags that the resolved backend/codec silently
+# ignores (C1–C5, C7–C9). Runs after detect_hw_accel (HW_ACCEL_RESOLVED known) and before
+# print_effective_config so the warnings appear there. Gated on _CLI_*_EXPLICIT.
+_warn_ignored_knobs
 
 
 # Display the resolved configuration from all sources (config files + profile + CLI).
