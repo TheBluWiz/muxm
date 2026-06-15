@@ -26,7 +26,7 @@ muxm --profile <name> --print-effective-config
 | `streaming-av1` | MP4 | AV1 (SVT) | Opus 256k | Modern clients with AV1 decode; smaller than HEVC. |
 | `animation` | MKV | HEVC | lossless | Anime or cartoons where banding and styled subs matter. |
 | `universal` | MP4 | H.264 | AAC stereo (native preferred) | It has to play everywhere, including old Rokus and phones. |
-| `youtube-upload` | MP4 | H.264 | best-scored track | Uploading to YouTube; give the re-encoder the cleanest source. |
+| `youtube-upload` | MP4 | H.264 | best-scored source track (surround allowed) | Uploading to YouTube; give the re-encoder the cleanest source. |
 
 ---
 

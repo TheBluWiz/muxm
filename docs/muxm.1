@@ -41,6 +41,11 @@ explicit output filename is provided, its stem and directory are used as the
 base; its extension is ignored (each profile determines its own container). A
 warning listing all output paths is printed before encoding starts.
 .PP
+Each profile re\-invokes the full pipeline from the original source, so total
+cost scales linearly with the number of profiles \(em there is no shared decode
+or amortization between passes. This isolation is intentional (each pass is
+independent and self\-contained).
+.PP
 .\" NOTE: Profile names below must match VALID_PROFILES in muxm (Section 2).
 Available profiles:
 .TP

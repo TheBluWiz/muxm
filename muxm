@@ -1610,6 +1610,11 @@ explicit output filename is provided, its stem and directory are used as the
 base; its extension is ignored (each profile determines its own container). A
 warning listing all output paths is printed before encoding starts.
 .PP
+Each profile re\-invokes the full pipeline from the original source, so total
+cost scales linearly with the number of profiles \(em there is no shared decode
+or amortization between passes. This isolation is intentional (each pass is
+independent and self\-contained).
+.PP
 .\" NOTE: Profile names below must match VALID_PROFILES in muxm (Section 2).
 Available profiles:
 .TP
@@ -4422,12 +4427,14 @@ Profiles (--profile NAME):
   streaming-av1              AV1 CRF 30/28 (res-aware), Opus audio. Optimized for AV1-capable platforms. MP4.
   animation                  Anime/cartoon. CRF 16, lossless audio, ASS subs. MKV.
   universal                  H.264 SDR, AAC stereo. Lean, play anywhere. MP4.
-  youtube-upload             H.264 high-profile CRF 16. AAC stereo, soft forced subs. MP4.
+  youtube-upload             H.264 high-profile CRF 16. Best-scored audio (surround allowed), soft forced subs. MP4.
 
 Common options:
   -h, --help                  Show this help
   -V, --version               Show version
-  --profile NAME              Apply a format profile (overrides config defaults)
+  --profile NAME[,NAME...]    Apply a format profile (overrides config defaults). Comma-
+                              separate names to run each as a full separate pass; cost
+                              scales linearly with the number of profiles (no shared decode).
   --crf N                     Video quality (default: ${CRF_VALUE})
   -p, --preset NAME           x265 preset (default: ${PRESET_VALUE})
   --hw-accel BACKEND          Hardware acceleration: none | auto | videotoolbox | nvenc
