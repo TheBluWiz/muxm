@@ -5557,10 +5557,13 @@ _crf_ratio() {
         *) (( crf < 14 )) && echo 1300 || echo 70 ;;
       esac ;;
     libsvt-av1|libaom-av1)
+      # Measured output/source bitrate ratios from AV1_CALIBRATION.md §6 (the prior
+      # values under-estimated AV1 output size by 28–80%, causing the preflight to
+      # under-warn). Out-of-range fallbacks bumped to stay monotonic with the table.
       case "$crf" in
-        20)echo 250;;22)echo 200;;24)echo 170;;26)echo 140;;28)echo 120;;30)echo 100;;
-        32)echo 85;;34)echo 70;;36)echo 58;;38)echo 48;;40)echo 38;;
-        *)(( crf<20 ))&&echo 320||echo 28;;
+        20)echo 320;;22)echo 260;;24)echo 211;;26)echo 189;;28)echo 178;;30)echo 166;;
+        32)echo 153;;34)echo 130;;36)echo 108;;38)echo 88;;40)echo 70;;
+        *)(( crf<20 ))&&echo 360||echo 55;;
       esac ;;
     *) echo 330 ;;  # fallback: x265 CRF 18 equivalent
   esac

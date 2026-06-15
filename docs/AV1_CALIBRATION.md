@@ -212,16 +212,19 @@ CRF 24 and 26 ratios derived from the Avatar 4K HDR data: `(8965 / 15658) × 330
 
 If a single set of ratios must cover both resolutions, the 1080p SDR values (178/166/153) are the conservative upper bound. Using these for 4K content will slightly overestimate file size — the safer failure mode for a disk preflight check.
 
-### Suggested updated values
+### Updated values (applied in `_crf_ratio`)
+
+These calibrated ratios are now live in `_crf_ratio` (shared by `libsvt-av1` and `libaom-av1`), replacing the prior values that under-estimated AV1 output size by 28–80%:
 
 ```bash
-# libsvt-av1 — calibrated ratios (1080p SDR upper bound)
+# libsvt-av1 / libaom-av1 — calibrated ratios (1080p SDR upper bound)
 20) echo 320 ;; 22) echo 260 ;; 24) echo 211 ;; 26) echo 189 ;;
 28) echo 178 ;; 30) echo 166 ;; 32) echo 153 ;; 34) echo 130 ;;
 36) echo 108 ;; 38) echo 88  ;; 40) echo 70  ;;
+*) (( crf<20 )) && echo 360 || echo 55 ;;   # out-of-range clamps, bumped to stay monotonic
 ```
 
-CRF 24 and 26 values anchored to 4K HDR measurements (189/167) plus the observed ~22-point gap between 4K HDR and 1080p SDR at CRF 28–32. CRF 28/30/32 are anchored to measured 1080p SDR values (178/166/153).
+CRF 24 and 26 values anchored to 4K HDR measurements (189/167) plus the observed ~22-point gap between 4K HDR and 1080p SDR at CRF 28–32. CRF 28/30/32 are anchored to measured 1080p SDR values (178/166/153). The below-/above-range clamps (360/55) were raised from the prior 320/28 to stay monotonic with the new in-range values.
 
 ---
 

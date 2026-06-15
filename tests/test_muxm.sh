@@ -5575,6 +5575,13 @@ _test_unit_disk_preflight() {
   assert_muxm_fn_stdout "_crf_ratio(libx264,23)=230"         "230" _crf_ratio "" "libx264" "23"
   assert_muxm_fn_stdout "_crf_ratio(libx265,10)=850(clamp)"  "850" _crf_ratio "" "libx265" "10"
   assert_muxm_fn_stdout "_crf_ratio(libx265,35)=35(clamp)"   "35"  _crf_ratio "" "libx265" "35"
+  # AV1 ratios corrected to measured AV1_CALIBRATION.md §6 values (WI-3 Fix A).
+  # Both libsvt-av1 and libaom-av1 share the table; spot-check named entries + both clamps.
+  assert_muxm_fn_stdout "_crf_ratio(libsvt-av1,30)=166"      "166" _crf_ratio "" "libsvt-av1" "30"
+  assert_muxm_fn_stdout "_crf_ratio(libsvt-av1,24)=211"      "211" _crf_ratio "" "libsvt-av1" "24"
+  assert_muxm_fn_stdout "_crf_ratio(libaom-av1,40)=70"       "70"  _crf_ratio "" "libaom-av1" "40"
+  assert_muxm_fn_stdout "_crf_ratio(libsvt-av1,18)=360(clamp)" "360" _crf_ratio "" "libsvt-av1" "18"
+  assert_muxm_fn_stdout "_crf_ratio(libsvt-av1,45)=55(clamp)"  "55"  _crf_ratio "" "libsvt-av1" "45"
 
   # ---- _preset_multiplier ----
   # Maps preset names to encode-size multiplier ×1000.
