@@ -66,7 +66,7 @@ muxm --profile <name> input.mkv
 | `archive` | Lossless preservation | Copy (no re-encode) | All tracks, lossless passthrough | Multi-track stream-copy (all types, up to 99) | Preserve |
 | `hdr10-hq` | Max HDR10 quality | HEVC CRF 17 | Lossless passthrough | Single-track per type, soft subs | Strip |
 | `atv-directplay-hq` | Apple TV Direct Play | HEVC Main10 (copy if compliant) | E-AC-3 | Soft forced (mov_text); others as mov_text; PGS→OCR | Convert to P8.1 (auto, if possible) |
-| `av1-hq` | High-quality AV1 archive | AV1 CRF 20, preset 6 | Lossless passthrough | Single-track per type, soft subs | Disabled (AV1 pipeline) |
+| `av1-hq` | High-quality AV1 archive | AV1 CRF 28/24 (res-aware), preset 6 | Lossless passthrough | Single-track per type, soft subs | Disabled (AV1 pipeline) |
 | `streaming-hevc` | Modern HEVC streaming | HEVC CRF 20 | E-AC-3 448k | Soft forced + full (no SDH); PGS→OCR | Strip |
 | `streaming-av1` | AV1 streaming | AV1 CRF 30 (≤1080p SDR) / 28 (≥4K or HDR), preset 6 | Opus 256k | Soft forced + full (no SDH); PGS→OCR | Strip |
 | `animation` | Anime/cartoon optimized | HEVC CRF 16, 10-bit | Lossless passthrough | Multi-track stream-copy (up to 6); preserve ASS/SSA | Strip |
@@ -102,7 +102,7 @@ muxm --profile atv-directplay-hq movie.mkv
 
 ### `av1-hq` — High-Quality AV1
 
-High-fidelity AV1 encode via SVT-AV1. CRF 20, preset 6, lossless audio passthrough, MKV container, and SHA-256 checksum enabled by default. Dolby Vision is automatically disabled — the AV1 encode pipeline does not support DV muxing. Intended as a modern space-efficient alternative to `hdr10-hq` for clients with AV1 decode support.
+High-fidelity AV1 encode via SVT-AV1 at preset 6 with a **resolution-aware CRF**: 28 for ≤1080p SDR (the transparency point) and 24 for ≥4K or HDR sources (the calibrated default; pass `--crf 20` for measured HEVC-CRF-18 parity at the cost of larger files). Lossless audio passthrough, MKV container, and SHA-256 checksum enabled by default. Dolby Vision is automatically disabled — the AV1 encode pipeline does not support DV muxing. Intended as a modern space-efficient alternative to `hdr10-hq` for clients with AV1 decode support.
 
 > **Requires AV1 encoder support in ffmpeg.** Unlike Dolby Vision tools, a missing AV1 encoder is a fatal error — ffmpeg will exit immediately. A standard `brew install ffmpeg` does not include AV1 encoders. Use `brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-svt-av1` for SVT-AV1 (`libsvtav1`) or `--with-libaom` for libaom (`libaom-av1`), or run `muxm --install-dependencies` to check what's available.
 

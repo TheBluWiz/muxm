@@ -86,9 +86,10 @@ The former name
 is accepted as a backwards\-compatible alias and emits a deprecation notice.
 .TP
 .B av1\-hq
-High\-quality AV1 archival via SVT\-AV1. CRF 20, preset 6. HDR10 preserved,
-DV disabled. MKV. Lossless audio passthrough.
-SHA\-256 checksum. VMAF 93.48 at 4K HDR (parity with HEVC CRF 18).
+High\-quality AV1 archival via SVT\-AV1. Resolution\-aware CRF: 28 for \(<=1080p SDR,
+24 for \(>=4K or HDR (preset 6). HDR10 preserved, DV disabled. MKV. Lossless audio
+passthrough. SHA\-256 checksum. VMAF 97.91 at 1080p SDR; 92.54 at 4K HDR. Pass
+\fB\-\-crf 20\fR for measured HEVC\-CRF\-18 parity (VMAF 93.48, larger files).
 See
 .I docs/AV1_CALIBRATION.md
 for methodology.

@@ -344,6 +344,12 @@ declare -i DISK_FREE_WARN_GB=5   # Minimum free-space floor (GB) for the preflig
                                  # stream-copies ignore the floor. Override: --no-disk-check.
 declare -i DISK_CHECK=1          # Set to 0 via --no-disk-check to suppress preflight estimation
 
+# av1-hq CRF for 4K/HDR sources (resolution-aware). The profile bases at CRF 28 (the 1080p
+# SDR transparency point) and drops to this value for >=4K or HDR content. 24 is the
+# documented calibrated default (VMAF 92.54 at 4K HDR); set to 20 for measured HEVC-CRF-18
+# parity (larger files). An explicit --crf always overrides this. One-line owner choice.
+declare -i AV1_HQ_HDR_CRF=24
+
 # ---- ffmpeg/ffprobe UX
 declare -i FFMPEG_HIDE_BANNER=1
 FFMPEG_LOGLEVEL="error"
@@ -1653,9 +1659,10 @@ The former name
 is accepted as a backwards\-compatible alias and emits a deprecation notice.
 .TP
 .B av1\-hq
-High\-quality AV1 archival via SVT\-AV1. CRF 20, preset 6. HDR10 preserved,
-DV disabled. MKV. Lossless audio passthrough.
-SHA\-256 checksum. VMAF 93.48 at 4K HDR (parity with HEVC CRF 18).
+High\-quality AV1 archival via SVT\-AV1. Resolution\-aware CRF: 28 for \(<=1080p SDR,
+24 for \(>=4K or HDR (preset 6). HDR10 preserved, DV disabled. MKV. Lossless audio
+passthrough. SHA\-256 checksum. VMAF 97.91 at 1080p SDR; 92.54 at 4K HDR. Pass
+\fB\-\-crf 20\fR for measured HEVC\-CRF\-18 parity (VMAF 93.48, larger files).
 See
 .I docs/AV1_CALIBRATION.md
 for methodology.
@@ -4044,8 +4051,10 @@ apply_profile_streaming_hevc() {
 
 apply_profile_av1_hq() {
   # High-quality AV1 archival encode via SVT-AV1. HDR10 preserved; DV auto-disabled.
-  # CRF 20 achieves VMAF 93.48 at 4K HDR (parity with HEVC CRF 18).
-  # CRF 28 achieves VMAF 97.91 at 1080p SDR.
+  # Resolution-aware CRF (applied after probe by _apply_av1_resolution_crf):
+  #   - base CRF 28 (VMAF 97.91 at 1080p SDR — the SDR transparency point),
+  #   - dropped to AV1_HQ_HDR_CRF (24, VMAF 92.54 at 4K HDR) for >=4K or HDR sources.
+  # CRF 20 (VMAF 93.48 at 4K HDR, parity with HEVC CRF 18) is reachable via --crf 20.
   # See docs/AV1_CALIBRATION.md for methodology.
   DISABLE_DV=1
   ALLOW_DV_FALLBACK=0
@@ -4053,7 +4062,7 @@ apply_profile_av1_hq() {
   OUTPUT_EXT="mkv"
   VIDEO_CODEC="libsvt-av1"
   VIDEO_COPY_IF_COMPLIANT=0
-  CRF_VALUE=20
+  CRF_VALUE=28
   PRESET_VALUE=6
   SVT_AV1_PARAMS_BASE='film-grain=0:enable-overlays=1:scd=1'
   HDR_TARGET_PIXFMT="yuv420p10le"
@@ -4071,8 +4080,8 @@ apply_profile_av1_hq() {
 }
 
 apply_profile_streaming_av1() {
-  # AV1 streaming profile. Opus audio, MP4 container, CRF 30 (main() drops it to 28 for
-  # >=4K or HDR sources — resolution-aware A1; an explicit --crf still wins).
+  # AV1 streaming profile. Opus audio, MP4 container, CRF 30 (_apply_av1_resolution_crf
+  # drops it to 28 for >=4K or HDR sources — resolution-aware A1; an explicit --crf still wins).
   # Optimized for platforms that accept AV1 (YouTube, Netflix ingest).
   # VMAF 97.70 at 1080p SDR, 90.65 at 4K HDR.
   DISABLE_DV=1
@@ -4098,6 +4107,35 @@ apply_profile_streaming_av1() {
   SUB_BURN_FORCED=0
   KEEP_CHAPTERS=1
   STRIP_METADATA=0
+}
+
+# _apply_av1_resolution_crf — resolution/HDR-aware CRF for the AV1 profiles.
+# Must run after the source is probed (PROFILE_DESC reflects the HDR/HLG decision). For
+# >=4K (width >= 3840 or height >= 2160) or HDR/HLG sources, drops the profile's base SDR
+# CRF to its 4K/HDR target; otherwise the base (≤1080p-SDR) CRF is kept. An explicit --crf
+# always wins (gated by _CLI_CRF_EXPLICIT). Calibration: docs/AV1_CALIBRATION.md.
+#   streaming-av1: base 30 (≤1080p SDR) → 28 (>=4K or HDR)
+#   av1-hq:        base 28 (≤1080p SDR) → AV1_HQ_HDR_CRF (24) (>=4K or HDR)
+_apply_av1_resolution_crf() {
+  (( _CLI_CRF_EXPLICIT )) && return 0
+  local _target
+  case "${PROFILE_NAME:-}" in
+    streaming-av1) _target=28 ;;
+    av1-hq)        _target="$AV1_HQ_HDR_CRF" ;;
+    *)             return 0 ;;
+  esac
+
+  local _w _h _is4k=0 _hdr=0
+  _w="$(_probe_field width)"; _h="$(_probe_field height)"
+  [[ "$_w" =~ ^[0-9]+$ ]] && (( _w >= 3840 )) && _is4k=1
+  [[ "$_h" =~ ^[0-9]+$ ]] && (( _h >= 2160 )) && _is4k=1
+  [[ "$PROFILE_DESC" == "HDR10" || "$PROFILE_DESC" == "HLG" ]] && _hdr=1
+
+  if (( _is4k || _hdr )); then
+    CRF_VALUE="$_target"
+    note "${PROFILE_NAME}: ${_w:-?}×${_h:-?} ${PROFILE_DESC} source → CRF ${_target} (4K/HDR quality; the ≤1080p-SDR default is higher)"
+    report_add "av1_crf_resolution_aware" "CRF ${_target} (${_w:-?}×${_h:-?}, ${PROFILE_DESC})"
+  fi
 }
 
 apply_profile_animation() {
@@ -4425,7 +4463,7 @@ Profiles (--profile NAME):
   atv-directplay-hq          Apple TV Direct Play. DV-aware, E-AC-3. Passthrough container.
   atv-directplay-animation   ATV Direct Play, animation quality. CRF 16, E-AC-3, ASS subs. Passthrough container.
   streaming-hevc             HEVC CRF 20 for Plex/Jellyfin. HDR10, E-AC-3. MP4.
-  av1-hq                     AV1 CRF 20, lossless audio. HDR10, MKV.
+  av1-hq                     AV1 CRF 28/24 (res-aware), lossless audio. HDR10, MKV.
   streaming-av1              AV1 CRF 30/28 (res-aware), Opus audio. Optimized for AV1-capable platforms. MP4.
   animation                  Anime/cartoon. CRF 16, lossless audio, ASS subs. MKV.
   universal                  H.264 SDR, AAC stereo. Lean, play anywhere. MP4.
@@ -10615,26 +10653,9 @@ main() {
   resolve_video_encoder
   build_video_encoder_params
 
-  # A1: streaming-av1 CRF is resolution/HDR-aware. CRF 30 is visually transparent at
-  # 1080p SDR (VMAF 97.7) but drops to VMAF 90.65 at 4K HDR — below the ~93 line — because
-  # the "+10 CRF vs HEVC" rule breaks down for UHD/HDR (docs/AV1_CALIBRATION.md, Test 2).
-  # Nudge ≥4K or HDR sources to CRF 28 (measured 91.24 at 4K HDR), keeping 30 for the common
-  # 1080p-SDR case. This stays a streaming bandwidth/quality trade-off — full transparency
-  # is av1-hq's job (CRF 24/20), not streaming-av1's. (1080p-HDR triggers the lower CRF too,
-  # an extrapolation beyond the measured 4K-HDR point.) Runs here so PROFILE_DESC (the HDR
-  # check) is set; an explicit --crf always wins via the _CLI_CRF_EXPLICIT gate.
-  if [[ "${PROFILE_NAME:-}" == "streaming-av1" ]] && (( ! _CLI_CRF_EXPLICIT )); then
-    local _sv_w _sv_h _sv_is4k=0 _sv_hdr=0
-    _sv_w="$(_probe_field width)"; _sv_h="$(_probe_field height)"
-    [[ "$_sv_w" =~ ^[0-9]+$ ]] && (( _sv_w >= 3840 )) && _sv_is4k=1
-    [[ "$_sv_h" =~ ^[0-9]+$ ]] && (( _sv_h >= 2160 )) && _sv_is4k=1
-    [[ "$PROFILE_DESC" == "HDR10" || "$PROFILE_DESC" == "HLG" ]] && _sv_hdr=1
-    if (( _sv_is4k || _sv_hdr )); then
-      CRF_VALUE=28
-      note "streaming-av1: ${_sv_w:-?}×${_sv_h:-?} ${PROFILE_DESC} source → CRF 28 (4K/HDR quality; default 30 is for ≤1080p SDR)"
-      report_add "av1_crf_resolution_aware" "CRF 28 (${_sv_w:-?}×${_sv_h:-?}, ${PROFILE_DESC})"
-    fi
-  fi
+  # A1: resolution/HDR-aware CRF for the AV1 profiles (streaming-av1 and av1-hq). Runs here
+  # so PROFILE_DESC (the HDR check) is set; an explicit --crf always wins via _CLI_CRF_EXPLICIT.
+  _apply_av1_resolution_crf
 
   # Deferred warning: H.264 + HDR source + no tone-mapping.
   # Both libx264 and h264_videotoolbox produce 8-bit yuv420p only; the output

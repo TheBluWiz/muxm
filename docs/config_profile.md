@@ -90,14 +90,20 @@ re-encode to HEVC Main10 at high quality (CRF 17 / slower), keep lossless audio.
 Shield Pro, Fire TV Stick 4K Max, Chromecast with Google TV, compatible smart
 TVs) who want a high-fidelity, space-efficient archive encode.
 
-**Goal:** Maximum AV1 quality. Encode to SVT-AV1 at CRF 20 / preset 6,
-preserve HDR10 metadata, keep lossless audio, generate a checksum for
-archival integrity. Dolby Vision is not supported by the AV1 encode pipeline
-and is automatically disabled.
+**Goal:** Maximum AV1 quality. Encode to SVT-AV1 at preset 6 with a
+**resolution-aware CRF** (28 for ≤1080p SDR, 24 for ≥4K or HDR — the calibrated
+transparency points, see `AV1_CALIBRATION.md §4`), preserve HDR10 metadata, keep
+lossless audio, generate a checksum for archival integrity. Dolby Vision is not
+supported by the AV1 encode pipeline and is automatically disabled.
 
 **Key behaviors:**
 
 - Video codec is `libsvt-av1`; `SVT_AV1_PARAMS_BASE` is applied when set.
+- CRF is resolution-aware: the profile bases at **CRF 28** (the 1080p-SDR
+  transparency point) and `_apply_av1_resolution_crf` drops it to
+  **`AV1_HQ_HDR_CRF`** (default **24**) for ≥4K or HDR sources, after the source
+  is probed. An explicit `--crf` always wins. For measured HEVC-CRF-18 parity on
+  4K/HDR (larger files), pass `--crf 20`, or set `AV1_HQ_HDR_CRF=20`.
 - DISABLE_DV is forced to `1` — AV1 containers cannot carry DV metadata.
   muxm emits an informational note when a DV source is detected.
 - Lossless audio codecs (TrueHD, DTS-HD MA, FLAC) are passed through

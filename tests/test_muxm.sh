@@ -2161,7 +2161,7 @@ test_profiles() {
   # av1-hq specifics
   out="$(run_muxm --profile av1-hq --print-effective-config)"
   assert_contains "VIDEO_CODEC               = libsvt-av1"  "av1-hq: SVT-AV1 codec" "$out"
-  assert_contains "CRF_VALUE                 = 20"          "av1-hq: CRF 20" "$out"
+  assert_contains "CRF_VALUE                 = 28"          "av1-hq: base CRF 28 (1080p-SDR; res-aware drops to 24 for 4K/HDR after probe)" "$out"
   assert_contains "PRESET_VALUE              = 6"           "av1-hq: preset 6" "$out"
   assert_contains "CHECKSUM                  = 1"           "av1-hq: checksum on by default" "$out"
   assert_contains "OUTPUT_EXT                = mkv"         "av1-hq: MKV container" "$out"
@@ -2865,14 +2865,14 @@ EOF
 
   # ---- AV1 profile dry-run: verify profile settings are applied ----
 
-  # av1-hq dry-run: CRF 20, libsvt-av1, MKV output, DV disabled, lossless audio passthrough.
+  # av1-hq dry-run: base CRF 28, libsvt-av1, MKV output, DV disabled, lossless audio passthrough.
   out="$(run_muxm --dry-run --profile av1-hq "$TESTDIR/basic_sdr_subs.mkv" 2>&1)"
   assert_contains "DRY-RUN" "dry-run av1-hq: announces DRY-RUN" "$out"
   # Effective-config check: confirm profile set the expected video codec and CRF.
   local av1hq_cfg
   av1hq_cfg="$(run_muxm --profile av1-hq --print-effective-config 2>&1)"
   assert_contains "libsvt-av1"  "av1-hq effective-config: VIDEO_CODEC=libsvt-av1" "$av1hq_cfg"
-  assert_contains "CRF_VALUE                 = 20" "av1-hq effective-config: CRF_VALUE=20" "$av1hq_cfg"
+  assert_contains "CRF_VALUE                 = 28" "av1-hq effective-config: base CRF_VALUE=28" "$av1hq_cfg"
   assert_contains "DISABLE_DV                = 1"  "av1-hq effective-config: DISABLE_DV=1" "$av1hq_cfg"
 
   # streaming-av1 dry-run: CRF 30, libsvt-av1, MP4 output, Opus audio.
@@ -3206,6 +3206,39 @@ test_video() {
         pass "A1: 1080p HDR source under streaming-av1 → CRF 28 (HDR trigger)"
       else
         fail "A1: 1080p HDR source under streaming-av1 → expected a CRF 28 override"
+      fi
+    fi
+
+    # ---- WI-2: av1-hq CRF is resolution-aware too (base 28 ≤1080p SDR, 24 for ≥4K/HDR) ----
+    # Shares the resolution helper with streaming-av1; reuses the same fixtures.
+    # (a) 4K source → override to CRF 24 (AV1_HQ_HDR_CRF)
+    _a1_out="$(run_muxm --profile av1-hq --dry-run "$_a1_4k")"
+    if printf '%s' "$_a1_out" | grep -qE 'av1-hq:.*→ CRF 24'; then
+      pass "WI-2: 4K source under av1-hq → CRF 24 (resolution-aware override)"
+    else
+      fail "WI-2: 4K source under av1-hq → expected a CRF 24 override note"
+    fi
+    # (b) 1080p SDR source → keeps the profile base CRF 28 (no override note)
+    _a1_out="$(run_muxm --profile av1-hq --dry-run "$_a1_1080")"
+    if printf '%s' "$_a1_out" | grep -qE 'av1-hq:.*→ CRF 24'; then
+      fail "WI-2: 1080p SDR source wrongly triggered the av1-hq 4K/HDR CRF override"
+    else
+      pass "WI-2: 1080p SDR source under av1-hq → keeps base CRF 28 (no override)"
+    fi
+    # (c) explicit --crf wins on a 4K source (override gated on !_CLI_CRF_EXPLICIT)
+    _a1_out="$(run_muxm --profile av1-hq --crf 30 --dry-run "$_a1_4k")"
+    if printf '%s' "$_a1_out" | grep -qE 'av1-hq:.*→ CRF 24'; then
+      fail "WI-2: explicit --crf 30 on a 4K av1-hq source was overridden by the resolution-aware CRF"
+    else
+      pass "WI-2: explicit --crf 30 on a 4K av1-hq source wins (no resolution-aware override)"
+    fi
+    # (d) 1080p HDR source → override fires to CRF 24 (HDR trigger)
+    if [[ -s "$_a1_1080hdr" ]]; then
+      _a1_out="$(run_muxm --profile av1-hq --dry-run "$_a1_1080hdr")"
+      if printf '%s' "$_a1_out" | grep -qE 'av1-hq:.*HDR10.*→ CRF 24'; then
+        pass "WI-2: 1080p HDR source under av1-hq → CRF 24 (HDR trigger)"
+      else
+        fail "WI-2: 1080p HDR source under av1-hq → expected a CRF 24 override"
       fi
     fi
   else
@@ -5662,6 +5695,44 @@ _test_unit_disk_fallback() {
 }
 
 
+_test_unit_av1_resolution_crf() {
+  # WI-2: _apply_av1_resolution_crf — resolution/HDR-aware CRF for the AV1 profiles.
+  # Source the helper with stubbed _probe_field/note/report_add and assert the resulting
+  # CRF_VALUE for each (profile × resolution/HDR × --crf) case. Deterministic, no encode.
+  local body
+  body="$(awk '/^_apply_av1_resolution_crf\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ -z "$body" ]]; then skip "_apply_av1_resolution_crf not found in muxm"; return; fi
+
+  # $1 profile  $2 width  $3 height  $4 PROFILE_DESC  $5 _CLI_CRF_EXPLICIT  $6 base CRF
+  _av1crf() {
+    bash -c '
+      AV1_HQ_HDR_CRF=24
+      _probe_field(){ case "$1" in width) echo '"$2"';; height) echo '"$3"';; esac; }
+      note(){ :; }; report_add(){ :; }
+      PROFILE_NAME="'"$1"'"; PROFILE_DESC="'"$4"'"; _CLI_CRF_EXPLICIT='"$5"'; CRF_VALUE='"$6"'
+      '"$body"'
+      _apply_av1_resolution_crf
+      echo "$CRF_VALUE"
+    '
+  }
+
+  # av1-hq: base 28 (≤1080p SDR) → 24 (≥4K or HDR); an explicit --crf wins.
+  [[ "$(_av1crf av1-hq 1920 1080 SDR 0 28)"   == 28 ]] && pass "av1-hq 1080p SDR → base CRF 28"           || fail "av1-hq 1080p SDR → expected 28, got $(_av1crf av1-hq 1920 1080 SDR 0 28)"
+  [[ "$(_av1crf av1-hq 3840 2160 SDR 0 28)"   == 24 ]] && pass "av1-hq 4K → CRF 24 (AV1_HQ_HDR_CRF)"       || fail "av1-hq 4K → expected 24, got $(_av1crf av1-hq 3840 2160 SDR 0 28)"
+  [[ "$(_av1crf av1-hq 1920 1080 HDR10 0 28)" == 24 ]] && pass "av1-hq 1080p HDR → CRF 24 (HDR trigger)"   || fail "av1-hq 1080p HDR → expected 24, got $(_av1crf av1-hq 1920 1080 HDR10 0 28)"
+  [[ "$(_av1crf av1-hq 3840 2160 SDR 1 30)"   == 30 ]] && pass "av1-hq 4K + explicit --crf 30 wins"        || fail "av1-hq 4K + --crf → expected 30, got $(_av1crf av1-hq 3840 2160 SDR 1 30)"
+
+  # streaming-av1: base 30 → 28 for ≥4K/HDR (behavior unchanged by the refactor).
+  [[ "$(_av1crf streaming-av1 3840 2160 SDR 0 30)" == 28 ]] && pass "streaming-av1 4K → CRF 28 (unchanged)"    || fail "streaming-av1 4K → expected 28, got $(_av1crf streaming-av1 3840 2160 SDR 0 30)"
+  [[ "$(_av1crf streaming-av1 1920 1080 SDR 0 30)" == 30 ]] && pass "streaming-av1 1080p SDR → keeps CRF 30"   || fail "streaming-av1 1080p SDR → expected 30, got $(_av1crf streaming-av1 1920 1080 SDR 0 30)"
+
+  # Non-AV1 profile: the helper is a no-op (leaves CRF untouched).
+  [[ "$(_av1crf animation 3840 2160 SDR 0 16)" == 16 ]] && pass "non-AV1 profile → helper no-op"  || fail "non-AV1 profile → expected 16, got $(_av1crf animation 3840 2160 SDR 0 16)"
+
+  unset -f _av1crf
+}
+
+
 _test_unit_realpath_fallback() {
   # ---- realpath_fallback ----
   # Cross-platform path resolver used throughout muxm for SRC_ABS, LOGFILE, etc.
@@ -5953,6 +6024,7 @@ test_unit() {
   _test_unit_misc_helpers
   _test_unit_disk_preflight
   _test_unit_disk_fallback
+  _test_unit_av1_resolution_crf
   _test_unit_realpath_fallback
   _test_unit_apply_level_vbv
   _test_unit_mapping_helpers
@@ -6049,7 +6121,7 @@ test_profile_e2e() {
   if (( _av1_probe_ok )); then
     rm -f "$_av1_probe_out"
 
-    # av1-hq: CRF 20, MKV, lossless audio passthrough
+    # av1-hq: res-aware CRF (here --crf 50 forces a fast encode), MKV, lossless audio passthrough
     local av1hq_e2e_out="$TESTDIR/e2e_av1hq.mkv"
     log "Full encode: av1-hq profile..."
     if assert_encode "av1-hq profile: output produced" "$av1hq_e2e_out" \
