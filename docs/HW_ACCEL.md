@@ -33,7 +33,7 @@ Precedence (last wins): script defaults → `/etc/.muxmrc` → `~/.muxmrc` → `
 | Backend         | HEVC | H.264 | AV1                  | Dolby Vision |
 |-----------------|------|-------|----------------------|--------------|
 | `none`          | ✅   | ✅    | ✅ (libsvt/libaom)   | ✅ (libx265) |
-| `videotoolbox`  | ✅ (hevc_videotoolbox) | ✅ (h264_videotoolbox) | ❌ (no HW encoder on Apple Silicon) | ❌ (DV RPU requires libx265) |
+| `videotoolbox`  | ✅ (hevc_videotoolbox) | ✅ (h264_videotoolbox) | ❌ (no HW encoder on Apple Silicon) | ✅ (RPU injected post-compression via dovi_tool — encoder-agnostic) |
 | `nvenc`         | ⚠️ not implemented (software fallback) | ⚠️ not implemented (software fallback) | ⚠️ not implemented (software fallback) | ❌ (DV RPU requires libx265) |
 
 Backends that cannot satisfy a request fall back to software and record the reason in `HW_ACCEL_FALLBACK_REASON`.
@@ -46,7 +46,7 @@ Backends that cannot satisfy a request fall back to software and record the reas
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────────┐    ┌───────────────────────┐
 │ HW_ACCEL set    │───▶│ detect_hw_accel  │───▶│ per-encode           │───▶│ resolve_video_encoder │
 │ (.muxmrc / CLI) │    │ (populate        │    │ compatibility gates  │    │ (choose -c:v arg)     │
-│                 │    │  AVAILABLE[],    │    │ (DV? AV1 on VT? …)   │    │                       │
+│                 │    │  AVAILABLE[],    │    │ (AV1 on VT? libaom?) │    │                       │
 │                 │    │  RESOLVED)       │    │                      │    │                       │
 └─────────────────┘    └──────────────────┘    └─────────────────────┘    └───────────────────────┘
 ```
@@ -56,12 +56,11 @@ Backends that cannot satisfy a request fall back to software and record the reas
 - **`resolve_video_encoder`** runs per-encode after Dolby Vision detection. It walks the gates in this order:
 
   1. `HW_ACCEL_RESOLVED == "none"` → software (no gate).
-  2. Source is Dolby Vision → software (DV RPU injection requires libx265).
-  3. `VIDEO_CODEC == libaom-av1` → software (no hardware libaom counterpart).
-  4. `videotoolbox + libsvt-av1` → software (Apple Silicon has no AV1 hardware encode).
-  5. `nvenc + libsvt-av1 + !av1_nvenc` → software (requires Ada Lovelace / RTX 40+).
+  2. `VIDEO_CODEC == libaom-av1` → software (no hardware libaom counterpart).
+  3. `videotoolbox + libsvt-av1` → software (Apple Silicon has no AV1 hardware encode).
+  4. `nvenc + libsvt-av1 + !av1_nvenc` → software (requires Ada Lovelace / RTX 40+).
 
-  The VideoToolbox arm is fully implemented. NVENC dispatch is not yet implemented; the nvenc arm emits a warning and falls back to software.
+  Dolby Vision is **not** a gate: VideoToolbox encodes an HDR10 base layer and the DV RPU is injected post-compression by `dovi_tool` (encoder-agnostic), then muxed with MP4Box. The VideoToolbox arm is fully implemented. NVENC dispatch is not yet implemented; the nvenc arm emits a warning and falls back to software.
 
 ---
 

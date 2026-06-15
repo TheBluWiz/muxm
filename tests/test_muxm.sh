@@ -84,6 +84,8 @@ show_help() {
       metadata     Metadata stripping and preservation
       e2e          Full profile end-to-end encodes
       regression_p5 Phase 5 regression tests (C1, M3, H9, H8, H10, DVMKV, DISKSTOP, WORKDIR, H1, H11)
+      dv_vt        VideoToolbox + Dolby Vision regression (gated: macOS + hevc_videotoolbox
+                   + dovi_tool + MP4Box + MUXM_DV_FIXTURE=/path/to/real_dv_source; else SKIPs)
 
     all            Run every suite above (default when --suite given)
 
@@ -7441,6 +7443,101 @@ UNAMESCRIPT
   fi
 }
 
+# === Suite: VideoToolbox + Dolby Vision (gated regression) ===
+# WI-4 / Phase 1: substantiates the code comment claiming VT-encoded HEVC round-trips
+# Dolby Vision RPU bit-perfect (resolve_video_encoder has no DV gate; the raw-ES path is
+# enabled for hevc_videotoolbox just like libx265). VT encodes an HDR10 base layer, the
+# source RPU is injected post-compression by dovi_tool (encoder-agnostic), and MP4Box muxes
+# the headerless ES. This proves VT + DV produces an output that still carries a valid DV
+# configuration record, with frame-count parity against the source.
+#
+# Heavily gated — runs ONLY when ALL of the following hold, otherwise it SKIPs (never fails)
+# so CI stays green without DV assets or Apple hardware:
+#   • macOS (VideoToolbox is macOS-only)
+#   • ffmpeg has the hevc_videotoolbox encoder
+#   • dovi_tool and MP4Box (or mp4box) are on PATH
+#   • a real Dolby Vision source is provided via the MUXM_DV_FIXTURE env var
+#     (a DV Profile 7/8 .mkv or .mp4 with genuine RPU — synthetic tagged fixtures won't do).
+# Example:
+#   MUXM_DV_FIXTURE=/path/to/dv_p8.mkv ./tests/test_muxm.sh --suite dv_vt
+test_dv_vt() {
+  section "VideoToolbox + Dolby Vision (gated regression)"
+
+  # --- Gate 1: platform ---
+  if [[ "$(uname -s 2>/dev/null)" != "Darwin" ]]; then
+    skip "dv_vt: VideoToolbox is macOS-only (host is $(uname -s 2>/dev/null))"
+    return 0
+  fi
+
+  # --- Gate 2: hardware encoder present ---
+  if ! ffmpeg_has_encoder hevc_videotoolbox; then
+    skip "dv_vt: ffmpeg lacks the hevc_videotoolbox encoder"
+    return 0
+  fi
+
+  # --- Gate 3: DV tooling present ---
+  if ! command -v dovi_tool >/dev/null 2>&1; then
+    skip "dv_vt: dovi_tool not on PATH (required for RPU inject)"
+    return 0
+  fi
+  local mp4box_cmd=""
+  if command -v MP4Box >/dev/null 2>&1; then
+    mp4box_cmd="MP4Box"
+  elif command -v mp4box >/dev/null 2>&1; then
+    mp4box_cmd="mp4box"
+  else
+    skip "dv_vt: MP4Box not on PATH (required to mux the DV ES)"
+    return 0
+  fi
+
+  # --- Gate 4: a real DV fixture must be supplied ---
+  if [[ -z "${MUXM_DV_FIXTURE:-}" ]]; then
+    skip "dv_vt: set MUXM_DV_FIXTURE=/path/to/real_dv_source to run this test"
+    return 0
+  fi
+  if [[ ! -f "$MUXM_DV_FIXTURE" || ! -r "$MUXM_DV_FIXTURE" ]]; then
+    skip "dv_vt: MUXM_DV_FIXTURE='$MUXM_DV_FIXTURE' is not a readable file"
+    return 0
+  fi
+
+  log "dv_vt: encoding '$MUXM_DV_FIXTURE' with --hw-accel videotoolbox (mp4box: $mp4box_cmd)"
+
+  # --- Encode the DV source through the VideoToolbox path ---
+  local out="$TESTDIR/dv_vt_out.mp4"
+  rm -f "$out"
+  if ! assert_encode "dv_vt: VT encode of DV source produces output" "$out" \
+        --hw-accel videotoolbox --output-ext mp4 "$MUXM_DV_FIXTURE"; then
+    # assert_encode already recorded the failure; nothing more to check.
+    return 0
+  fi
+
+  # --- Assertion 1: output still carries a Dolby Vision configuration record / RPU ---
+  # The dvcC/dvvC box (or DOVI side data) survives the VT-base + post-hoc inject + mux path.
+  local dv_probe
+  dv_probe="$(ffprobe -v error -show_streams -of default=noprint_wrappers=1 "$out" 2>/dev/null)"
+  if printf '%s' "$dv_probe" | grep -qiE 'dovi|dv_profile|dvhe|dvh1|DOVIConfigurationRecord'; then
+    pass "dv_vt: output carries a Dolby Vision configuration record (RPU survived VT path)"
+  else
+    fail "dv_vt: no Dolby Vision configuration record found in VT-encoded output"
+  fi
+
+  # --- Assertion 2: frame-count parity between source and output ---
+  local src_frames out_frames
+  src_frames="$(ffprobe -v error -select_streams v:0 -count_frames \
+    -show_entries stream=nb_read_frames -of csv=p=0 "$MUXM_DV_FIXTURE" 2>/dev/null | head -1)"
+  out_frames="$(ffprobe -v error -select_streams v:0 -count_frames \
+    -show_entries stream=nb_read_frames -of csv=p=0 "$out" 2>/dev/null | head -1)"
+  if [[ "$src_frames" =~ ^[0-9]+$ && "$out_frames" =~ ^[0-9]+$ && "$src_frames" -gt 0 ]]; then
+    if [[ "$src_frames" -eq "$out_frames" ]]; then
+      pass "dv_vt: frame-count parity (source=$src_frames, output=$out_frames)"
+    else
+      fail "dv_vt: frame-count mismatch — source=$src_frames, output=$out_frames"
+    fi
+  else
+    skip "dv_vt: could not count frames (source='$src_frames', output='$out_frames')"
+  fi
+}
+
 # ---- Run Suites ----
 # NOTE: Suite names are listed in three places that must stay in sync:
 #   1. File header comment (top of file)
@@ -7486,6 +7583,7 @@ run_suites() {
       run_suite_tracked e2e           test_profile_e2e
       run_suite_tracked multi_profile test_multi_profile
       run_suite_tracked regression_p5 test_regression_p5
+      run_suite_tracked dv_vt         test_dv_vt
       ;;
     cli)           test_cli ;;
     toggles)       test_toggles ;;
@@ -7510,6 +7608,7 @@ run_suites() {
     e2e)           test_profile_e2e ;;
     multi_profile)   test_multi_profile ;;
     regression_p5)   test_regression_p5 ;;
+    dv_vt)           test_dv_vt ;;
     *)
       echo "Unknown suite: $SUITE (run with --help to see available suites)"
       exit 1
@@ -7574,7 +7673,10 @@ summary() {
 # MEDIA_FREE_SUITES: Pure config/CLI/unit tests — no ffmpeg fixtures needed (~2s).
 # Core media: basic_sdr_subs.mkv only — needed by cli, dryrun, edge, etc. (~3s to generate).
 # EXTENDED_SUITES: Full fixture set (multi-track, HDR, chapters, metadata) (~15s to generate).
-readonly MEDIA_FREE_SUITES="^(toggles|completions|setup|config|profiles|conflicts|hw_accel|unit)$"
+# dv_vt is "media-free" only in the sense that it generates NO synthetic fixtures — it
+# either SKIPs (default) or encodes a real DV source supplied via MUXM_DV_FIXTURE, so it
+# needs none of the generated clips.
+readonly MEDIA_FREE_SUITES="^(toggles|completions|setup|config|profiles|conflicts|hw_accel|unit|dv_vt)$"
 readonly EXTENDED_SUITES="^(collision|dryrun|video|hdr|audio|subs|ext_subs|output|containers|metadata|edge|e2e|multi_profile|regression_p5|all)$"
 
 auto_cleanup_test_dirs
