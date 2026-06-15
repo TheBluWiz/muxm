@@ -400,7 +400,7 @@ Validates filename collision auto-versioning and source replacement flags. Uses 
 | 170 | `--no-overwrite` (enhanced) | Exit 11 + error message mentions "already exists" | ✅ |
 | 171 | `--output-ext "mp4;"` | Rejected (injection prevention) | ✅ |
 | 172 | `--ocr-tool "sub2srt;rm -rf /"` | Rejected (injection prevention) | ✅ |
-| 173 | `--skip-video` | Behavior validated (can't produce output) | ✅ |
+| 173 | `--skip-video` (removed) | Rejected as unknown option (exit 11) — flag deleted, see WI-6b | ✅ |
 | 174 | Non-readable source file | Rejected with "not readable" error | ✅ |
 | 175 | Non-writable output directory | Rejected with "not writable" error | ✅ |
 | 176 | Double-dash (`--`) argument terminator | Source after `--` parsed as positional arg | ✅ |

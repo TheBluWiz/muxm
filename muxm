@@ -355,7 +355,6 @@ declare -i REPLACE_SOURCE=0
 declare -i FORCE_REPLACE_SOURCE=0
 
 # ---- Quick-test toggles
-declare -i SKIP_VIDEO=0
 declare -i SKIP_AUDIO=0
 declare -i SKIP_SUBS=0
 
@@ -2739,7 +2738,7 @@ _muxm_completions() {
             --ext-subs --no-ext-subs --ext-subs-dir
             --sub-sole-ext-fallback --no-sub-sole-ext-fallback
 
-            --skip-video --skip-audio --skip-subs
+            --skip-audio --skip-subs
 
             --output-ext
             --keep-chapters --no-keep-chapters
@@ -4603,7 +4602,6 @@ while [[ $# -gt 0 ]]; do
       [[ ! -d "$EXT_SUB_DIR" ]] && die 11 "--ext-subs-dir: directory not found: $EXT_SUB_DIR"
       shift 2 ;;
 
-    --skip-video) SKIP_VIDEO=1; shift ;;
     --skip-audio) SKIP_AUDIO=1; shift ;;
     --skip-subs)  SKIP_SUBS=1;  shift ;;
 
@@ -9831,10 +9829,6 @@ mux_final() {
   local -a _ext_sub_idxs=()    # ffmpeg -i index for each unique external subtitle path
 
   # Validate and add video stream
-  if (( SKIP_VIDEO )); then
-    die 42 "Video was skipped but output container requires a video stream."
-  fi
-  
   if (( VIDEO_COPY_FROM_SOURCE )); then
     # Map video directly from source to preserve container-level metadata
     # (DOVI configuration record, displaymatrix, etc.)
@@ -10356,7 +10350,6 @@ main() {
 
   (( DRY_RUN )) && note "DRY-RUN is ON"
   [[ ${#MUXM_CONFIG_LOADED[@]} -gt 0 ]] && note "Loaded config: ${MUXM_CONFIG_LOADED[*]}"
-  (( SKIP_VIDEO )) && note "[Quick Test] Video processing disabled (--skip-video)"
   (( SKIP_AUDIO )) && note "[Quick Test] Audio processing disabled (--skip-audio)"
   (( SKIP_SUBS  )) && note "[Quick Test] Subtitle processing disabled (--skip-subs)"
 
@@ -10617,11 +10610,7 @@ main() {
   fi
 
   # Run pipelines
-  if (( SKIP_VIDEO )); then
-    die 42 "--skip-video is incompatible with producing a valid output file."
-  else
-    run_video_pipeline
-  fi
+  run_video_pipeline
 
   if (( SKIP_AUDIO )); then
     note "[Quick Test] --skip-audio: skipping audio selection/transcode"

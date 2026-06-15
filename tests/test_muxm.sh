@@ -4966,12 +4966,14 @@ test_edge() {
   out="$(run_muxm --dry-run --ocr-tool "sub2srt;rm -rf /" "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "disallowed" "OCR tool injection prevented" "$out"
 
-  # --skip-video: muxm dies with exit 42 — incompatible with producing a valid output.
-  assert_exit 42 "--skip-video: exits 42 (incompatible with output)" \
+  # --skip-video was removed (WI-6b, dead flag). It is now rejected as an unknown option.
+  # (--skip-audio / --skip-subs remain; users wanting audio/subs-only work that leaves the
+  # video untouched should use --video-copy-if-compliant, which copies rather than drops it.)
+  assert_exit "$EXIT_VALIDATION" "--skip-video: removed flag rejected as unknown (exit $EXIT_VALIDATION)" \
     --skip-video "$TESTDIR/basic_sdr_subs.mkv"
   out="$(run_muxm --skip-video "$TESTDIR/basic_sdr_subs.mkv")"
-  assert_contains "incompatible with producing a valid output file" \
-    "--skip-video: error message names the incompatibility" "$out"
+  assert_contains "Unknown option: --skip-video" \
+    "--skip-video: error message names the unknown flag" "$out"
 
   # Non-readable source file (#55)
   local unreadable="$TESTDIR/unreadable.mkv"

@@ -91,7 +91,7 @@ _muxm_completions() {
             --ext-subs --no-ext-subs --ext-subs-dir
             --sub-sole-ext-fallback --no-sub-sole-ext-fallback
 
-            --skip-video --skip-audio --skip-subs
+            --skip-audio --skip-subs
 
             --output-ext
             --keep-chapters --no-keep-chapters
