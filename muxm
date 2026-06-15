@@ -1854,6 +1854,13 @@ If
 is set: exit with status\ 40. Use this in automated pipelines where
 silent DV loss would be unacceptable.
 .PP
+Dolby Vision can only be carried when the video codec is HEVC (\fBlibx265\fR, or
+\fBhevc_videotoolbox\fR via post\-compression RPU injection). Selecting H.264
+(\fB\-\-video\-codec libx264\fR) cannot carry DV: muxm warns once the source is
+probed and produces non\-DV output. AV1 profiles likewise cannot carry DV and
+auto\-disable it. Use \fBlibx265\fR to preserve Dolby Vision, or \fB\-\-no\-dv\fR
+to silence the warning.
+.PP
 Summary of the controlling flags:
 .RS
 .TP
@@ -4727,6 +4734,20 @@ _warn_container_unusual(){
 # Args: profile msg
 _warn_h264_hdr(){
   [[ "$VIDEO_CODEC" == "libx264" ]] && _warn_conflict "$1" "--video-codec libx264" "$2"
+  return 0
+}
+
+# Deferred warning (C6): H.264 cannot carry Dolby Vision. The libx264 path silently drops
+# the source RPU — the DV RPU-injection gate excludes libx264 (only libx265/hevc_videotoolbox
+# produce a raw HEVC ES suitable for dovi_tool). AV1 + DV already warns and auto-disables DV
+# upstream; this surfaces the previously-silent H.264 case. Must be called POST-PROBE (IS_DV
+# set), and is gated on !DISABLE_DV so a deliberate --no-dv stays quiet. VIDEO_CODEC=="libx264"
+# also covers h264_videotoolbox, which likewise cannot carry DV. Globals: VIDEO_CODEC, IS_DV,
+# DISABLE_DV.
+_warn_h264_drops_dv() {
+  if [[ "$VIDEO_CODEC" == "libx264" ]] && (( IS_DV )) && (( ! DISABLE_DV )); then
+    warn "H.264 cannot carry Dolby Vision; the source's DV metadata will be dropped. Use --video-codec libx265 to preserve Dolby Vision, or --no-dv to silence this warning."
+  fi
   return 0
 }
 
@@ -10784,6 +10805,9 @@ main() {
   if (( _H264_HDR_WARN_PENDING )) && [[ "$PROFILE_DESC" == "HDR10" || "$PROFILE_DESC" == "HLG" ]]; then
     warn "H.264 + HDR source ($PROFILE_DESC) + TONEMAP_HDR_TO_SDR=0: encoder ($VIDEO_ENCODER_FFMPEG) produces 8-bit yuv420p — output will carry HDR metadata but video data is 8-bit and will appear washed out. Use --tonemap for correct SDR output."
   fi
+
+  # Deferred warning (C6): H.264 cannot carry Dolby Vision. Post-probe, so IS_DV is known.
+  _warn_h264_drops_dv
 
   [[ -n "$LEVEL_VALUE" ]] && apply_level_vbv "$LEVEL_VALUE"
 

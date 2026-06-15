@@ -5929,6 +5929,47 @@ _test_unit_ignored_knobs() {
 }
 
 
+_test_unit_h264_drops_dv() {
+  # WI-1c / C6: _warn_h264_drops_dv warns when the source is Dolby Vision and the codec is
+  # H.264 (which silently drops the RPU), but only when DV is still enabled. Source the helper
+  # with a `warn` stub printing to stdout; deterministic, no real DV source needed. The
+  # gated `dv_vt` suite covers the full post-probe path against a real DV fixture.
+  local body
+  body="$(awk '/^_warn_h264_drops_dv\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ -z "$body" ]]; then skip "_warn_h264_drops_dv not found in muxm"; return; fi
+
+  _wddv() {  # $1 = global assignments
+    bash -c 'warn(){ printf "%s\n" "$*"; }
+      VIDEO_CODEC=libx265; IS_DV=0; DISABLE_DV=0
+      '"$1"'
+      '"$body"'
+      _warn_h264_drops_dv'
+  }
+  local out
+
+  out="$(_wddv 'VIDEO_CODEC=libx264; IS_DV=1; DISABLE_DV=0')"
+  echo "$out" | grep -qi "H.264 cannot carry Dolby Vision" \
+    && pass "C6: libx264 + DV source + DV enabled → warns" \
+    || fail "C6: expected DV-dropped warning, got: $out"
+
+  # Negatives: --no-dv (DISABLE_DV=1), non-DV source, and DV-capable codecs must stay quiet.
+  [[ -z "$(_wddv 'VIDEO_CODEC=libx264; IS_DV=1; DISABLE_DV=1')" ]] \
+    && pass "C6 neg: libx264 + DV + --no-dv → no warning (deliberate opt-out)" \
+    || fail "C6 neg: warned despite DISABLE_DV=1"
+  [[ -z "$(_wddv 'VIDEO_CODEC=libx264; IS_DV=0; DISABLE_DV=0')" ]] \
+    && pass "C6 neg: libx264 + non-DV source → no warning" \
+    || fail "C6 neg: warned on a non-DV source"
+  [[ -z "$(_wddv 'VIDEO_CODEC=libx265; IS_DV=1; DISABLE_DV=0')" ]] \
+    && pass "C6 neg: libx265 + DV → no warning (HEVC carries DV)" \
+    || fail "C6 neg: warned for libx265"
+  [[ -z "$(_wddv 'VIDEO_CODEC=libsvt-av1; IS_DV=1; DISABLE_DV=0')" ]] \
+    && pass "C6 neg: libsvt-av1 + DV → no C6 warning (AV1+DV handled upstream)" \
+    || fail "C6 neg: C6 warned for AV1 (should be handled by the upstream AV1+DV path)"
+
+  unset -f _wddv
+}
+
+
 _test_unit_realpath_fallback() {
   # ---- realpath_fallback ----
   # Cross-platform path resolver used throughout muxm for SRC_ABS, LOGFILE, etc.
@@ -6222,6 +6263,7 @@ test_unit() {
   _test_unit_disk_fallback
   _test_unit_av1_resolution_crf
   _test_unit_ignored_knobs
+  _test_unit_h264_drops_dv
   _test_unit_realpath_fallback
   _test_unit_apply_level_vbv
   _test_unit_mapping_helpers
@@ -7821,6 +7863,38 @@ UNAMESCRIPT
 #   MUXM_DV_FIXTURE=/path/to/dv_p8.mkv ./tests/test_muxm.sh --suite dv_vt
 test_dv_vt() {
   section "VideoToolbox + Dolby Vision (gated regression)"
+
+  # ---- C6 (WI-1c): H.264 drops Dolby Vision — deferred post-probe warning ----
+  # Needs only a real DV source (detect_dv → IS_DV=1) and a dry-run; no VideoToolbox,
+  # dovi_tool, or MP4Box required. Gated on MUXM_DV_FIXTURE alone, ahead of the VT gates
+  # below, so it runs on any host that can supply a DV fixture. The unit suite
+  # (_test_unit_h264_drops_dv) covers the predicate deterministically without a fixture.
+  if [[ -n "${MUXM_DV_FIXTURE:-}" && -f "${MUXM_DV_FIXTURE:-}" && -r "${MUXM_DV_FIXTURE:-}" ]]; then
+    local _c6
+    # libx264 + DV source → warning fires.
+    _c6="$(run_muxm --dry-run --video-codec libx264 "$MUXM_DV_FIXTURE" 2>&1)"
+    if echo "$_c6" | grep -qi "H.264 cannot carry Dolby Vision"; then
+      pass "C6 (e2e): libx264 on a DV source warns that DV will be dropped"
+    else
+      fail "C6 (e2e): expected an H.264-drops-DV warning for libx264 on a DV source"
+    fi
+    # libx265 carries DV → no C6 warning.
+    _c6="$(run_muxm --dry-run --video-codec libx265 "$MUXM_DV_FIXTURE" 2>&1)"
+    if echo "$_c6" | grep -qi "H.264 cannot carry Dolby Vision"; then
+      fail "C6 (e2e): libx265 on a DV source wrongly emitted the H.264-drops-DV warning"
+    else
+      pass "C6 (e2e): libx265 on a DV source emits no H.264-drops-DV warning"
+    fi
+    # libx264 + --no-dv → deliberate opt-out, no warning.
+    _c6="$(run_muxm --dry-run --video-codec libx264 --no-dv "$MUXM_DV_FIXTURE" 2>&1)"
+    if echo "$_c6" | grep -qi "H.264 cannot carry Dolby Vision"; then
+      fail "C6 (e2e): libx264 + --no-dv still warned (should be silent on deliberate opt-out)"
+    else
+      pass "C6 (e2e): libx264 + --no-dv emits no H.264-drops-DV warning"
+    fi
+  else
+    skip "C6 (e2e): set MUXM_DV_FIXTURE=/path/to/real_dv_source to exercise the post-probe path (unit suite covers the predicate)"
+  fi
 
   # --- Gate 1: platform ---
   if [[ "$(uname -s 2>/dev/null)" != "Darwin" ]]; then

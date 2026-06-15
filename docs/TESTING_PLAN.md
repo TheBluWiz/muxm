@@ -916,7 +916,7 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 | Multi-track audio (dv-archival) | ✅ Full | — | `hevc_multi_audio.mkv` fixture (eng main + eng commentary + spa) drives dry-run keep-list assertions ("keeping 2 of 3", ✗ drop marker, commentary dropped), AUDIO_MULTI_TRACK/AUDIO_KEEP_COMMENTARY profile defaults, --stereo-fallback interaction, and e2e archive encodes |
 | Multi-track subtitles (archival/animation) | ✅ Full | — | `hevc_multi_subs.mkv` fixture (5 subs: eng forced/full/SDH, spa, fra) drives multi-track announce, SUB_MULTI_TRACK defaults, language/type filtering, demotion-on-conflict, and e2e encodes |
 | Source replacement & collision | ✅ Full | Interactive prompt (M59–M60) | Auto-versioning, --force-replace-source, non-TTY rejection, --help/config registration all tested; interactive --replace-source confirmation requires TTY |
-| Dolby Vision | ❌ None | Full DV pipeline (M1–M7, M64–M70) | Requires real DV source + dovi_tool + MP4Box |
+| Dolby Vision | ❌ None | Full DV pipeline (M1–M7, M64–M70) | Requires real DV source + dovi_tool + MP4Box. C6 (H.264 drops DV) post-probe warning: predicate covered deterministically in `--suite unit` (`_test_unit_h264_drops_dv`); end-to-end gated on `MUXM_DV_FIXTURE` in `--suite dv_vt` (libx264 warns; libx265 / `--no-dv` do not) |
 | DV container verification | ❌ None | dvcC box checks (M64–M68) | verify_dv_container_record, pre-wrap, mp4box fallback untested |
 | DV P7/P5→P8.1 conversion | ❌ None | Profile conversion (M69–M70) | dovi_tool convert pipeline untested |
 | HDR10 static metadata check | ❌ None | M7 | _check_hdr10_static_metadata untested |

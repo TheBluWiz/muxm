@@ -278,6 +278,13 @@ If
 is set: exit with status\ 40. Use this in automated pipelines where
 silent DV loss would be unacceptable.
 .PP
+Dolby Vision can only be carried when the video codec is HEVC (\fBlibx265\fR, or
+\fBhevc_videotoolbox\fR via post\-compression RPU injection). Selecting H.264
+(\fB\-\-video\-codec libx264\fR) cannot carry DV: muxm warns once the source is
+probed and produces non\-DV output. AV1 profiles likewise cannot carry DV and
+auto\-disable it. Use \fBlibx265\fR to preserve Dolby Vision, or \fB\-\-no\-dv\fR
+to silence the warning.
+.PP
 Summary of the controlling flags:
 .RS
 .TP
