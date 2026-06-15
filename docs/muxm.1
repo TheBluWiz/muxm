@@ -666,6 +666,9 @@ Estimation uses per\-codec CRF\-to\-bitrate\-ratio tables and preset size
 multipliers; a 25\ % safety margin and a floor of
 .BR DISK_FREE_WARN_GB
 are applied.
+When the source carries no bitrate metadata (common for MKV inputs), the
+estimate falls back to the source file size so the check is not silently
+defeated.
 Set
 .B DISK_CHECK=0
 in

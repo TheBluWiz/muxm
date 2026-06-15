@@ -5592,6 +5592,75 @@ _test_unit_disk_preflight() {
   assert_muxm_fn_stdout "_preset_multiplier(bogus)=1000"      "1000" _preset_multiplier "" "bogus"
 }
 
+# WI-3 Fix B: disk_free_warn source-file-size fallback when bitrate metadata is missing.
+# disk_free_warn has many dependencies, so we source its body with stubbed helpers and a
+# `log` override that prints the preflight line to stdout, then inspect the estimate.
+# Covers the three branches plus the copy-mode source-size floor. The integer-math values
+# are deterministic for a 10 MiB source @ 100 s, libx265 CRF 28 (_crf_ratio=50, preset 1000).
+_test_unit_disk_fallback() {
+  local body
+  body="$(awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ -z "$body" ]]; then skip "disk_free_warn not found in muxm"; return; fi
+
+  local srcfile; srcfile="$(mktemp "$TESTDIR/disk_fallback.XXXXXX")"
+  head -c 10485760 /dev/zero > "$srcfile"   # exactly 10 MiB = 10485760 bytes
+
+  # Shared stubs + globals. df reports huge free space so the guard never dies; log prints
+  # the preflight line to stdout. _jq_cache / SRC_ABS / VIDEO_COPY_IF_COMPLIANT vary per case.
+  local common='
+    DISK_CHECK=1; VIDEO_CODEC=libx265; CRF_VALUE=28; PRESET_VALUE=medium
+    DISABLE_DV=1; AUDIO_MULTI_TRACK=0; AUDIO_FORCE_CODEC=""; METADATA_CACHE=""
+    DISK_FREE_WARN_GB=0; WORKDIR=/tmp; OUT_DIR=/tmp
+    _get_source_duration_secs(){ echo 100; }
+    _audio_stream_count(){ echo 0; }
+    _audio_stream_info(){ echo ""; }
+    _source_has_dv_metadata(){ return 1; }
+    _crf_ratio(){ echo 50; }
+    _preset_multiplier(){ echo 1000; }
+    _av1_preset_multiplier(){ echo 1000; }
+    _gb(){ echo 0; }
+    df(){ printf "Filesystem 1K-blocks Used Available Capacity Mounted\nstubdev 100000000000 0 99999999999 1%% /\n"; }
+    die(){ echo "DIE:$*"; }
+    say(){ :; }
+    log(){ printf "%s " "$@"; printf "\n"; }
+  '
+  local out
+
+  # Branch 1 — bitrate present (re-encode): unchanged behavior, est from bitrate (not size).
+  out="$(bash -c "$common"$'\n''_jq_cache(){ echo 5000000; }'$'\n'"SRC_ABS='$srcfile'; VIDEO_COPY_IF_COMPLIANT=0"$'\n'"$body"$'\n''disk_free_warn')"
+  assert_contains "video_bytes=3125000" "disk fallback: bitrate present → bitrate-derived estimate" "$out"
+  assert_contains "src_size=10485760"   "disk fallback: source size is stat'd"                       "$out"
+  assert_contains "peak_factor=2"       "disk fallback: non-DV re-encode keeps peak_factor=2"        "$out"
+
+  # peak_factor axis is unchanged by Fix B: a DV re-encode still reserves 3×. Drive the DV
+  # path via METADATA_CACHE (DISABLE_DV=0) so _source_has_dv_metadata need not be real.
+  out="$(bash -c "$common"$'\n''_jq_cache(){ echo 5000000; }'$'\n'"SRC_ABS='$srcfile'; VIDEO_COPY_IF_COMPLIANT=0; DISABLE_DV=0; METADATA_CACHE='dovi'"$'\n'"$body"$'\n''disk_free_warn')"
+  assert_contains "peak_factor=3"       "disk fallback: DV re-encode keeps peak_factor=3"            "$out"
+
+  # Branch 2 — bitrate MISSING but size available: estimate is now NON-ZERO (synthesized from
+  # file size), instead of collapsing to 0 the way it did before WI-3 Fix B.
+  out="$(bash -c "$common"$'\n''_jq_cache(){ echo ""; }'$'\n'"SRC_ABS='$srcfile'; VIDEO_COPY_IF_COMPLIANT=0"$'\n'"$body"$'\n''disk_free_warn')"
+  assert_contains "video_bytes=524000" "disk fallback: missing bitrate → estimate derived from source size (non-zero)" "$out"
+  if echo "$out" | grep -qE 'video_bytes=0( |$)'; then
+    fail "disk fallback: missing-bitrate estimate collapsed to 0 (fallback did not fire)"
+  else
+    pass "disk fallback: missing-bitrate estimate did not collapse to 0"
+  fi
+
+  # Branch 3 — neither bitrate nor a stat-able size: estimate is 0 and the conservative
+  # DISK_FREE_WARN_GB floor governs (unchanged behavior). Use a nonexistent SRC_ABS.
+  out="$(bash -c "$common"$'\n''_jq_cache(){ echo ""; }'$'\n'"SRC_ABS='$TESTDIR/does-not-exist.xyz'; VIDEO_COPY_IF_COMPLIANT=0"$'\n'"$body"$'\n''disk_free_warn')"
+  assert_contains "video_bytes=0 audio_bytes=0 src_size=0" "disk fallback: neither bitrate nor size → estimate 0 (floor governs)" "$out"
+
+  # Branch 4 — copy/remux mode: the output estimate is floored at the source size (×1.25),
+  # so a small/low bit_rate can't under-reserve for a near-1:1 remux. 10 MiB × 1.25 = 13107200.
+  out="$(bash -c "$common"$'\n''_jq_cache(){ echo 80000; }'$'\n'"SRC_ABS='$srcfile'; VIDEO_COPY_IF_COMPLIANT=1"$'\n'"$body"$'\n''disk_free_warn')"
+  assert_contains "est_output=13107200" "disk fallback: copy mode floors output estimate at source size" "$out"
+  assert_contains "peak_factor=1"        "disk fallback: copy mode keeps peak_factor=1"                   "$out"
+
+  rm -f "$srcfile"
+}
+
 
 _test_unit_realpath_fallback() {
   # ---- realpath_fallback ----
@@ -5883,6 +5952,7 @@ test_unit() {
   _test_unit_sii_container_safety
   _test_unit_misc_helpers
   _test_unit_disk_preflight
+  _test_unit_disk_fallback
   _test_unit_realpath_fallback
   _test_unit_apply_level_vbv
   _test_unit_mapping_helpers

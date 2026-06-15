@@ -2183,6 +2183,9 @@ Estimation uses per\-codec CRF\-to\-bitrate\-ratio tables and preset size
 multipliers; a 25\ % safety margin and a floor of
 .BR DISK_FREE_WARN_GB
 are applied.
+When the source carries no bitrate metadata (common for MKV inputs), the
+estimate falls back to the source file size so the check is not silently
+defeated.
 Set
 .B DISK_CHECK=0
 in
@@ -5605,6 +5608,11 @@ _gb() { LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; ${1:-0} / 1073741824" | bc 
 # disk_free_warn — smart disk space preflight
 # Estimates output size from source bitrate + CRF/preset tables, then warns
 # if estimated required space exceeds available space on the output (or temp) volume.
+# When bitrate metadata is absent (common for MKV inputs), it falls back to the
+# source file size: an effective bitrate is synthesized from size×8/dur so the same
+# CRF-ratio/preset math runs, and copy/remux estimates are floored at the source size.
+# This is hybrid by design — the per-copy size estimate is bitrate/size-derived, while
+# peak_factor (1× copy / 2× non-DV / 3× DV) is the separate copy-count axis.
 # Must be called AFTER cache_stream_metadata() so METADATA_CACHE is populated.
 # Set DISK_CHECK=0 (--no-disk-check) to skip entirely.
 disk_free_warn() {
@@ -5614,6 +5622,15 @@ disk_free_warn() {
   local -i dur
   dur="$(_get_source_duration_secs)"
   (( dur <= 0 )) && dur=1
+
+  # ---- Source file size (single stat; the bitrate-free fallback below) ----
+  # MKV inputs frequently carry no per-stream (or container) bit_rate, which used to
+  # collapse est_video_bytes to 0 and let the guard silently under-warn. The actual
+  # file size is always available and is a sound conservative proxy.
+  local -i src_size=0
+  local _src_sz
+  _src_sz="$(stat -f%z "$SRC_ABS" 2>/dev/null || stat -c%s "$SRC_ABS" 2>/dev/null || echo 0)"
+  [[ "$_src_sz" =~ ^[0-9]+$ ]] && src_size="$_src_sz"
 
   # ---- Video estimate ----
   local -i est_video_bytes=0
@@ -5630,6 +5647,15 @@ disk_free_warn() {
     [[ "$fbr_raw" =~ ^[0-9]+$ ]] && vbr="$fbr_raw"
   fi
 
+  # Bitrate metadata absent but file size known: synthesize an effective bitrate
+  # from the source size so the existing CRF-ratio/preset math still runs (copy mode
+  # → ≈ source size; re-encode → ratio applied to the source-derived rate). src_size
+  # includes audio + container, so this slightly overestimates the video portion —
+  # the safe (conservative) direction for a disk guard.
+  if (( vbr == 0 && src_size > 0 )); then
+    vbr=$(( src_size * 8 / dur ))
+  fi
+
   if (( vbr > 0 )); then
     if (( VIDEO_COPY_IF_COMPLIANT )); then
       # Copy mode: output ≈ source size (no CRF reduction)
@@ -5643,6 +5669,13 @@ disk_free_warn() {
       esac
       # shellcheck disable=SC2017 # Early division order is intentional: prevents signed-64-bit overflow on long 4K sources (H5).
       est_video_bytes=$(( vbr / 8 * dur / 1000 * ratio / 1000 * preset_mult ))
+      # Floor a degenerate (collapsed-to-zero) re-encode estimate against a
+      # source-derived estimate, so a stale/odd bit_rate tag can't defeat the guard.
+      # Only fires when the bitrate math underflows to 0; legitimately small
+      # (heavy-compression) estimates are left untouched to avoid over-blocking.
+      if (( est_video_bytes == 0 && src_size > 0 )); then
+        est_video_bytes=$(( src_size / 1000 * ratio / 1000 * preset_mult ))
+      fi
     fi
   fi
 
@@ -5708,6 +5741,16 @@ disk_free_warn() {
   fi
   local -i est_peak=$(( (est_video_bytes * peak_factor + est_audio_bytes + sub_overhead) * 125 / 100 ))
 
+  # Copy/remux output can't be much smaller than the source — floor both estimates at
+  # the source size (with the same 25% margin) when known. Uses max(), not a sum, so it
+  # never double-counts audio; it just prevents a missing/low bit_rate from
+  # under-reserving for a near-1:1 remux.
+  if (( VIDEO_COPY_IF_COMPLIANT && src_size > 0 )); then
+    local -i src_floor=$(( src_size * 125 / 100 ))
+    (( est_output > src_floor )) || est_output=$src_floor
+    (( est_peak   > src_floor )) || est_peak=$src_floor
+  fi
+
   # Floor: require at least DISK_FREE_WARN_GB free — but only for re-encodes
   # (peak_factor > 1), which stage multi-GB scratch. A pure stream-copy/remux
   # (peak_factor == 1) needs no scratch, so it is gated by its own (small)
@@ -5717,7 +5760,7 @@ disk_free_warn() {
   local -i need_workdir=$(( est_peak   > floor_bytes ? est_peak   : floor_bytes ))
   local -i need_output=$((  est_output > floor_bytes ? est_output : floor_bytes ))
 
-  log "Disk preflight: video_bytes=${est_video_bytes} audio_bytes=${est_audio_bytes} peak_factor=${peak_factor}" \
+  log "Disk preflight: video_bytes=${est_video_bytes} audio_bytes=${est_audio_bytes} src_size=${src_size} peak_factor=${peak_factor}" \
       "est_output=${est_output} est_peak=${est_peak} need_workdir=${need_workdir} need_output=${need_output} (~$(_gb "$need_workdir")GB peak)"
 
   # ---- Enforce per-volume (hard stop; override with --no-disk-check) ----
