@@ -567,8 +567,11 @@ filters as a cap). Defaults to 99 for
 6 for
 .BR animation " and " atv\-directplay\-animation .
 .PP
-Bitmap subtitles (PGS, VobSub) that cannot be muxed into the target
-container (e.g., PGS into MP4) are silently skipped.
+In multi\-track mode, a kept stream the target container cannot hold
+losslessly \(em a bitmap subtitle (PGS, VobSub), styled ASS/SSA into
+MP4/MOV, or lossless HD audio (TrueHD, DTS\-HD MA) into MP4/MOV \(em is a
+hard error before the encode starts, recommending
+.BR \-\-output\-ext " " mkv .
 .BR archive ", " animation ", and " atv\-directplay\-animation
 use MKV (or passthrough MKV), which handles all subtitle formats.
 .PP

@@ -1176,6 +1176,37 @@ test_cli() {
   _test_cli_profile_crossref
   _test_cli_flag_drift
   _test_cli_robustness
+  _test_cli_value_flag_no_value
+}
+
+# M2: a value-flag used as the FINAL token (no value after it) must error cleanly —
+# exit 11 with "requires a value" — never crash with "$2: unbound variable" under set -u.
+# Pre-fix _require_val only rejected a value that *looked* like a flag; a truly absent
+# value slipped through and the call site read a bare $2, tripping set -u.
+_test_cli_value_flag_no_value() {
+  local _flag _out _code
+  for _flag in --threads --crf --preset --output-ext --sub-lang-pref --audio-lang-pref \
+               --level --x265-params --ocr-tool --max-copy-bitrate --workdir --checksum-algo; do
+    # set -e-safe capture: the flag-with-no-value exits 11, which would otherwise abort.
+    _out="$(cd "$TESTDIR" && "$MUXM" "$_flag" 2>&1)" && _code=$? || _code=$?
+    if [[ "$_code" -eq 11 ]] && printf '%s' "$_out" | grep -qiE 'requires a value'; then
+      pass "M2: '$_flag' as final token → exit 11 'requires a value'"
+    else
+      fail "M2: '$_flag' as final token → expected exit 11 'requires a value', got exit $_code"
+    fi
+    if printf '%s' "$_out" | grep -qi 'unbound variable'; then
+      fail "M2: '$_flag' leaked 'unbound variable' (set -u crash)"
+    else
+      pass "M2: '$_flag' does not leak 'unbound variable'"
+    fi
+  done
+  # A value-flag followed by another flag is still rejected (not silently consumed).
+  _out="$(cd "$TESTDIR" && "$MUXM" --threads --crf 20 2>&1)" && _code=$? || _code=$?
+  if [[ "$_code" -eq 11 ]] && printf '%s' "$_out" | grep -qiE 'requires a value, not a flag'; then
+    pass "M2: '--threads --crf' rejects the following flag as the value"
+  else
+    fail "M2: '--threads --crf' → expected exit 11 'not a flag', got exit $_code"
+  fi
 }
 
 # === Suite: Toggle Flag Coverage ===
@@ -3896,6 +3927,37 @@ EOF
   mt_sub_anim_export="$(run_muxm --dry-run --profile animation --sub-export-external "$TESTDIR/hevc_multi_subs.mkv")"
   assert_contains "multi-track" "animation multi-track sub + --sub-export-external: stays in multi-track" "$mt_sub_anim_export"
   assert_contains "export-external ignored" "animation multi-track sub + --sub-export-external: notes export ignored" "$mt_sub_anim_export"
+
+  # ---- M4: forced-sub burn into an output directory whose name contains an apostrophe ----
+  # Pre-fix, the burn filter embedded the absolute WORKDIR path (which lives under the
+  # output directory) in the filtergraph as subtitles=filename='…It's…/burn.srt'; the
+  # apostrophe closed the single quote and ffmpeg aborted with "Unable to open …". The fix
+  # references the staged file by its bare relative name (burn.srt) and runs the encode
+  # from inside WORKDIR, so no user path is ever escaped. (universal burns forced by
+  # default; multi_subs.mkv has an eng forced track.)
+  local _m4_dir="$TESTDIR/It's A Test"
+  mkdir -p "$_m4_dir"
+  local _m4_out="$_m4_dir/burned.mkv"
+  rm -f "$_m4_out"
+  local _m4_log _m4_code=0
+  _m4_log="$(cd "$TESTDIR" && HOME="${MUXM_HOME:-$HOME}" "$MUXM" -K --profile universal \
+    --sub-burn-forced --preset ultrafast --crf 30 "$TESTDIR/multi_subs.mkv" "$_m4_out" 2>&1)" || _m4_code=$?
+  if printf '%s\n' "$_m4_log" | grep -qiF 'Burning forced subtitles'; then
+    pass "M4: forced-sub burn attempted into \"It's A Test/\" output directory"
+    if [[ "$_m4_code" -eq 0 && -f "$_m4_out" && -s "$_m4_out" ]]; then
+      pass "M4: forced-burn encode completes into apostrophe directory (filtergraph parsed)"
+    else
+      fail "M4: forced-burn into apostrophe directory failed (exit $_m4_code) — path escaping regressed"
+    fi
+    if printf '%s\n' "$_m4_log" | grep -qiE 'No option name|Unable to open .*burn|Error initializing filters'; then
+      fail "M4: filtergraph parse error on apostrophe output path"
+    else
+      pass "M4: no filtergraph parse error on apostrophe output path"
+    fi
+  else
+    skip "M4: forced subtitle not prepared from multi_subs.mkv — burn path not exercised"
+  fi
+  rm -rf "$_m4_dir"
 }
 
 # === Suite: Output Features ===
@@ -4229,6 +4291,88 @@ test_containers() {
     else
       fail "passthrough CLI override: expected MP4 container, got format='$fmt'"
     fi
+  fi
+
+  # ---- M1: multi-track container safety ----
+  # Multi-track copy mode (archive / atv-directplay-animation / forced --output-ext)
+  # stream-copies every kept track. MKV holds everything, but MP4/MOV can only carry some
+  # streams lossily. M1 hard-stops BEFORE the encode (recommend MKV) when a kept stream
+  # would be dropped/degraded, and converts plain-text subs to mov_text on the proceed
+  # path. Note: the PGS/VobSub bitmap hard-stop shares the identical `! _is_text_sub_codec`
+  # → blocker code path tested below for ASS, and the bitmap classification itself is
+  # unit-tested (_is_text_sub_codec); ffmpeg cannot synthesize a bitmap sub fixture from
+  # text, so there is no e2e bitmap case here.
+  local _m1_thd="$TESTDIR/m1_truehd.mkv"
+  if [[ ! -f "$_m1_thd" ]]; then
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=green:s=320x240:r=24:d=1" \
+      -f lavfi -i "sine=duration=1" -c:v libx265 -preset ultrafast -crf 30 \
+      -strict -2 -c:a truehd -ac 2 -metadata:s:a:0 language=eng "$_m1_thd" 2>/dev/null || true
+  fi
+
+  # (a) lossless HD audio → MP4 multi-track: hard-stop, exit 11, recommend MKV, NO encode.
+  if [[ -s "$_m1_thd" ]]; then
+    local _m1a_log _m1a_code=0
+    _m1a_log="$(cd "$TESTDIR" && "$MUXM" --profile archive --output-ext mp4 \
+      --preset ultrafast --crf 30 "$_m1_thd" 2>&1)" || _m1a_code=$?
+    if [[ "$_m1a_code" -eq 11 ]] && printf '%s' "$_m1a_log" | grep -qiE "can't preserve|--output-ext mkv"; then
+      pass "M1: TrueHD + archive→mp4 multi-track → pre-encode hard stop (exit 11, recommend MKV)"
+    else
+      fail "M1: TrueHD + archive→mp4 → expected exit 11 hard stop, got exit $_m1a_code"
+    fi
+    # Must fail BEFORE the encode (no wasted encode, never die 41 at mux_final).
+    if printf '%s' "$_m1a_log" | grep -qiE 'Encoding video|final mux failed'; then
+      fail "M1: TrueHD hard stop fired too late (encode started or mux ran)"
+    else
+      pass "M1: TrueHD hard stop fired before any encode"
+    fi
+    # (d) MKV passthrough → TrueHD copied losslessly (all streams kept).
+    local _m1d_out="$TESTDIR/m1_arch.mkv"; rm -f "$_m1d_out"
+    (cd "$TESTDIR" && "$MUXM" -K --profile archive --preset ultrafast --crf 30 "$_m1_thd" "$_m1d_out" >/dev/null 2>&1) || true
+    local _m1d_acodec
+    _m1d_acodec="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$_m1d_out" 2>/dev/null || true)"
+    if [[ "$_m1d_acodec" == "truehd" ]]; then
+      pass "M1: TrueHD + archive→mkv → stream-copied losslessly"
+    else
+      fail "M1: TrueHD + archive→mkv → expected copied truehd, got '${_m1d_acodec:-none}'"
+    fi
+    rm -f "$_m1d_out"
+  else
+    skip "M1: TrueHD fixture could not be generated (ffmpeg truehd encoder unavailable)"
+  fi
+
+  # (a) styled ASS → MP4 multi-track: hard-stop (would flatten to plain mov_text).
+  if [[ -f "$TESTDIR/ass_subs.mkv" ]]; then
+    local _m1b_log _m1b_code=0
+    _m1b_log="$(cd "$TESTDIR" && "$MUXM" --profile atv-directplay-animation --output-ext mp4 \
+      --preset ultrafast --crf 30 "$TESTDIR/ass_subs.mkv" 2>&1)" || _m1b_code=$?
+    if [[ "$_m1b_code" -eq 11 ]] && printf '%s' "$_m1b_log" | grep -qiE "styled|flatten|--output-ext mkv"; then
+      pass "M1: ASS + atv-directplay-animation→mp4 → pre-encode hard stop (would flatten)"
+    else
+      fail "M1: ASS + atv-anim→mp4 → expected exit 11 hard stop, got exit $_m1b_code"
+    fi
+  else
+    skip "M1: ass_subs.mkv fixture not found"
+  fi
+
+  # (b) plain subrip → MP4 multi-track: PROCEEDS; sub converted to mov_text (not failed copy).
+  if [[ -f "$TESTDIR/multi_subs.mkv" ]]; then
+    local _m1c_out="$TESTDIR/m1_subrip.mp4"; rm -f "$_m1c_out"
+    local _m1c_code=0
+    (cd "$TESTDIR" && "$MUXM" -K --profile archive --output-ext mp4 \
+      --preset ultrafast --crf 30 "$TESTDIR/multi_subs.mkv" "$_m1c_out" >/dev/null 2>&1) || _m1c_code=$?
+    if [[ "$_m1c_code" -eq 0 && -s "$_m1c_out" ]]; then
+      pass "M1: subrip + archive→mp4 multi-track → proceeds (mux succeeds)"
+      local _m1c_scodec
+      _m1c_scodec="$(ffprobe -v error -select_streams s:0 -show_entries stream=codec_name -of csv=p=0 "$_m1c_out" 2>/dev/null || true)"
+      if [[ "$_m1c_scodec" == "mov_text" ]]; then
+        pass "M1: subrip → mov_text in MP4 (not a failed -c copy)"
+      else
+        fail "M1: subrip in MP4 → expected mov_text, got '${_m1c_scodec:-none}'"
+      fi
+    else
+      fail "M1: subrip + archive→mp4 multi-track → expected success, got exit $_m1c_code"
+    fi
+    rm -f "$_m1c_out"
   fi
 }
 
@@ -6354,6 +6498,30 @@ test_multi_profile() {
   # --- Comma parsing: empty name rejected ---
   out="$(run_muxm --profile 'streaming,' --print-effective-config 2>&1)" || true
   assert_contains "empty" "multi-profile: empty name in list rejected" "$out"
+
+  # --- M3: positional source BEFORE flags must not corrupt the per-child arg list ---
+  # Pre-fix, child flags were built by slicing off the last ${#POSITIONALS[@]} args,
+  # assuming positionals trail — so `<src> --crf N --profile a,b` stripped the flag VALUE
+  # instead of the source, yielding "Too many arguments" (or a flag-missing-value) in the
+  # child. Both arg orders must work and run all children.
+  local _m3_src="$TESTDIR/basic_sdr_subs.mkv"
+  # (i) source first, then flags
+  out="$(run_muxm "$_m3_src" --crf 30 --profile streaming-hevc,universal --dry-run 2>&1)" || true
+  if printf '%s' "$out" | grep -qiE 'Too many arguments'; then
+    fail "M3: source-before-flags multi-profile → 'Too many arguments' (positional stripping regressed)"
+  else
+    pass "M3: source-before-flags multi-profile → no 'Too many arguments'"
+  fi
+  assert_contains "Profile 1/2" "M3: source-before-flags → first child runs" "$out"
+  assert_contains "Profile 2/2" "M3: source-before-flags → second child runs" "$out"
+  # (ii) flags first, then source (the conventional order) — must still work
+  out="$(run_muxm --crf 30 --profile streaming-hevc,universal --dry-run "$_m3_src" 2>&1)" || true
+  if printf '%s' "$out" | grep -qiE 'Too many arguments'; then
+    fail "M3: flags-before-source multi-profile → unexpected 'Too many arguments'"
+  else
+    pass "M3: flags-before-source multi-profile → no 'Too many arguments'"
+  fi
+  assert_contains "Profile 2/2" "M3: flags-before-source → second child runs" "$out"
 
   # --- Multi-profile output auto-naming: output paths contain profile suffix ---
   # Run a dry-run multi-profile pass against the core fixture and verify both

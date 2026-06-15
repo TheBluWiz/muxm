@@ -550,10 +550,21 @@ _ffmpeg_run_with_ui() {
   local _ffui_label="$2"
   local _ffui_err="$3"
   local _ffui_secs="${4:-0}"
+  local _ffui_cwd="${5:-}"     # optional: run ffmpeg from this directory (used by the
+                               # forced-sub burn-in, whose -vf references burn.srt
+                               # relatively so no user path needs filtergraph escaping).
   local _ffui_pipe="$WORKDIR/_ffui.$$.pipe"
 
+  # When a cwd is requested, launch ffmpeg inside a subshell that cd's first. `exec`
+  # replaces the subshell with ffmpeg, so $! is ffmpeg's own PID (not the subshell's) —
+  # keeping _ACTIVE_FFMPEG_PID accurate so on_exit can SIGKILL it on Ctrl+C. Every path
+  # passed to ffmpeg is absolute, so the cwd change only affects the relative burn.srt.
   if _make_progress_pipe "$_ffui_pipe"; then
-    ffmpeg "${_ffui_cmd[@]}" -progress "$_ffui_pipe" 2>"$_ffui_err" &
+    if [[ -n "$_ffui_cwd" ]]; then
+      ( cd "$_ffui_cwd" && exec ffmpeg "${_ffui_cmd[@]}" -progress "$_ffui_pipe" 2>"$_ffui_err" ) &
+    else
+      ffmpeg "${_ffui_cmd[@]}" -progress "$_ffui_pipe" 2>"$_ffui_err" &
+    fi
     local _ffui_pid=$!
     _ACTIVE_FFMPEG_PID=$_ffui_pid
     ffmpeg_progress_bar "$_ffui_pid" "$_ffui_pipe" "$_ffui_secs" "$_ffui_label"
@@ -562,7 +573,11 @@ _ffmpeg_run_with_ui() {
     rm -f "$_ffui_pipe" 2>/dev/null || true
     return $_ffui_rc
   else
-    ffmpeg "${_ffui_cmd[@]}" 2>"$_ffui_err" &
+    if [[ -n "$_ffui_cwd" ]]; then
+      ( cd "$_ffui_cwd" && exec ffmpeg "${_ffui_cmd[@]}" 2>"$_ffui_err" ) &
+    else
+      ffmpeg "${_ffui_cmd[@]}" 2>"$_ffui_err" &
+    fi
     local _ffui_pid=$!
     _ACTIVE_FFMPEG_PID=$_ffui_pid
     spinner "$_ffui_pid" "$_ffui_label"
@@ -1268,15 +1283,24 @@ _dep_install_dependencies(){
       # Ensure pipx is available
       if ! command -v pipx >/dev/null 2>&1; then
         printf "⏳ installing pipx first...\n"
-        brew install pipx 2>&1 | sed 's/^/    /'
-        pipx ensurepath 2>/dev/null || true
-        # Add pipx bin dir to current PATH (without eval of arbitrary output)
-        local _pipx_bin
-        _pipx_bin="$(pipx environment --value PIPX_BIN_DIR 2>/dev/null)" || true
-        if [[ -n "$_pipx_bin" && -d "$_pipx_bin" ]]; then
-          export PATH="$_pipx_bin:$PATH"
+        # Guard the brew install: an unguarded failing command aborts the whole
+        # --install-dependencies run under `set -eEuo pipefail` (the ERR trap fires).
+        # Matches the guarded `pipx install` below — on failure, skip this tool and
+        # continue with the rest rather than killing the installer.
+        if brew install pipx 2>&1 | sed 's/^/    /'; then
+          pipx ensurepath 2>/dev/null || true
+          # Add pipx bin dir to current PATH (without eval of arbitrary output)
+          local _pipx_bin
+          _pipx_bin="$(pipx environment --value PIPX_BIN_DIR 2>/dev/null)" || true
+          if [[ -n "$_pipx_bin" && -d "$_pipx_bin" ]]; then
+            export PATH="$_pipx_bin:$PATH"
+          fi
+          export PATH="$HOME/.local/bin:$PATH"
+        else
+          printf "  %-14s❌ could not install pipx via brew — skipping %s\n" "$_tool" "$pkg"
+          failed=$(( failed + 1 ))
+          return
         fi
-        export PATH="$HOME/.local/bin:$PATH"
       fi
       printf "  %-14s⏳ installing via pipx (%s)...\n" "$_tool" "$pkg"
       if pipx install "$pkg" 2>&1 | sed 's/^/    /'; then
@@ -4254,16 +4278,27 @@ _run_multi_profiles() {
     _out_stem_full="$_src_stem"
   fi
 
-  # Build child flag args: _ORIG_FILTERED_ARGS with source/output positionals stripped.
-  # Positionals are always collected at the end by the CLI parser; strip the last
-  # ${#POSITIONALS[@]} elements (1 = source only, 2 = source + explicit output).
-  # _nflags = total arg count minus positionals = count of flag-only args to pass through.
+  # Build child flag args: _ORIG_FILTERED_ARGS with the source/output positionals
+  # removed by VALUE, not by position. The CLI parser does NOT require positionals to be
+  # trailing — `muxm <src> --crf 20 --profile a,b` puts the source first — so slicing off
+  # the last ${#POSITIONALS[@]} elements would strip flag values instead, corrupting the
+  # child invocation ("Too many arguments" / a flag left without its value). Each child is
+  # re-invoked with the source (and per-profile output) re-appended after the injected
+  # --profile/--output-ext below, so _child_flags must contain ONLY flags.
   local -a _child_flags=()
-  local -i _nargs=${#_ORIG_FILTERED_ARGS[@]}
-  local -i _npos=${#POSITIONALS[@]}
-  local -i _nflags=$(( _nargs - _npos ))
-  (( _nflags < 0 )) && _nflags=0
-  _child_flags=("${_ORIG_FILTERED_ARGS[@]:0:$_nflags}")
+  local -a _pos_pending=("${POSITIONALS[@]}")   # multiset of positional values to drop
+  local _ofa _ppi _dropped
+  for _ofa in "${_ORIG_FILTERED_ARGS[@]}"; do
+    _dropped=0
+    for _ppi in "${!_pos_pending[@]}"; do
+      if [[ "$_ofa" == "${_pos_pending[$_ppi]}" ]]; then
+        unset '_pos_pending[$_ppi]'   # remove one occurrence per positional
+        _dropped=1
+        break
+      fi
+    done
+    (( _dropped )) || _child_flags+=("$_ofa")
+  done
 
   # Pre-compute per-profile extensions and output paths (needed for warning + invocation).
   local -a _prof_exts=()
@@ -4396,7 +4431,12 @@ is_valid_preset(){
 # L10: die clearly when a value-taking flag receives another flag as its value.
 # Empty-string values are allowed (some flags use "" as "no filter").
 _require_val(){
-  local _flag="$1" _val="${2:-}"
+  # Args: $1 = flag name, $2 = remaining arg count ($# at the call site), $3 = value.
+  # Passing $# lets us detect a value-flag used as the FINAL token (no value follows):
+  # the old 2-arg form read a missing $2 afterward and crashed with "$2: unbound
+  # variable" under `set -u`. argc>=2 means the flag itself plus a value are present.
+  local _flag="$1" _argc="${2:-0}" _val="${3:-}"
+  (( _argc >= 2 )) || die 11 "$_flag requires a value"
   [[ "$_val" == -* ]] && die 11 "$_flag requires a value, not a flag (got: $_val)"
   return 0
 }
@@ -4415,40 +4455,40 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --checksum) CHECKSUM=1; shift ;;
     --no-checksum) CHECKSUM=0; shift ;;
-    --checksum-algo) _require_val "$1" "${2:-}"; CHECKSUM_ALGO="$2"; CHECKSUM=1; shift 2 ;;
+    --checksum-algo) _require_val "$1" "$#" "${2:-}"; CHECKSUM_ALGO="$2"; CHECKSUM=1; shift 2 ;;
     --disk-check) DISK_CHECK=1; shift ;;
     --no-disk-check) DISK_CHECK=0; shift ;;
 
     --ffmpeg-loglevel)
-      _require_val "$1" "${2:-}"; FFMPEG_LOGLEVEL="$2"
+      _require_val "$1" "$#" "${2:-}"; FFMPEG_LOGLEVEL="$2"
       is_valid_loglevel "$FFMPEG_LOGLEVEL" || die 11 "Invalid --ffmpeg-loglevel: \"$FFMPEG_LOGLEVEL\". Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
       shift 2 ;;
     --no-hide-banner) FFMPEG_HIDE_BANNER=0; shift ;;
     --no-overwrite) FFMPEG_OVERWRITE=0; shift ;;
     --ffprobe-loglevel)
-      _require_val "$1" "${2:-}"; FFPROBE_LOGLEVEL="$2"
+      _require_val "$1" "$#" "${2:-}"; FFPROBE_LOGLEVEL="$2"
       is_valid_loglevel "$FFPROBE_LOGLEVEL" || die 11 "Invalid --ffprobe-loglevel: \"$FFPROBE_LOGLEVEL\". Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
       shift 2 ;;
-    --threads) _require_val "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
-    --workdir) _require_val "$1" "${2:-}"; WORKDIR_BASE="$2"; shift 2 ;;
+    --threads) _require_val "$1" "$#" "${2:-}"; THREADS="$2"; shift 2 ;;
+    --workdir) _require_val "$1" "$#" "${2:-}"; WORKDIR_BASE="$2"; shift 2 ;;
 
     --crf)
-      _require_val "$1" "${2:-}"; _crf_in="$2"
+      _require_val "$1" "$#" "${2:-}"; _crf_in="$2"
       if [[ ! "$_crf_in" =~ ^[0-9]+$ ]] || (( 10#$_crf_in > 51 )); then
         die 11 "Invalid --crf: integer 0–51 expected (got: ${_crf_in})"
       fi
       CRF_VALUE="$_crf_in"; _CLI_CRF_EXPLICIT=1; shift 2 ;;
     -p|--preset)
-      _require_val "$1" "${2:-}"; PRESET_VALUE="$2"; _CLI_PRESET_EXPLICIT=1
+      _require_val "$1" "$#" "${2:-}"; PRESET_VALUE="$2"; _CLI_PRESET_EXPLICIT=1
       is_valid_preset "$PRESET_VALUE" || die 11 "Invalid preset: $PRESET_VALUE"
       shift 2
       ;;
-    --x265-params) _require_val "$1" "${2:-}"; X265_PARAMS_BASE="$2"; shift 2 ;;
-    --x264-params) _require_val "$1" "${2:-}"; X264_PARAMS_BASE="$2"; shift 2 ;;
-    --av1-params)  _require_val "$1" "${2:-}"; SVT_AV1_PARAMS_BASE="$2"; shift 2 ;;
-    --av1-maxrate) _require_val "$1" "${2:-}"; AV1_MAXRATE="$2"; shift 2 ;;
-    --av1-bufsize) _require_val "$1" "${2:-}"; AV1_BUFSIZE="$2"; shift 2 ;;
-    -l|--level)    _require_val "$1" "${2:-}"; LEVEL_VALUE="$2"; shift 2 ;;
+    --x265-params) _require_val "$1" "$#" "${2:-}"; X265_PARAMS_BASE="$2"; shift 2 ;;
+    --x264-params) _require_val "$1" "$#" "${2:-}"; X264_PARAMS_BASE="$2"; shift 2 ;;
+    --av1-params)  _require_val "$1" "$#" "${2:-}"; SVT_AV1_PARAMS_BASE="$2"; shift 2 ;;
+    --av1-maxrate) _require_val "$1" "$#" "${2:-}"; AV1_MAXRATE="$2"; shift 2 ;;
+    --av1-bufsize) _require_val "$1" "$#" "${2:-}"; AV1_BUFSIZE="$2"; shift 2 ;;
+    -l|--level)    _require_val "$1" "$#" "${2:-}"; LEVEL_VALUE="$2"; shift 2 ;;
     --conservative-vbv) CONSERVATIVE_VBV=1; shift ;;
     --no-conservative-vbv) CONSERVATIVE_VBV=0; shift ;;
     --dv) DISABLE_DV=0; shift ;;
@@ -4458,7 +4498,7 @@ while [[ $# -gt 0 ]]; do
     --dv-convert-p81) DV_CONVERT_TO_P81_IF_FAIL=1; shift ;;
     --no-dv-convert-p81) DV_CONVERT_TO_P81_IF_FAIL=0; shift ;;
     --video-codec)
-      _require_val "$1" "${2:-}"; VIDEO_CODEC="$2"
+      _require_val "$1" "$#" "${2:-}"; VIDEO_CODEC="$2"
       case "$VIDEO_CODEC" in
         libx265|libx264|libsvt-av1|libaom-av1) ;;
         *) die 11 "Invalid --video-codec: must be libx265, libx264, libsvt-av1, or libaom-av1 (got: $VIDEO_CODEC)" ;;
@@ -4466,12 +4506,12 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --hw-accel)
-      _require_val "$1" "${2:-}"; HW_ACCEL="$2"; _CLI_HW_ACCEL_EXPLICIT=1
+      _require_val "$1" "$#" "${2:-}"; HW_ACCEL="$2"; _CLI_HW_ACCEL_EXPLICIT=1
       is_valid_hw_accel "$HW_ACCEL" || die 11 "Invalid --hw-accel: \"$HW_ACCEL\". Valid values: none, auto, videotoolbox, nvenc"
       shift 2
       ;;
     --hw-accel-quality)
-      _require_val "$1" "${2:-}"; HW_ACCEL_QUALITY="$2"; _CLI_HW_ACCEL_QUALITY_EXPLICIT=1
+      _require_val "$1" "$#" "${2:-}"; HW_ACCEL_QUALITY="$2"; _CLI_HW_ACCEL_QUALITY_EXPLICIT=1
       # Accept integer 0–100 (VT/NVENC quality scales both fit this range).
       if [[ ! "$HW_ACCEL_QUALITY" =~ ^[0-9]+$ ]] || (( HW_ACCEL_QUALITY < 0 )) || (( HW_ACCEL_QUALITY > 100 )); then
         die 11 "Invalid --hw-accel-quality: \"$HW_ACCEL_QUALITY\". Must be an integer between 0 and 100."
@@ -4486,28 +4526,28 @@ while [[ $# -gt 0 ]]; do
     --no-tonemap) TONEMAP_HDR_TO_SDR=0; shift ;;
     --sdr-force-10bit) SDR_FORCE_10BIT=1; shift ;;
     --no-sdr-force-10bit) SDR_FORCE_10BIT=0; shift ;;
-    --max-copy-bitrate) _require_val "$1" "${2:-}"; MAX_COPY_BITRATE="$2"; shift 2 ;;
+    --max-copy-bitrate) _require_val "$1" "$#" "${2:-}"; MAX_COPY_BITRATE="$2"; shift 2 ;;
 
-    --audio-track)        _require_val "$1" "${2:-}"; AUDIO_TRACK_OVERRIDE="$2"; shift 2 ;;
-    --audio-lang-pref)    _require_val "$1" "${2:-}"; AUDIO_LANG_PREF="$2"; shift 2 ;;
-    --stereo-bitrate)     _require_val "$1" "${2:-}"; STEREO_BITRATE="$2"; shift 2 ;;
+    --audio-track)        _require_val "$1" "$#" "${2:-}"; AUDIO_TRACK_OVERRIDE="$2"; shift 2 ;;
+    --audio-lang-pref)    _require_val "$1" "$#" "${2:-}"; AUDIO_LANG_PREF="$2"; shift 2 ;;
+    --stereo-bitrate)     _require_val "$1" "$#" "${2:-}"; STEREO_BITRATE="$2"; shift 2 ;;
     --prefer-stereo) AUDIO_PREFER_STEREO=1; shift ;;
     --no-prefer-stereo) AUDIO_PREFER_STEREO=0; shift ;;
     --stereo-fallback) ADD_STEREO_IF_MULTICH=1; shift ;;
     --no-stereo-fallback) ADD_STEREO_IF_MULTICH=0; shift ;;
-    --audio-force-codec)   _require_val "$1" "${2:-}"; AUDIO_FORCE_CODEC="$2"; shift 2 ;;
-    --audio-force-bitrate) _require_val "$1" "${2:-}"; AUDIO_FORCE_BITRATE="$2"; shift 2 ;;
+    --audio-force-codec)   _require_val "$1" "$#" "${2:-}"; AUDIO_FORCE_CODEC="$2"; shift 2 ;;
+    --audio-force-bitrate) _require_val "$1" "$#" "${2:-}"; AUDIO_FORCE_BITRATE="$2"; shift 2 ;;
     --audio-lossless-passthrough) AUDIO_LOSSLESS_PASSTHROUGH=1; shift ;;
     --no-audio-lossless-passthrough) AUDIO_LOSSLESS_PASSTHROUGH=0; shift ;;
     --audio-titles) INCLUDE_AUDIO_TITLES=1; shift ;;
     --no-audio-titles) INCLUDE_AUDIO_TITLES=0; shift ;;
 
     --no-subtitles) SUB_INCLUDE_FORCED=0; SUB_INCLUDE_FULL=0; SUB_INCLUDE_SDH=0; shift ;;
-    --sub-lang-pref) _require_val "$1" "${2:-}"; SUB_LANG_PREF="$2"; shift 2 ;;
+    --sub-lang-pref) _require_val "$1" "$#" "${2:-}"; SUB_LANG_PREF="$2"; shift 2 ;;
     --no-sub-sdh) SUB_INCLUDE_SDH=0; shift ;;
-    --ocr-lang)  _require_val "$1" "${2:-}"; SUB_OCR_LANG="$2"; shift 2 ;;
+    --ocr-lang)  _require_val "$1" "$#" "${2:-}"; SUB_OCR_LANG="$2"; shift 2 ;;
     --no-ocr) SUB_ENABLE_OCR=0; shift ;;
-    --ocr-tool)  _require_val "$1" "${2:-}"; SUB_OCR_TOOL="$2"; shift 2 ;;
+    --ocr-tool)  _require_val "$1" "$#" "${2:-}"; SUB_OCR_TOOL="$2"; shift 2 ;;
     --sub-burn-forced) SUB_BURN_FORCED=1; _CLI_SUB_BURN_FORCED=1; shift ;;
     --no-sub-burn-forced) SUB_BURN_FORCED=0; shift ;;
     --sub-export-external) SUB_EXPORT_EXTERNAL=1; shift ;;
@@ -4522,7 +4562,7 @@ while [[ $# -gt 0 ]]; do
     --sub-sole-ext-fallback)    SUB_SOLE_EXT_FALLBACK=1; shift ;;
     --no-sub-sole-ext-fallback) SUB_SOLE_EXT_FALLBACK=0; shift ;;
     --ext-subs-dir)
-      _require_val "$1" "${2:-}"; EXT_SUB_DIR="$2"
+      _require_val "$1" "$#" "${2:-}"; EXT_SUB_DIR="$2"
       [[ ! -d "$EXT_SUB_DIR" ]] && die 11 "--ext-subs-dir: directory not found: $EXT_SUB_DIR"
       shift 2 ;;
 
@@ -4530,7 +4570,7 @@ while [[ $# -gt 0 ]]; do
     --skip-audio) SKIP_AUDIO=1; shift ;;
     --skip-subs)  SKIP_SUBS=1;  shift ;;
 
-    --output-ext) _require_val "$1" "${2:-}"; OUTPUT_EXT="$2"; _OUTPUT_EXT_EXPLICIT=1; shift 2 ;;
+    --output-ext) _require_val "$1" "$#" "${2:-}"; OUTPUT_EXT="$2"; _OUTPUT_EXT_EXPLICIT=1; shift 2 ;;
     --keep-chapters) KEEP_CHAPTERS=1; shift ;;
     --no-keep-chapters) KEEP_CHAPTERS=0; shift ;;
     --strip-metadata) STRIP_METADATA=1; shift ;;
@@ -6935,6 +6975,7 @@ run_video_pipeline() {
   # Build encode command based on VIDEO_CODEC and PROFILE_DESC
   local -a vf_filters=()
   local -a encode_args=()
+  local _enc_cwd=""    # if set, run the encode ffmpeg from this dir (forced-sub burn-in)
   local thread_args=()
   [[ -n "${THREADS:-}" ]] && thread_args=(-threads "$THREADS")
 
@@ -6951,15 +6992,21 @@ run_video_pipeline() {
     # Stage the forced SRT at a clean temp path for the ffmpeg subtitles filter.
     # The subtitles filter requires the explicit 'filename=' key — positional
     # argument form (subtitles=/path) fails on many ffmpeg builds with
-    # "No option name near '/path'".  Single quotes are ffmpeg filter-level
-    # escaping, protecting the path from the filter graph parser (colons,
-    # commas, etc. are syntactic in that context).
-    # Security: Use WORKDIR (mktemp -d, unpredictable name, 0700 on Linux) so
-    # the path is not guessable by a local attacker — eliminates the TOCTOU
-    # race that a predictable /tmp/muxm-burn-$$.srt name would expose.
+    # "No option name near '/path'".
+    # Path safety: reference the staged file by its bare RELATIVE name (burn.srt) and
+    # run the encode ffmpeg from inside WORKDIR (see _enc_cwd below). burn.srt contains
+    # no filtergraph metacharacters, so NO escaping is needed for any user path — quoting
+    # the absolute WORKDIR path here would still break on an apostrophe in the output
+    # directory (e.g. "It's A Test/"), since the filtergraph parser unquotes it. Every
+    # other path in the encode invocation is absolute (SRC_ABS, V_BASE, the .err redirect,
+    # the progress pipe), so the cwd change is harmless.
+    # Security: WORKDIR is mktemp -d (unpredictable name, 0700 on Linux), so the staged
+    # file is not guessable by a local attacker — eliminates the TOCTOU race that a
+    # predictable /tmp/muxm-burn-$$.srt name would expose.
     _BURN_SRT_FILTER="$WORKDIR/burn.srt"
     cp -f "$SRT_FORCED_BURN_PATH" "$_BURN_SRT_FILTER"
-    vf_filters+=("subtitles=filename='${_BURN_SRT_FILTER}'")
+    vf_filters+=("subtitles=filename=burn.srt")
+    _enc_cwd="$WORKDIR"
     note "→ Burning forced subtitles into video stream"
     report_add "sub_burn_forced" "true"
   elif (( SUB_BURN_FORCED )); then
@@ -7093,7 +7140,7 @@ run_video_pipeline() {
     local total_secs
     total_secs="$(_get_source_duration_secs)"
     log "ffmpeg encode command: ffmpeg ${ff_cmd[*]}"
-    if ! _ffmpeg_run_with_ui ff_cmd "Encoding video" "$WORKDIR/encode.err" "$total_secs"; then
+    if ! _ffmpeg_run_with_ui ff_cmd "Encoding video" "$WORKDIR/encode.err" "$total_secs" "$_enc_cwd"; then
       _check_disk_full "$WORKDIR/encode.err"
       die 40 "Base video encode failed. See: $WORKDIR/encode.err"
     fi
@@ -9953,7 +10000,15 @@ mux_final() {
           fi
           ;;
         *)
-          ff_codec+=( "-c:s:${out_s_idx}" copy )
+          if [[ "$MUX_FORMAT" == "matroska" ]]; then
+            ff_codec+=( "-c:s:${out_s_idx}" copy )
+          else
+            # MP4/MOV: plain-text subs (subrip/webvtt/mov_text) must convert to mov_text —
+            # `copy` of a subrip stream into MP4 fails ("Subtitle codec ... not supported").
+            # Bitmap subs (PGS/VobSub) never reach here for MP4: _build_subtitle_keep_list
+            # drops them and the multi-track pre-encode safety check hard-stops on them.
+            ff_codec+=( "-c:s:${out_s_idx}" mov_text )
+          fi
           ;;
       esac
 
@@ -10159,6 +10214,78 @@ mux_final() {
   mark_done "Mux final ${OUTPUT_EXT}"
 }
 
+# _check_multitrack_container_safety — M1: hard-stop BEFORE the encode when multi-track
+# COPY mode would have to drop or degrade a kept stream to fit the target container.
+# Multi-track mode stream-copies every kept audio/subtitle track verbatim; MKV carries
+# everything losslessly, but MP4/MOV cannot hold lossless HD audio (TrueHD/DTS-HD MA),
+# bitmap subtitles (PGS/VobSub), or styled ASS/SSA (which would flatten to plain
+# mov_text). Failing here — in seconds, before run_video_pipeline — avoids a long encode
+# that would only die at mux_final, and turns the old "bitmap subs silently skipped in
+# MP4" behaviour into an explicit "use MKV" choice (never silently lose a track).
+# Only KEPT tracks are considered: this mirrors the language/type/commentary keep filters
+# of _build_audio_keep_list / _build_subtitle_keep_list (SYNC: keep these in step).
+# Globals (read): MUX_FORMAT, OUTPUT_EXT, AUDIO_MULTI_TRACK, SUB_MULTI_TRACK, SKIP_AUDIO,
+#   SKIP_SUBS, AUDIO_LANG_PREF, AUDIO_KEEP_COMMENTARY, SUB_LANG_PREF, SUB_INCLUDE_FORCED,
+#   SUB_INCLUDE_SDH, SUB_INCLUDE_FULL, SUB_PRESERVE_TEXT_FORMAT, ALL_SUB_CODECS/LANGS/TYPES.
+_check_multitrack_container_safety() {
+  # MKV holds every codec/format losslessly — nothing can be lost, so skip the check.
+  [[ "$MUX_FORMAT" == "matroska" ]] && return 0
+  (( AUDIO_MULTI_TRACK || SUB_MULTI_TRACK )) || return 0
+
+  local -a _blk=()
+  local _ext="${OUTPUT_EXT,,}"
+
+  # ---- Audio: every kept track is stream-copied (-c copy); MP4/MOV can't carry the
+  # lossless HD codecs.  Keep-filter mirrors _build_audio_keep_list (language + commentary).
+  if (( AUDIO_MULTI_TRACK )) && (( ! SKIP_AUDIO )); then
+    local _an _ai _info _codec _ch _lang _br _title _profile
+    _an="$(_audio_stream_count)"
+    for (( _ai=0; _ai<_an; _ai++ )); do
+      _info="$(_audio_stream_info "$_ai")"
+      IFS=$'\t' read -r _codec _ch _lang _br _title <<< "$_info"
+      _normalize_codec_lang _codec _lang
+      [[ -n "${AUDIO_LANG_PREF:-}" ]] && ! _audio_lang_matches "$_lang" && continue
+      (( ! AUDIO_KEEP_COMMENTARY )) && _audio_is_commentary "$_title" && continue
+      case "$_codec" in
+        truehd|mlp) _blk+=("audio #${_ai}: ${_codec} (lossless)") ;;
+        dts|dca)
+          _profile="$(_audio_field "$_ai" profile)"
+          [[ "${_profile,,}" == *"hd ma"* ]] && _blk+=("audio #${_ai}: DTS-HD MA (lossless)") ;;
+      esac
+    done
+  fi
+
+  # ---- Subtitles: every kept track is stream-copied; MP4/MOV can't carry bitmap subs and
+  # flattens styled ASS/SSA.  Keep-filter mirrors Filters 1-2 of _build_subtitle_keep_list
+  # (language + type); the container drop (Filter 3) becomes this hard-stop instead.
+  if (( SUB_MULTI_TRACK )) && (( ! SKIP_SUBS )); then
+    local _si _scodec _slang _stype
+    for (( _si=0; _si<${#ALL_SUB_CODECS[@]}; _si++ )); do
+      _scodec="${ALL_SUB_CODECS[$_si],,}"
+      _slang="${ALL_SUB_LANGS[$_si]}"
+      _stype="${ALL_SUB_TYPES[$_si]}"
+      [[ -n "${SUB_LANG_PREF:-}" && ",$SUB_LANG_PREF," != *",$_slang,"* ]] && continue
+      case "$_stype" in
+        forced) (( SUB_INCLUDE_FORCED )) || continue ;;
+        sdh)    (( SUB_INCLUDE_SDH ))    || continue ;;
+        full)   (( SUB_INCLUDE_FULL ))   || continue ;;
+      esac
+      if ! _is_text_sub_codec "$_scodec"; then
+        _blk+=("subtitle #${_si}: ${_scodec} (bitmap — cannot be carried)")
+      elif [[ "$_scodec" == "ass" || "$_scodec" == "ssa" ]] && (( SUB_PRESERVE_TEXT_FORMAT )); then
+        _blk+=("subtitle #${_si}: ${_scodec} (styled — would flatten to plain mov_text)")
+      fi
+    done
+  fi
+
+  (( ${#_blk[@]} > 0 )) || return 0
+
+  local _list="" _b
+  for _b in "${_blk[@]}"; do _list+=$'\n'"     • ${_b}"; done
+  die 11 "Multi-track output to .${_ext} can't preserve these stream(s) without quality loss:${_list}
+   Use --output-ext mkv — MKV carries all of them losslessly (or drop the affected track(s))."
+}
+
 # ===== Section 30: Main =======================================================================
 main() {
   say "=== ${APP_NAME} v${VERSION} — CLI: ${CLI_NAME}"
@@ -10336,6 +10463,11 @@ main() {
     note "No Dolby Vision detected."
     report_add "dv_detected" "false"
   fi
+
+  # M1: in multi-track copy mode, hard-stop NOW (before the encode) if the target
+  # container can't carry a kept stream losslessly — recommend MKV. Runs before the
+  # single-track advisory warnings below so it pre-empts a redundant warn-then-die.
+  _check_multitrack_container_safety
 
   # Warn: ASS/SSA subtitles + MP4 container + SUB_PRESERVE_TEXT_FORMAT=1
   # ASS/SSA native format cannot be carried by MP4; subtitles will be flattened to mov_text.

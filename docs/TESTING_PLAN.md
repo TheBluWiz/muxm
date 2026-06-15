@@ -73,6 +73,7 @@ The test harness (`test_muxm.sh`) generates synthetic test media — short 2-sec
 | 17b | VALID_PROFILES ↔ completions | Every profile in VALID_PROFILES appears in installed completion script | ✅ |
 | 18 | `DEBUG=1` dry-run | Exits 0 with tracing on; `set -x` trace lands on stderr (not stdout) | ✅ |
 | 19 | bash 4.3+ version guard | Under macOS `/bin/bash` (3.2): "requires bash 4.3+", nonzero exit (skips if only modern bash present) | ✅ |
+| 20 | Value-flag as final token (M2) | A value-flag with no value (`muxm --threads`, `--crf`, `--output-ext`, …) → exit 11 "requires a value"; never crashes with "$2: unbound variable"; a following flag is rejected ("not a flag") | ✅ |
 
 ### 1.2 Toggle Flag Coverage (suite: `toggles`)
 
@@ -332,6 +333,7 @@ Validates filename collision auto-versioning and source replacement flags. Uses 
 | 140 | `--ocr-lang jpn` | SUB_OCR_LANG = jpn in effective config | ✅ |
 | 141 | `SUB_MAX_TRACKS=1` via config file | Output limited to ≤1 subtitle track | ✅ |
 | 142 | `--sub-lang-pref spa` with multilang source | Output subtitle track is Spanish | ✅ |
+| 143 | Forced-sub burn into apostrophe path (M4) | `--sub-burn-forced` into an output dir named `It's A Test/` → filtergraph parses (relative `burn.srt`, encode runs from WORKDIR), encode completes | ✅ |
 
 ### 1.14 Output Features (suite: `output`)
 
@@ -402,6 +404,10 @@ Validates filename collision auto-versioning and source replacement flags. Uses 
 | 178d | `--replace-source` non-interactive | `echo n | muxm --replace-source ...` → exits 11 (stdin not TTY) | ❌ |
 | 178e | `--max-copy-bitrate` with non-k format | Edge: empty string, missing k suffix, "0k" | ❌ |
 | 178f | Source collision auto-version loop | Source = output with existing `(1)` file → output becomes `(2)` | ❌ |
+| 179a | Multi-track container safety: lossless audio (M1) | TrueHD source + `archive --output-ext mp4` → pre-encode hard stop (exit 11, recommend MKV), before any encode | ✅ |
+| 179b | Multi-track container safety: styled subs (M1) | ASS source + `atv-directplay-animation --output-ext mp4` → pre-encode hard stop (would flatten to mov_text) | ✅ |
+| 179c | Multi-track container safety: proceed path (M1) | subrip source + `archive --output-ext mp4` → proceeds; subtitle converted to `mov_text` (not a failed `-c copy`), mux succeeds | ✅ |
+| 179d | Multi-track to MKV copies all (M1) | TrueHD source + `archive` (MKV) → stream-copied losslessly | ✅ |
 
 ### 1.18 Profile End-to-End Encodes (suite: `e2e`)
 
