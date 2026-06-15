@@ -3150,6 +3150,55 @@ test_video() {
   else
     skip "fps preservation: could not generate fractional-fps fixture"
   fi
+
+  # ---- A1: streaming-av1 CRF is resolution/HDR-aware ----
+  # CRF 30 is transparent at 1080p SDR but drops below the ~93 VMAF line at 4K HDR, so ≥4K
+  # or HDR sources are nudged to CRF 28 (1080p SDR keeps 30; explicit --crf always wins).
+  # Driven via --dry-run (no real AV1 encode); the override emits a "→ CRF 28" note.
+  local _a1_4k="$TESTDIR/a1_4k.mp4" _a1_1080="$TESTDIR/a1_1080.mp4" _a1_1080hdr="$TESTDIR/a1_1080hdr.mp4"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=blue:s=3840x2160:r=24:d=1" \
+    -f lavfi -i "sine=duration=1" -c:v libx265 -tag:v hvc1 -preset ultrafast -crf 35 -c:a aac -ac 2 "$_a1_4k" 2>/dev/null || true
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=blue:s=1920x1080:r=24:d=1" \
+    -f lavfi -i "sine=duration=1" -c:v libx265 -tag:v hvc1 -preset ultrafast -crf 35 -c:a aac -ac 2 "$_a1_1080" 2>/dev/null || true
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=blue:s=1920x1080:r=24:d=1" \
+    -f lavfi -i "sine=duration=1" -c:v libx265 -tag:v hvc1 -preset ultrafast -crf 35 -pix_fmt yuv420p10le \
+    -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -c:a aac -ac 2 "$_a1_1080hdr" 2>/dev/null || true
+  if [[ -s "$_a1_4k" && -s "$_a1_1080" ]] && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libsvtav1; then
+    local _a1_out
+    # (a) 4K source → override to CRF 28
+    _a1_out="$(run_muxm --profile streaming-av1 --dry-run "$_a1_4k")"
+    if printf '%s' "$_a1_out" | grep -qE 'streaming-av1:.*→ CRF 28'; then
+      pass "A1: 4K source under streaming-av1 → CRF 28 (resolution-aware override)"
+    else
+      fail "A1: 4K source under streaming-av1 → expected a CRF 28 override note"
+    fi
+    # (b) 1080p SDR source → stays at the profile default CRF 30 (no override)
+    _a1_out="$(run_muxm --profile streaming-av1 --dry-run "$_a1_1080")"
+    if printf '%s' "$_a1_out" | grep -qE 'streaming-av1:.*→ CRF 28'; then
+      fail "A1: 1080p SDR source wrongly triggered the 4K/HDR CRF override"
+    else
+      pass "A1: 1080p SDR source under streaming-av1 → keeps CRF 30 (no override)"
+    fi
+    # (c) explicit --crf wins on a 4K source (override gated on !_CLI_CRF_EXPLICIT)
+    _a1_out="$(run_muxm --profile streaming-av1 --crf 25 --dry-run "$_a1_4k")"
+    if printf '%s' "$_a1_out" | grep -qE 'streaming-av1:.*→ CRF 28'; then
+      fail "A1: explicit --crf 25 on a 4K source was overridden by the resolution-aware CRF"
+    else
+      pass "A1: explicit --crf 25 on a 4K source wins (no resolution-aware override)"
+    fi
+    # (d) 1080p HDR source → override fires (extrapolation beyond the measured 4K-HDR point)
+    if [[ -s "$_a1_1080hdr" ]]; then
+      _a1_out="$(run_muxm --profile streaming-av1 --dry-run "$_a1_1080hdr")"
+      if printf '%s' "$_a1_out" | grep -qE 'streaming-av1:.*HDR10.*→ CRF 28'; then
+        pass "A1: 1080p HDR source under streaming-av1 → CRF 28 (HDR trigger)"
+      else
+        fail "A1: 1080p HDR source under streaming-av1 → expected a CRF 28 override"
+      fi
+    fi
+  else
+    skip "A1: 4K/1080p fixtures or libsvtav1 unavailable"
+  fi
+  rm -f "$_a1_4k" "$_a1_1080" "$_a1_1080hdr"
 }
 
 # === Suite: HDR Pipeline ===

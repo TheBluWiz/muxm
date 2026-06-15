@@ -288,6 +288,7 @@ Validates filename collision auto-versioning and source replacement flags. Uses 
 | 114 | `--level 5.1` VBV injection | Dry-run with HDR source includes vbv-maxrate/vbv-bufsize in x265 params | ✅ |
 | 115 | `--sdr-force-10bit` | 8-bit SDR source → output `pix_fmt` = yuv420p10le (probe) | ✅ |
 | 116 | `--no-sdr-force-10bit` | 8-bit SDR source → output `pix_fmt` stays yuv420p (probe) | ✅ |
+| 117 | `streaming-av1` resolution/HDR-aware CRF (A1) | 4K source → CRF 28; 1080p SDR → CRF 30; explicit `--crf 25` on a 4K source wins; 1080p HDR → CRF 28 | ✅ |
 
 ### 1.11 HDR Pipeline (suite: `hdr`)
 

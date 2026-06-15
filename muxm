@@ -1657,7 +1657,7 @@ See
 for methodology.
 .TP
 .B streaming\-av1
-AV1 streaming. CRF 30, preset 6. Opus 256k surround
+AV1 streaming. CRF 30 (\(<=1080p SDR) / 28 (\(>=4K or HDR), preset 6. Opus 256k surround
 .RB ( AUDIO_FORCE_BITRATE=256k ).
 MP4 container.
 Optimized for platforms that accept AV1 (YouTube, Netflix ingest).
@@ -2276,7 +2276,7 @@ High\-quality AV1 encode via SVT\-AV1. CRF 20, lossless audio, HDR10
 preserved. MKV output. Requires ffmpeg built with SVT\-AV1 support.
 .TP
 .B muxm \-\-profile streaming\-av1 Movie.mkv
-AV1 streaming encode. CRF 30, Opus surround, MP4.
+AV1 streaming encode. CRF 30/28 (resolution\-aware), Opus surround, MP4.
 Smaller files than streaming\-hevc on AV1\-capable clients.
 .TP
 .B muxm \-\-dry\-run \-\-profile streaming\-hevc Movie.mkv
@@ -4064,7 +4064,8 @@ apply_profile_av1_hq() {
 }
 
 apply_profile_streaming_av1() {
-  # AV1 streaming profile. Opus audio, MP4 container, CRF 30.
+  # AV1 streaming profile. Opus audio, MP4 container, CRF 30 (main() drops it to 28 for
+  # >=4K or HDR sources — resolution-aware A1; an explicit --crf still wins).
   # Optimized for platforms that accept AV1 (YouTube, Netflix ingest).
   # VMAF 97.70 at 1080p SDR, 90.65 at 4K HDR.
   DISABLE_DV=1
@@ -4418,7 +4419,7 @@ Profiles (--profile NAME):
   atv-directplay-animation   ATV Direct Play, animation quality. CRF 16, E-AC-3, ASS subs. Passthrough container.
   streaming-hevc             HEVC CRF 20 for Plex/Jellyfin. HDR10, E-AC-3. MP4.
   av1-hq                     AV1 CRF 20, lossless audio. HDR10, MKV.
-  streaming-av1              AV1 CRF 30, Opus audio. Optimized for AV1-capable platforms. MP4.
+  streaming-av1              AV1 CRF 30/28 (res-aware), Opus audio. Optimized for AV1-capable platforms. MP4.
   animation                  Anime/cartoon. CRF 16, lossless audio, ASS subs. MKV.
   universal                  H.264 SDR, AAC stereo. Lean, play anywhere. MP4.
   youtube-upload             H.264 high-profile CRF 16. AAC stereo, soft forced subs. MP4.
@@ -5437,6 +5438,26 @@ _ensure_src_es() {
 #
 # Globals read: FAILED, DRY_RUN, TMP_OUT, OUT, CHECKSUM, WORKDIR, DEBUG,
 #               KEEP_TEMP, KEEP_TEMP_ALWAYS, EXIT_CODE, FAIL_MSG, TERM_FD
+
+# _drain_tee — restore stdout/stderr to the terminal, drain the tee logger, and close FD 3.
+# Identical work on the success and failure on_exit paths (A3 — DRY). Runs in the main shell
+# (on_exit is the EXIT trap, not a subshell; a function call doesn't subshell), so the `exec`
+# FD restore affects the right shell.
+_drain_tee() {
+  exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" || true
+  if [[ -n "${TEE_PID:-}" ]]; then
+    # Backstop: if any child still holds the tee pipe write end, kill tee after 5s so we
+    # never block forever. FDs are already restored to the terminal, so this watchdog does
+    # not itself hold the pipe. The subshell traps ERR off and `|| true`s the kill so a
+    # tee-already-gone failure can't fire on_error (L9).
+    ( trap '' ERR; sleep 5; kill "$TEE_PID" 2>/dev/null || true ) &
+    local _tee_wd=$!
+    wait "$TEE_PID" 2>/dev/null || true
+    kill "$_tee_wd" 2>/dev/null; wait "$_tee_wd" 2>/dev/null || true
+  fi
+  [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
+}
+
 on_exit() {
   trap '' INT TERM EXIT  # prevent re-entrancy: cleanup must run atomically (M10)
   # Clean up subtitle burn-in temp file (lives inside WORKDIR; explicit removal before workdir cleanup)
@@ -5475,17 +5496,7 @@ on_exit() {
     _print_completed_steps
     _cleanup_workdir 0
     # Drain the tee logger: restore stdout/stderr to terminal, wait for tee to flush (H6).
-    exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" || true
-    if [[ -n "${TEE_PID:-}" ]]; then
-      # Backstop: if any child still holds the tee pipe write end, kill tee after 5s
-      # so we never block forever. FDs are already restored to terminal, so this
-      # watchdog does not itself hold the pipe.
-      ( trap '' ERR; sleep 5; kill "$TEE_PID" 2>/dev/null || true ) &
-      local _tee_wd=$!
-      wait "$TEE_PID" 2>/dev/null || true
-      kill "$_tee_wd" 2>/dev/null; wait "$_tee_wd" 2>/dev/null || true
-    fi
-    [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
+    _drain_tee
     exit 0
   else
     [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely earlier parse/runtime error)."
@@ -5506,17 +5517,7 @@ on_exit() {
     fi
     _cleanup_workdir 1
     # Drain the tee logger: restore stdout/stderr to terminal, wait for tee to flush (H6).
-    exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" || true
-    if [[ -n "${TEE_PID:-}" ]]; then
-      # Backstop: if any child still holds the tee pipe write end, kill tee after 5s
-      # so we never block forever. FDs are already restored to terminal, so this
-      # watchdog does not itself hold the pipe.
-      ( trap '' ERR; sleep 5; kill "$TEE_PID" 2>/dev/null || true ) &
-      local _tee_wd=$!
-      wait "$TEE_PID" 2>/dev/null || true
-      kill "$_tee_wd" 2>/dev/null; wait "$_tee_wd" 2>/dev/null || true
-    fi
-    [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
+    _drain_tee
     exit "${EXIT_CODE:-1}"
   fi
 }
@@ -10569,6 +10570,27 @@ main() {
   decide_color_and_pixfmt
   resolve_video_encoder
   build_video_encoder_params
+
+  # A1: streaming-av1 CRF is resolution/HDR-aware. CRF 30 is visually transparent at
+  # 1080p SDR (VMAF 97.7) but drops to VMAF 90.65 at 4K HDR — below the ~93 line — because
+  # the "+10 CRF vs HEVC" rule breaks down for UHD/HDR (docs/AV1_CALIBRATION.md, Test 2).
+  # Nudge ≥4K or HDR sources to CRF 28 (measured 91.24 at 4K HDR), keeping 30 for the common
+  # 1080p-SDR case. This stays a streaming bandwidth/quality trade-off — full transparency
+  # is av1-hq's job (CRF 24/20), not streaming-av1's. (1080p-HDR triggers the lower CRF too,
+  # an extrapolation beyond the measured 4K-HDR point.) Runs here so PROFILE_DESC (the HDR
+  # check) is set; an explicit --crf always wins via the _CLI_CRF_EXPLICIT gate.
+  if [[ "${PROFILE_NAME:-}" == "streaming-av1" ]] && (( ! _CLI_CRF_EXPLICIT )); then
+    local _sv_w _sv_h _sv_is4k=0 _sv_hdr=0
+    _sv_w="$(_probe_field width)"; _sv_h="$(_probe_field height)"
+    [[ "$_sv_w" =~ ^[0-9]+$ ]] && (( _sv_w >= 3840 )) && _sv_is4k=1
+    [[ "$_sv_h" =~ ^[0-9]+$ ]] && (( _sv_h >= 2160 )) && _sv_is4k=1
+    [[ "$PROFILE_DESC" == "HDR10" || "$PROFILE_DESC" == "HLG" ]] && _sv_hdr=1
+    if (( _sv_is4k || _sv_hdr )); then
+      CRF_VALUE=28
+      note "streaming-av1: ${_sv_w:-?}×${_sv_h:-?} ${PROFILE_DESC} source → CRF 28 (4K/HDR quality; default 30 is for ≤1080p SDR)"
+      report_add "av1_crf_resolution_aware" "CRF 28 (${_sv_w:-?}×${_sv_h:-?}, ${PROFILE_DESC})"
+    fi
+  fi
 
   # Deferred warning: H.264 + HDR source + no tone-mapping.
   # Both libx264 and h264_videotoolbox produce 8-bit yuv420p only; the output

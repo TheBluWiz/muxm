@@ -132,17 +132,17 @@ Recommended as the **primary AV1 encode profile**, and the AV1 equivalent of the
 
 ---
 
-### `streaming-av1` — CRF 30, preset 6
+### `streaming-av1` — CRF 30 (≤1080p SDR) / CRF 28 (≥4K or HDR), preset 6
 
-Recommended for **streaming delivery at 1080p SDR** where per-GB bandwidth cost outweighs the marginal quality difference.
+Recommended for **streaming delivery** where per-GB bandwidth cost outweighs the marginal quality difference. The CRF is **resolution/HDR-aware** (A1): CRF 30 for the common 1080p-SDR case, dropping to **CRF 28 for ≥4K or HDR sources**, applied automatically in `main()` after the source is probed (an explicit `--crf` always overrides it). Because the override happens at encode time after probing, `--print-effective-config` — which never reads a source file — always reports the base CRF 30; the effective CRF is logged at encode time (e.g. `streaming-av1: 3840×2160 … → CRF 28`).
 
-| Metric | 1080p SDR (City of God) | 4K HDR (Avatar) |
+| Metric | 1080p SDR (City of God), CRF 30 | 4K HDR (Avatar), CRF 28 |
 |---|---|---|
-| VMAF | 97.70 (Δ −0.84 vs HEVC CRF 18) | 90.65 (Δ −4.33 vs HEVC CRF 18) |
-| Size vs HEVC CRF 18 | −49.8% | −56.7% |
+| VMAF | 97.70 (Δ −0.84 vs HEVC CRF 18) | 91.24 (Δ −3.74 vs HEVC CRF 18) |
+| Size vs HEVC CRF 18 | −49.8% | −53.7% |
 | Encode speed vs HEVC | 17.7× faster | 32.8× faster |
 
-**Caveat (4K HDR):** CRF 30 at 4K HDR (VMAF 90.65) is not recommended for quality-sensitive workflows but is acceptable for streaming where bandwidth cost outweighs marginal quality difference. VMAF 90.65 is below the visually transparent threshold for UHD content.
+**Why CRF 28 at 4K/HDR (not full transparency):** at 4K HDR the "+10 CRF vs HEVC" rule breaks down — CRF 30 scores VMAF 90.65 and even CRF 28 reaches only 91.24, still below the ~93 visually-transparent line (clearing 93 needs CRF ~20, which is `av1-hq`'s job, not a streaming profile's). CRF 28 is a deliberate streaming trade-off: it nudges quality up (+0.59 VMAF) for a small bandwidth cost (−53.7% vs −56.7% size reduction), without paying the full bitrate to reach transparency. **Note:** the ≥4K trigger also fires for 4K SDR, and the HDR trigger fires for 1080p HDR — both extrapolations beyond the single measured 4K-HDR data point, chosen as the safer (higher-quality) default on a per-the-decision "≥4K and/or HDR" basis.
 
 ---
 

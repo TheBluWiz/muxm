@@ -68,7 +68,7 @@ muxm --profile <name> input.mkv
 | `atv-directplay-hq` | Apple TV Direct Play | HEVC Main10 (copy if compliant) | E-AC-3 | Soft forced (mov_text); others as mov_text; PGS→OCR | Convert to P8.1 (auto, if possible) |
 | `av1-hq` | High-quality AV1 archive | AV1 CRF 20, preset 6 | Lossless passthrough | Single-track per type, soft subs | Disabled (AV1 pipeline) |
 | `streaming-hevc` | Modern HEVC streaming | HEVC CRF 20 | E-AC-3 448k | Soft forced + full (no SDH); PGS→OCR | Strip |
-| `streaming-av1` | AV1 streaming | AV1 CRF 30, preset 6 | Opus 256k | Soft forced + full (no SDH); PGS→OCR | Strip |
+| `streaming-av1` | AV1 streaming | AV1 CRF 30 (≤1080p SDR) / 28 (≥4K or HDR), preset 6 | Opus 256k | Soft forced + full (no SDH); PGS→OCR | Strip |
 | `animation` | Anime/cartoon optimized | HEVC CRF 16, 10-bit | Lossless passthrough | Multi-track stream-copy (up to 6); preserve ASS/SSA | Strip |
 | `atv-directplay-animation` | Anime for Apple TV Direct Play | HEVC CRF 16, slower, animation psy params | E-AC-3 (lossless transcoded for ATV) | Multi-track; native ASS/SSA; soft forced | Strip |
 | `universal` | Play anywhere | H.264 SDR (tone-map HDR) | AAC stereo (native preferred, else downmix) | Burn forced; export others as external SRT | Strip |
@@ -122,7 +122,7 @@ muxm --profile streaming-hevc movie.mkv
 
 ### `streaming-av1` — AV1 Streaming
 
-AV1 streaming encode for modern clients with AV1 decode support (Fire TV Stick 4K Max, Chromecast with Google TV, web browsers). AV1 CRF 30, preset 6, Opus audio at 256k (`AUDIO_FORCE_BITRATE="256k"`), soft subtitles. Always outputs MP4. Strips DV; HDR10 preserved. Delivers smaller files than `streaming-hevc` at equivalent perceptual quality on supported hardware.
+AV1 streaming encode for modern clients with AV1 decode support (Fire TV Stick 4K Max, Chromecast with Google TV, web browsers). Preset 6, Opus audio at 256k (`AUDIO_FORCE_BITRATE="256k"`), soft subtitles. Always outputs MP4. Strips DV; HDR10 preserved. The CRF is resolution/HDR-aware: CRF 30 for ≤1080p SDR (visually transparent), dropping to CRF 28 for ≥4K or HDR sources where CRF 30 falls below the perceptual-transparency line (see `docs/AV1_CALIBRATION.md`); an explicit `--crf` overrides this. Delivers smaller files than `streaming-hevc` at equivalent perceptual quality on supported hardware.
 
 > **Requires AV1 encoder support in ffmpeg** — see the note under [`av1-hq`](#av1-hq--high-quality-av1) above.
 
