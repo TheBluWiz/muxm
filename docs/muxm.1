@@ -45,9 +45,10 @@ warning listing all output paths is printed before encoding starts.
 Available profiles:
 .TP
 .B archive
-Remux\-first archival. DV + HDR10, multi\-track, copy only. Passthrough container
-(MKV sources stay MKV, MP4 sources stay MP4). Commentary/descriptive audio tracks
-dropped by default.
+Remux\-first archival. DV + HDR10, multi\-track, copy only. Always outputs MKV \(em
+the only container that holds TrueHD/DTS\-HD MA, PGS/VobSub, and native ASS/SSA
+losslessly, so any source container is preserved without conversion.
+Commentary/descriptive audio tracks dropped by default.
 Audio filterable via
 .BR AUDIO_LANG_PREF " and " AUDIO_KEEP_COMMENTARY ;
 subtitles filterable via

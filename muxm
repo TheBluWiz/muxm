@@ -163,7 +163,6 @@ MP4BOX_CMD=""            # Path to mp4box/MP4Box binary (detected at runtime)
 declare -i _H264_HDR_WARN_PENDING=0
 
 declare -i _OUTPUT_EXT_EXPLICIT=0   # 1 when --output-ext was explicitly passed on the CLI
-declare -i _CLI_SUB_BURN_FORCED=0   # 1 when --sub-burn-forced was explicitly passed on CLI
 declare -i _CLI_CRF_EXPLICIT=0      # 1 when --crf was explicitly passed on the CLI
 declare -i _CLI_PRESET_EXPLICIT=0   # 1 when --preset/-p was explicitly passed on the CLI
 
@@ -204,6 +203,10 @@ LEVEL_VBV_5_2_MAXRATE=60000k; LEVEL_VBV_5_2_BUFSIZE=120000k
 #   nvenc        — NVIDIA NVENC (HEVC/H.264; AV1 on Ada Lovelace/RTX 40+)
 # Phase 2 adds the VideoToolbox dispatch arm; Phase 3 adds NVENC.
 HW_ACCEL="none"
+# Reserved foundation for the VideoToolbox (v1.5.0) / NVENC (v1.6.0) backends: records
+# whether the user typed --hw-accel explicitly, for the future "explicit backend beats
+# profile/config default" precedence decision (mirrors _CLI_CRF_EXPLICIT). Set at parse,
+# not yet read — see docs/HW_ACCEL.md.
 declare -i _CLI_HW_ACCEL_EXPLICIT=0
 declare -a HW_ACCEL_AVAILABLE=()   # populated by detect_hw_accel()
 HW_ACCEL_RESOLVED=""               # concrete backend after auto→explicit resolution
@@ -246,6 +249,8 @@ declare -i VT_QUALITY_DEFAULT=65
 # When empty, build_videotoolbox_params resolves VT_QUALITY_MAP[profile]
 # (or VT_QUALITY_DEFAULT if profile not in the map).
 HW_ACCEL_QUALITY=""
+# Reserved foundation (see _CLI_HW_ACCEL_EXPLICIT above): records whether --hw-accel-quality
+# was typed explicitly, for the upcoming HW-backend precedence logic. Set at parse, not yet read.
 declare -i _CLI_HW_ACCEL_QUALITY_EXPLICIT=0
 
 # Let VideoToolbox fall back to its internal software encoder path when the
@@ -444,19 +449,6 @@ spinner() {
   (( show )) && _term_print '\r  %s  [ done ]\n' "$msg" || true
 }
 
-# run_with_spinner CMD_ARRAY_NAME "Message"
-# Runs a command (passed as array name) in the background with a spinner.
-# Returns the exit status of the background command.
-run_with_spinner() {
-  local -n _cmd_arr=$1
-  local msg="$2"
-  "${_cmd_arr[@]}" &
-  local bg_pid=$!
-  spinner "$bg_pid" "$msg"
-  wait "$bg_pid" 2>/dev/null
-  return $?
-}
-
 # _make_progress_pipe — Create a named pipe (FIFO) for ffmpeg -progress output.
 # Args: $1 — path for the FIFO
 # Returns: 0 if FIFO created successfully, 1 on failure (with warning logged).
@@ -505,9 +497,14 @@ ffmpeg_progress_bar() {
   fi
 
   local -i cols=40
-  # Suppress ERR trap for the read loop: SIGINT-interrupted read returns exit 1,
-  # which fires on_error spuriously (as a "command failed") before the INT trap runs.
-  # Restore ERR before wait "$pid" so real ffmpeg failures still trigger it.
+  # Suppress the ERR trap for the read loop: a SIGINT-interrupted read returns exit 1,
+  # which would fire on_error spuriously ("command failed") before the INT trap runs.
+  # The original handler is restored after the loop only to leave the global trap state
+  # as we found it — NOT so a failing `wait "$pid"` below can fire it: ffmpeg_progress_bar
+  # always runs via _ffmpeg_run_with_ui, which every caller invokes under `if ! …`. That
+  # `!` disables errexit/ERR for the whole call chain (bash skips both in an if-condition),
+  # so a real ffmpeg failure surfaces through this function's return status — checked by
+  # the `if !` caller — not through the ERR trap.
   trap '' ERR
   while IFS='=' read -r key val 2>/dev/null; do
     case "$key" in
@@ -1078,9 +1075,12 @@ _muxm_try_source(){
   . "$f"
   MUXM_CONFIG_LOADED+=("$f")
 }
-# Structural (L4 root cause): single authoritative list of all .muxmrc-configurable variables.
-# _MUXM_PRE_CONFIG, _snap_vars, and the _create_config_emit _V calls all derive from this.
-# Add a new config variable here; the other three sites update automatically via the loops below.
+# Structural: single authoritative list of all .muxmrc-configurable variables. The
+# _MUXM_PRE_CONFIG default snapshot and the _create_config_emit reset+diff loops derive from
+# this list automatically (add a variable here and those update via the loops below). The
+# per-variable `_V <name>` emission calls in _create_config_emit's template are
+# HAND-MAINTAINED, not generated — a newly tracked variable must also get its own `_V` line
+# so the template emits its live default instead of a stale hardcoded literal.
 readonly CONFIG_TRACKED_VARS=(
   VIDEO_CODEC CRF_VALUE PRESET_VALUE X265_PARAMS_BASE X264_PARAMS_BASE SVT_AV1_PARAMS_BASE
   AV1_MAXRATE AV1_BUFSIZE
@@ -1107,6 +1107,12 @@ readonly CONFIG_TRACKED_VARS=(
   OUTPUT_EXT KEEP_CHAPTERS STRIP_METADATA PROFILE_COMMENT INCLUDE_AUDIO_TITLES
   CHECKSUM CHECKSUM_ALGO SKIP_IF_IDEAL REPORT_JSON
   FFMPEG_LOGLEVEL
+  # L3: vars previously emitted as hardcoded literals in the config template — tracked here
+  # so _create_config_emit emits their live defaults (no drift from the Section-4 values).
+  AUDIO_SCORE_CHANNEL_MULTIPLIER AUDIO_SCORE_SURROUND_BONUS AUDIO_SCORE_LANG_BONUS AUDIO_SCORE_COMMENTARY_PENALTY
+  TAG_LANGUAGE_DEFAULT DISK_FREE_WARN_GB TONEMAP_FILTER
+  DRY_RUN KEEP_TEMP KEEP_TEMP_ALWAYS REPLACE_SOURCE FORCE_REPLACE_SOURCE
+  FFMPEG_HIDE_BANNER FFMPEG_OVERWRITE
 )
 
 # Capture script-builtin defaults before any .muxmrc is sourced.
@@ -1536,6 +1542,7 @@ _dep_install_dependencies(){
 
 # Pre-scan for --install-dependencies (must run before config/profile/CLI parsing)
 for _arg in "$@"; do
+  [[ "$_arg" == "--" ]] && break   # end-of-options: a flag after -- is a positional
   if [[ "$_arg" == "--install-dependencies" ]]; then
     _dep_install_dependencies
     # _dep_install_dependencies always exits; this line is unreachable
@@ -2588,7 +2595,9 @@ _uninstall_man(){
   say "=== ${APP_NAME} v${VERSION} — Manual Page Uninstaller ==="
   printf '\n'
 
-  if [[ ! -f "$target" ]]; then
+  # -e is false for a DANGLING symlink (its target is gone), but -L still matches the link
+  # itself — so a broken muxm.1 symlink is detected and removed, not reported "not found".
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
     printf '  ⚠️  Man page not found at %s — nothing to remove.\n' "$target"
     exit 0
   fi
@@ -2602,11 +2611,22 @@ _uninstall_man(){
   fi
 
   printf '  ✅ Removed %s\n' "$target"
+
+  # Refresh the man database so the removed page drops out of `man -k`/whatis (mirrors install).
+  if command -v mandb >/dev/null 2>&1; then
+    printf '  🔄 Updating man database ...\n'
+    if [[ -w "$mandir" ]]; then
+      mandb -q 2>/dev/null || true
+    else
+      sudo mandb -q 2>/dev/null || true
+    fi
+  fi
   exit 0
 }
 
 # Pre-scan for --install-man / --uninstall-man
 for _arg in "$@"; do
+  [[ "$_arg" == "--" ]] && break   # end-of-options: a flag after -- is a positional
   case "$_arg" in
     --install-man)   _install_man ;;
     --uninstall-man) _uninstall_man ;;
@@ -2884,6 +2904,7 @@ _uninstall_completions(){
 
 # Pre-scan for --install-completions / --uninstall-completions
 for _arg in "$@"; do
+  [[ "$_arg" == "--" ]] && break   # end-of-options: a flag after -- is a positional
   case "$_arg" in
     --install-completions)   _install_completions ;;
     --uninstall-completions) _uninstall_completions ;;
@@ -2952,6 +2973,7 @@ _setup_all(){
 
 # Pre-scan for --setup
 for _arg in "$@"; do
+  [[ "$_arg" == "--" ]] && break   # end-of-options: a flag after -- is a positional
   if [[ "$_arg" == "--setup" ]]; then
     _setup_all
     # _setup_all always exits; this line is unreachable
@@ -3166,7 +3188,7 @@ HEADER
   _V TONEMAP_HDR_TO_SDR
   printf '\n'
   echo "# Tone-map filter chain: advanced ffmpeg filter string for HDR→SDR conversion."
-  printf "#TONEMAP_FILTER='zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p'\n"
+  _V TONEMAP_FILTER quoted
   printf '\n'
 
   printf '\n'
@@ -3227,13 +3249,13 @@ HEADER
   echo "#   the wrong language is a worse outcome than fewer channels."
   echo "#   Reduce AUDIO_SCORE_LANG_BONUS to ~25 if you always want the highest-"
   echo "#   channel track regardless of language."
-  printf '#AUDIO_SCORE_CHANNEL_MULTIPLIER=20\n'
-  printf '#AUDIO_SCORE_SURROUND_BONUS=30\n'
-  printf '#AUDIO_SCORE_LANG_BONUS=150\n'
+  _V AUDIO_SCORE_CHANNEL_MULTIPLIER
+  _V AUDIO_SCORE_SURROUND_BONUS
+  _V AUDIO_SCORE_LANG_BONUS
   printf '\n'
   echo "# Penalty applied to commentary / audio-description tracks (detected by title tag)."
   echo "# Set to 0 to disable commentary detection."
-  printf '#AUDIO_SCORE_COMMENTARY_PENALTY=200\n'
+  _V AUDIO_SCORE_COMMENTARY_PENALTY
   printf '\n'
 
   printf '\n'
@@ -3419,7 +3441,7 @@ HEADER
   _V PROFILE_COMMENT
   printf '\n'
   echo "# Default language tag for streams missing language metadata"
-  printf '#TAG_LANGUAGE_DEFAULT=und\n'
+  _V TAG_LANGUAGE_DEFAULT
   printf '\n'
   echo "# Generate descriptive titles for audio streams (e.g., \"5.1 Surround (E-AC-3)\")"
   _V INCLUDE_AUDIO_TITLES
@@ -3437,7 +3459,7 @@ HEADER
   _V CHECKSUM_ALGO
   printf '\n'
   echo "# Dry-run: plan the steps without generating real outputs"
-  printf '#DRY_RUN=0\n'
+  _V DRY_RUN
   printf '\n'
   echo "# Skip processing if source already matches profile requirements"
   _V SKIP_IF_IDEAL
@@ -3446,22 +3468,22 @@ HEADER
   _V REPORT_JSON
   printf '\n'
   echo "# Warn when free disk space drops below this many GB during encode"
-  printf '#DISK_FREE_WARN_GB=5\n'
+  _V DISK_FREE_WARN_GB
   printf '\n'
   echo "# Enable smart disk space preflight estimation (1 = enabled, 0 = disable with --no-disk-check)"
   _V DISK_CHECK
   printf '\n'
   echo "# Keep temporary workdir on failure (for debugging)"
-  printf '#KEEP_TEMP=0\n'
+  _V KEEP_TEMP
   printf '\n'
   echo "# Keep temporary workdir even on success"
-  printf '#KEEP_TEMP_ALWAYS=0\n'
+  _V KEEP_TEMP_ALWAYS
   printf '\n'
   echo "# Replace the original source file with the output (requires interactive TTY)"
-  printf '#REPLACE_SOURCE=0\n'
+  _V REPLACE_SOURCE
   printf '\n'
   echo "# Replace the original source file without confirmation (scripting-friendly)"
-  printf '#FORCE_REPLACE_SOURCE=0\n'
+  _V FORCE_REPLACE_SOURCE
   printf '\n'
 
   printf '\n'
@@ -3470,13 +3492,13 @@ HEADER
   echo "# ========================="
   printf '\n'
   echo "# Hide ffmpeg banner: 1 = hide  |  0 = show"
-  printf '#FFMPEG_HIDE_BANNER=1\n'
+  _V FFMPEG_HIDE_BANNER
   printf '\n'
   echo "# ffmpeg log level: quiet|panic|fatal|error|warning|info|verbose|debug|trace"
   _V FFMPEG_LOGLEVEL "quoted"
   printf '\n'
   echo "# Overwrite outputs without prompting"
-  printf '#FFMPEG_OVERWRITE=1\n'
+  _V FFMPEG_OVERWRITE
   printf '\n'
   echo "# ffprobe log level"
   _V FFPROBE_LOGLEVEL quoted
@@ -3793,10 +3815,12 @@ apply_profile_archive() {
   DISABLE_DV=0
   ALLOW_DV_FALLBACK=1
   DV_CONVERT_TO_P81_IF_FAIL=1
-  # Container: passthrough — keep source container.
-  # Sources with unsupported output containers (avi, ts, etc.) fall back to mkv
-  # via the passthrough resolution block in Section 15.
-  OUTPUT_EXT=""
+  # Container: MKV. Archival keeps everything losslessly — MKV is the only container
+  # that universally holds TrueHD/DTS-HD MA, PGS/VobSub, and native ASS/SSA, so a copy-only
+  # archive of any source container (mp4, mov, ts, avi, …) is preserved without conversion.
+  # (A user can still force a different container with --output-ext, but that overrides this
+  # explicit profile default and is on them; the multi-track container-safety guard backstops it.)
+  OUTPUT_EXT="mkv"
   # Video: copy, don't re-encode
   VIDEO_COPY_IF_COMPLIANT=1
   VIDEO_CODEC="libx265"
@@ -4194,6 +4218,10 @@ _create_config_prescan() {
   local -a _cc_args=("$@")
   while (( _cc_i < ${#_cc_args[@]} )); do
     case "${_cc_args[$_cc_i]}" in
+      --)
+        # End-of-options: a --create-config after -- is a positional, not the flag.
+        break
+        ;;
       --create-config|--force-create-config)
         _cc_found=1
         [[ "${_cc_args[$_cc_i]}" == "--force-create-config" ]] && _cc_force=1
@@ -4306,9 +4334,10 @@ _run_multi_profiles() {
   local _mp _prof_ext
   for _mp in "${_MULTI_PROFILES[@]}"; do
     _prof_ext="$(_probe_profile_ext "$_mp")"
-    # Passthrough profiles set OUTPUT_EXT="" — fall back to user extension (if
-    # the user specified an explicit output filename with a recognised container
-    # extension) or the source extension.
+    # Passthrough profiles (atv-directplay-hq, atv-directplay-animation) set OUTPUT_EXT=""
+    # — fall back to the user extension (if an explicit output filename with a recognised
+    # container extension was given) or the source extension. (archive now forces MKV, so
+    # it returns a concrete ext here and never takes this fallback.)
     if [[ -z "$_prof_ext" ]]; then
       if (( _user_provided )) && [[ -n "${_user_ext:-}" ]]; then
         _prof_ext="$_user_ext"
@@ -4383,7 +4412,7 @@ ${APP_NAME} v${VERSION} — ${CLI_NAME}
 $USAGE_SHORT
 
 Profiles (--profile NAME):
-  archive                    Remux-first archival. DV + HDR10, multi-track. Passthrough container.
+  archive                    Remux-first archival. DV + HDR10, multi-track. MKV (lossless).
   hdr10-hq                   Strip DV, keep HDR10. CRF 17, lossless audio. MKV.
   atv-directplay-hq          Apple TV Direct Play. DV-aware, E-AC-3. Passthrough container.
   atv-directplay-animation   ATV Direct Play, animation quality. CRF 16, E-AC-3, ASS subs. Passthrough container.
@@ -4548,7 +4577,7 @@ while [[ $# -gt 0 ]]; do
     --ocr-lang)  _require_val "$1" "$#" "${2:-}"; SUB_OCR_LANG="$2"; shift 2 ;;
     --no-ocr) SUB_ENABLE_OCR=0; shift ;;
     --ocr-tool)  _require_val "$1" "$#" "${2:-}"; SUB_OCR_TOOL="$2"; shift 2 ;;
-    --sub-burn-forced) SUB_BURN_FORCED=1; _CLI_SUB_BURN_FORCED=1; shift ;;
+    --sub-burn-forced) SUB_BURN_FORCED=1; shift ;;
     --no-sub-burn-forced) SUB_BURN_FORCED=0; shift ;;
     --sub-export-external) SUB_EXPORT_EXTERNAL=1; shift ;;
     --no-sub-export-external) SUB_EXPORT_EXTERNAL=0; shift ;;
@@ -4655,8 +4684,11 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
         _warn_conflict "$PROFILE_NAME" "--no-dv" \
           "DV archival without Dolby Vision is pointless. Output will be a plain remux."
 
-      # archive is copy-only; setting CRF implies the user wants to re-encode
-      if [[ "$_PROFILE_SOURCE" == "cli" ]] && [[ "$CRF_VALUE" -ne 18 ]]; then
+      # archive is copy-only; an explicit --crf on the CLI implies the user expects a
+      # re-encode. Gate on _CLI_CRF_EXPLICIT (was the CRF actually typed on the CLI?), not
+      # on the profile source / CRF≠18 — a CRF set via .muxmrc, or an explicit --crf 18,
+      # was previously mis-handled (config CRF warned; explicit --crf 18 stayed silent).
+      if (( _CLI_CRF_EXPLICIT )); then
         _warn_conflict "$PROFILE_NAME" "--crf $CRF_VALUE" \
           "archive is designed for copy-only (no re-encode). CRF is ignored when VIDEO_COPY_IF_COMPLIANT succeeds."
       fi
@@ -5448,7 +5480,7 @@ on_exit() {
       # Backstop: if any child still holds the tee pipe write end, kill tee after 5s
       # so we never block forever. FDs are already restored to terminal, so this
       # watchdog does not itself hold the pipe.
-      ( sleep 5; kill "$TEE_PID" 2>/dev/null ) &
+      ( trap '' ERR; sleep 5; kill "$TEE_PID" 2>/dev/null || true ) &
       local _tee_wd=$!
       wait "$TEE_PID" 2>/dev/null || true
       kill "$_tee_wd" 2>/dev/null; wait "$_tee_wd" 2>/dev/null || true
@@ -5479,7 +5511,7 @@ on_exit() {
       # Backstop: if any child still holds the tee pipe write end, kill tee after 5s
       # so we never block forever. FDs are already restored to terminal, so this
       # watchdog does not itself hold the pipe.
-      ( sleep 5; kill "$TEE_PID" 2>/dev/null ) &
+      ( trap '' ERR; sleep 5; kill "$TEE_PID" 2>/dev/null || true ) &
       local _tee_wd=$!
       wait "$TEE_PID" 2>/dev/null || true
       kill "$_tee_wd" 2>/dev/null; wait "$_tee_wd" 2>/dev/null || true
@@ -5815,8 +5847,8 @@ check_skip_if_ideal() {
     n_audio="$(_audio_stream_count)"
     if (( n_audio > 0 )); then
       a_codec="$(_audio_codec 0)"
-      if [[ -n "${AUDIO_FORCE_CODEC:-}" && "$a_codec" != "$AUDIO_FORCE_CODEC" ]]; then
-        ideal=0; reason="audio codec is $a_codec (need $AUDIO_FORCE_CODEC)"
+      if [[ -n "${AUDIO_FORCE_CODEC:-}" && "$a_codec" != "$(_encoder_to_codec "$AUDIO_FORCE_CODEC")" ]]; then
+        ideal=0; reason="audio codec is $a_codec (need $(_encoder_to_codec "$AUDIO_FORCE_CODEC"))"
       elif ! audio_is_direct_play_copyable "$a_codec"; then
         ideal=0; reason="audio codec $a_codec not Direct Play compatible"
       fi
@@ -8061,6 +8093,21 @@ _audio_codec_ext() {
   esac
 }
 
+# Normalize an ffmpeg ENCODER name to the ffprobe CODEC name it produces, so
+# "source already matches target" comparisons (source codec from ffprobe vs the target
+# encoder) and the descriptive title work for encoders whose name differs from the codec.
+# e.g. an Opus source (ffprobe: "opus") vs AUDIO_FORCE_CODEC=libopus must be seen as a
+# match (→ stream-copy, not a pointless re-encode). Unknown/already-codec names pass through.
+_encoder_to_codec() {
+  case "$1" in
+    libopus)                 echo "opus" ;;
+    libfdk_aac|aac_at)       echo "aac" ;;
+    libmp3lame)              echo "mp3" ;;
+    libvorbis)               echo "vorbis" ;;
+    *)                       echo "$1" ;;  # aac/ac3/eac3/flac/alac/dts/truehd already match
+  esac
+}
+
 # Determine target codec and bitrate for audio transcode based on channel count.
 # Outputs: "codec bitrate" (space-separated, suitable for `read`)
 # Channel thresholds are centralized here to avoid divergence.
@@ -8353,10 +8400,14 @@ run_audio_pipeline(){
   if [[ -n "${AUDIO_FORCE_CODEC:-}" ]]; then
     # Force codec: always transcode to target
     tgt_codec="$AUDIO_FORCE_CODEC"
-    if [[ "$tgt_codec" == "$codec" ]] && (( effective_ch == ch )); then
+    # Compare the codec the target ENCODER produces (libopus→opus) against the source
+    # codec (ffprobe name) — a naive "$tgt_codec" == "$codec" never matches an Opus source
+    # vs AUDIO_FORCE_CODEC=libopus and would re-encode it pointlessly.
+    local _tgt_native; _tgt_native="$(_encoder_to_codec "$tgt_codec")"
+    if [[ "$_tgt_native" == "$codec" ]] && (( effective_ch == ch )); then
       do_copy=1
-      note "Audio already matches forced codec ($tgt_codec). Copying."
-      report_add "audio_action" "copy (already $tgt_codec)"
+      note "Audio already matches forced codec ($_tgt_native). Copying."
+      report_add "audio_action" "copy (already $_tgt_native)"
     else
       read -r _ tgt_br <<< "$(audio_transcode_target "$effective_ch")"
       if [[ "$tgt_codec" == "aac" ]]; then
@@ -8390,11 +8441,13 @@ run_audio_pipeline(){
     report_add "audio_action" "transcode $codec → $tgt_codec"
   fi
 
-  # Update metadata to reflect the final output codec and channel count
+  # Update metadata to reflect the final output codec and channel count.
+  # On transcode, store the ffprobe CODEC name the encoder produces (libopus→opus), not the
+  # raw encoder name — so the descriptive audio title reads "… (Opus)", not "… (libopus)".
   if (( do_copy )); then
     A_PRIMARY_CODEC="$codec"
   else
-    A_PRIMARY_CODEC="$tgt_codec"
+    A_PRIMARY_CODEC="$(_encoder_to_codec "$tgt_codec")"
   fi
 
   # Enforce encoder channel ceiling (e.g., eac3/ac3 max = 6ch).

@@ -1207,6 +1207,24 @@ _test_cli_value_flag_no_value() {
   else
     fail "M2: '--threads --crf' → expected exit 11 'not a flag', got exit $_code"
   fi
+
+  # L5: the action prescans (--install-man, --setup, --create-config, …) must stop at the
+  # `--` end-of-options marker, so an action flag AFTER `--` is treated as a positional,
+  # not invoked. Pre-fix the prescan loops scanned all of "$@" and fired the installer.
+  _out="$(cd "$TESTDIR" && "$MUXM" -- --install-man "$TESTDIR/basic_sdr_subs.mkv" 2>&1)" && _code=$? || _code=$?
+  if printf '%s' "$_out" | grep -qF 'Manual Page Installer'; then
+    fail "L5: 'muxm -- --install-man <file>' wrongly ran the man-page installer (-- not honored)"
+  else
+    pass "L5: 'muxm -- --install-man <file>' does not run the man-page installer (-- honored)"
+  fi
+  # Sanity: without --, --install-man still triggers the installer (behavior unchanged).
+  local _l5_home="$TESTDIR/l5_home"; rm -rf "$_l5_home"; mkdir -p "$_l5_home"
+  _out="$(HOME="$_l5_home" "$MUXM" --install-man 2>&1)" && _code=$? || _code=$?
+  if printf '%s' "$_out" | grep -qF 'Manual Page Installer'; then
+    pass "L5: '--install-man' (no --) still runs the installer"
+  else
+    fail "L5: '--install-man' (no --) should still run the installer"
+  fi
 }
 
 # === Suite: Toggle Flag Coverage ===
@@ -1686,6 +1704,33 @@ _test_config_create_overrides() {
   fi
   rm -f "$cfg_leak_dir/.muxmrc"
 
+  # ---- L3: template emits the LIVE Section-4 default, not a stale hardcoded literal ----
+  # Pre-fix, vars like DISK_FREE_WARN_GB were emitted via a hardcoded `printf '#…=5'` that
+  # drifts when the Section-4 default changes. They're now tracked + emitted via _V (dynamic).
+  # Verify by changing a default in a copy of muxm and confirming the generated config follows.
+  local _l3_muxm="$TESTDIR/l3_muxm"
+  sed 's/^declare -i DISK_FREE_WARN_GB=5/declare -i DISK_FREE_WARN_GB=7/' "$MUXM" > "$_l3_muxm"
+  chmod +x "$_l3_muxm"
+  local _l3_dir="$TESTDIR/l3_cfg" _l3_home="$TESTDIR/l3_home"
+  mkdir -p "$_l3_dir" "$_l3_home"
+  (cd "$_l3_dir" && HOME="$_l3_home" "$_l3_muxm" --create-config project streaming-hevc >/dev/null 2>&1) || true
+  if [[ -f "$_l3_dir/.muxmrc" ]]; then
+    if grep -qE '^#DISK_FREE_WARN_GB=7$' "$_l3_dir/.muxmrc"; then
+      pass "L3: generated config tracks the changed Section-4 default (#DISK_FREE_WARN_GB=7), not a stale literal"
+    else
+      fail "L3: generated config shows a stale DISK_FREE_WARN_GB (got: $(grep DISK_FREE_WARN_GB "$_l3_dir/.muxmrc" || echo '<none>'))"
+    fi
+    # TONEMAP_FILTER is now emitted via `_V … quoted` (double-quoted) and must round-trip.
+    if grep -qE '^#TONEMAP_FILTER="' "$_l3_dir/.muxmrc"; then
+      pass "L3: TONEMAP_FILTER emitted via _V (double-quoted, round-trippable)"
+    else
+      fail "L3: TONEMAP_FILTER not emitted via _V in generated config"
+    fi
+  else
+    fail "L3: --create-config (changed-default copy) did not create .muxmrc"
+  fi
+  rm -f "$_l3_muxm" "$_l3_dir/.muxmrc"
+
   # Unknown flag: --bogus-flag should produce an error and exit non-zero
   local bogus_dir="$TESTDIR/config_create_bogus"
   mkdir -p "$bogus_dir"
@@ -2009,7 +2054,9 @@ test_profiles() {
   assert_contains "SKIP_IF_IDEAL             = 1" "archive: skip-if-ideal on" "$out"
   assert_contains "REPORT_JSON               = 1" "archive: JSON report on" "$out"
   assert_contains "AUDIO_LOSSLESS_PASSTHROUGH = 1" "archive: lossless audio on" "$out"
-  assert_matches '^[[:space:]]*OUTPUT_EXT[[:space:]]+=[[:space:]]*$' "archive: passthrough container (empty = resolve from source)" "$out"
+  # A2: archive forces MKV (was passthrough OUTPUT_EXT="") — MKV holds TrueHD/DTS-HD/PGS/ASS
+  # losslessly, so any source container archives without conversion.
+  assert_contains "OUTPUT_EXT                = mkv" "archive: forces MKV container (A2)" "$out"
   assert_contains "truehd,dts,flac" "archive: lossless-first codec preference" "$out"
   assert_contains "AUDIO_MULTI_TRACK         = 1" "archive: multi-track audio enabled" "$out"
   assert_contains "AUDIO_KEEP_COMMENTARY     = 0" "archive: commentary excluded by default" "$out"
@@ -2302,10 +2349,28 @@ test_conflicts() {
   assert_contains "no forced subtitles to burn" "Cross: burn-forced + no-forced warns (#43)" "$out"
 
   # --- archive + --crf conflict ---
-  # archive is copy-only; specifying --crf from CLI with a value ≠18 triggers a warning
+  # archive is copy-only; specifying --crf from CLI triggers a warning
   out="$(run_muxm --profile archive --crf 22 --print-effective-config 2>&1)"
   assert_contains "⚠" "archive + --crf 22 emits conflict warning" "$out"
   assert_contains "copy-only" "archive + --crf 22 warning mentions copy-only" "$out"
+
+  # --- L2: the warning gates on _CLI_CRF_EXPLICIT (was the CRF typed on the CLI?), not on
+  #     CRF_VALUE != 18 / profile source. So a CRF set in .muxmrc (no --crf) must NOT warn,
+  #     and an explicit --crf 18 (== the default) MUST warn. ---
+  local _l2_home="$TESTDIR/l2_crf_home"; mkdir -p "$_l2_home"
+  printf 'CRF_VALUE=22\n' > "$_l2_home/.muxmrc"
+  out="$(MUXM_HOME="$_l2_home" run_muxm_in "$TESTDIR" --profile archive --print-effective-config 2>&1)"
+  if printf '%s' "$out" | grep -qE 'copy-only.*re-encode|CRF is ignored'; then
+    fail "L2: archive + config-set CRF (no --crf) → spurious copy-only warning"
+  else
+    pass "L2: archive + config-set CRF (no --crf) → no warning (gated on --crf, not CRF value)"
+  fi
+  out="$(run_muxm --profile archive --crf 18 --print-effective-config 2>&1)"
+  if printf '%s' "$out" | grep -qE 'copy-only'; then
+    pass "L2: archive + explicit --crf 18 → warns (explicit --crf, even at the default)"
+  else
+    fail "L2: archive + explicit --crf 18 → expected a copy-only warning"
+  fi
 
   # --- hdr10-hq + --dv (101f): DV re-enabled on an HDR10 profile ---
   out="$(run_muxm --profile hdr10-hq --dv --print-effective-config)"
@@ -2631,10 +2696,12 @@ test_dryrun() {
 
   # ---- Container passthrough resolution (dry-run log messages) ----
 
-  # archive + mkv source: passthrough resolves OUTPUT_EXT=mkv, logs the resolution.
-  out="$(run_muxm --dry-run --profile archive "$TESTDIR/basic_sdr_subs.mkv")"
+  # Passthrough profile + mkv source: resolves OUTPUT_EXT=mkv, logs the resolution.
+  # (archive no longer exercises this — it now forces MKV directly per A2; use a profile
+  # that is still passthrough, atv-directplay-hq, to verify the resolution logging.)
+  out="$(run_muxm --dry-run --profile atv-directplay-hq "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "[container-passthrough] Source .mkv" \
-    "dry-run archive + mkv source: passthrough logs mkv resolution" "$out"
+    "dry-run passthrough profile + mkv source: logs mkv resolution" "$out"
 
   # atv-directplay-hq + mkv source: passthrough → OUTPUT_EXT=mkv → MKV subtitle adjustment fires
   # (enables ASS/SSA + PGS bitmap preservation; forced subs are already soft by profile default).
@@ -3452,6 +3519,48 @@ EOF
   assert_contains "commentary" \
     "Multi-track + AUDIO_KEEP_COMMENTARY=1: commentary track detected" "$mt_keep_comm"
 
+  # ---- L6: encoder↔codec normalization in the audio "already matches" check ----
+  # AUDIO_FORCE_CODEC holds an ENCODER name (streaming-av1 → libopus); the source codec is
+  # an ffprobe name (opus). A naive compare never matched, so an Opus source was pointlessly
+  # re-encoded (which still yields codec "opus", so the discriminator is COPY vs transcode:
+  # the log says "Copying" and the descriptive title reads "(Opus)" only when normalized).
+  local _l6_src="$TESTDIR/l6_opus.mp4"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=olive:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=duration=1" -c:v libx265 -tag:v hvc1 -preset ultrafast -crf 30 \
+    -c:a libopus -ac 2 -metadata:s:a:0 language=eng "$_l6_src" 2>/dev/null || true
+  if [[ -s "$_l6_src" ]] && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libsvtav1; then
+    local _l6_out="$TESTDIR/l6_out.mp4"; rm -f "$_l6_out"
+    local _l6_log _l6_code=0
+    _l6_log="$(cd "$TESTDIR" && "$MUXM" -K --no-skip-if-ideal --audio-titles --profile streaming-av1 \
+      --crf 40 "$_l6_src" "$_l6_out" 2>&1)" || _l6_code=$?
+    if [[ "$_l6_code" -eq 0 && -s "$_l6_out" ]]; then
+      # Copied, not transcoded (both produce "opus"; the log distinguishes them).
+      if printf '%s' "$_l6_log" | grep -qiE 'already matches forced codec.*[Cc]opying' \
+         && ! printf '%s' "$_l6_log" | grep -qiE 'Force transcoding audio'; then
+        pass "L6: streaming-av1 on an Opus source → audio stream-copied (not re-encoded)"
+      else
+        fail "L6: streaming-av1 on Opus source → expected -c:a copy, log shows a transcode"
+      fi
+      local _l6_ac _l6_title
+      _l6_ac="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$_l6_out" 2>/dev/null || true)"
+      [[ "$_l6_ac" == "opus" ]] && pass "L6: output audio codec is opus" \
+        || fail "L6: output audio codec expected opus, got '$_l6_ac'"
+      # MP4 stores the audio title in the 'name' tag; must read "Opus", not "libopus".
+      _l6_title="$(ffprobe -v error -select_streams a:0 -show_entries stream_tags=name -of csv=p=0 "$_l6_out" 2>/dev/null || true)"
+      if [[ "$_l6_title" == *Opus* && "$_l6_title" != *libopus* ]]; then
+        pass "L6: copied-Opus audio title is accurate ('$_l6_title')"
+      else
+        fail "L6: Opus audio title expected '… (Opus)', got '$_l6_title'"
+      fi
+    else
+      fail "L6: streaming-av1 on Opus source → encode failed (exit $_l6_code)"
+    fi
+    rm -f "$_l6_out"
+  else
+    skip "L6: Opus fixture or libsvtav1 encoder unavailable"
+  fi
+  rm -f "$_l6_src"
+
   _test_audio_native_stereo
 }
 
@@ -4267,7 +4376,9 @@ test_containers() {
     "$avi_src" 2>/dev/null
   if [[ -f "$avi_src" ]]; then
     local avi_out
-    avi_out="$(run_muxm --dry-run --profile archive "$avi_src")"
+    # Use a still-passthrough profile (atv-directplay-hq) — archive now forces MKV (A2),
+    # so it no longer exercises the unsupported-container passthrough fallback path.
+    avi_out="$(run_muxm --dry-run --profile atv-directplay-hq "$avi_src")"
     if echo "$avi_out" | grep -qiE "not supported for output|defaulting to .mkv"; then
       pass "passthrough fallback: .avi source triggers mkv fallback notice"
     else
@@ -4373,6 +4484,44 @@ test_containers() {
       fail "M1: subrip + archive→mp4 multi-track → expected success, got exit $_m1c_code"
     fi
     rm -f "$_m1c_out"
+  fi
+
+  # ---- A2: archive forces MKV output (was passthrough-to-source-container) ----
+  # An MP4/MOV source archived now yields MKV, not MP4 — so codecs MKV holds but the source
+  # container's output couldn't are preserved as bit-identical stream copies.
+  local _a2_src="$TESTDIR/m1_a2_src.mp4"
+  if [[ ! -f "$_a2_src" ]]; then
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=navy:s=320x240:r=24:d=1" \
+      -f lavfi -i "sine=duration=1" -c:v libx265 -tag:v hvc1 -preset ultrafast -crf 30 \
+      -c:a eac3 -ac 6 -metadata:s:a:0 language=eng "$_a2_src" 2>/dev/null || true
+  fi
+  if [[ -s "$_a2_src" ]]; then
+    local _a2_out="$TESTDIR/m1_a2_out.mkv"; rm -f "$_a2_out"
+    local _a2_code=0
+    (cd "$TESTDIR" && "$MUXM" -K --no-skip-if-ideal --profile archive \
+      --preset ultrafast --crf 30 "$_a2_src" "$_a2_out" >/dev/null 2>&1) || _a2_code=$?
+    if [[ "$_a2_code" -eq 0 && -s "$_a2_out" ]]; then
+      pass "A2: archive on an MP4 source produces MKV output"
+      local _a2_fmt _a2_vc _a2_ac
+      _a2_fmt="$(probe_format "$_a2_out" format_name)"
+      _a2_vc="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$_a2_out" 2>/dev/null || true)"
+      _a2_ac="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$_a2_out" 2>/dev/null || true)"
+      if printf '%s' "$_a2_fmt" | grep -q matroska; then
+        pass "A2: archive MP4-in → Matroska container"
+      else
+        fail "A2: archive MP4-in → expected matroska, got '$_a2_fmt'"
+      fi
+      if [[ "$_a2_vc" == "hevc" && "$_a2_ac" == "eac3" ]]; then
+        pass "A2: archive copies source streams bit-identically (hevc video, eac3 audio)"
+      else
+        fail "A2: archive expected copied hevc/eac3, got video='$_a2_vc' audio='$_a2_ac'"
+      fi
+    else
+      fail "A2: archive on MP4 source → expected MKV output, got exit $_a2_code"
+    fi
+    rm -f "$_a2_out" "$_a2_src"
+  else
+    skip "A2: could not generate MP4 source fixture"
   fi
 }
 
@@ -6182,6 +6331,30 @@ test_setup() {
     fail "--uninstall-man: unexpected output: ${man_out:0:200}"
   fi
 
+  # ---- L4: --uninstall-man removes a DANGLING man-page symlink ----
+  # Pre-fix the check was `[[ ! -f "$target" ]]`, which is true for a broken symlink (its
+  # target is gone) — so the uninstaller reported "nothing to remove" and orphaned it. The
+  # fix uses `[[ ! -e && ! -L ]]`. Stub `brew --prefix` to point the man dir at a temp,
+  # writable location, plant a dangling muxm.1 symlink there, and verify it gets removed.
+  local _l4_prefix="$fake_home/l4_prefix"
+  local _l4_mandir="$_l4_prefix/share/man/man1"
+  local _l4_bin="$fake_home/l4_bin"
+  mkdir -p "$_l4_mandir" "$_l4_bin"
+  printf '#!/bin/bash\n[[ "$1" == "--prefix" ]] && { printf "%%s\\n" "%s"; exit 0; }\nexit 0\n' "$_l4_prefix" > "$_l4_bin/brew"
+  chmod +x "$_l4_bin/brew"
+  ln -sf "$_l4_mandir/nonexistent-page.1" "$_l4_mandir/muxm.1"   # dangling symlink
+  if [[ -L "$_l4_mandir/muxm.1" && ! -e "$_l4_mandir/muxm.1" ]]; then
+    local _l4_out
+    _l4_out="$(PATH="$_l4_bin:$PATH" "$MUXM" --uninstall-man 2>&1)" || true
+    if [[ -L "$_l4_mandir/muxm.1" || -e "$_l4_mandir/muxm.1" ]]; then
+      fail "L4: --uninstall-man left the dangling muxm.1 symlink in place"
+    else
+      pass "L4: --uninstall-man removes a dangling muxm.1 symlink"
+    fi
+  else
+    skip "L4: filesystem did not create a dangling symlink as expected"
+  fi
+
   # ---- Cleanup ----
   rm -rf "$fake_home"
 }
@@ -6523,6 +6696,16 @@ test_multi_profile() {
   fi
   assert_contains "Profile 2/2" "M3: flags-before-source → second child runs" "$out"
 
+  # --- L9: multi-profile --dry-run must not emit the spurious tee-drain watchdog ERR-trap
+  #     message. The on_exit backstop `( sleep 5; kill "$TEE_PID" ) &` runs under set -E,
+  #     so a failing kill (tee already gone) fired on_error ("Command failed at line …:
+  #     kill …") in each child. The watchdog now traps '' ERR and `|| true`s the kill. ---
+  if printf '%s' "$out" | grep -qE 'Command failed at line [0-9]+: kill'; then
+    fail "L9: multi-profile --dry-run emits spurious watchdog kill ERR-trap message"
+  else
+    pass "L9: multi-profile --dry-run emits no spurious watchdog kill ERR-trap message"
+  fi
+
   # --- Multi-profile output auto-naming: output paths contain profile suffix ---
   # Run a dry-run multi-profile pass against the core fixture and verify both
   # per-profile output files have the expected profile-suffixed names.
@@ -6571,16 +6754,17 @@ test_multi_profile() {
   fi
 
   # --- Multi-profile passthrough + user filename extension hint ---
-  # archive profile is passthrough (OUTPUT_EXT=""). Without a user filename hint,
-  # it would fall back to the source extension (.mkv). With an explicit .mp4 output
-  # filename, the dispatch block (Section 11) should use .mp4 for the archive pass.
+  # atv-directplay-hq is passthrough (OUTPUT_EXT=""). Without a user filename hint it would
+  # fall back to the source extension (.mkv); with an explicit .mp4 output filename, the
+  # dispatch block (Section 11) should use .mp4 for that pass. (archive no longer exercises
+  # this — A2 forces it to MKV, so use a still-passthrough profile here.)
   local _hint_src="$TESTDIR/basic_sdr_subs.mkv"
   local _hint_out="$TESTDIR/passthrough_hint.mp4"
 
-  out="$(run_muxm --profile archive,streaming --dry-run "$_hint_src" "$_hint_out" 2>&1)" || true
-  # The pre-encode warning lists per-profile output paths; archive should appear as .mp4
-  assert_contains "passthrough_hint.archive.mp4" \
-    "multi-profile passthrough + user .mp4 hint: archive output path uses .mp4 (not .mkv)" "$out"
+  out="$(run_muxm --profile atv-directplay-hq,streaming --dry-run "$_hint_src" "$_hint_out" 2>&1)" || true
+  # The pre-encode warning lists per-profile output paths; the passthrough pass uses .mp4.
+  assert_contains "passthrough_hint.atv-directplay-hq.mp4" \
+    "multi-profile passthrough + user .mp4 hint: passthrough output path uses .mp4 (not .mkv)" "$out"
 }
 
 # === Suite: Phase 5 Regression Tests (P5.3) ===
