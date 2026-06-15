@@ -360,10 +360,6 @@ muxm --profile archive --no-dv input.mkv
 # ⚠️  Profile 'archive' + --no-dv: DV archival without Dolby Vision is pointless.
 #     Output will be a plain remux.
 
-muxm --profile atv-directplay-hq --output-ext mkv input.mkv
-# ⚠️  Profile 'atv-directplay-hq' + --output-ext mkv: MKV does not Direct Play
-#     on Apple TV. Use mp4 for ATV compatibility.
-
 muxm --profile animation --sub-burn-forced input.mkv
 # ⚠️  Profile 'animation' + --sub-burn-forced: Burning subs destroys ASS styling
 #     (typesetting, signs, karaoke). Soft subs recommended.

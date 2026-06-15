@@ -2255,8 +2255,14 @@ test_conflicts() {
   assert_contains "⚠" "hdr10-hq + --video-codec libx264 warns (#34)" "$out"
 
   # --- atv-directplay-hq conflicts ---
+  # WI-5: MKV Direct Plays on Apple TV via Plex/Infuse, so forcing MKV is a supported
+  # choice and must NOT emit a conflict warning anymore.
   out="$(run_muxm --profile atv-directplay-hq --output-ext mkv --print-effective-config)"
-  assert_contains "⚠" "atv-directplay + mkv warns" "$out"
+  if echo "$out" | grep -qiE "Forcing MKV|MKV Direct Plays|native TV app"; then
+    fail "atv-directplay-hq + mkv: MKV/ATV warning should no longer fire (WI-5)"
+  else
+    pass "atv-directplay-hq + mkv: no MKV/ATV conflict warning (WI-5)"
+  fi
 
   out="$(run_muxm --profile atv-directplay-hq --tonemap --print-effective-config)"
   assert_contains "⚠" "atv-directplay + --tonemap warns (#37)" "$out"
@@ -2268,8 +2274,13 @@ test_conflicts() {
   assert_contains "⚠" "atv-directplay + --audio-lossless-passthrough warns (#35)" "$out"
 
   # --- atv-directplay-animation conflicts ---
+  # WI-5: MKV Direct Plays on Apple TV via Plex/Infuse — forcing MKV must NOT warn anymore.
   out="$(run_muxm --profile atv-directplay-animation --output-ext mkv --print-effective-config)"
-  assert_contains "⚠" "atv-directplay-animation + mkv warns" "$out"
+  if echo "$out" | grep -qiE "Forcing MKV|MKV Direct Plays|native TV app"; then
+    fail "atv-directplay-animation + mkv: MKV/ATV warning should no longer fire (WI-5)"
+  else
+    pass "atv-directplay-animation + mkv: no MKV/ATV conflict warning (WI-5)"
+  fi
 
   out="$(run_muxm --profile atv-directplay-animation --tonemap --print-effective-config)"
   assert_contains "⚠" "atv-directplay-animation + --tonemap warns" "$out"

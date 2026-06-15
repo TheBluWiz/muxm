@@ -4747,9 +4747,8 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       # Note: SUB_PRESERVE_TEXT_FORMAT for MKV output is set post-resolution (Section 15).
       # There is no conflict check here for it because OUTPUT_EXT is not yet resolved at this point.
 
-      # MKV won’t Direct Play on Apple TV (only warn when user explicitly forced it)
-      _warn_container_unusual "$PROFILE_NAME" "mkv" \
-        "Forcing MKV output. MKV Direct Plays on ATV via Plex/Infuse but not the native TV app." 1
+      # No MKV warning: MKV Direct Plays on Apple TV via Plex/Infuse (the native TV.app
+      # requires MP4, but that is not a footgun worth a conflict warning). See WI-5.
       # MOV is unusual but works
       _warn_container_unusual "$PROFILE_NAME" "mov" \
         "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play."
@@ -4766,9 +4765,8 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       ;;
 
     atv-directplay-animation)
-      # MKV explicit override (passthrough may also produce MKV — that is intentional)
-      _warn_container_unusual "$PROFILE_NAME" "mkv" \
-        "Forcing MKV output. MKV Direct Plays on ATV via Plex/Infuse but not the native TV app." 1
+      # No MKV warning: MKV Direct Plays on Apple TV via Plex/Infuse (passthrough may also
+      # produce MKV — that is intentional and supported). See WI-5.
       # MOV is unusual
       _warn_container_unusual "$PROFILE_NAME" "mov" \
         "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play."
