@@ -3592,8 +3592,11 @@ EOF
       fi
       local _l6_ac _l6_title
       _l6_ac="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$_l6_out" 2>/dev/null || true)"
-      [[ "$_l6_ac" == "opus" ]] && pass "L6: output audio codec is opus" \
-        || fail "L6: output audio codec expected opus, got '$_l6_ac'"
+      if [[ "$_l6_ac" == "opus" ]]; then
+        pass "L6: output audio codec is opus"
+      else
+        fail "L6: output audio codec expected opus, got '$_l6_ac'"
+      fi
       # MP4 stores the audio title in the 'name' tag; must read "Opus", not "libopus".
       _l6_title="$(ffprobe -v error -select_streams a:0 -show_entries stream_tags=name -of csv=p=0 "$_l6_out" 2>/dev/null || true)"
       if [[ "$_l6_title" == *Opus* && "$_l6_title" != *libopus* ]]; then
@@ -6389,6 +6392,11 @@ test_setup() {
   local _l4_mandir="$_l4_prefix/share/man/man1"
   local _l4_bin="$fake_home/l4_bin"
   mkdir -p "$_l4_mandir" "$_l4_bin"
+  # Single-quoted on purpose: `$1` must stay LITERAL (it's the generated stub's own runtime
+  # arg, read when muxm later runs `brew --prefix`), while `%s` is printf's placeholder,
+  # substituted here with "$_l4_prefix". `%%s`→literal `%s` and `\\n`→literal `\n` are for
+  # the generated stub's inner printf. So only the prefix path is expanded at generation.
+  # shellcheck disable=SC2016
   printf '#!/bin/bash\n[[ "$1" == "--prefix" ]] && { printf "%%s\\n" "%s"; exit 0; }\nexit 0\n' "$_l4_prefix" > "$_l4_bin/brew"
   chmod +x "$_l4_bin/brew"
   ln -sf "$_l4_mandir/nonexistent-page.1" "$_l4_mandir/muxm.1"   # dangling symlink
