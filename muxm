@@ -1726,11 +1726,6 @@ target directory is not writable. Detects Homebrew prefix automatically.
 .BR \-\-uninstall\-man
 Remove the installed manual page.
 .TP
-.BR \-\-emit\-man
-Write this manual page's roff source to standard output and exit. This is the
-single source of truth for the page; \fItools/gen\-docs.sh\fR uses it to
-regenerate \fIdocs/muxm.1\fR.
-.TP
 .BR \-\-install\-completions
 Install bash/zsh tab\-completion to \fI~/.muxm/\fR and add a
 \fBsource\fR line to the user's shell RC files
@@ -1891,6 +1886,30 @@ level. Default: enabled.
 .TP
 .BR \-\-threads " " \fIN\fR
 Number of threads for ffmpeg encoding.
+.SS Hardware Acceleration
+.TP
+.BR \-\-hw\-accel " " none|auto|videotoolbox|nvenc
+Select a hardware encoder backend. Default: none (software x265/x264/SVT\-AV1).
+.B auto
+resolves to a supported backend when one is available.
+Also configurable in
+.I .muxmrc
+as
+.BR HW_ACCEL .
+.TP
+.BR \-\-hw\-accel\-quality " " \fIN\fR
+Quality knob for the VideoToolbox/NVENC encoder: an integer from 0 to 100
+(higher keeps more quality). Default: profile\-calibrated
+.RB ( HW_ACCEL_QUALITY ).
+.TP
+.BR \-\-hw\-accel\-allow\-sw " , " \-\-no\-hw\-accel\-allow\-sw
+Allow or forbid the hardware encoder's own software fallback. When allowed
+(the default), VideoToolbox may quietly fall back to software; when forbidden,
+an unavailable hardware encoder is a hard error instead
+.RB ( HW_ACCEL_ALLOW_SW ).
+.PP
+Hardware acceleration is supported on \fBmacOS\fR (Apple VideoToolbox) only.
+On Linux, \fB\-\-hw\-accel\fR is accepted but encoding always runs in software.
 .SH AUDIO OPTIONS
 .TP
 .BR \-\-audio\-track " " \fIN\fR
@@ -2283,6 +2302,17 @@ Keep temporary workdir even on success.
 .TP
 .BR \-k ", " \-\-keep\-temp
 Keep temporary workdir on failure.
+.TP
+.BR \-\-workdir " " \fIDIR\fR
+Stage temporary intermediates (the
+.I .muxm.tmp.*
+workdir) under
+.I DIR
+instead of the output directory. Point this at a roomier volume to keep
+multi\-GB intermediates off the output disk.
+.I DIR
+must already exist and be writable
+.RB ( WORKDIR_BASE ).
 .SH QUICK TEST OPTIONS
 .TP
 .BR \-\-skip\-audio " , " \-\-skip\-subs
@@ -2719,7 +2749,14 @@ _uninstall_man(){
 for _arg in "$@"; do
   [[ "$_arg" == "--" ]] && break   # end-of-options: a flag after -- is a positional
   case "$_arg" in
-    --emit-man)      _man_emit; exit 0 ;;   # emit roff man source to stdout (single source of truth; used by tools/gen-docs.sh)
+    # --emit-man: MAINTAINER-ONLY, HIDDEN flag. Emits the roff man-page source to stdout
+    # (the single source of truth; consumed by tools/gen-docs.sh to regenerate docs/muxm.1).
+    # Deliberately excluded from --help, tab-completion, AND the man page itself. Because it
+    # is parser-accepted but intentionally undocumented, it is allow-listed in BOTH drift
+    # guards in tests/test_muxm.sh _test_cli_flag_drift: the parser<->completion check and
+    # the parser->man-page reverse-sweep check (see the `hidden_flags` array there). Keep
+    # those allowlists in sync if this flag is ever renamed or unhidden.
+    --emit-man)      _man_emit; exit 0 ;;
     --install-man)   _install_man ;;
     --uninstall-man) _uninstall_man ;;
   esac
@@ -2795,7 +2832,7 @@ _muxm_completions() {
         local flags="
             -h --help -V --version
             --profile --dry-run --print-effective-config
-            --install-dependencies --install-man --uninstall-man --emit-man
+            --install-dependencies --install-man --uninstall-man
             --install-completions --uninstall-completions
             --setup
             --create-config --force-create-config
@@ -4561,6 +4598,7 @@ Common options:
   --hw-accel-quality N        Override VT/NVENC quality knob (0-100, default: profile-calibrated)
   --no-hw-accel-allow-sw      Disallow VT's internal software fallback (default: allowed)
   --dry-run                   Plan steps without encoding
+  --workdir DIR               Stage temp intermediates under DIR (e.g. a roomier volume)
   --setup                     Install dependencies, man page, and completions
   --create-config {system|user|project} [PROFILE]
                               Generate a .muxmrc config file

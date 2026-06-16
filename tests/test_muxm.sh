@@ -1135,8 +1135,18 @@ _test_cli_flag_drift() {
     | tr ' \t' '\n' | grep -E '^-{1,2}[a-zA-Z]' | sort -u > "$comp"
 
   # ---- Assertion A: parser <-> completion, both directions ----
+  # Intentionally hidden / maintainer-only flags: accepted by the parser but
+  # deliberately kept out of --help, tab-completion, AND the man page (documented
+  # only in a code comment at the flag, e.g. --emit-man). This one allowlist
+  # exempts them from BOTH the completion check below and the man-page coverage
+  # check (Assertion C); the guards still catch drift for every other flag, and
+  # the reverse direction still rejects any completion flag that is not real.
+  local -a hidden_flags=( --emit-man )
+  local -a _hidden_excl=()
+  local _hf
+  for _hf in "${hidden_flags[@]}"; do _hidden_excl+=( -e "$_hf" ); done
   local missing_in_comp missing_in_parser
-  missing_in_comp="$(comm -23 "$parser" "$comp")"
+  missing_in_comp="$(comm -23 "$parser" "$comp" | grep -vxF "${_hidden_excl[@]}" || true)"
   missing_in_parser="$(comm -13 "$parser" "$comp")"
   if [[ -z "$missing_in_comp" ]]; then
     pass "Every CLI flag is offered by tab-completion"
@@ -1147,6 +1157,33 @@ _test_cli_flag_drift() {
     pass "Every completion flag is a real CLI flag"
   else
     fail "Flags offered by completion but not accepted by parser: ${missing_in_parser//$'\n'/ }"
+  fi
+
+  # ---- Assertion C: parser -> man page coverage (committed reverse sweep) ----
+  # Every parser flag must be documented in the man page, EXCEPT the hidden
+  # maintainer flags allow-listed above. Emitted from the same muxm under test
+  # (the `docs` suite separately proves that emit matches the checked-in
+  # docs/muxm.1). Flags appear roff-escaped (-- -> \-\-), so match the escaped
+  # form via substring; this is the committed form of the Phase 3 reverse sweep
+  # and fails if a new flag is added to the parser but never documented.
+  local man_src="$wd/man.txt"
+  "$MUXM" --emit-man > "$man_src" 2>/dev/null || true
+  if [[ ! -s "$man_src" ]]; then
+    skip "man page not emitted — man-page coverage check skipped"
+  else
+    local undoc_man="" _pf _esc _skip
+    while IFS= read -r _pf; do
+      _skip=0
+      for _hf in "${hidden_flags[@]}"; do [[ "$_pf" == "$_hf" ]] && { _skip=1; break; }; done
+      (( _skip )) && continue
+      _esc="${_pf//-/\\-}"   # --workdir -> \-\-workdir (roff escapes each hyphen)
+      grep -qF -- "$_esc" "$man_src" || undoc_man+="$_pf "
+    done < "$parser"
+    if [[ -z "$undoc_man" ]]; then
+      pass "Every CLI flag is documented in the man page"
+    else
+      fail "Flags accepted by parser but missing from the man page: ${undoc_man}"
+    fi
   fi
 
   # ---- Assertion B: every --create-config override var is tracked (else silently dropped) ----
