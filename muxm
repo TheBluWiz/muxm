@@ -5518,8 +5518,14 @@ if [[ "${DEBUG:-0}" != "1" ]]; then
   # FD 3 bypasses tee so \r-based progress UI doesn't pollute the log file.
   exec 3>&2
   TERM_FD=3
-  exec > >(tee -a "$LOGFILE") 2>&1
-  TEE_PID=$!
+  # Hold the tee on an explicit descriptor (fd 4) so _drain_tee can close it deterministically.
+  # With the bare `exec > >(tee …)` form, the shell keeps an unnamed write-end to the process
+  # substitution open until it exits, so at drain time tee never sees EOF and `wait $TEE_PID`
+  # blocks until the watchdog kills it (~5s of dead wait on every run). Owning the write-end on
+  # a named fd lets us close it explicitly → tee gets EOF immediately → wait returns at once.
+  # Fixed fd number (not the {var}> form) for bash 3.2 portability.
+  exec 4> >(tee -a "$LOGFILE"); TEE_PID=$!
+  exec 1>&4 2>&4
   note "Logging to $(realpath_fallback "$LOGFILE")"
 fi
 
@@ -5628,14 +5634,21 @@ _ensure_src_es() {
 _drain_tee() {
   exec 1>&"${TERM_FD:-2}" 2>&"${TERM_FD:-2}" || true
   if [[ -n "${TEE_PID:-}" ]]; then
-    # Backstop: if any child still holds the tee pipe write end, kill tee after 5s so we
-    # never block forever. FDs are already restored to the terminal, so this watchdog does
-    # not itself hold the pipe. The subshell traps ERR off and `|| true`s the kill so a
-    # tee-already-gone failure can't fire on_error (L9).
-    ( trap '' ERR; sleep 5; kill "$TEE_PID" 2>/dev/null || true ) &
+    # Close our write-end (fd 4, opened in Section 17) so tee sees EOF and exits promptly;
+    # `wait $TEE_PID` then returns at once instead of blocking on a never-arriving EOF.
+    exec 4>&- 2>/dev/null || true
+    # Safety backstop in case some stray child still holds the pipe: a watchdog that holds NO
+    # pipe fds of its own (it redirects 1/2 to /dev/null and closes 3/4, so neither it nor an
+    # orphaned sleep can keep tee's input — or the caller's captured stdout — open) and is
+    # SIGKILL'd the instant the wait returns, so it never adds latency. SIGKILL (not TERM)
+    # because on_exit set `trap '' TERM`, which a forked subshell inherits — a plain kill would
+    # be ignored and `wait` would then block for the full sleep. With the fd-close above this
+    # backstop essentially never fires.
+    ( trap '' ERR; exec 1>/dev/null 2>&1 3>&- 4>&-; sleep 2; kill "$TEE_PID" 2>/dev/null || true ) &
     local _tee_wd=$!
     wait "$TEE_PID" 2>/dev/null || true
-    kill "$_tee_wd" 2>/dev/null; wait "$_tee_wd" 2>/dev/null || true
+    kill -KILL "$_tee_wd" 2>/dev/null || true
+    wait "$_tee_wd" 2>/dev/null || true
   fi
   [[ -n "${TERM_FD:-}" ]] && exec 3>&- 2>/dev/null || true
 }

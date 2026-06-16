@@ -259,7 +259,9 @@ assert_exit() {
 # Assert output contains string
 assert_contains() {
   local needle="$1" label="$2" haystack="$3"
-  if echo "$haystack" | grep -qiF -- "$needle"; then
+  # here-string (not `echo | grep`) avoids spawning an echo subshell + pipe per call;
+  # this helper runs ~460×, so the saved process churn is worth the one-line change.
+  if grep -qiF -- "$needle" <<<"$haystack"; then
     pass "$label"
   else
     fail "$label — output missing: '$needle'"
@@ -2874,16 +2876,15 @@ test_dryrun() {
 
   # ---- Container passthrough resolution (dry-run log messages) ----
 
-  # Passthrough profile + mkv source: resolves OUTPUT_EXT=mkv, logs the resolution.
-  # (archive no longer exercises this — it now forces MKV directly per A2; use a profile
-  # that is still passthrough, atv-directplay-hq, to verify the resolution logging.)
+  # Passthrough profile (atv-directplay-hq) + mkv source drives all of these in one dry-run:
+  # resolves OUTPUT_EXT=mkv and logs the resolution, and because OUTPUT_EXT=mkv the MKV subtitle
+  # adjustment fires (native ASS/SSA + PGS bitmap preservation; forced subs are already soft by
+  # profile default). A single invocation feeds every assertion below — re-running the identical
+  # dry-run gained nothing. (archive no longer exercises this — it forces MKV directly per A2;
+  # atv-directplay-hq is still passthrough, so it verifies the resolution logging.)
   out="$(run_muxm --dry-run --profile atv-directplay-hq "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "[container-passthrough] Source .mkv" \
     "dry-run passthrough profile + mkv source: logs mkv resolution" "$out"
-
-  # atv-directplay-hq + mkv source: passthrough → OUTPUT_EXT=mkv → MKV subtitle adjustment fires
-  # (enables ASS/SSA + PGS bitmap preservation; forced subs are already soft by profile default).
-  out="$(run_muxm --dry-run --profile atv-directplay-hq "$TESTDIR/basic_sdr_subs.mkv")"
   assert_contains "[container-passthrough] Source .mkv" \
     "dry-run atv + mkv source: passthrough logs mkv resolution" "$out"
   assert_contains "[atv-directplay-hq] MKV output: enabling native ASS/SSA" \
