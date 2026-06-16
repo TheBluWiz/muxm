@@ -2772,6 +2772,10 @@ _completions_emit(){
   sed "s/__MUXM_PROFILES__/$VALID_PROFILES/g" <<'COMPLETIONS_EOF'
 # =============================================================================
 #  muxm — Bash/Zsh tab completion  (installed by muxm --install-completions)
+#
+#  GENERATED FILE: the committed completions/muxm-completion.bash is generated
+#  from this embedded heredoc via `muxm --emit-completions` (see tools/gen-docs.sh).
+#  Edit the heredoc in `muxm`, not the committed file.
 # =============================================================================
 
 _muxm_completions() {
@@ -3031,10 +3035,17 @@ _uninstall_completions(){
   exit 0
 }
 
-# Pre-scan for --install-completions / --uninstall-completions
+# Pre-scan for --emit-completions / --install-completions / --uninstall-completions
 for _arg in "$@"; do
   [[ "$_arg" == "--" ]] && break   # end-of-options: a flag after -- is a positional
   case "$_arg" in
+    # --emit-completions: MAINTAINER-ONLY, HIDDEN flag (mirrors --emit-man). Emits the
+    # bash/zsh completion source to stdout (the single source of truth; consumed by
+    # tools/gen-docs.sh to regenerate completions/muxm-completion.bash). Deliberately
+    # excluded from --help, tab-completion, AND the man page. It is allow-listed in BOTH
+    # drift guards in tests/test_muxm.sh _test_cli_flag_drift (the `hidden_flags` array):
+    # the parser<->completion check and the parser->man-page reverse-sweep check.
+    --emit-completions)      _completions_emit; exit 0 ;;
     --install-completions)   _install_completions ;;
     --uninstall-completions) _uninstall_completions ;;
   esac

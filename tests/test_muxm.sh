@@ -70,7 +70,7 @@ show_help() {
       unit          Pure unit tests (helpers, codec maps, heuristics)
       completions   Tab-completion installer/uninstaller
       setup         --install-dependencies, --install-man, etc.
-      docs          Man-page parity (docs/muxm.1 vs muxm --emit-man)
+      docs          Generated-artifact parity (man page + completions vs muxm --emit-*)
 
     Medium (core fixture only, ~5s):
       cli           CLI parsing, --help, --version, error codes
@@ -1141,7 +1141,7 @@ _test_cli_flag_drift() {
   # exempts them from BOTH the completion check below and the man-page coverage
   # check (Assertion C); the guards still catch drift for every other flag, and
   # the reverse direction still rejects any completion flag that is not real.
-  local -a hidden_flags=( --emit-man )
+  local -a hidden_flags=( --emit-man --emit-completions )
   local -a _hidden_excl=()
   local _hf
   for _hf in "${hidden_flags[@]}"; do _hidden_excl+=( -e "$_hf" ); done
@@ -8064,26 +8064,37 @@ test_dv_vt() {
   fi
 }
 
-# ---- Suite: docs (man-page parity) ----
-# Verifies docs/muxm.1 is in sync with the embedded man page in muxm (the
-# single source of truth, emitted by `muxm --emit-man`). Delegates to the
-# standalone tests/test_docs_parity.sh so the logic lives in one place; here
-# we just translate its exit code into the harness pass/fail counters.
+# ---- Suite: docs (generated-artifact parity) ----
+# Verifies the two committed generated artifacts are in sync with their embedded
+# heredocs in muxm (the single source of truth):
+#   * docs/muxm.1                      vs `muxm --emit-man`   (test_docs_parity.sh)
+#   * completions/muxm-completion.bash vs `muxm --emit-completions`
+#                                                            (test_completions_parity.sh)
+# Delegates to the standalone scripts so the logic lives in one place; here we
+# just translate their exit codes into the harness pass/fail counters.
 # Needs no media fixtures (see MEDIA_FREE_SUITES).
 test_docs_parity() {
-  section "Suite: docs (man-page parity)"
-  local tests_dir script
+  section "Suite: docs (generated-artifact parity)"
+  local tests_dir
   tests_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  script="${tests_dir}/test_docs_parity.sh"
-  if [[ ! -x "$script" ]]; then
-    fail "docs parity: tests/test_docs_parity.sh not found or not executable ($script)"
-    return
-  fi
-  # The standalone script prints its own ✅/❌ detail (and the diff on failure).
-  if "$script"; then
+
+  # The standalone scripts print their own ✅/❌ detail (and the diff on failure).
+  local man_script="${tests_dir}/test_docs_parity.sh"
+  if [[ ! -x "$man_script" ]]; then
+    fail "docs parity: tests/test_docs_parity.sh not found or not executable ($man_script)"
+  elif "$man_script"; then
     pass "docs/muxm.1 in sync with muxm embedded man page"
   else
     fail "docs/muxm.1 OUT OF SYNC with muxm heredoc — run tools/gen-docs.sh and commit"
+  fi
+
+  local comp_script="${tests_dir}/test_completions_parity.sh"
+  if [[ ! -x "$comp_script" ]]; then
+    fail "completions parity: tests/test_completions_parity.sh not found or not executable ($comp_script)"
+  elif "$comp_script"; then
+    pass "completions/muxm-completion.bash in sync with muxm embedded completion"
+  else
+    fail "completions/muxm-completion.bash OUT OF SYNC with muxm heredoc — run tools/gen-docs.sh and commit"
   fi
 }
 

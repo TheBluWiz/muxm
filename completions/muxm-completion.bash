@@ -1,5 +1,9 @@
 # =============================================================================
 #  muxm — Bash/Zsh tab completion  (installed by muxm --install-completions)
+#
+#  GENERATED FILE: the committed completions/muxm-completion.bash is generated
+#  from this embedded heredoc via `muxm --emit-completions` (see tools/gen-docs.sh).
+#  Edit the heredoc in `muxm`, not the committed file.
 # =============================================================================
 
 _muxm_completions() {
@@ -106,7 +110,7 @@ _muxm_completions() {
 
             -k --keep-temp -K --keep-temp-always
             --ffmpeg-loglevel --ffprobe-loglevel --no-hide-banner
-            --threads
+            --threads --workdir
         "
         COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
         return
