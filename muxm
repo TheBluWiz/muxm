@@ -1580,7 +1580,7 @@ _man_target_dir(){
 # <<< embedded man page >>>
 _man_emit(){
   sed "s/__VERSION__/$VERSION/" <<'MANPAGE_EOF'
-.TH MUXM 1 "2026-04-11" "MuxMaster v__VERSION__" "User Commands"
+.TH MUXM 1 "2026-06-16" "MuxMaster v__VERSION__" "User Commands"
 .SH NAME
 muxm \- Universal AV1/DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
