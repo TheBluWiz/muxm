@@ -5850,7 +5850,7 @@ disk_free_warn() {
       # Only fires when the bitrate math underflows to 0; legitimately small
       # (heavy-compression) estimates are left untouched to avoid over-blocking.
       if (( est_video_bytes == 0 && src_size > 0 )); then
-        est_video_bytes=$(( src_size / 1000 * ratio / 1000 * preset_mult ))
+        est_video_bytes=$(( src_size * ratio * preset_mult / 1000 / 1000 ))
       fi
     fi
   fi

@@ -5838,17 +5838,17 @@ _test_unit_av1_resolution_crf() {
   }
 
   # av1-hq: base 28 (≤1080p SDR) → 24 (≥4K or HDR); an explicit --crf wins.
-  [[ "$(_av1crf av1-hq 1920 1080 SDR 0 28)"   == 28 ]] && pass "av1-hq 1080p SDR → base CRF 28"           || fail "av1-hq 1080p SDR → expected 28, got $(_av1crf av1-hq 1920 1080 SDR 0 28)"
-  [[ "$(_av1crf av1-hq 3840 2160 SDR 0 28)"   == 24 ]] && pass "av1-hq 4K → CRF 24 (AV1_HQ_HDR_CRF)"       || fail "av1-hq 4K → expected 24, got $(_av1crf av1-hq 3840 2160 SDR 0 28)"
-  [[ "$(_av1crf av1-hq 1920 1080 HDR10 0 28)" == 24 ]] && pass "av1-hq 1080p HDR → CRF 24 (HDR trigger)"   || fail "av1-hq 1080p HDR → expected 24, got $(_av1crf av1-hq 1920 1080 HDR10 0 28)"
-  [[ "$(_av1crf av1-hq 3840 2160 SDR 1 30)"   == 30 ]] && pass "av1-hq 4K + explicit --crf 30 wins"        || fail "av1-hq 4K + --crf → expected 30, got $(_av1crf av1-hq 3840 2160 SDR 1 30)"
+  if [[ "$(_av1crf av1-hq 1920 1080 SDR 0 28)" == 28 ]]; then pass "av1-hq 1080p SDR → base CRF 28"; else fail "av1-hq 1080p SDR → expected 28, got $(_av1crf av1-hq 1920 1080 SDR 0 28)"; fi
+  if [[ "$(_av1crf av1-hq 3840 2160 SDR 0 28)" == 24 ]]; then pass "av1-hq 4K → CRF 24 (AV1_HQ_HDR_CRF)"; else fail "av1-hq 4K → expected 24, got $(_av1crf av1-hq 3840 2160 SDR 0 28)"; fi
+  if [[ "$(_av1crf av1-hq 1920 1080 HDR10 0 28)" == 24 ]]; then pass "av1-hq 1080p HDR → CRF 24 (HDR trigger)"; else fail "av1-hq 1080p HDR → expected 24, got $(_av1crf av1-hq 1920 1080 HDR10 0 28)"; fi
+  if [[ "$(_av1crf av1-hq 3840 2160 SDR 1 30)" == 30 ]]; then pass "av1-hq 4K + explicit --crf 30 wins"; else fail "av1-hq 4K + --crf → expected 30, got $(_av1crf av1-hq 3840 2160 SDR 1 30)"; fi
 
   # streaming-av1: base 30 → 28 for ≥4K/HDR (behavior unchanged by the refactor).
-  [[ "$(_av1crf streaming-av1 3840 2160 SDR 0 30)" == 28 ]] && pass "streaming-av1 4K → CRF 28 (unchanged)"    || fail "streaming-av1 4K → expected 28, got $(_av1crf streaming-av1 3840 2160 SDR 0 30)"
-  [[ "$(_av1crf streaming-av1 1920 1080 SDR 0 30)" == 30 ]] && pass "streaming-av1 1080p SDR → keeps CRF 30"   || fail "streaming-av1 1080p SDR → expected 30, got $(_av1crf streaming-av1 1920 1080 SDR 0 30)"
+  if [[ "$(_av1crf streaming-av1 3840 2160 SDR 0 30)" == 28 ]]; then pass "streaming-av1 4K → CRF 28 (unchanged)"; else fail "streaming-av1 4K → expected 28, got $(_av1crf streaming-av1 3840 2160 SDR 0 30)"; fi
+  if [[ "$(_av1crf streaming-av1 1920 1080 SDR 0 30)" == 30 ]]; then pass "streaming-av1 1080p SDR → keeps CRF 30"; else fail "streaming-av1 1080p SDR → expected 30, got $(_av1crf streaming-av1 1920 1080 SDR 0 30)"; fi
 
   # Non-AV1 profile: the helper is a no-op (leaves CRF untouched).
-  [[ "$(_av1crf animation 3840 2160 SDR 0 16)" == 16 ]] && pass "non-AV1 profile → helper no-op"  || fail "non-AV1 profile → expected 16, got $(_av1crf animation 3840 2160 SDR 0 16)"
+  if [[ "$(_av1crf animation 3840 2160 SDR 0 16)" == 16 ]]; then pass "non-AV1 profile → helper no-op"; else fail "non-AV1 profile → expected 16, got $(_av1crf animation 3840 2160 SDR 0 16)"; fi
 
   unset -f _av1crf
 }
@@ -5880,50 +5880,50 @@ _test_unit_ignored_knobs() {
 
   # ---- C1–C4: VideoToolbox ignores the x265/x264 software knobs ----
   out="$(_wik 'HW_ACCEL_RESOLVED=videotoolbox; _CLI_CRF_EXPLICIT=1')"
-  _has 'VideoToolbox.*-q:v.*--crf 18 is ignored' "$out" && pass "C1: VT + --crf → warns -q:v" || fail "C1: expected --crf-ignored warning, got: $out"
+  if _has 'VideoToolbox.*-q:v.*--crf 18 is ignored' "$out"; then pass "C1: VT + --crf → warns -q:v"; else fail "C1: expected --crf-ignored warning, got: $out"; fi
 
   out="$(_wik 'HW_ACCEL_RESOLVED=videotoolbox; VIDEO_CODEC=libx264; _CLI_PRESET_EXPLICIT=1; PRESET_VALUE=slow')"
-  _has 'does not accept x265/x264 presets.*--preset slow' "$out" && pass "C2: VT + --preset → warns preset ignored" || fail "C2: expected --preset-ignored warning, got: $out"
+  if _has 'does not accept x265/x264 presets.*--preset slow' "$out"; then pass "C2: VT + --preset → warns preset ignored"; else fail "C2: expected --preset-ignored warning, got: $out"; fi
 
   out="$(_wik 'HW_ACCEL_RESOLVED=videotoolbox; _CLI_X265_PARAMS_EXPLICIT=1')"
-  _has 'does not accept --x265-params' "$out" && pass "C3: VT + libx265 + --x265-params → warns" || fail "C3: expected --x265-params-ignored warning, got: $out"
+  if _has 'does not accept --x265-params' "$out"; then pass "C3: VT + libx265 + --x265-params → warns"; else fail "C3: expected --x265-params-ignored warning, got: $out"; fi
 
   out="$(_wik 'HW_ACCEL_RESOLVED=videotoolbox; VIDEO_CODEC=libx264; _CLI_X264_PARAMS_EXPLICIT=1')"
-  _has 'honors only profile=high from --x264-params' "$out" && pass "C4: VT + libx264 + --x264-params → warns" || fail "C4: expected --x264-params-ignored warning, got: $out"
+  if _has 'honors only profile=high from --x264-params' "$out"; then pass "C4: VT + libx264 + --x264-params → warns"; else fail "C4: expected --x264-params-ignored warning, got: $out"; fi
 
   # C1–C4 negatives: not explicit, or software backend → no warning.
   out="$(_wik 'HW_ACCEL_RESOLVED=videotoolbox; _CLI_CRF_EXPLICIT=0')"
-  _has 'q:v' "$out" && fail "C1 neg: warned even though --crf not explicit" || pass "C1 neg: profile/default --crf does not warn under VT"
+  if _has 'q:v' "$out"; then fail "C1 neg: warned even though --crf not explicit"; else pass "C1 neg: profile/default --crf does not warn under VT"; fi
   out="$(_wik 'HW_ACCEL_RESOLVED=none; _CLI_X265_PARAMS_EXPLICIT=1')"
-  [[ -z "$out" ]] && pass "C3 neg: software backend honors --x265-params (no warning)" || fail "C3 neg: unexpected warning on software backend: $out"
+  if [[ -z "$out" ]]; then pass "C3 neg: software backend honors --x265-params (no warning)"; else fail "C3 neg: unexpected warning on software backend: $out"; fi
 
   # ---- C5: --hw-accel-quality only affects hardware encoders ----
   out="$(_wik '_CLI_HW_ACCEL_QUALITY_EXPLICIT=1; HW_ACCEL_RESOLVED=none')"
-  _has 'hw-accel-quality has no effect' "$out" && pass "C5: --hw-accel-quality + no HW backend → warns" || fail "C5: expected hw-accel-quality warning, got: $out"
+  if _has 'hw-accel-quality has no effect' "$out"; then pass "C5: --hw-accel-quality + no HW backend → warns"; else fail "C5: expected hw-accel-quality warning, got: $out"; fi
   out="$(_wik '_CLI_HW_ACCEL_QUALITY_EXPLICIT=1; HW_ACCEL_RESOLVED=videotoolbox')"
-  _has 'hw-accel-quality has no effect' "$out" && fail "C5 neg: warned even with a HW backend" || pass "C5 neg: --hw-accel-quality with HW backend does not warn"
+  if _has 'hw-accel-quality has no effect' "$out"; then fail "C5 neg: warned even with a HW backend"; else pass "C5 neg: --hw-accel-quality with HW backend does not warn"; fi
 
   # ---- C7: --av1-params / --av1-maxrate / --av1-bufsize only for AV1 ----
   out="$(_wik '_CLI_AV1_PARAMS_EXPLICIT=1')"   # codec libx265
-  _has 'av1-params.*apply only to AV1' "$out" && pass "C7: --av1-params on non-AV1 → warns" || fail "C7: expected av1-params warning, got: $out"
+  if _has 'av1-params.*apply only to AV1' "$out"; then pass "C7: --av1-params on non-AV1 → warns"; else fail "C7: expected av1-params warning, got: $out"; fi
   out="$(_wik 'AV1_MAXRATE=8000k')"
-  _has 'apply only to AV1' "$out" && pass "C7: --av1-maxrate on non-AV1 → warns" || fail "C7: expected av1 rate warning, got: $out"
+  if _has 'apply only to AV1' "$out"; then pass "C7: --av1-maxrate on non-AV1 → warns"; else fail "C7: expected av1 rate warning, got: $out"; fi
   out="$(_wik 'VIDEO_CODEC=libsvt-av1; _CLI_AV1_PARAMS_EXPLICIT=1')"
-  _has 'apply only to AV1' "$out" && fail "C7 neg: warned for an AV1 codec" || pass "C7 neg: --av1-params honored on AV1 (no warning)"
+  if _has 'apply only to AV1' "$out"; then fail "C7 neg: warned for an AV1 codec"; else pass "C7 neg: --av1-params honored on AV1 (no warning)"; fi
 
   # ---- C8: --x265-params / --x264-params only for their own codec ----
   out="$(_wik 'VIDEO_CODEC=libx264; _CLI_X265_PARAMS_EXPLICIT=1')"
-  _has 'x265-params applies only to the libx265' "$out" && pass "C8: --x265-params on libx264 → warns" || fail "C8: expected x265-params codec warning, got: $out"
+  if _has 'x265-params applies only to the libx265' "$out"; then pass "C8: --x265-params on libx264 → warns"; else fail "C8: expected x265-params codec warning, got: $out"; fi
   out="$(_wik 'VIDEO_CODEC=libsvt-av1; _CLI_X264_PARAMS_EXPLICIT=1')"
-  _has 'x264-params applies only to the libx264' "$out" && pass "C8: --x264-params on non-libx264 → warns" || fail "C8: expected x264-params codec warning, got: $out"
+  if _has 'x264-params applies only to the libx264' "$out"; then pass "C8: --x264-params on non-libx264 → warns"; else fail "C8: expected x264-params codec warning, got: $out"; fi
   out="$(_wik '_CLI_X265_PARAMS_EXPLICIT=1')"   # codec libx265 (matches)
-  _has 'x265-params applies only' "$out" && fail "C8 neg: warned when codec matches" || pass "C8 neg: --x265-params on libx265 honored (no warning)"
+  if _has 'x265-params applies only' "$out"; then fail "C8 neg: warned when codec matches"; else pass "C8 neg: --x265-params on libx265 honored (no warning)"; fi
 
   # ---- C9: --level has no effect on AV1 ----
   out="$(_wik 'VIDEO_CODEC=libsvt-av1; _CLI_LEVEL_EXPLICIT=1')"
-  _has 'level has no effect on AV1' "$out" && pass "C9: --level on AV1 → warns" || fail "C9: expected level warning, got: $out"
+  if _has 'level has no effect on AV1' "$out"; then pass "C9: --level on AV1 → warns"; else fail "C9: expected level warning, got: $out"; fi
   out="$(_wik '_CLI_LEVEL_EXPLICIT=1')"   # libx265, level honored
-  _has 'level has no effect' "$out" && fail "C9 neg: warned on a non-AV1 codec" || pass "C9 neg: --level on libx265 honored (no warning)"
+  if _has 'level has no effect' "$out"; then fail "C9 neg: warned on a non-AV1 codec"; else pass "C9 neg: --level on libx265 honored (no warning)"; fi
 
   unset -f _wik _has
 }
@@ -5948,23 +5948,33 @@ _test_unit_h264_drops_dv() {
   local out
 
   out="$(_wddv 'VIDEO_CODEC=libx264; IS_DV=1; DISABLE_DV=0')"
-  echo "$out" | grep -qi "H.264 cannot carry Dolby Vision" \
-    && pass "C6: libx264 + DV source + DV enabled → warns" \
-    || fail "C6: expected DV-dropped warning, got: $out"
+  if echo "$out" | grep -qi "H.264 cannot carry Dolby Vision"; then
+    pass "C6: libx264 + DV source + DV enabled → warns"
+  else
+    fail "C6: expected DV-dropped warning, got: $out"
+  fi
 
   # Negatives: --no-dv (DISABLE_DV=1), non-DV source, and DV-capable codecs must stay quiet.
-  [[ -z "$(_wddv 'VIDEO_CODEC=libx264; IS_DV=1; DISABLE_DV=1')" ]] \
-    && pass "C6 neg: libx264 + DV + --no-dv → no warning (deliberate opt-out)" \
-    || fail "C6 neg: warned despite DISABLE_DV=1"
-  [[ -z "$(_wddv 'VIDEO_CODEC=libx264; IS_DV=0; DISABLE_DV=0')" ]] \
-    && pass "C6 neg: libx264 + non-DV source → no warning" \
-    || fail "C6 neg: warned on a non-DV source"
-  [[ -z "$(_wddv 'VIDEO_CODEC=libx265; IS_DV=1; DISABLE_DV=0')" ]] \
-    && pass "C6 neg: libx265 + DV → no warning (HEVC carries DV)" \
-    || fail "C6 neg: warned for libx265"
-  [[ -z "$(_wddv 'VIDEO_CODEC=libsvt-av1; IS_DV=1; DISABLE_DV=0')" ]] \
-    && pass "C6 neg: libsvt-av1 + DV → no C6 warning (AV1+DV handled upstream)" \
-    || fail "C6 neg: C6 warned for AV1 (should be handled by the upstream AV1+DV path)"
+  if [[ -z "$(_wddv 'VIDEO_CODEC=libx264; IS_DV=1; DISABLE_DV=1')" ]]; then
+    pass "C6 neg: libx264 + DV + --no-dv → no warning (deliberate opt-out)"
+  else
+    fail "C6 neg: warned despite DISABLE_DV=1"
+  fi
+  if [[ -z "$(_wddv 'VIDEO_CODEC=libx264; IS_DV=0; DISABLE_DV=0')" ]]; then
+    pass "C6 neg: libx264 + non-DV source → no warning"
+  else
+    fail "C6 neg: warned on a non-DV source"
+  fi
+  if [[ -z "$(_wddv 'VIDEO_CODEC=libx265; IS_DV=1; DISABLE_DV=0')" ]]; then
+    pass "C6 neg: libx265 + DV → no warning (HEVC carries DV)"
+  else
+    fail "C6 neg: warned for libx265"
+  fi
+  if [[ -z "$(_wddv 'VIDEO_CODEC=libsvt-av1; IS_DV=1; DISABLE_DV=0')" ]]; then
+    pass "C6 neg: libsvt-av1 + DV → no C6 warning (AV1+DV handled upstream)"
+  else
+    fail "C6 neg: C6 warned for AV1 (should be handled by the upstream AV1+DV path)"
+  fi
 
   unset -f _wddv
 }
