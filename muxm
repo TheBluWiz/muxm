@@ -1580,7 +1580,7 @@ _man_target_dir(){
 # <<< embedded man page >>>
 _man_emit(){
   sed "s/__VERSION__/$VERSION/" <<'MANPAGE_EOF'
-.TH MUXM 1 "2026-04-11" "MuxMaster __VERSION__" "User Commands"
+.TH MUXM 1 "2026-04-11" "MuxMaster v__VERSION__" "User Commands"
 .SH NAME
 muxm \- Universal AV1/DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
@@ -1632,9 +1632,10 @@ independent and self\-contained).
 Available profiles:
 .TP
 .B archive
-Remux\-first archival. DV + HDR10, multi\-track, copy only. Passthrough container
-(MKV sources stay MKV, MP4 sources stay MP4). Commentary/descriptive audio tracks
-dropped by default.
+Remux\-first archival. DV + HDR10, multi\-track, copy only. Always outputs MKV \(em
+the only container that holds TrueHD/DTS\-HD MA, PGS/VobSub, and native ASS/SSA
+losslessly, so any source container is preserved without conversion.
+Commentary/descriptive audio tracks dropped by default.
 Audio filterable via
 .BR AUDIO_LANG_PREF " and " AUDIO_KEEP_COMMENTARY ;
 subtitles filterable via
@@ -1725,6 +1726,11 @@ target directory is not writable. Detects Homebrew prefix automatically.
 .BR \-\-uninstall\-man
 Remove the installed manual page.
 .TP
+.BR \-\-emit\-man
+Write this manual page's roff source to standard output and exit. This is the
+single source of truth for the page; \fItools/gen\-docs.sh\fR uses it to
+regenerate \fIdocs/muxm.1\fR.
+.TP
 .BR \-\-install\-completions
 Install bash/zsh tab\-completion to \fI~/.muxm/\fR and add a
 \fBsource\fR line to the user's shell RC files
@@ -1773,11 +1779,13 @@ Video quality CRF (lower = higher quality). Typical: 16\(en22.
 .BR \-p ", " \-\-preset " " \fINAME\fR
 Encoder preset: ultrafast \fIto\fR placebo. Default: slower.
 .TP
-.BR \-\-video\-codec " " libx265|libx264|libsvt-av1|libaom-av1
-Video encoder. Default: libx265. Use \fBlibsvt-av1\fR or \fBlibaom-av1\fR for AV1 output.
+.BR \-\-video\-codec " " libx265|libx264|libsvt\-av1|libaom\-av1
+Video encoder. Default: libx265 (HEVC). Use \fBlibsvt\-av1\fR for SVT\-AV1
+or \fBlibaom\-av1\fR for libaom AV1.
 .TP
 .BR \-l ", " \-\-level " " \fIN\fR
-x265 level\-idc (e.g., 5.1). Ignored for AV1 codecs.
+x265 level\-idc (e.g., 5.1). Not applied for AV1 codecs — AV1 level
+selection is handled by the encoder automatically.
 .TP
 .BR \-\-x265\-params " " \fISTR\fR
 Advanced x265 parameter string.
@@ -1789,14 +1797,17 @@ profile; e.g.,
 .BR "profile=high:rc-lookahead=60:aq-mode=2:aq-strength=1.0" ).
 .TP
 .BR \-\-av1\-params " " \fISTR\fR
-Advanced AV1 parameter string passed to \fB\-svtav1\-params\fR. Colon-separated key=value pairs
-(e.g., \fBfilm-grain=0:enable-overlays=1:scd=1\fR). Only used with \fBlibsvt-av1\fR.
+SVT\-AV1 parameter string passed via \fB\-svtav1\-params\fR. Colon\-separated
+key=value pairs (e.g., \fBfilm\-grain=0:enable\-overlays=1:scd=1\fR).
+Only used when \fB\-\-video\-codec libsvt\-av1\fR is selected.
 .TP
 .BR \-\-av1\-maxrate " " \fIRATE\fR
-Optional maximum bitrate for AV1 VBV-style rate control (e.g., \fB20000k\fR).
+Optional peak bitrate cap for AV1 encodes (e.g., \fB20000k\fR). Passed
+as \fB\-maxrate\fR to ffmpeg. Leave empty (default) for unconstrained CRF.
 .TP
 .BR \-\-av1\-bufsize " " \fISIZE\fR
-Optional VBV buffer size for AV1 rate control (e.g., \fB40000k\fR).
+VBV buffer size for AV1 rate control (e.g., \fB40000k\fR). Passed as
+\fB\-bufsize\fR to ffmpeg. Typically set together with \fB\-\-av1\-maxrate\fR.
 .TP
 .BR \-\-tonemap " , " \-\-no\-tonemap
 Enable/disable HDR/HLG to SDR tone\-mapping.
@@ -2007,6 +2018,21 @@ The
 .B animation
 profile enables this by default.
 .TP
+.BR \-\-sub\-preserve\-bitmap " , " \-\-no\-sub\-preserve\-bitmap
+Preserve/discard PGS bitmap subtitles via stream\-copy when the output
+container supports them (MKV).
+When enabled (the default), PGS tracks are stream\-copied as\-is into
+MKV output with no OCR; the
+.B copy
+codec is used for the subtitle stream.
+When disabled, PGS tracks follow the normal OCR pipeline
+.RB ( \-\-no\-ocr
+or missing OCR tool will skip them entirely).
+Has no effect for MP4/MOV output (PGS cannot be carried in those
+containers) and is ignored when
+.B \-\-sub\-burn\-forced
+is active.
+.TP
 .BR \-\-ocr\-tool " " \fITOOL\fR
 OCR backend: pgsrip or sub2srt.
 .TP
@@ -2142,8 +2168,11 @@ filters as a cap). Defaults to 99 for
 6 for
 .BR animation " and " atv\-directplay\-animation .
 .PP
-Bitmap subtitles (PGS, VobSub) that cannot be muxed into the target
-container (e.g., PGS into MP4) are silently skipped.
+In multi\-track mode, a kept stream the target container cannot hold
+losslessly \(em a bitmap subtitle (PGS, VobSub), styled ASS/SSA into
+MP4/MOV, or lossless HD audio (TrueHD, DTS\-HD MA) into MP4/MOV \(em is a
+hard error before the encode starts, recommending
+.BR \-\-output\-ext " " mkv .
 .BR archive ", " animation ", and " atv\-directplay\-animation
 use MKV (or passthrough MKV), which handles all subtitle formats.
 .PP
@@ -2194,7 +2223,34 @@ sidecar files that need muxing in.
 Generate/suppress JSON report alongside output.
 .TP
 .BR \-\-checksum " , " \-\-no\-checksum
-Write/suppress SHA\-256 checksum for final output.
+Write/suppress a checksum sidecar for the final output.
+The algorithm is controlled by
+.BR \-\-checksum\-algo .
+.TP
+.BR \-\-checksum\-algo " \fIalgo\fR"
+Select the checksum algorithm.
+Allowed values:
+.BR sha256
+(default — writes a
+.I .sha256
+sidecar using
+.B sha256sum
+or
+.BR "shasum \-a 256" ),
+.BR blake2b
+(writes a
+.I .b2
+sidecar using
+.BR b2sum ),
+and
+.BR auto
+(prefers
+.B b2sum
+if available, falls back to sha256).
+Specifying
+.B \-\-checksum\-algo
+implies
+.BR \-\-checksum .
 .TP
 .BR \-\-disk\-check " , " \-\-no\-disk\-check
 Enable/disable the smart disk\-space preflight (default: on).
@@ -2420,7 +2476,7 @@ On Linux, \fB\-\-hw\-accel\fR is accepted but encoding always runs in software.
 .TP
 .B Audio
 .BR AUDIO_LANG_PREF ", " AUDIO_CODEC_PREFERENCE ", "
-.BR AUDIO_TRACK_OVERRIDE ", " AUDIO_FORCE_CODEC ", "
+.BR AUDIO_TRACK_OVERRIDE ", " AUDIO_FORCE_CODEC ", " AUDIO_FORCE_BITRATE ", "
 .BR MAX_AUDIO_CHANNELS ", " ADD_STEREO_IF_MULTICH ", " AUDIO_PREFER_STEREO ", "
 .BR STEREO_BITRATE ", " EAC3_BITRATE_5_1 ", " EAC3_BITRATE_7_1 ", "
 .BR AUDIO_LOSSLESS_PASSTHROUGH ", " INCLUDE_AUDIO_TITLES .
@@ -2436,6 +2492,7 @@ On Linux, \fB\-\-hw\-accel\fR is accepted but encoding always runs in software.
 .BR SUB_LANG_PREF ", " SUB_INCLUDE_FORCED ", " SUB_INCLUDE_FULL ", "
 .BR SUB_INCLUDE_SDH ", " SUB_MAX_TRACKS ", " SUB_BURN_FORCED ", "
 .BR SUB_EXPORT_EXTERNAL ", " SUB_PRESERVE_TEXT_FORMAT ", "
+.BR SUB_PRESERVE_BITMAP ", "
 .BR SUB_ENABLE_OCR ", " SUB_OCR_TOOL ", "
 .BR SUB_OCR_LANG .
 .TP
@@ -2470,11 +2527,11 @@ Base x264 parameter string for H.264 encodes. Appended to the ffmpeg
 Default: empty.
 .TP
 .B SVT_AV1_PARAMS_BASE
-Base SVT-AV1 parameter string for AV1 encodes (\fBlibsvt-av1\fR). Passed via
-\fB\-svtav1\-params\fR. Default: \fBfilm-grain=0:enable-overlays=1:scd=1\fR.
+Base SVT\-AV1 parameter string for AV1 encodes (\fBlibsvt\-av1\fR). Passed via
+\fB\-svtav1\-params\fR. Default: \fBfilm\-grain=0:enable\-overlays=1:scd=1\fR.
 .TP
 .B AV1_MAXRATE
-Optional maximum bitrate for AV1 VBV-style rate control. Example: \fB20000k\fR.
+Optional maximum bitrate for AV1 VBV\-style rate control. Example: \fB20000k\fR.
 Default: empty (no VBV).
 .TP
 .B AV1_BUFSIZE
@@ -2653,10 +2710,11 @@ _uninstall_man(){
   exit 0
 }
 
-# Pre-scan for --install-man / --uninstall-man
+# Pre-scan for --emit-man / --install-man / --uninstall-man
 for _arg in "$@"; do
   [[ "$_arg" == "--" ]] && break   # end-of-options: a flag after -- is a positional
   case "$_arg" in
+    --emit-man)      _man_emit; exit 0 ;;   # emit roff man source to stdout (single source of truth; used by tools/gen-docs.sh)
     --install-man)   _install_man ;;
     --uninstall-man) _uninstall_man ;;
   esac

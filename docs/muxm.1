@@ -1,3 +1,9 @@
+.\" ============================================================================
+.\" GENERATED FILE — do not edit.
+.\" This page is generated from the embedded man-page heredoc in `muxm`
+.\" (emitted by `muxm --emit-man`). To change it, edit that heredoc and
+.\" regenerate with tools/gen-docs.sh. Hand edits here will be overwritten.
+.\" ============================================================================
 .TH MUXM 1 "2026-04-11" "MuxMaster v1.4.0" "User Commands"
 .SH NAME
 muxm \- Universal AV1/DV/HLG/HDR10/SDR video encoder/muxer with format profiles
@@ -143,6 +149,11 @@ target directory is not writable. Detects Homebrew prefix automatically.
 .TP
 .BR \-\-uninstall\-man
 Remove the installed manual page.
+.TP
+.BR \-\-emit\-man
+Write this manual page's roff source to standard output and exit. This is the
+single source of truth for the page; \fItools/gen\-docs.sh\fR uses it to
+regenerate \fIdocs/muxm.1\fR.
 .TP
 .BR \-\-install\-completions
 Install bash/zsh tab\-completion to \fI~/.muxm/\fR and add a
@@ -774,7 +785,7 @@ High\-quality AV1 encode via SVT\-AV1. CRF 20, lossless audio, HDR10
 preserved. MKV output. Requires ffmpeg built with SVT\-AV1 support.
 .TP
 .B muxm \-\-profile streaming\-av1 Movie.mkv
-AV1 streaming encode. CRF 30, Opus surround, MP4.
+AV1 streaming encode. CRF 30/28 (resolution\-aware), Opus surround, MP4.
 Smaller files than streaming\-hevc on AV1\-capable clients.
 .TP
 .B muxm \-\-dry\-run \-\-profile streaming\-hevc Movie.mkv
@@ -870,11 +881,19 @@ commented with their defaults.
 Major variable groups:
 .TP
 .B Video
-.BR CRF_VALUE ", " PRESET_VALUE ", " VIDEO_CODEC ", " X265_PARAMS_BASE ", " X264_PARAMS_BASE ", "
+.BR CRF_VALUE ", " PRESET_VALUE ", " VIDEO_CODEC ", " X265_PARAMS_BASE ", " X264_PARAMS_BASE ", " SVT_AV1_PARAMS_BASE ", "
 .BR LEVEL_VALUE ", " CONSERVATIVE_VBV ", " FORCE_CHROMA_420 ", "
 .BR SDR_USE_10BIT_IF_SRC_10BIT ", " SDR_FORCE_10BIT ", "
 .BR HDR_TARGET_PIXFMT ", " MAX_COPY_BITRATE ", "
 .BR TONEMAP_HDR_TO_SDR ", " TONEMAP_FILTER .
+.TP
+.B Hardware acceleration (macOS VideoToolbox only)
+.BR HW_ACCEL " (none | auto | videotoolbox | nvenc; default: none),"
+.BR HW_ACCEL_QUALITY " (0\(en100; quality knob for VT/NVENC),"
+.BR HW_ACCEL_ALLOW_SW " (1 = allow software fallback; 0 = hard\-fail)."
+.br
+Hardware acceleration is supported on \fBmacOS\fR (Apple VideoToolbox) only.
+On Linux, \fB\-\-hw\-accel\fR is accepted but encoding always runs in software.
 .TP
 .B Dolby Vision
 .BR DISABLE_DV ", " ALLOW_DV_FALLBACK ", " DV_CONVERT_TO_P81_IF_FAIL .
@@ -929,6 +948,18 @@ Major variable groups:
 .B X264_PARAMS_BASE
 Base x264 parameter string for H.264 encodes. Appended to the ffmpeg
 \fB\-x264\-params\fR flag. Used by the \fByoutube\-upload\fR profile.
+Default: empty.
+.TP
+.B SVT_AV1_PARAMS_BASE
+Base SVT\-AV1 parameter string for AV1 encodes (\fBlibsvt\-av1\fR). Passed via
+\fB\-svtav1\-params\fR. Default: \fBfilm\-grain=0:enable\-overlays=1:scd=1\fR.
+.TP
+.B AV1_MAXRATE
+Optional maximum bitrate for AV1 VBV\-style rate control. Example: \fB20000k\fR.
+Default: empty (no VBV).
+.TP
+.B AV1_BUFSIZE
+Optional VBV buffer size for AV1 rate control. Example: \fB40000k\fR.
 Default: empty.
 .PP
 Use

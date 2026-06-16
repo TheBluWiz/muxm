@@ -70,6 +70,7 @@ show_help() {
       unit          Pure unit tests (helpers, codec maps, heuristics)
       completions   Tab-completion installer/uninstaller
       setup         --install-dependencies, --install-man, etc.
+      docs          Man-page parity (docs/muxm.1 vs muxm --emit-man)
 
     Medium (core fixture only, ~5s):
       cli           CLI parsing, --help, --version, error codes
@@ -8026,6 +8027,29 @@ test_dv_vt() {
   fi
 }
 
+# ---- Suite: docs (man-page parity) ----
+# Verifies docs/muxm.1 is in sync with the embedded man page in muxm (the
+# single source of truth, emitted by `muxm --emit-man`). Delegates to the
+# standalone tests/test_docs_parity.sh so the logic lives in one place; here
+# we just translate its exit code into the harness pass/fail counters.
+# Needs no media fixtures (see MEDIA_FREE_SUITES).
+test_docs_parity() {
+  section "Suite: docs (man-page parity)"
+  local tests_dir script
+  tests_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  script="${tests_dir}/test_docs_parity.sh"
+  if [[ ! -x "$script" ]]; then
+    fail "docs parity: tests/test_docs_parity.sh not found or not executable ($script)"
+    return
+  fi
+  # The standalone script prints its own ✅/❌ detail (and the diff on failure).
+  if "$script"; then
+    pass "docs/muxm.1 in sync with muxm embedded man page"
+  else
+    fail "docs/muxm.1 OUT OF SYNC with muxm heredoc — run tools/gen-docs.sh and commit"
+  fi
+}
+
 # ---- Run Suites ----
 # NOTE: Suite names are listed in three places that must stay in sync:
 #   1. File header comment (top of file)
@@ -8072,6 +8096,7 @@ run_suites() {
       run_suite_tracked multi_profile test_multi_profile
       run_suite_tracked regression_p5 test_regression_p5
       run_suite_tracked dv_vt         test_dv_vt
+      run_suite_tracked docs          test_docs_parity
       ;;
     cli)           test_cli ;;
     toggles)       test_toggles ;;
@@ -8097,6 +8122,7 @@ run_suites() {
     multi_profile)   test_multi_profile ;;
     regression_p5)   test_regression_p5 ;;
     dv_vt)           test_dv_vt ;;
+    docs)            test_docs_parity ;;
     *)
       echo "Unknown suite: $SUITE (run with --help to see available suites)"
       exit 1
@@ -8164,7 +8190,7 @@ summary() {
 # dv_vt is "media-free" only in the sense that it generates NO synthetic fixtures — it
 # either SKIPs (default) or encodes a real DV source supplied via MUXM_DV_FIXTURE, so it
 # needs none of the generated clips.
-readonly MEDIA_FREE_SUITES="^(toggles|completions|setup|config|profiles|conflicts|hw_accel|unit|dv_vt)$"
+readonly MEDIA_FREE_SUITES="^(toggles|completions|setup|config|profiles|conflicts|hw_accel|unit|dv_vt|docs)$"
 readonly EXTENDED_SUITES="^(collision|dryrun|video|hdr|audio|subs|ext_subs|output|containers|metadata|edge|e2e|multi_profile|regression_p5|all)$"
 
 auto_cleanup_test_dirs
