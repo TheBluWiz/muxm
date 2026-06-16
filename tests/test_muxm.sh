@@ -22,6 +22,11 @@ SUITE="${SUITE:-all}"
 # never diverge. Honors $TMPDIR (macOS sets a per-user dir under /var/folders);
 # trailing slash stripped so globs don't produce "//".
 TMP_BASE="${TMPDIR:-/tmp}"; TMP_BASE="${TMP_BASE%/}"
+# Per-run lock file written inside each run's $TESTDIR, naming the owning PID.
+# Cleanup (auto_cleanup_test_dirs / do_cleanup) treats a muxm-test.* dir as live
+# while that PID is still running, so a fresh run never deletes a concurrent
+# run's in-use directory. See _testdir_pid / _testdir_is_live.
+readonly TESTDIR_LOCK=".muxm-test.lock"
 VERBOSE=0
 TESTDIR=""
 PASS=0
@@ -101,6 +106,28 @@ EOF
 }
 
 # ---- Cleanup ----
+# _testdir_pid — Echo the PID recorded in a muxm-test.* dir's lock file, or
+# nothing if the dir has no (readable, numeric) lock. Reads only the first line.
+_testdir_pid() {
+  local pid
+  [[ -f "$1/$TESTDIR_LOCK" ]] || return 1
+  read -r pid < "$1/$TESTDIR_LOCK" 2>/dev/null || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$pid"
+}
+
+# _testdir_is_live — True when a muxm-test.* dir belongs to a run still in
+# progress, i.e. its lock file names a PID that is still alive. Dirs with no
+# lock (older harness, or a half-created dir) or a dead PID are treated as stale
+# and therefore removable. kill -0 only probes existence; it sends no signal.
+# Failure mode is deliberately conservative: a reused PID may keep a stale dir
+# around one extra cycle, but a live run's dir is never deleted.
+_testdir_is_live() {
+  local pid
+  pid="$(_testdir_pid "$1")" || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
 _cleanup_format_kb() {
   local kb=$1
   if (( kb >= 1048576 )); then
@@ -114,12 +141,22 @@ _cleanup_format_kb() {
 
 do_cleanup() {
   local tmpbase="$TMP_BASE"
-  local dirs=()
+  local dirs=() skipped=0
   for d in "$tmpbase"/muxm-test.*; do
-    [[ -d "$d" ]] && dirs+=("$d")
+    [[ -d "$d" ]] || continue
+    if _testdir_is_live "$d"; then
+      echo "Skipping $d (in use by PID $(_testdir_pid "$d"))"
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
+    dirs+=("$d")
   done
   if [[ ${#dirs[@]} -eq 0 ]]; then
-    echo "No muxm test directories found."
+    if [[ $skipped -gt 0 ]]; then
+      echo "No removable muxm test directories ($skipped in use)."
+    else
+      echo "No muxm test directories found."
+    fi
     exit 0
   fi
   local total_kb=0
@@ -145,7 +182,11 @@ auto_cleanup_test_dirs() {
   local tmpbase="$TMP_BASE"
   local dirs=()
   for d in "$tmpbase"/muxm-test.*; do
-    [[ -d "$d" ]] && dirs+=("$d")
+    [[ -d "$d" ]] || continue
+    # Never delete a directory owned by a still-running test instance — that is
+    # the race that wiped a concurrent run's $TESTDIR mid-suite.
+    _testdir_is_live "$d" && continue
+    dirs+=("$d")
   done
   if [[ ${#dirs[@]} -gt 0 ]]; then
     rm -rf "${dirs[@]}"
@@ -404,6 +445,9 @@ preflight() {
 
   # Create test directory
   TESTDIR="$(mktemp -d "$TMP_BASE/muxm-test.XXXXXXXX")"
+  # Claim this dir for the current run: record our PID so a concurrently-starting
+  # instance's auto_cleanup_test_dirs / do_cleanup skips it while we are alive.
+  printf '%s\n' "$$" > "$TESTDIR/$TESTDIR_LOCK"
   # Isolate HOME for the entire run so muxm never sources the developer's real
   # ~/.muxmrc (muxm sources $HOME/.muxmrc). Kept separate from the fixture dir so
   # muxm writing ~/.muxm (completions) doesn't litter $TESTDIR's media files.
