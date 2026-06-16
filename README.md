@@ -34,12 +34,12 @@ Configuration is where the design philosophy comes together. Most CLI tools expe
 
 ## Table of Contents
 
+- [Why MuxMaster?](#why-muxmaster)
 - [Format Profiles](#format-profiles)
 - [How It Works](#how-it-works)
 - [Installation](#installation)
   - [Upgrading](#upgrading)
 - [Usage](#usage)
-- [Why MuxMaster?](#why-muxmaster)
 - [Configuration](#configuration)
 - [Additional Features](#additional-features)
 - [FAQ](#faq)
@@ -288,7 +288,7 @@ muxm --install-completions
 
 # Generate a config file pre-filled with a profile's defaults
 muxm --create-config user atv-directplay-hq   # ~/.muxmrc
-muxm --create-config project streaming         # ./.muxmrc
+muxm --create-config project streaming-hevc    # ./.muxmrc
 
 # Remove installed components
 muxm --uninstall-man
@@ -365,8 +365,8 @@ muxm [options] <source> [target.mp4]
 **Multi-profile encoding:** Pass comma-separated profiles to encode the same source once per profile. Output filenames are auto-suffixed with the profile name, and each profile runs sequentially:
 
 ```bash
-muxm --profile youtube-upload,streaming source.mkv
-# → source.youtube-upload.mp4  source.streaming.mp4
+muxm --profile youtube-upload,streaming-hevc source.mkv
+# → source.youtube-upload.mp4  source.streaming-hevc.mp4
 ```
 
 **Output container inference:** When you provide an explicit output filename, `muxm` infers the container from its extension — `output.mkv` forces MKV regardless of the profile default.
@@ -425,6 +425,8 @@ muxm --create-config user atv-directplay-hq --crf 20 --preset medium
 
 See `man muxm` for the full list of 40+ supported override flags. Use `--force-create-config` to overwrite an existing file.
 
+See [`docs/config_profile.md`](docs/config_profile.md) for a per-profile reference of the exact variables each profile sets — a useful starting point when deciding what to override.
+
 ### Verifying Effective Configuration
 
 When configs cascade through multiple layers, it's easy to lose track of what's actually active. `--print-effective-config` resolves every layer and shows you the final result before anything is encoded:
@@ -445,6 +447,7 @@ Every variable is displayed grouped by section, with the active profile name and
 Beyond profiles and the core encoding pipeline, `muxm` ships with a set of operational features that make it safer and easier to use in practice:
 
 - **Skip-if-Ideal** – Before encoding, `muxm` inspects the source to determine if it already matches the target profile. If it does, the file is linked or copied without re-encoding, saving time and avoiding generation loss. When multi-track audio or subtitle modes are active, the ideal check verifies that every source track would survive the filter — if any would be dropped, the source is not ideal and remuxing proceeds with explicit per-stream maps. Enabled per-profile or via `--skip-if-ideal`.
+- **Hardware-Accelerated Encoding (macOS)** – On macOS, `--hw-accel videotoolbox` (or `auto`) offloads encoding to Apple's VideoToolbox for dramatically faster encodes, with `--hw-accel-quality` to tune the quality/speed trade-off. Software encoding stays the cross-platform default. See [`docs/HW_ACCEL.md`](docs/HW_ACCEL.md).
 - **Collision Handling** – When the derived output filename matches the source (e.g., encoding `movie.mp4` with the default `.mp4` extension), `muxm` auto-versions the output to `movie(1).mp4`, `movie(2).mp4`, etc. instead of failing. Use `--replace-source` for interactive in-place replacement or `--force-replace-source` for scripted workflows.
 - **Conflict Warnings** – Running `--profile archive --no-dv` doesn't error out — it warns you that the combination is contradictory and proceeds with your explicit flags taking precedence. Flags that are incompatible with multi-track modes (e.g., `--audio-track`, `--audio-force-codec`, `--sub-burn-forced`) trigger a graceful demotion: multi-track mode drops to single-track mode with an informational note, and the explicit CLI flag wins. The tool trusts you but lets you know when something looks wrong.
 - **Dry-Run Mode** – `--dry-run` executes the entire decision pipeline (profile resolution, codec detection, DV identification, audio selection) and prints what it would do, without writing any output files.
@@ -453,10 +456,10 @@ Beyond profiles and the core encoding pipeline, `muxm` ships with a set of opera
 - **External Subtitle Discovery** – At startup, `muxm` automatically scans for sidecar subtitle files alongside the source: `.srt`, `.ass`, `.ssa`, `.vtt`, `.sup`, and `.idx`. Common filename conventions are recognized — `movie.en.srt`, `movie.forced.en.srt`, and similar patterns — and discovered tracks are fed into the subtitle pipeline alongside embedded streams, subject to the same language and type filters already in effect. Enabled by default; use `--no-ext-subs` to opt out, or `--ext-subs-dir` to point at a different search directory. See `man muxm` for the full filename convention reference.
 - **Man Page** – A full `muxm(1)` manual page with complete flag reference, profile documentation, and examples, accessible via `man muxm`. See [Installation → Setup Helpers](#installation) for setup commands.
 - **Tab Completion** – bash/zsh tab completion for all flags, profiles, presets, and config scopes. Completes media file extensions when providing input files. See [Installation → Setup Helpers](#installation) for setup commands.
-- **Live Progress Bar** – During encoding, `muxm` displays a live progress bar showing percentage complete and elapsed time via Unicode block characters (▏▎▍▌▋▊▉█), updated in real-time through a named FIFO. A clean single-line indicator replaces the raw ffmpeg output and clears automatically when the encode finishes.
-- **Smart Disk Space Preflight** – Before starting an encode, `muxm` estimates the required output size from the source video bitrate, CRF value, codec, preset, and audio configuration using conservative CRF-to-ratio lookup tables with a 25% safety margin. Both the output volume and the temp volume (when on a separate device) are checked. If available space appears insufficient, the run is aborted early rather than failing mid-encode and leaving a partial file. Use `--no-disk-check` to disable, or set `DISK_CHECK=0` in `.muxmrc`.
-- **Signal Handling** – `muxm` catches `SIGINT` (Ctrl-C), `SIGTERM`, and `SIGHUP` and performs a clean shutdown: partial output files and temp files are removed, the named FIFO is cleaned up, and a brief summary is printed before exit. No stray temp files left behind.
-- **DEBUG=1 Trace Mode** – Set `DEBUG=1` in your environment (`DEBUG=1 muxm --profile streaming movie.mkv`) to enable verbose trace output. Every major decision point — profile resolution, codec detection, DV identification, stream selection — is logged to stderr, making it straightforward to diagnose unexpected behavior without modifying the script. Debug mode also traces jq metadata cache queries (filter expression, exit code, and result preview), which is useful for diagnosing probe failures or unexpected stream detection results.
+- **Live Progress Bar** – A clean single-line indicator shows percentage complete and elapsed time during encoding, replacing raw ffmpeg output and clearing itself when the encode finishes.
+- **Smart Disk Space Preflight** – Estimates the encoded output size before starting and aborts early if the output or temp volume lacks room, rather than failing mid-encode and leaving a partial file. Use `--no-disk-check` to disable (or set `DISK_CHECK=0` in `.muxmrc`); see `man muxm` for how the estimate is calculated.
+- **Signal Handling** – Interrupting a run (e.g. Ctrl-C) triggers a clean shutdown: partial output and temp files are removed and a brief summary is printed before exit. No stray temp files left behind.
+- **DEBUG=1 Trace Mode** – Set `DEBUG=1` in your environment (`DEBUG=1 muxm --profile streaming-hevc movie.mkv`) to log every major decision point — profile resolution, codec detection, DV identification, stream selection — to stderr, making unexpected behavior straightforward to diagnose without modifying the script.
 
 ---
 
