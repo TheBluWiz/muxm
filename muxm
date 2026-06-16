@@ -2173,8 +2173,10 @@ losslessly \(em a bitmap subtitle (PGS, VobSub), styled ASS/SSA into
 MP4/MOV, or lossless HD audio (TrueHD, DTS\-HD MA) into MP4/MOV \(em is a
 hard error before the encode starts, recommending
 .BR \-\-output\-ext " " mkv .
-.BR archive ", " animation ", and " atv\-directplay\-animation
-use MKV (or passthrough MKV), which handles all subtitle formats.
+.BR archive " and " animation " force MKV output;"
+.B atv\-directplay\-animation
+reaches MKV via container passthrough.
+MKV handles all subtitle formats.
 .PP
 Multi\-track subtitle mode is automatically demoted to single\-track if
 .B \-\-sub\-burn\-forced
@@ -2185,10 +2187,14 @@ forced track).
 .BR \-\-output\-ext " " \fIEXT\fR
 Output container: mp4|m4v|mov|mkv. Default: mp4.
 Profiles with container passthrough
-.RB ( archive ", " atv\-directplay\-hq ", " atv\-directplay\-animation )
+.RB ( atv\-directplay\-hq ", " atv\-directplay\-animation )
 set this to empty, deriving the output container from the source file extension
 (mkv\(->mkv, mp4\(->mp4, etc.).
 Sources with unsupported containers fall back to mkv.
+The
+.B archive
+profile instead forces MKV output (the only container that can hold its lossless
+HD audio and bitmap subtitles), so it never uses passthrough.
 .B \-\-output\-ext
 on the CLI always overrides passthrough resolution.
 .PP
@@ -2279,7 +2285,7 @@ Keep temporary workdir even on success.
 Keep temporary workdir on failure.
 .SH QUICK TEST OPTIONS
 .TP
-.BR \-\-skip\-video " , " \-\-skip\-audio " , " \-\-skip\-subs
+.BR \-\-skip\-audio " , " \-\-skip\-subs
 Disable respective pipelines (useful for quick tests).
 .SH FFMPEG OPTIONS
 .TP
@@ -2357,8 +2363,8 @@ HDR10 encode keeping lossless audio (TrueHD/DTS\-HD MA) passed through
 instead of transcoding.
 .TP
 .B muxm \-\-profile av1\-hq Movie.mkv
-High\-quality AV1 encode via SVT\-AV1. CRF 20, lossless audio, HDR10
-preserved. MKV output. Requires ffmpeg built with SVT\-AV1 support.
+High\-quality AV1 encode via SVT\-AV1. CRF 28/24 (resolution\-aware), lossless
+audio, HDR10 preserved. MKV output. Requires ffmpeg built with SVT\-AV1 support.
 .TP
 .B muxm \-\-profile streaming\-av1 Movie.mkv
 AV1 streaming encode. CRF 30/28 (resolution\-aware), Opus surround, MP4.
@@ -2414,8 +2420,7 @@ Video encode or Dolby Vision RPU extraction/validation failure (with fallback di
 DV RPU injection failure, intermediate file validation failure, or final mux failure.
 .TP
 .B 42
-Video pipeline structural error (e.g., \-\-skip\-video with no alternative, missing
-or corrupt encoded video stream).
+Video pipeline structural error (missing or corrupt encoded video stream).
 .TP
 .B 43
 Audio transcode or copy failure.
@@ -2790,7 +2795,7 @@ _muxm_completions() {
         local flags="
             -h --help -V --version
             --profile --dry-run --print-effective-config
-            --install-dependencies --install-man --uninstall-man
+            --install-dependencies --install-man --uninstall-man --emit-man
             --install-completions --uninstall-completions
             --setup
             --create-config --force-create-config
