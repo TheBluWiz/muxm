@@ -1,6 +1,6 @@
 # ![muxm](assets/muxm_header_small.png) MuxMaster
 
-[![Version](https://img.shields.io/badge/version-1.4.0-blue)](https://github.com/TheBluWiz/MuxMaster/releases)
+[![Version](https://img.shields.io/badge/version-1.5.0-blue)](https://github.com/TheBluWiz/MuxMaster/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#compatibility)
 [![License](https://img.shields.io/badge/license-freeware-green)](#license)
 
@@ -258,6 +258,56 @@ sudo cp muxm /usr/local/bin/muxm
 muxm --setup                     # installs dependencies, man page, and tab completion
 ```
 
+### Linux (from source)
+
+There's no Linux package yet — install the dependencies (native packages **or** Homebrew,
+both shown below), then follow [Manual Install](#manual-install-macoslinux) above to put
+`muxm` on your `PATH`.
+
+**Native packages (apt / dnf / pacman):**
+
+```bash
+# Core (required) — ffprobe ships inside the ffmpeg package on all three
+sudo apt install ffmpeg jq bc            # Debian / Ubuntu
+sudo dnf install ffmpeg jq bc            # Fedora / RHEL
+sudo pacman -S ffmpeg jq bc              # Arch
+
+# Optional — Dolby Vision muxing, subtitle OCR, subtitle burn-in (MP4Box ships in gpac)
+sudo apt install gpac tesseract-ocr               # Debian / Ubuntu
+sudo dnf install gpac tesseract                   # Fedora / RHEL
+sudo pacman -S gpac tesseract tesseract-data-eng  # Arch
+pipx install pgsrip                               # PGS → SRT OCR (all distros)
+```
+
+- **dovi_tool** (Dolby Vision RPU handling) is not in the Debian, Fedora, or Arch
+  repositories — install the prebuilt binary from its
+  [GitHub releases](https://github.com/quietvoid/dovi_tool/releases) (or the `dovi_tool`
+  AUR package on Arch). DV handling auto-disables if it is missing.
+- **libass + AV1:** `--sub-burn-forced` needs an ffmpeg built with libass, and the
+  `av1-hq` / `streaming-av1` profiles need an AV1 encoder (`libsvtav1` or `libaom-av1`).
+  Most distro `ffmpeg` builds include both — verify with `ffmpeg -version` (look for
+  `--enable-libass` and `--enable-libsvtav1`), or run `muxm --install-dependencies`, which
+  prints a per-tool advisory (with package names) on any Linux distro it can't auto-install for.
+
+**Homebrew (Linux) — convenience option:**
+
+[Homebrew runs on Linux too](https://brew.sh) and is the **simplest way to get `dovi_tool`** —
+the one optional dependency the native package managers above don't carry (homebrew-core ships
+prebuilt `dovi_tool` bottles for x86-64 and ARM64), so there's no GitHub-release or AUR step.
+It is a heavier footprint than native packages, so use it for convenience, not as a replacement
+for your distro's packages.
+
+```bash
+# 1. Install Homebrew on Linux — see https://brew.sh
+# 2. Add brew to your PATH — its installer prints the exact line; also add it to ~/.profile:
+eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+# 3. Install muxm's dependencies (gpac provides MP4Box; ffmpeg provides ffprobe):
+brew install ffmpeg jq bc gpac tesseract dovi_tool
+```
+
+`pgsrip` (the optional PGS-subtitle OCR helper) is a Python tool, so install it with
+`pipx install pgsrip` regardless of which route above you choose.
+
 ### Dependencies
 
 **Required:**
@@ -447,7 +497,7 @@ Every variable is displayed grouped by section, with the active profile name and
 Beyond profiles and the core encoding pipeline, `muxm` ships with a set of operational features that make it safer and easier to use in practice:
 
 - **Skip-if-Ideal** – Before encoding, `muxm` inspects the source to determine if it already matches the target profile. If it does, the file is linked or copied without re-encoding, saving time and avoiding generation loss. When multi-track audio or subtitle modes are active, the ideal check verifies that every source track would survive the filter — if any would be dropped, the source is not ideal and remuxing proceeds with explicit per-stream maps. Enabled per-profile or via `--skip-if-ideal`.
-- **Hardware-Accelerated Encoding (macOS)** – On macOS, `--hw-accel videotoolbox` (or `auto`) offloads encoding to Apple's VideoToolbox for dramatically faster encodes, with `--hw-accel-quality` to tune the quality/speed trade-off. Software encoding stays the cross-platform default. See [`docs/HW_ACCEL.md`](docs/HW_ACCEL.md).
+- **Hardware-Accelerated Encoding (macOS)** – On macOS, `--hw-accel videotoolbox` (or `auto`) offloads encoding to Apple's VideoToolbox for dramatically faster encodes, with `--hw-accel-quality` to tune the quality/speed trade-off. Software encoding stays the cross-platform default. See [`docs/HW_ACCEL.md`](docs/HW_ACCEL.md) for the architecture and [`docs/VIDEOTOOLBOX_CALIBRATION.md`](docs/VIDEOTOOLBOX_CALIBRATION.md) for the per-profile quality calibration.
 - **Collision Handling** – When the derived output filename matches the source (e.g., encoding `movie.mp4` with the default `.mp4` extension), `muxm` auto-versions the output to `movie(1).mp4`, `movie(2).mp4`, etc. instead of failing. Use `--replace-source` for interactive in-place replacement or `--force-replace-source` for scripted workflows.
 - **Conflict Warnings** – Running `--profile archive --no-dv` doesn't error out — it warns you that the combination is contradictory and proceeds with your explicit flags taking precedence. Flags that are incompatible with multi-track modes (e.g., `--audio-track`, `--audio-force-codec`, `--sub-burn-forced`) trigger a graceful demotion: multi-track mode drops to single-track mode with an informational note, and the explicit CLI flag wins. The tool trusts you but lets you know when something looks wrong.
 - **Dry-Run Mode** – `--dry-run` executes the entire decision pipeline (profile resolution, codec detection, DV identification, audio selection) and prints what it would do, without writing any output files.

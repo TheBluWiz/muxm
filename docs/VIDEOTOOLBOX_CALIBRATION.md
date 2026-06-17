@@ -368,7 +368,7 @@ On Clip B, only q:v 65 passes. The window between "VT is 0.34 VMAF better than b
 | `universal` | h264_videotoolbox | **70** | Both (agree) | libx264 CRF 22 slow |
 | `youtube-upload` | h264_videotoolbox | **75** | Clip A (1080p SDR) | libx264 CRF 16 slow |
 
-These values are written to `VT_QUALITY_MAP` in `muxm` (Section 6 of the script, ~line 195).
+These values are written to the `VT_QUALITY_MAP` array in `muxm` (Section 4, *Opinionated defaults*).
 
 ---
 
@@ -382,7 +382,7 @@ However, both `h264_videotoolbox` and `libx264` produce **8-bit H.264 only** (`-
 
 ### Decision (2026-06-11): Option C — warn, don't block
 
-The existing behaviour is preserved for both `libx264` and `h264_videotoolbox`. A runtime warning fires whenever the combination (H.264 encoder, HDR source, `TONEMAP_HDR_TO_SDR=0`) is detected — via the deferred check at `muxm:9891`. The warning is unconditional (`warn()` → stderr, always visible). Users who need clean SDR output can pass `--tonemap`; users who want to pass through to YouTube's HDR pipeline accept the 8-bit degradation.
+The existing behaviour is preserved for both `libx264` and `h264_videotoolbox`. A runtime warning fires whenever the combination (H.264 encoder, HDR source, `TONEMAP_HDR_TO_SDR=0`) is detected — via the deferred H.264 + HDR + no-tone-map check in muxm's *Main* section (post-probe). The warning is unconditional (`warn()` → stderr, always visible). Users who need clean SDR output can pass `--tonemap`; users who want to pass through to YouTube's HDR pipeline accept the 8-bit degradation.
 
 The Clip B cross-check (q:v 80) is documented here for completeness — it confirms VT parity with `libx264` on the 8-bit HDR passthrough path. It is **not** used as the calibrated value for `VT_QUALITY_MAP`; the SDR-calibrated value (q:v 75) is correct for the intended `youtube-upload` use case.
 

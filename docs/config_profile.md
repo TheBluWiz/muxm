@@ -32,7 +32,7 @@ muxm --profile <name> --print-effective-config
 
 ## Profile Details
 
-### 1) `archive` — Lossless Archival
+### `archive` — Lossless Archival
 
 **For:** Collectors and Plex users with a Dolby Vision ecosystem (Apple TV 4K +
 DV display, Shield, LG WebOS) who want to preserve original quality for long-term
@@ -63,7 +63,7 @@ target. Generate a JSON report and SHA-256 checksum for archival integrity.
 
 ---
 
-### 2) `hdr10-hq` — High Quality HDR10 (No Dolby Vision)
+### `hdr10-hq` — High Quality HDR10 (No Dolby Vision)
 
 **For:** HDR10 displays and mixed-device setups where Dolby Vision causes playback
 quirks (older streaming devices, non-DV TVs, varied Plex clients).
@@ -84,7 +84,7 @@ re-encode to HEVC Main10 at high quality (CRF 17 / slower), keep lossless audio.
 
 ---
 
-### 3) `av1-hq` — High-Quality AV1
+### `av1-hq` — High-Quality AV1
 
 **For:** Home media enthusiasts with AV1-capable playback hardware (Plex on
 Shield Pro, Fire TV Stick 4K Max, Chromecast with Google TV, compatible smart
@@ -116,7 +116,7 @@ supported by the AV1 encode pipeline and is automatically disabled.
 
 ---
 
-### 4) `atv-directplay-hq` — Apple TV Direct Play (Plex) Optimized
+### `atv-directplay-hq` — Apple TV Direct Play (Plex) Optimized
 
 **For:** Plex → Apple TV 4K setups aiming for true Direct Play with zero
 transcoding.
@@ -145,7 +145,7 @@ E-AC-3 audio (with Atmos JOC when present), and text-based subtitles.
 
 ---
 
-### 5) `atv-directplay-animation` — Anime for Apple TV Direct Play
+### `atv-directplay-animation` — Anime for Apple TV Direct Play
 
 **For:** Anime and cartoon content destined for Apple TV 4K via Plex, where both
 animation quality and true Direct Play matter.
@@ -171,7 +171,7 @@ transcoding on playback, styled subs preserved.
 
 ---
 
-### 5) `streaming-hevc` — Modern HEVC Streaming
+### `streaming-hevc` — Modern HEVC Streaming
 
 **For:** Plex, Jellyfin, and Emby users targeting modern clients — Shield, Fire
 TV, Roku Ultra, smart TVs, and web browsers. Balances quality with file size.
@@ -194,7 +194,7 @@ HDR10 preserved, DV stripped, E-AC-3 surround at streaming-friendly bitrates.
 
 ---
 
-### 5a) `streaming-av1` — AV1 Streaming
+### `streaming-av1` — AV1 Streaming
 
 **For:** Plex, Jellyfin, and Emby users whose clients support AV1 hardware
 decode — Fire TV Stick 4K Max, Chromecast with Google TV, modern web browsers,
@@ -220,7 +220,7 @@ HDR10 preserved, DV stripped, Opus audio at 256k. Always outputs MP4.
 
 ---
 
-### 7) `animation` — Anime & Cartoon Optimized
+### `animation` — Anime & Cartoon Optimized
 
 **For:** Anime and cartoon content where banding-free gradients, clean hard edges,
 and styled subtitle preservation matter. Ideal for archival-quality animation
@@ -247,7 +247,7 @@ subtitles and lossless audio.
 
 ---
 
-### 8) `universal` — Universal Compatibility
+### `universal` — Universal Compatibility
 
 **For:** Playback anywhere — old Rokus, mobile devices, web browsers, non-HDR TVs.
 Sharing with friends and family who shouldn't have to think about playback
@@ -272,7 +272,7 @@ strip chapters and non-essential metadata.
 
 ---
 
-### 9) `youtube-upload` — YouTube Upload Prep
+### `youtube-upload` — YouTube Upload Prep
 
 **For:** Uploading videos to YouTube where you want to give YouTube's encoder the
 cleanest, highest-quality master possible.

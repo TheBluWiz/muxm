@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ## [Unreleased]
 
+## [1.5.0] - soon
+
 ### Added
 
 - **Single source of truth for the man page and tab completions** — `docs/muxm.1` and `completions/muxm-completion.bash` are now *generated* from embedded heredocs in `muxm` (the `MANPAGE_EOF` and `COMPLETIONS_EOF` blocks) rather than hand-maintained, ending the recurring drift between the installed and committed copies. New hidden, maintainer-only `--emit-man` / `--emit-completions` flags emit each source; `tools/gen-docs.sh` regenerates both committed files from them (the man page gets a prepended `.\"` "do not edit" banner; the completion carries its banner inside the heredoc, so its committed copy is byte-identical to `muxm --emit-completions`). A new `docs` test suite (`tests/test_docs_parity.sh` + `tests/test_completions_parity.sh`) fails if either committed file diverges from its heredoc, and `_test_cli_flag_drift` gained a parser→man-page reverse sweep so every CLI flag must be documented. `--emit-man` / `--emit-completions` are deliberately absent from `--help`, tab completion, and the man page, and are allow-listed via a `hidden_flags` array so the drift guards still cover every other flag. See `CLAUDE.md` for the workflow.

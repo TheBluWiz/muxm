@@ -181,7 +181,7 @@ Approximate HEVC CRF → AV1 CRF mapping. **Values are calibrated for 1080p SDR.
 
 ## 6. `_crf_ratio()` Calibration
 
-`_crf_ratio()` (`muxm:4665`) estimates the output/source bitrate ratio for disk space preflight warnings.
+`_crf_ratio()` (in muxm's *Disk space preflight* section) estimates the output/source bitrate ratio behind the disk-space preflight warnings.
 
 ### Method
 

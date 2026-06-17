@@ -4,7 +4,7 @@
 > On Linux, encoding always runs in software regardless of `--hw-accel` setting.
 > NVENC dispatch is not yet implemented; passing `--hw-accel nvenc` falls back to software with a warning.
 
-**Status:** Phase 2 complete — VideoToolbox dispatch and calibration done (live-action + animation content, 2026-06-10/11).
+**Status:** VideoToolbox dispatch and calibration **shipped in v1.5.0** (Phase 2 — live-action + animation content, calibrated 2026-06-10/11). Phase 3 (NVENC) is the next milestone.
 
 ---
 
@@ -124,5 +124,5 @@ During encode, `HW_ACCEL_FALLBACK_REASON` is logged via `note` whenever a gate f
 
 | Version | Scope |
 |---------|-------|
-| v1.5.0 (in progress) | VideoToolbox dispatch complete; calibration committed |
-| v1.6.0 | Phase 3 NVENC dispatch + calibration + `--hw-accel auto` CI coverage |
+| v1.5.0 (released) | VideoToolbox dispatch complete; calibration committed |
+| v1.6.0 (next) | Phase 3 NVENC dispatch + calibration + `--hw-accel auto` CI coverage |

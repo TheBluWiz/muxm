@@ -1,7 +1,7 @@
 # MuxMaster (muxm) Testing Plan
 
-**Version:** v1.4.0
-**Date:** 2026-04-11
+**Version:** v1.5.0
+**Date:** 2026-06-16
 **Scope:** Comprehensive feature coverage — automated test harness + manual testing checklist
 
 ---
@@ -14,27 +14,27 @@ muxm has grown to include 10 format profiles, 70+ CLI flags, layered configurati
 
 | File | Purpose |
 |------|---------|
-| `test_muxm.sh` | Automated test harness v2.0 — generates synthetic media, runs ~780 assertions across 22 suites |
+| `test_muxm.sh` | Automated test harness v2.0 — generates synthetic media, runs ~1290 assertions across 25 suites |
 | This document | Manual testing procedures for features that require real media or subjective verification; identifies ~100 additional test cases for new features |
 
 ### Running the Automated Tests
 
 ```bash
 # Full suite (from project root)
-./test_muxm.sh --muxm ./muxm
+tests/test_muxm.sh --muxm ./muxm
 
 # Specific suite
-./test_muxm.sh --muxm ./muxm --suite cli
-./test_muxm.sh --muxm ./muxm --suite profiles
-./test_muxm.sh --muxm ./muxm --suite e2e
+tests/test_muxm.sh --muxm ./muxm --suite cli
+tests/test_muxm.sh --muxm ./muxm --suite profiles
+tests/test_muxm.sh --muxm ./muxm --suite e2e
 
 # Verbose (shows output on failures)
-./test_muxm.sh --muxm ./muxm --verbose
+tests/test_muxm.sh --muxm ./muxm --verbose
 
 # Available suites: all, cli, toggles, unit, completions, setup, config, profiles,
-#                   conflicts, collision, dryrun, video, hdr, audio, subs, ext_subs,
-#                   output, containers, metadata, edge, e2e, disk_preflight,
-#                   multi_profile
+#                   conflicts, hw_accel, docs, collision, dryrun, video, hdr, audio,
+#                   subs, ext_subs, output, containers, metadata, edge, e2e,
+#                   multi_profile, regression_p5, dv_vt
 ```
 
 ### Prerequisites
@@ -47,6 +47,12 @@ Optional: `dovi_tool`, `MP4Box`/`mp4box`, `pgsrip`/`sub2srt`, `tesseract`
 ## 1. Automated Test Coverage
 
 The test harness (`test_muxm.sh`) generates synthetic test media — short 2-second clips with various codec/audio/subtitle combinations — and validates behavior against expected outcomes. No real movie files needed.
+
+> **Note on profile names below.** Rows that invoke `--profile dv-archival` or
+> `--profile streaming` intentionally exercise the **deprecated aliases** (they
+> normalize to `archive` / `streaming-hevc` and emit a deprecation warning), so
+> those names are kept here to match what `tests/test_muxm.sh` actually runs.
+> Canonical profile names are used everywhere outside these automated-coverage tables.
 
 ### 1.1 CLI Parsing & Validation (suite: `cli`)
 
@@ -192,7 +198,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 72 | All 10 profiles accepted | Each shows in effective config | ✅ |
 | 73 | `dv-archival` defaults | VIDEO_COPY=1, SKIP_IF_IDEAL=1, REPORT_JSON=1, LOSSLESS_PASSTHROUGH=1, MKV | ✅ |
 | 74 | `hdr10-hq` defaults | DISABLE_DV=1, CRF=17, MKV | ✅ |
-| 74a | `av1-hq` defaults | VIDEO_CODEC=libsvt-av1, CRF=20, PRESET=6, MKV, LOSSLESS_PASSTHROUGH=1, CHECKSUM=1, DISABLE_DV=1 | ✅ |
+| 74a | `av1-hq` defaults | VIDEO_CODEC=libsvt-av1, CRF=28 (base; →24 for ≥4K/HDR), PRESET=6, MKV, LOSSLESS_PASSTHROUGH=1, CHECKSUM=1, DISABLE_DV=1 | ✅ |
 | 75 | `atv-directplay-hq` defaults | MP4, SUB_BURN_FORCED=1, SKIP_IF_IDEAL=1 | ✅ |
 | 76 | `streaming-hevc` defaults | CRF=20, preset=medium | ✅ |
 | 76a | `streaming` deprecated alias | Same config as `streaming-hevc`; deprecation warning emitted | ✅ |
@@ -473,7 +479,7 @@ Direct tests for deterministic helper functions extracted from muxm and run in i
 |---|------|-----------|------|
 | 210 | `is_valid_loglevel` | quiet, error, warning, info, verbose, debug, trace → valid. "bogus", "" → invalid | ✅ |
 | 211 | `is_valid_preset` | ultrafast, medium, slow, slower, veryslow, placebo, fast → valid. "bogus", "" → invalid | ✅ |
-| 212 | `_is_valid_profile` | All 6 profiles → valid. "nonexistent", "" → invalid | ✅ |
+| 212 | `_is_valid_profile` | 6 canonical profiles + the `streaming`/`dv-archival` aliases → valid; "nonexistent", "" → invalid | ✅ |
 | 213 | `_valid_profiles_display` | Returns comma-separated list containing "streaming" and "universal" | ✅ |
 
 #### File Size Utility
@@ -561,7 +567,7 @@ These tests require real media files, specialized hardware, or subjective qualit
 | # | Test | Steps | Expected Result |
 |---|------|-------|-----------------|
 | M1 | DV detection | Run `muxm --dry-run dv_source.mkv` | "Dolby Vision detected" message, DV profile/compat ID logged |
-| M2 | DV preservation (`dv-archival`) | `muxm --profile dv-archival dv_source.mkv` | Output has DV signaling (`dvcC` box present). Verify with `mediainfo` or `ffprobe -show_streams` |
+| M2 | DV preservation (`archive`) | `muxm --profile archive dv_source.mkv` | Output has DV signaling (`dvcC` box present). Verify with `mediainfo` or `ffprobe -show_streams` |
 | M3 | DV → P8.1 conversion (`atv-directplay-hq`) | `muxm --profile atv-directplay-hq dv_p7.mkv` | DV Profile 8.1 in MP4 output. `mediainfo --full` shows DV config record |
 | M4 | DV stripping (`hdr10-hq`) | `muxm --profile hdr10-hq dv_source.mkv` | No DV in output, HDR10 static metadata preserved (check MaxCLL/MDCV) |
 | M5 | DV fallback on failure | Corrupt the RPU or use P5 dual-layer source without EL access | ⚠️ warning, falls back to non-DV output |
@@ -576,7 +582,7 @@ These tests require real media files, specialized hardware, or subjective qualit
 |---|------|-------|-----------------|
 | M8 | HDR10 passthrough | `muxm --profile hdr10-hq hdr10_source.mkv` | HDR10 metadata preserved: `color_primaries=bt2020`, `transfer=smpte2084`, MaxCLL/MDCV present |
 | M9 | HDR → SDR tone-mapping | `muxm --profile universal hdr10_source.mkv` | SDR output, BT.709 color, visually acceptable brightness (not washed out) |
-| M10 | HLG handling | `muxm --profile streaming hlg_source.mkv` | HLG metadata preserved: `transfer=arib-std-b67` |
+| M10 | HLG handling | `muxm --profile streaming-hevc hlg_source.mkv` | HLG metadata preserved: `transfer=arib-std-b67` |
 | M11 | Color space matching | `muxm hdr_source.mkv --print-effective-config` and inspect output | `decide_color_and_pixfmt` selects correct pixfmt and x265 color params |
 | M12 | libx264 + HDR warning | `muxm --video-codec libx264 hdr10_source.mkv` | ⚠️ "H.264 cannot preserve HDR metadata — output will appear washed out" |
 
@@ -627,7 +633,7 @@ These tests require real media files, specialized hardware, or subjective qualit
 |---|------|-------|-----------------|
 | M30 | Ideal file skipped | Pre-encode a file to match `atv-directplay-hq`, re-run same profile with `--skip-if-ideal` | "already ideal" message, output is hardlinked/copied (near-instant) |
 | M31 | Non-ideal file processed | Run `--skip-if-ideal` on mismatched source | Normal encode proceeds |
-| M32 | JSON report on skip | `--profile dv-archival` on ideal source | Report JSON written with skip status |
+| M32 | JSON report on skip | `--profile archive` on ideal source | Report JSON written with skip status |
 
 ### 2.7 Error Recovery & Cleanup
 
@@ -657,24 +663,24 @@ These tests require real media files, specialized hardware, or subjective qualit
 |---|------|--------|----------|
 | M43 | `atv-directplay-hq` output | Apple TV 4K + Plex | Direct Play (no transcode in Plex dashboard) |
 | M44 | `atv-directplay-hq` DV output | Apple TV 4K + DV TV | Dolby Vision activates on TV |
-| M45 | `streaming` output | Roku / Fire TV / Shield | Plays without buffering, correct audio/subs |
+| M45 | `streaming-hevc` output | Roku / Fire TV / Shield | Plays without buffering, correct audio/subs |
 | M46 | `universal` output | Old Roku / Browser / Phone | Plays everywhere, SDR, stereo |
 | M47 | `animation` output | Desktop player (mpv/VLC) | ASS subs render with styling, lossless audio plays |
-| M48 | `dv-archival` output | DV-capable client | Full fidelity preserved, lossless audio |
+| M48 | `archive` output | DV-capable client | Full fidelity preserved, lossless audio |
 
-### 2.10 Multi-Track Audio (dv-archival)
+### 2.10 Multi-Track Audio (archive)
 
 > **Requires:** Source with 3+ audio tracks in mixed languages/codecs
 
 | # | Test | Steps | Expected Result |
 |---|------|-------|-----------------|
-| M49 | Multi-track all kept | `muxm --profile dv-archival multilang_audio.mkv` | All audio tracks from source present in output (stream-copied, no transcode) |
-| M50 | Language filtering | Set `AUDIO_LANG_PREF="eng,jpn"` in `.muxmrc`, run `dv-archival` on 3-lang source | Only eng and jpn tracks kept; other languages dropped with log message |
+| M49 | Multi-track all kept | `muxm --profile archive multilang_audio.mkv` | All audio tracks from source present in output (stream-copied, no transcode) |
+| M50 | Language filtering | Set `AUDIO_LANG_PREF="eng,jpn"` in `.muxmrc`, run `archive` on 3-lang source | Only eng and jpn tracks kept; other languages dropped with log message |
 | M51 | Commentary filtering | Source with main + commentary tracks, `AUDIO_KEEP_COMMENTARY=0` (default) | Commentary track dropped, main feature kept |
 | M52 | Commentary kept | `AUDIO_KEEP_COMMENTARY=1` in `.muxmrc`, same source | Both main and commentary tracks present in output |
 | M53 | Multi-track titles | `--audio-titles` with multi-track source | Each track has descriptive title (e.g., "5.1 Surround (TrueHD)") |
 
-### 2.11 Multi-Track Subtitles (dv-archival / animation)
+### 2.11 Multi-Track Subtitles (archive / animation)
 
 > **Requires:** Source with 4+ subtitle tracks (mixed forced/full/SDH, mixed languages)
 
@@ -739,7 +745,7 @@ These tests require real media files, specialized hardware, or subjective qualit
 |---|------|-------|-----------------|
 | M78 | Disk space warning | Encode to a volume with < 5 GB free | ⚠️ "Less than ~5GB free" warning at start |
 | M79 | `DISK_FREE_WARN_GB` custom | Set `DISK_FREE_WARN_GB=20` in `.muxmrc`, encode with 10 GB free | ⚠️ warning triggers at higher threshold |
-| M80 | `DEBUG=1` mode | `DEBUG=1 muxm --profile streaming --preset ultrafast test.mkv` | `set -x` trace output visible; encode completes; temp files preserved |
+| M80 | `DEBUG=1` mode | `DEBUG=1 muxm --profile streaming-hevc --preset ultrafast test.mkv` | `set -x` trace output visible; encode completes; temp files preserved |
 | M81 | macOS hidden flag cleared | Encode on macOS (APFS) | Output file is not hidden in Finder (chflags nohidden) |
 | M82 | Duration detection tiers | MKV without standard duration field (relies on Matroska tags) | Progress bar shows percentage (duration detected from tier 3: Matroska DURATION tag) |
 
@@ -775,22 +781,22 @@ Run after every code change:
 
 ```bash
 # 1. Fast automated suite (< 2 min)
-./test_muxm.sh --muxm ./muxm --suite all
+tests/test_muxm.sh --muxm ./muxm --suite all
 
 # 2. Quick smoke test with real media (if available)
 muxm --dry-run --profile atv-directplay-hq real_source.mkv
 muxm --dry-run --profile universal real_source.mkv
-muxm --dry-run --profile dv-archival real_source.mkv
+muxm --dry-run --profile archive real_source.mkv
 
 # 3. If video pipeline changed: one real encode
-muxm --profile streaming --preset ultrafast --crf 28 real_source.mkv /tmp/regression_test.mp4
+muxm --profile streaming-hevc --preset ultrafast --crf 28 real_source.mkv /tmp/regression_test.mp4
 
 # 4. If audio pipeline changed:
 muxm --preset ultrafast --crf 28 multi_audio_source.mkv /tmp/audio_test.mp4
 ffprobe -v error -show_streams -of json /tmp/audio_test.mp4 | jq '[.streams[] | select(.codec_type=="audio")] | length'
 
-# 5. If multi-track audio/sub changed (dv-archival / animation):
-muxm --profile dv-archival multi_audio_source.mkv /tmp/archival_test.mkv
+# 5. If multi-track audio/sub changed (archive / animation):
+muxm --profile archive multi_audio_source.mkv /tmp/archival_test.mkv
 ffprobe -v error -show_streams -of json /tmp/archival_test.mkv | jq '[.streams[] | select(.codec_type=="audio")] | length'
 muxm --profile animation anime_source.mkv /tmp/anime_test.mkv
 ffprobe -v error -show_streams -of json /tmp/anime_test.mkv | jq '[.streams[] | select(.codec_type=="subtitle")] | length'
@@ -829,9 +835,9 @@ jobs:
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y ffmpeg jq bc
       - name: Run all tests
-        run: ./test_muxm.sh --muxm ./muxm --suite all
+        run: tests/test_muxm.sh --muxm ./muxm --suite all
       - name: Locale regression (LANG=C)
-        run: LANG=C LC_ALL=C ./test_muxm.sh --muxm ./muxm --suite all
+        run: LANG=C LC_ALL=C tests/test_muxm.sh --muxm ./muxm --suite all
 ```
 
 ### Locale Regression Testing
@@ -853,10 +859,10 @@ Section 1 of the script). The script is locale-safe by design:
 
 ```bash
 # Full suite under C locale (should produce identical results to default locale)
-LANG=C LC_ALL=C ./test_muxm.sh --muxm ./muxm --suite all
+LANG=C LC_ALL=C tests/test_muxm.sh --muxm ./muxm --suite all
 
 # Quick smoke test (fast suites only)
-LANG=C LC_ALL=C ./test_muxm.sh --muxm ./muxm --suite cli
+LANG=C LC_ALL=C tests/test_muxm.sh --muxm ./muxm --suite cli
 ```
 
 If any tests fail under `LANG=C` that pass under the default locale, investigate
@@ -866,13 +872,14 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 
 ## 6. Coverage Gap Analysis
 
-> **Coverage audit — 2026-06-12.** The harness grew substantially since this
+> **Coverage audit — 2026-06-16.** The harness grew substantially since this
 > table was first written; most items previously marked ❌/⚠️ are now covered.
 > This pass cross-referenced every muxm flag and helper against the *current*
 > `tests/test_muxm.sh` and closed the remaining automatable gaps. Full suite:
-> **1097 passed / 0 failed / 2 skipped** (skips: the bash-version guard on hosts
-> whose only bash is ≥ 4.3, and the `_detect_mp4box` lowercase-fallback assertion
-> on case-insensitive filesystems). Newly added automated coverage:
+> **1292 passed / 0 failed / 2 skipped** (skips observed on this host: the
+> `_detect_mp4box` lowercase-fallback assertion on case-insensitive filesystems,
+> and the NVENC fallback-reason assertion on hosts without `hevc_nvenc`). Newly
+> added automated coverage:
 >
 > - **Pure mapping/parse helpers (unit suite, `_test_unit_mapping_helpers`):**
 >   `_audio_codec_ext`, `_ext_sub_codec_from_ext`, `_norm_lang_code`,
@@ -902,7 +909,7 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 | Completions installer | ✅ Full | — | Install, idempotency, uninstall, safe-when-absent |
 | Setup combined installer | ✅ Full | — | All three sub-installers + standalone deps/man |
 | Config precedence | ✅ Full | — | Single-layer, multi-layer (user+project+CLI), all --create-config profiles, loglevel validation, deprecated variable migration |
-| Profile defaults | ✅ Full | — | All 6 profiles validated |
+| Profile defaults | ✅ Full | — | All 10 profiles validated |
 | Conflict warnings | ✅ Full | — | 40+ combinations tested, incl. archive/animation multi-track audio+sub conflicts (--audio-track, --audio-force-codec, --stereo-fallback, --sub-burn-forced, --sub-export-external), hdr10-hq+DV, universal+DV, AV1+DV, and burn-forced+no-subtitles. Warning *text* (not just presence) asserted after the Phase 8 needle hardening. Plus the silently-ignored-flag warnings C1–C5,C7–C10 (`_warn_ignored_knobs` + av1-hq/streaming-av1 profile arms): C5/C7/C8/C9/C10 e2e in `--suite conflicts`; C1–C4 (VideoToolbox-only) deterministically in `--suite unit` (`_test_unit_ignored_knobs`) and e2e-gated on a VT host |
 | Dry-run mode | ✅ Full | — | Includes HDR source dry-run |
 | Video encode (SDR) | ✅ Full | — | Includes x265-params, threads, video-copy-if-compliant, --level VBV |
@@ -913,7 +920,7 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 | Subtitle track limiting | ✅ Full | — | SUB_MAX_TRACKS=1 via config file and --sub-lang-pref multilang tested |
 | SDR 10-bit forcing | ✅ Automated (probe) | Visual only (M71–M74) | **Added 2026-06-12:** video suite encodes an 8-bit SDR source and probes `pix_fmt` — `yuv420p10le` with `--sdr-force-10bit`, `yuv420p` with `--no-sdr-force-10bit`. `SDR_USE_10BIT_IF_SRC_10BIT` (src-10bit auto path) still relies on the HDR/10-bit encode fixtures |
 | Max copy bitrate | ❌ None | Bitrate-gated copy (M75–M77) | --max-copy-bitrate ceiling logic untested |
-| Multi-track audio (dv-archival) | ✅ Full | — | `hevc_multi_audio.mkv` fixture (eng main + eng commentary + spa) drives dry-run keep-list assertions ("keeping 2 of 3", ✗ drop marker, commentary dropped), AUDIO_MULTI_TRACK/AUDIO_KEEP_COMMENTARY profile defaults, --stereo-fallback interaction, and e2e archive encodes |
+| Multi-track audio (archive) | ✅ Full | — | `hevc_multi_audio.mkv` fixture (eng main + eng commentary + spa) drives dry-run keep-list assertions ("keeping 2 of 3", ✗ drop marker, commentary dropped), AUDIO_MULTI_TRACK/AUDIO_KEEP_COMMENTARY profile defaults, --stereo-fallback interaction, and e2e archive encodes |
 | Multi-track subtitles (archival/animation) | ✅ Full | — | `hevc_multi_subs.mkv` fixture (5 subs: eng forced/full/SDH, spa, fra) drives multi-track announce, SUB_MULTI_TRACK defaults, language/type filtering, demotion-on-conflict, and e2e encodes |
 | Source replacement & collision | ✅ Full | Interactive prompt (M59–M60) | Auto-versioning, --force-replace-source, non-TTY rejection, --help/config registration all tested; interactive --replace-source confirmation requires TTY |
 | Dolby Vision | ❌ None | Full DV pipeline (M1–M7, M64–M70) | Requires real DV source + dovi_tool + MP4Box. C6 (H.264 drops DV) post-probe warning: predicate covered deterministically in `--suite unit` (`_test_unit_h264_drops_dv`); end-to-end gated on `MUXM_DV_FIXTURE` in `--suite dv_vt` (libx264 warns; libx265 / `--no-dv` do not) |
@@ -930,9 +937,9 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 | Skip-if-ideal | ⚠️ Partial | Full roundtrip (M30–M32) | Basic compliant-source test exists; multi-track audio/sub filtering in ideal-check untested |
 | Output features | ✅ Full | — | Chapters, checksum (with validation), JSON report (content + key checks), keep-temp all tested |
 | Edge cases & security | ✅ Full | — | Includes permissions, control chars, collision prevention, double-dash terminator, auto-generated output path, injection prevention |
-| E2E profiles | ✅ Full | — | All 6 profiles validated with real encodes |
+| E2E profiles | ✅ Full | — | All 10 profiles validated with real encodes (av1-hq & streaming-av1 gated on a functional AV1 encoder) |
 | VALID_PROFILES drift | ✅ Full | — | Cross-reference test verifies --help and installed completions match canonical constant |
-| Locale regression | ✅ Full | — | Static audit complete; CI step: `LANG=C LC_ALL=C ./test_muxm.sh` |
+| Locale regression | ✅ Full | — | Static audit complete; CI step: `LANG=C LC_ALL=C tests/test_muxm.sh` |
 | Duration detection | ⚠️ Indirect | M82 (tier 3) | `_get_source_duration_secs` tiers 1–2 (stream / format duration) are exercised by every encode's progress path; tier 3 (Matroska `DURATION` tag) still lacks a dedicated fixture |
 | `ffmpeg_has_muxer` | ✅ Full | — | **Added 2026-06-12:** matroska/mp4/mov → present, bogus name → absent. Doubles as the regression guard for the `$1`→`$2` awk-field fix |
 | `DEBUG=1` trace mode | ✅ Full | — | **Added 2026-06-12:** cli suite — dry-run exits 0 with `set -x` on, trace lands on stderr (does not corrupt stdout) |

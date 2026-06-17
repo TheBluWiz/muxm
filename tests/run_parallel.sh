@@ -142,8 +142,15 @@ echo "$$" > "$WORKDIR/.pid"                  # claim it so a concurrent run's sw
 
 _keep_workdir=0
 _driver=""                                   # PID of the in-flight phase driver (for the signal handler)
+# _cleanup and _on_signal are invoked indirectly by the `trap` registrations below, never
+# called directly. shellcheck's SC2329 stops crediting trap-registered functions as "used"
+# once a script ends in an explicit `exit` (as this one does in its final if/else), so it
+# misreports them as never invoked — they are NOT dead code; the EXIT trap fires on the
+# explicit `exit 0`/`exit 1` and the workdir cleanup does run.
+# shellcheck disable=SC2329
 _cleanup() { (( _keep_workdir )) || rm -rf "$WORKDIR"; }
 trap _cleanup EXIT
+# shellcheck disable=SC2329  # see the note above _cleanup — invoked via `trap _on_signal INT TERM`
 _on_signal() {
   trap '' INT TERM                           # don't re-enter while we tear down
   [[ -n "$_driver" ]] && kill "$_driver" 2>/dev/null
