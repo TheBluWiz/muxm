@@ -87,7 +87,7 @@ fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="1.4.0"
+readonly VERSION="1.5.0"
 
 # Canonical list of valid profile names (space-separated for compgen/iteration).
 # All profile validation, error messages, completions, and config generators

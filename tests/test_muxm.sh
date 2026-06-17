@@ -90,8 +90,9 @@ show_help() {
       metadata     Metadata stripping and preservation
       e2e          Full profile end-to-end encodes
       regression_p5 Phase 5 regression tests (C1, M3, H9, H8, H10, DVMKV, DISKSTOP, WORKDIR, H1, H11)
-      dv_vt        VideoToolbox + Dolby Vision regression (gated: macOS + hevc_videotoolbox
-                   + dovi_tool + MP4Box + MUXM_DV_FIXTURE=/path/to/real_dv_source; else SKIPs)
+      dv_vt        VideoToolbox + Dolby Vision regression (uses bundled DV fixture by
+                   default; VT encode gated on macOS + hevc_videotoolbox + dovi_tool +
+                   MP4Box, else SKIPs. Override source with MUXM_DV_FIXTURE=/path/to/dv)
 
     all            Run every suite above (default when --suite given)
 
@@ -2828,7 +2829,7 @@ EOF
     ffmpeg -f lavfi -i "color=c=black:s=64x64:r=1" -t 1 -c:v libx264 -an \
       -y "$nvenc_dry_src" >/dev/null 2>&1
     out="$(run_muxm --dry-run --hw-accel nvenc --profile hdr10-hq "$nvenc_dry_src")"
-    assert_contains "NVENC dispatch pending" \
+    assert_contains "NVENC encoder dispatch not yet implemented" \
       "NVENC stub: fallback reason logged to stderr" "$out"
   else
     skip "NVENC stub fallback: host lacks hevc_nvenc"
@@ -7945,17 +7946,39 @@ UNAMESCRIPT
 # the headerless ES. This proves VT + DV produces an output that still carries a valid DV
 # configuration record, with frame-count parity against the source.
 #
-# Heavily gated — runs ONLY when ALL of the following hold, otherwise it SKIPs (never fails)
-# so CI stays green without DV assets or Apple hardware:
+# DV source: by default the bundled DV Profile 8 fixture (tests/fixtures/HDR1080p.MOV,
+# a genuine RPU-carrying clip) is copied into the temp workspace and used. Set
+# MUXM_DV_FIXTURE=/path/to/your_dv_source to override with your own DV file instead.
+# (A real RPU is required — synthetic tagged fixtures won't do.)
+#
+# Still gated on the platform/tooling below; when any of these is missing the VT
+# encode SKIPs (never fails) so CI stays green without Apple hardware or DV tooling:
 #   • macOS (VideoToolbox is macOS-only)
 #   • ffmpeg has the hevc_videotoolbox encoder
 #   • dovi_tool and MP4Box (or mp4box) are on PATH
-#   • a real Dolby Vision source is provided via the MUXM_DV_FIXTURE env var
-#     (a DV Profile 7/8 .mkv or .mp4 with genuine RPU — synthetic tagged fixtures won't do).
-# Example:
+# The C6 dry-run check below needs only the DV source (no VT/dovi_tool), so it runs
+# on any host once the fixture is available.
+# Example (override the bundled fixture):
 #   MUXM_DV_FIXTURE=/path/to/dv_p8.mkv ./tests/test_muxm.sh --suite dv_vt
 test_dv_vt() {
   section "VideoToolbox + Dolby Vision (gated regression)"
+
+  # Resolve the DV fixture. An explicit MUXM_DV_FIXTURE wins (a user's own DV source,
+  # referenced in place). Otherwise fall back to the bundled DV Profile 8 fixture,
+  # copied into $TESTDIR so the read-only original is never touched and muxm writes
+  # only inside the temp workspace. The copy is named .mp4 (its bitstream is ISOBMFF,
+  # read identically to .mov) because muxm's default output container is derived from
+  # the source extension and ffmpeg refuses to mux Dolby Vision into a .mov.
+  local _dv_fixture="${MUXM_DV_FIXTURE:-}"
+  if [[ -z "$_dv_fixture" ]]; then
+    local _bundled_dv
+    _bundled_dv="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures/HDR1080p.MOV"
+    if [[ -f "$_bundled_dv" && -r "$_bundled_dv" ]] && cp "$_bundled_dv" "$TESTDIR/dv_source.mp4"; then
+      _dv_fixture="$TESTDIR/dv_source.mp4"
+    fi
+  fi
+  # Shadow MUXM_DV_FIXTURE for the rest of this function (no global mutation).
+  local MUXM_DV_FIXTURE="$_dv_fixture"
 
   # ---- C6 (WI-1c): H.264 drops Dolby Vision — deferred post-probe warning ----
   # Needs only a real DV source (detect_dv → IS_DV=1) and a dry-run; no VideoToolbox,
@@ -8053,6 +8076,10 @@ test_dv_vt() {
     -show_entries stream=nb_read_frames -of csv=p=0 "$MUXM_DV_FIXTURE" 2>/dev/null | head -1)"
   out_frames="$(ffprobe -v error -select_streams v:0 -count_frames \
     -show_entries stream=nb_read_frames -of csv=p=0 "$out" 2>/dev/null | head -1)"
+  # ffprobe's csv writer appends a trailing field separator (e.g. "258,") on some
+  # builds; strip every non-digit so the numeric comparison below sees a bare count.
+  src_frames="${src_frames//[^0-9]/}"
+  out_frames="${out_frames//[^0-9]/}"
   if [[ "$src_frames" =~ ^[0-9]+$ && "$out_frames" =~ ^[0-9]+$ && "$src_frames" -gt 0 ]]; then
     if [[ "$src_frames" -eq "$out_frames" ]]; then
       pass "dv_vt: frame-count parity (source=$src_frames, output=$out_frames)"
@@ -8061,6 +8088,98 @@ test_dv_vt() {
     fi
   else
     skip "dv_vt: could not count frames (source='$src_frames', output='$out_frames')"
+  fi
+}
+
+# Phase 2.1: prose-doc profile drift guard. Mirrors the cli-suite VALID_PROFILES
+# cross-check (_test_cli_profile_crossref) but targets the *unguarded* prose docs the
+# docs review flagged: README's profile table and docs/config_profile.md's profile
+# sections. Catches the class of drift found in that review — a profile added/renamed in
+# the script but not the docs, or a deprecated alias resurfacing as a heading. Extraction
+# is anchored on stable structure (the "| Profile |" table header, "### " headings), never
+# line numbers, so it survives doc edits.
+_test_docs_prose_drift() {
+  local repo_root readme cfgprofile av1doc
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  readme="$repo_root/README.md"
+  cfgprofile="$repo_root/docs/config_profile.md"
+  av1doc="$repo_root/docs/AV1_CALIBRATION.md"
+
+  # Single source of truth (same extraction as _test_cli_profile_crossref).
+  local canonical
+  canonical="$(grep '^readonly VALID_PROFILES=' "$MUXM" | sed 's/^readonly VALID_PROFILES="//;s/"$//')"
+  if [[ -z "$canonical" ]]; then
+    skip "VALID_PROFILES constant not found in script — prose-doc drift guard skipped"
+    return
+  fi
+
+  # ---- README profile table: a `\`name\`` row for every canonical profile ----
+  # Anchor on the table header so profile names appearing in *other* README tables
+  # (flags, config vars) can't false-match; read from the header to the next blank line.
+  if [[ -r "$readme" ]]; then
+    local table
+    table="$(awk '/^\|[[:space:]]*Profile[[:space:]]*\|/{f=1} f{print} f&&/^[[:space:]]*$/{exit}' "$readme")"
+    if [[ -z "$table" ]]; then
+      skip "README.md profile table (\"| Profile |\" header) not found — README cross-ref skipped"
+    else
+      local r_missing=0 p
+      for p in $canonical; do
+        printf '%s\n' "$table" | grep -qE "^\|[[:space:]]*\`$p\`[[:space:]]*\|" \
+          || { fail "Profile '$p' missing from the README.md profile table"; r_missing=1; }
+      done
+      (( r_missing )) || pass "README.md profile table lists all VALID_PROFILES"
+    fi
+  else
+    skip "README.md not readable — README profile cross-ref skipped"
+  fi
+
+  # ---- config_profile.md: a `### \`name\`` section heading per canonical profile ----
+  if [[ -r "$cfgprofile" ]]; then
+    local c_missing=0 p
+    for p in $canonical; do
+      grep -qE "^### \`$p\`" "$cfgprofile" \
+        || { fail "Profile '$p' missing a section heading in docs/config_profile.md"; c_missing=1; }
+    done
+    (( c_missing )) || pass "docs/config_profile.md has a section heading for every VALID_PROFILES entry"
+
+    # A deprecated alias must never resurface as a primary (###) profile heading. The
+    # backtick delimiters make `\`streaming\`` reject the canonical `\`streaming-hevc\``.
+    local alias_hit=0 a
+    for a in dv-archival streaming; do
+      grep -qE "^### \`$a\`" "$cfgprofile" \
+        && { fail "Deprecated alias '$a' used as a profile heading in docs/config_profile.md"; alias_hit=1; }
+    done
+    (( alias_hit )) || pass "docs/config_profile.md uses no deprecated alias (dv-archival/streaming) as a heading"
+  else
+    skip "docs/config_profile.md not readable — config_profile cross-ref skipped"
+  fi
+
+  # ---- Stretch: AV1 _crf_ratio table in AV1_CALIBRATION.md matches the live function ----
+  # The doc reproduces _crf_ratio's libsvt-av1 case arm; verify each CRF→ratio pair the doc
+  # states by *executing* the real function (not string-diffing), so a doc value that drifts
+  # from the script fails. Direction note: this guards "every value the doc states is
+  # correct" — it won't catch a CRF arm added to the function but not the doc (the safe
+  # direction to miss). VT_QUALITY_MAP is intentionally NOT cross-checked: its values live in
+  # scattered prose, not a structured table, so there is nothing to diff without fragile parsing.
+  if [[ -r "$av1doc" ]]; then
+    local body pairs
+    body="$(awk '/^_crf_ratio\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+    pairs="$(grep -oE '[0-9]+\) echo [0-9]+' "$av1doc" | sed 's/) echo / /')"
+    if [[ -z "$body" || -z "$pairs" ]]; then
+      skip "_crf_ratio function or AV1 ratio table not found — AV1 ratio cross-check skipped"
+    else
+      local av1_bad=0 crf ratio actual n=0
+      while read -r crf ratio; do
+        [[ -n "$crf" ]] || continue
+        n=$(( n + 1 ))
+        actual="$(bash -c "$body"$'\n''_crf_ratio "$1" "$2"' -- libsvt-av1 "$crf")"
+        if [[ "$actual" != "$ratio" ]]; then
+          fail "AV1_CALIBRATION.md says CRF $crf → $ratio, but _crf_ratio(libsvt-av1,$crf)=$actual"
+          av1_bad=1
+        fi
+      done <<< "$pairs"
+      (( av1_bad )) || pass "AV1_CALIBRATION.md _crf_ratio table matches the script ($n values)"
+    fi
   fi
 }
 
@@ -8096,6 +8215,10 @@ test_docs_parity() {
   else
     fail "completions/muxm-completion.bash OUT OF SYNC with muxm heredoc — run tools/gen-docs.sh and commit"
   fi
+
+  # Phase 2.1: cross-check the prose docs (README profile table + config_profile.md
+  # sections, and the AV1 _crf_ratio table) against the canonical VALID_PROFILES / script.
+  _test_docs_prose_drift
 }
 
 # ---- Run Suites ----
