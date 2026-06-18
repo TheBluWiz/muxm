@@ -93,6 +93,9 @@ show_help() {
       dv_vt        VideoToolbox + Dolby Vision regression (uses bundled DV fixture by
                    default; VT encode gated on macOS + hevc_videotoolbox + dovi_tool +
                    MP4Box, else SKIPs. Override source with MUXM_DV_FIXTURE=/path/to/dv)
+      dv_sw        Portable software Dolby Vision round-trip (bundled DV fixture; real
+                   libx265 encode + RPU extract/inject/dvcC, gated on dovi_tool + MP4Box,
+                   else SKIPs — no VideoToolbox needed. Override with MUXM_DV_FIXTURE)
 
     all            Run every suite above (default when --suite given)
 
@@ -2821,19 +2824,49 @@ EOF
     skip "VT+AV1 encode-path fallback: host lacks hevc_videotoolbox on Apple Silicon"
   fi
 
-  # --- NVENC stub fallback reason logged to stderr ---
-  # resolve_video_encoder() is only reachable when hevc_nvenc is present;
-  # without it, the Section 14 strict check fires at exit 10 first.
-  if ffmpeg_has_encoder hevc_nvenc; then
-    local nvenc_dry_src="$TESTDIR/nvenc_probe.mkv"
-    ffmpeg -f lavfi -i "color=c=black:s=64x64:r=1" -t 1 -c:v libx264 -an \
-      -y "$nvenc_dry_src" >/dev/null 2>&1
-    out="$(run_muxm --dry-run --hw-accel nvenc --profile hdr10-hq "$nvenc_dry_src")"
-    assert_contains "NVENC encoder dispatch not yet implemented" \
-      "NVENC stub: fallback reason logged to stderr" "$out"
+  # ---- 5.2: NVENC software-fallback contract + QSV/VAAPI unsupported (host-independent) ----
+  # NVENC dispatch is a documented dead stub: an nvenc request must fall back to SOFTWARE and
+  # record a reason, never silently dispatch hevc_nvenc. The old e2e test only ran when the host
+  # had hevc_nvenc (else it skipped), so on most hosts the contract went unverified — replaced here
+  # by a direct unit test of resolve_video_encoder. Mock uname=Darwin so the macOS arm is reached
+  # (not the Linux software-fallback guard) and set HW_ACCEL_RESOLVED=nvenc: assert the encoder
+  # stays the software codec (libx265, NOT hevc_nvenc) and the fallback reason names NVENC.
+  # M-NVENC-1 strips "NVENC" from that reason → the reason assertion goes red.
+  local _rve_body
+  _rve_body="$(awk '/^resolve_video_encoder\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ -z "$_rve_body" ]]; then
+    fail "5.2 NVENC: could not extract resolve_video_encoder from muxm"
   else
-    skip "NVENC stub fallback: host lacks hevc_nvenc"
+    local _nv_out _nv_enc _nv_reason
+    _nv_out="$(bash -c '
+VIDEO_CODEC=libx265; HW_ACCEL_RESOLVED=nvenc; VIDEO_ENCODER_FFMPEG=""; HW_ACCEL_FALLBACK_REASON=""
+uname(){ echo Darwin; }            # force the macOS arm so the nvenc stub (not the Linux guard) is reached
+ffmpeg_has_encoder(){ return 1; }; is_apple_silicon(){ return 0; }
+warn(){ :; }; note(){ :; }
+'"$_rve_body"'
+resolve_video_encoder
+printf "%s|%s" "$VIDEO_ENCODER_FFMPEG" "$HW_ACCEL_FALLBACK_REASON"')"
+    _nv_enc="${_nv_out%%|*}"; _nv_reason="${_nv_out#*|}"
+    if [[ "$_nv_enc" == "libx265" ]]; then
+      pass "5.2 NVENC: nvenc request falls back to the software encoder (VIDEO_ENCODER_FFMPEG=$_nv_enc, not hevc_nvenc)"
+    else
+      fail "5.2 NVENC: nvenc request should fall back to software libx265, got VIDEO_ENCODER_FFMPEG='$_nv_enc'"
+    fi
+    if [[ "$_nv_reason" == *[Nn][Vv][Ee][Nn][Cc]* ]]; then
+      pass "5.2 NVENC: software-fallback reason names NVENC ('$_nv_reason')"
+    else
+      fail "5.2 NVENC: software-fallback reason should mention NVENC, got '$_nv_reason'"
+    fi
   fi
+
+  # QSV / VAAPI are not implemented backends — they must be REJECTED at validation (exit 11),
+  # never silently mis-dispatched. (Same is_valid_hw_accel path as --hw-accel bogus.)
+  assert_exit "$EXIT_VALIDATION" "5.2 QSV unsupported: --hw-accel qsv rejected (exit $EXIT_VALIDATION)" \
+    --hw-accel qsv --print-effective-config
+  assert_exit "$EXIT_VALIDATION" "5.2 VAAPI unsupported: --hw-accel vaapi rejected (exit $EXIT_VALIDATION)" \
+    --hw-accel vaapi --print-effective-config
+  out="$(run_muxm --hw-accel qsv --print-effective-config)"
+  assert_contains "Invalid --hw-accel" "5.2 QSV unsupported: error names the flag" "$out"
 
   # --- VT_QUALITY_MAP resolution in --print-effective-config ---
   # Profile in map → calibrated value; profile absent from map → VT_QUALITY_DEFAULT.
@@ -2854,6 +2887,51 @@ EOF
   out="$(run_muxm --profile archive --print-effective-config)"
   assert_contains "VT_QUALITY (active profile) = 65 (default)" \
     "VT_QUALITY_MAP: profile not in map shows VT_QUALITY_DEFAULT" "$out"
+
+  # ---- 5.3: build_videotoolbox_params param-string unit test (off-VT-host coverage) ----
+  # build_videotoolbox_params only ran inside a real VideoToolbox encode, so its arg string had
+  # ZERO coverage off a Mac VT host. Extract it and assert the assembled VIDEOTOOLBOX_ARGS for a
+  # 10-bit mp4 HEVC encode carry -q:v (quality), -allow_sw, -profile:v main10, and -tag:v hvc1 —
+  # a pure param builder inspected directly, no encoder or VT host required. HW_ACCEL_QUALITY is
+  # set to a concrete value so vt_q resolves from it and the VT_QUALITY_MAP associative-array
+  # branch is never taken (avoids an unbound-array read under set -u). M-VTPARAMS-1 drops the
+  # hvc1 tag → the 10-bit-mp4 assertion goes red (the 8-bit-mkv case, which has no tag, stays green).
+  local _vtp_body
+  _vtp_body="$(awk '/^build_videotoolbox_params\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ -z "$_vtp_body" ]]; then
+    fail "5.3 VT params: could not extract build_videotoolbox_params from muxm"
+  else
+    local _vtp_args
+    _vtp_args="$(bash -c '
+HW_ACCEL_QUALITY=80; HW_ACCEL_ALLOW_SW=1; VT_QUALITY_DEFAULT=65
+VIDEO_ENCODER_FFMPEG=hevc_videotoolbox; TARGET_PIXFMT=yuv420p10le; OUTPUT_EXT=mp4; X264_PARAMS_BASE=""
+'"$_vtp_body"'
+build_videotoolbox_params
+printf "%s " "${VIDEOTOOLBOX_ARGS[@]}"')"
+    local _vtp_ok=1 needle
+    for needle in "-q:v 80" "-allow_sw 1" "-profile:v main10" "-tag:v hvc1"; do
+      [[ "$_vtp_args" == *"$needle"* ]] || _vtp_ok=0
+    done
+    if (( _vtp_ok )); then
+      pass "5.3 VT params: hevc_videotoolbox mp4 10-bit → -q:v/-allow_sw/profile main10/hvc1 all present"
+    else
+      fail "5.3 VT params: hevc_videotoolbox mp4 10-bit — expected -q:v 80/-allow_sw 1/-profile:v main10/-tag:v hvc1, got: $_vtp_args"
+    fi
+    # 8-bit SDR mkv → -profile:v main (not main10) and NO hvc1 tag (MKV is tag-agnostic) — proves
+    # the profile/tag arms branch on pixfmt + container (keeps the M-VTPARAMS-1 signature isolated).
+    local _vtp_args8
+    _vtp_args8="$(bash -c '
+HW_ACCEL_QUALITY=70; HW_ACCEL_ALLOW_SW=1; VT_QUALITY_DEFAULT=65
+VIDEO_ENCODER_FFMPEG=hevc_videotoolbox; TARGET_PIXFMT=yuv420p; OUTPUT_EXT=mkv; X264_PARAMS_BASE=""
+'"$_vtp_body"'
+build_videotoolbox_params
+printf "%s " "${VIDEOTOOLBOX_ARGS[@]}"')"
+    if [[ "$_vtp_args8" == *"-profile:v main"* && "$_vtp_args8" != *"main10"* && "$_vtp_args8" != *"hvc1"* ]]; then
+      pass "5.3 VT params: 8-bit mkv → -profile:v main, no main10, no hvc1 tag (MKV agnostic)"
+    else
+      fail "5.3 VT params: 8-bit mkv — expected -profile:v main (not main10) and no hvc1, got: $_vtp_args8"
+    fi
+  fi
 
   # --- Cleanup ---
   rm -rf "$rc_home"
@@ -3238,11 +3316,18 @@ test_video() {
     fail "--x265-params: no output"
   fi
 
-  # --threads (#22)
+  # --threads (#22) — 1.6: was Category-D (`then :;` — encode ran, never probed). Exact thread
+  # *count* in the output isn't probeable. Assert (honest B-class) that the setting is parsed and
+  # registered — muxm feeds THREADS straight into the encode as `-threads "$THREADS"`
+  # (thread_args, muxm:7363 → base-video command muxm:7518/7520), so a registered THREADS=N
+  # reaches ffmpeg. (A live DEBUG command-grep confirms `-threads 2` standalone but is unreliable
+  # under muxm's tee/FD routing inside the harness, so we assert registration instead.)
   outfile="$TESTDIR/vid_threads.mp4"
   log "Encoding with --threads 2..."
-  if assert_encode "--threads 2: encode succeeded" "$outfile" \
-    --crf 28 --preset ultrafast --threads 2 "$src"; then :; fi
+  assert_encode "--threads 2: encode succeeded" "$outfile" \
+    --crf 28 --preset ultrafast --threads 2 "$src"
+  out="$(run_muxm --threads 2 --print-effective-config)"
+  assert_matches "THREADS[[:space:]]+= 2" "--threads 2: setting registered (feeds the ffmpeg -threads arg)" "$out"
 
   # --video-copy-if-compliant with HEVC source (#19)
   # Part 1: explicit --preset forces re-encode even with copy flag set — output is still HEVC.
@@ -3465,19 +3550,47 @@ test_hdr() {
        --output-ext mkv --crf 28 --preset ultrafast "$TESTDIR/hevc_hdr10_tagged.mkv"; then
     assert_probe "HDR10 encode: HEVC codec" "$outfile" codec_name hevc
 
-    # Check HDR metadata preserved (soft — ffprobe reporting varies by version)
+    # 1.2: HDR10 color tags must be present on the re-encoded output — converted from a soft
+    # `skip` to a hard `fail` (the `*2020*`/`*2084*` substring tolerates ffprobe-version
+    # spellings like "bt2020nc" while still catching a totally-untagged output).
+    # HONEST LIMIT: this cannot isolate muxm's COLOR_ARGS from ffmpeg's auto-copy of the source's
+    # color metadata — verified in Phase 1.2 that dropping/overriding/force-toggling COLOR_ARGS
+    # leaves the probed output tags unchanged, so there is no working "color-flag" mutation here.
+    # The non-tautological HDR-metadata test (with a real must-fail mutation) is Phase 3.1's
+    # master-display/MaxCLL frame_side_data probe (catalog M-HDR-2).
     local cp tf
     cp="$(probe_video "$outfile" color_primaries)"
     tf="$(probe_video "$outfile" color_transfer)"
-    if [[ "$cp" == "bt2020" ]] || [[ "$cp" == *"2020"* ]]; then
-      pass "HDR10 encode: BT.2020 color primaries preserved"
+    if [[ "$cp" == *"2020"* ]]; then
+      pass "HDR10 encode: BT.2020 primaries re-applied on re-encode ($cp)"
     else
-      skip "HDR10 encode: BT.2020 primaries (ffprobe reported '$cp', varies by version)"
+      fail "HDR10 encode: expected BT.2020 primaries on re-encode, got '$cp' — color signaling dropped"
     fi
-    if [[ "$tf" == "smpte2084" ]] || [[ "$tf" == *"2084"* ]]; then
-      pass "HDR10 encode: SMPTE 2084 transfer preserved"
+    if [[ "$tf" == *"2084"* ]]; then
+      pass "HDR10 encode: SMPTE 2084 (PQ) transfer re-applied on re-encode ($tf)"
     else
-      skip "HDR10 encode: SMPTE 2084 transfer (ffprobe reported '$tf', varies by version)"
+      fail "HDR10 encode: expected SMPTE 2084 transfer on re-encode, got '$tf' — color signaling dropped"
+    fi
+  fi
+
+  # 1.2 negative control: an SDR source must NOT come out tagged HDR — catches the inverse
+  # (always-tag) bug that the M-HDR-1 drop can't. basic_sdr_subs.mkv is bt709 SDR; the explicit
+  # --crf forces a re-encode here too.
+  local sdr_out="$TESTDIR/hdr_negctl_sdr.mkv"
+  if assert_encode "HDR neg-control: SDR encode produced" "$sdr_out" \
+       --output-ext mkv --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv"; then
+    local scp stf
+    scp="$(probe_video "$sdr_out" color_primaries)"
+    stf="$(probe_video "$sdr_out" color_transfer)"
+    if [[ "$scp" != *"2020"* ]]; then
+      pass "HDR neg-control: SDR output not tagged BT.2020 ($scp)"
+    else
+      fail "HDR neg-control: SDR source wrongly tagged BT.2020 ($scp) — always-tag bug"
+    fi
+    if [[ "$stf" != *"2084"* ]]; then
+      pass "HDR neg-control: SDR output not tagged SMPTE 2084 ($stf)"
+    else
+      fail "HDR neg-control: SDR source wrongly tagged SMPTE 2084 ($stf) — always-tag bug"
     fi
   fi
 
@@ -3486,24 +3599,78 @@ test_hdr() {
   out="$(run_muxm --no-tonemap --print-effective-config)"
   assert_contains "TONEMAP_HDR_TO_SDR        = 0" "--no-tonemap: flag registered" "$out"
 
-  # ---- Phase 4a: Tonemap filter chain verification (R28, R29) ----
-  # The dry-run with --tonemap on an HDR source should trigger the SDR-TONEMAP
-  # color profile and include the zscale/tonemap filter chain in the output.
-
-  # R28: Explicit --tonemap flag with HDR source
-  out="$(run_muxm --dry-run --tonemap "$TESTDIR/hevc_hdr10_tagged.mkv" 2>&1)"
-  if echo "$out" | grep -qiE "zscale|tonemap="; then
-    pass "--tonemap + HDR source: tonemap filter chain present in dry-run"
+  # ---- 4.1: Tone-map HDR→SDR real-encode color verification (A-class; replaces R28/R29 dry-run) ----
+  # The old R28/R29 only grepped the --dry-run filter text and `else skip`ped when the synthetic
+  # HDR tags didn't trigger detection. This runs a REAL --tonemap encode on the HDR fixture and
+  # probes that the output is SDR-tagged (color_transfer / color_primaries == bt709, NOT
+  # smpte2084/arib-std-b67/bt2020). Non-tautological: muxm's COLOR_ARGS override the source's HDR
+  # tags (ffmpeg would otherwise auto-copy them), and the SDR-TONEMAP arm both sets bt709 tags and
+  # gates the zscale tonemap filter — so M-TM-2 (disable the tonemap arm → it falls to the HDR10
+  # arm) leaves the output HDR-tagged → red.
+  # zscale (libzimg) is required for the tonemap filter chain — gate on it (host-capability skip).
+  # Collect the filter list into a variable first: a `ffmpeg | grep -q` pipe SIGPIPEs ffmpeg under
+  # `set -o pipefail` (returns 141) and would skip a capable host (cf. ffmpeg_has_encoder).
+  local _ff_filters; _ff_filters="$(ffmpeg -hide_banner -filters 2>/dev/null || true)"
+  if [[ "$_ff_filters" != *zscale* ]]; then
+    skip "tonemap real encode: ffmpeg built without zscale/libzimg — tonemap filter unavailable"
   else
-    skip "--tonemap + HDR source: filter keywords not found (synthetic HDR tags may not trigger detection)"
+    local tm_out="$TESTDIR/hdr_tonemap_real.mkv"
+    if assert_encode "tonemap real encode: --tonemap output produced" "$tm_out" \
+         --tonemap --output-ext mkv --crf 28 --preset ultrafast "$TESTDIR/hevc_hdr10_tagged.mkv"; then
+      local tm_trc tm_prim
+      tm_trc="$(probe_video "$tm_out" color_transfer)"
+      tm_prim="$(probe_video "$tm_out" color_primaries)"
+      if [[ "$tm_trc" != *2084* && "$tm_trc" != *b67* && "$tm_trc" != *2020* ]]; then
+        pass "tonemap real encode: output transfer is SDR ($tm_trc, not PQ/HLG)"
+      else
+        fail "tonemap real encode: output stayed HDR transfer '$tm_trc' — SDR-tonemap arm not applied"
+      fi
+      if [[ "$tm_prim" != *2020* ]]; then
+        pass "tonemap real encode: output primaries are SDR ($tm_prim, not BT.2020)"
+      else
+        fail "tonemap real encode: output stayed BT.2020 primaries '$tm_prim' — SDR-tonemap arm not applied"
+      fi
+    fi
   fi
 
-  # R29: --profile universal implies tonemap — verify with HDR source
-  out="$(run_muxm --dry-run --profile universal "$TESTDIR/hevc_hdr10_tagged.mkv" 2>&1)"
-  if echo "$out" | grep -qiE "zscale|tonemap="; then
-    pass "--profile universal + HDR source: tonemap filter chain present"
+  # ---- 3.1: HDR10 static-metadata (mastering-display + MaxCLL) survival smoke probe ----
+  # A-class smoke check: build a source carrying real mastering-display + MaxCLL frame side-data,
+  # encode with hdr10-hq, and assert the output still carries BOTH. Catches a catastrophic regression
+  # (an encode that drops static metadata entirely, e.g. via a stray strip/downconvert).
+  # HONEST LIMIT — NOT the enforced HDR mutation: muxm sets no master-display/max-cll x265 params;
+  # ffmpeg auto-forwards the source frame side-data to libx265 regardless (verified: survives even
+  # with no x265-params at all), so this cannot isolate a muxm color lever and would pass for the
+  # "wrong reason" if treated as a feature gate. The genuinely-mutable HDR10-static-metadata test
+  # with the real must-fail mutation (M-HDR-2) is _test_unit_hdr10_static_metadata in the unit suite.
+  if ! ffmpeg_has_encoder libx265; then
+    skip "HDR10 static-metadata smoke probe: libx265 unavailable on this ffmpeg build"
   else
-    skip "--profile universal + HDR source: filter keywords not found (may require real HDR source)"
+    local _hdrs_src="$TESTDIR/hdr10_static_md.mkv" _hdrs_out="$TESTDIR/hdr10_static_md_out.mkv"
+    ffmpeg -hide_banner -loglevel error -y \
+      -f lavfi -i "color=c=green:s=320x240:r=24:d=1" \
+      -f lavfi -i "sine=frequency=440:duration=1" \
+      -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+      -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400" \
+      -c:a eac3 -b:a 448k -ac 6 -metadata:s:a:0 language=eng "$_hdrs_src" 2>/dev/null || true
+    # Confirm the fixture itself carries both before relying on it (guards a host ffmpeg that
+    # silently drops the params — a genuine capability gap, not a muxm regression).
+    local _hdrs_src_sd
+    _hdrs_src_sd="$(ffprobe -v error -select_streams v:0 -read_intervals "%+#1" -show_frames \
+      -show_entries frame_side_data=side_data_type "$_hdrs_src" 2>/dev/null | grep -ciE 'mastering display|content light')"
+    if [[ ! -s "$_hdrs_src" || "${_hdrs_src_sd:-0}" -lt 2 ]]; then
+      skip "HDR10 static-metadata smoke probe: host ffmpeg did not embed mastering-display+MaxCLL in the fixture"
+    elif assert_encode "HDR10 static-metadata smoke: hdr10-hq output produced" "$_hdrs_out" \
+           --profile hdr10-hq --preset ultrafast --crf 28 "$_hdrs_src"; then
+      local _hdrs_out_sd
+      _hdrs_out_sd="$(ffprobe -v error -select_streams v:0 -read_intervals "%+#1" -show_frames \
+        -show_entries frame_side_data=side_data_type "$_hdrs_out" 2>/dev/null | grep -ciE 'mastering display|content light')"
+      if [[ "${_hdrs_out_sd:-0}" -ge 2 ]]; then
+        pass "HDR10 static-metadata smoke: mastering-display + MaxCLL survive the hdr10-hq encode (auto-forward)"
+      else
+        fail "HDR10 static-metadata smoke: output lost mastering-display/MaxCLL side-data (got $_hdrs_out_sd of 2)"
+      fi
+    fi
+    rm -f "$_hdrs_src" "$_hdrs_out"
   fi
 }
 
@@ -3523,7 +3690,7 @@ test_audio() {
   log "Testing audio pipeline..."
   if assert_encode "Audio test encode" "$outfile" \
        --crf 28 --preset ultrafast --stereo-fallback "$TESTDIR/hevc_sdr_51.mkv"; then
-    assert_stream_count "Audio track present in output" "$outfile" a 1
+    assert_stream_count "Audio track present in output" "$outfile" a 2 2  # 5.1 + stereo-fallback
     # Hard assert: 6ch source + --stereo-fallback must produce a second stereo track
     acount="$(count_streams "$outfile" a)"
     if [[ "$acount" -ge 2 ]]; then
@@ -3542,7 +3709,7 @@ test_audio() {
     if [[ "$acount" -eq 1 ]]; then
       pass "--no-stereo-fallback: single audio track"
     else
-      skip "--no-stereo-fallback: $acount tracks (may vary by source)"
+      fail "--no-stereo-fallback: expected exactly 1 audio track (no fallback added), got $acount"
     fi
   fi
 
@@ -3555,13 +3722,13 @@ test_audio() {
   log "Testing multi-audio auto-selection..."
   if assert_encode "Multi-audio encode: output produced" "$outfile" \
        --crf 28 --preset ultrafast "$TESTDIR/multi_audio.mkv"; then
-    assert_stream_count "Multi-audio: audio tracks present" "$outfile" a 1
+    assert_stream_count "Multi-audio: audio tracks present" "$outfile" a 2 2
     # The 5.1 EAC3 should be preferred by the scoring algorithm
     ch="$(probe_audio "$outfile" channels 0)"
     if [[ "$ch" =~ ^[0-9]+$ && "$ch" -ge 6 ]]; then
       pass "Multi-audio: primary track is surround (${ch}ch)"
     else
-      skip "Multi-audio: primary track has ${ch}ch (5.1 preference may vary)"
+      fail "Multi-audio: expected surround (≥6ch) primary track, got ${ch}ch — 5.1 not preferred by scoring"
     fi
   fi
 
@@ -3576,7 +3743,7 @@ test_audio() {
     if [[ "$ch" =~ ^[0-9]+$ && "$ch" -le 2 ]]; then
       pass "--audio-track 0: stereo track selected (${ch}ch)"
     else
-      skip "--audio-track 0: got ${ch}ch (expected stereo from track 0)"
+      fail "--audio-track 0: expected stereo (≤2ch) from track 0, got ${ch}ch"
     fi
   fi
 
@@ -3604,7 +3771,7 @@ test_audio() {
     if [[ "$acodec" == "aac" ]]; then
       pass "--audio-force-codec aac: audio is AAC"
     else
-      skip "--audio-force-codec aac: got codec='$acodec' (expected aac)"
+      fail "--audio-force-codec aac: expected aac, got codec='$acodec'"
     fi
   fi
 
@@ -3627,7 +3794,7 @@ test_audio() {
     if [[ "$acodec" == "eac3" ]]; then
       pass "7.1→eac3: output codec is eac3"
     else
-      skip "7.1→eac3: output codec is '$acodec' (expected eac3)"
+      fail "7.1→eac3: expected eac3, got codec='$acodec'"
     fi
   fi
 
@@ -3745,7 +3912,7 @@ test_audio() {
   log "Testing pipe characters in audio stream title..."
   if assert_encode "Pipe in audio title: encode completes (no crash)" "$pipe_audio_out" \
        --crf 28 --preset ultrafast "$TESTDIR/pipe_titles.mkv"; then
-    assert_stream_count "Pipe in audio title: audio stream present" "$pipe_audio_out" a 1
+    assert_stream_count "Pipe in audio title: audio stream present" "$pipe_audio_out" a 1 1
   fi
 
   # ---- Multi-track audio (archive) ----
@@ -4039,7 +4206,7 @@ test_subs() {
   log "Testing subtitle inclusion in MKV..."
   if assert_encode "Subtitle test encode" "$outfile" \
        --output-ext mkv --crf 28 --preset ultrafast "$TESTDIR/multi_subs.mkv"; then
-    assert_stream_count "Subtitles present in MKV output" "$outfile" s 1
+    assert_stream_count "Subtitles present in MKV output" "$outfile" s 3 3
   fi
 
   # --no-subtitles
@@ -4067,13 +4234,15 @@ test_subs() {
   log "Testing --sub-export-external..."
   if assert_encode "--sub-export-external: output produced" "$outfile" \
        --sub-export-external --crf 28 --preset ultrafast "$TESTDIR/multi_subs.mkv"; then
-    # Check for .srt sidecar file(s)
+    # 1.6: real output probe, not just existence — multi_subs.mkv has text subs, so
+    # --sub-export-external must (a) re-encode valid video and (b) write ≥1 .srt sidecar.
+    assert_probe "--sub-export-external: output is a valid HEVC encode" "$outfile" codec_name hevc
     local srt_count
     srt_count="$(find "$TESTDIR" -name "subs_export*.srt" 2>/dev/null | wc -l | tr -d ' ')"
     if [[ "$srt_count" -ge 1 ]]; then
       pass "--sub-export-external: SRT sidecar(s) created ($srt_count)"
     else
-      skip "--sub-export-external: no .srt sidecar found (may depend on subtitle type)"
+      fail "--sub-export-external: expected ≥1 .srt sidecar exported from multi_subs.mkv, found none"
     fi
   fi
 
@@ -4237,7 +4406,7 @@ EOF
   log "Testing pipe characters in subtitle stream title..."
   if assert_encode "Pipe in sub title: encode completes (no crash)" "$pipe_sub_out" \
        --output-ext mkv --crf 28 --preset ultrafast "$TESTDIR/pipe_titles.mkv"; then
-    assert_stream_count "Pipe in sub title: subtitle stream present" "$pipe_sub_out" s 1
+    assert_stream_count "Pipe in sub title: subtitle stream present" "$pipe_sub_out" s 1 1
     local pipe_sub_codec
     pipe_sub_codec="$(probe_sub "$pipe_sub_out" codec_name)"
     if [[ -n "$pipe_sub_codec" ]]; then
@@ -4370,6 +4539,69 @@ EOF
     skip "M4: forced subtitle not prepared from multi_subs.mkv — burn path not exercised"
   fi
   rm -rf "$_m4_dir"
+
+  # ---- 3.3: forced-subtitle burn-in PIXEL verification (M-BURN-1) ----
+  # M4 above only greps the log for "Burning forced subtitles"; this proves the burn actually
+  # writes pixels. Encode the SAME source twice — with and without --sub-burn-forced — then PSNR
+  # the bottom subtitle band of the two video streams. A real burn overlays opaque text, dragging
+  # the band's y-PSNR far down (≈21 dB observed); a no-op burn leaves the band bit-identical to the
+  # plain encode (y:inf). Threshold 45 dB cleanly separates the two (text ≪ 45 ≪ inf).
+  # EXPLICIT NON-CLAIM: proves PIXELS CHANGED in the sub region, not positioning/styling fidelity.
+  # M-BURN-1 turns the `subtitles=filename=burn.srt` filter into a `null` passthrough (still a valid
+  # encode, just no burn) → the bands become identical → this test goes red.
+  # A dedicated fixture (640×360 gray, one long forced line for the full clip) makes the delta
+  # unambiguous and the forced line present at every sampled frame — built inline (not a shared
+  # fixture) so it is self-contained.
+  local _burn_dir="$TESTDIR/burnpix"
+  mkdir -p "$_burn_dir"
+  cat > "$_burn_dir/forced.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+FORCED SUBTITLE BURN TEST LINE ONE TWO THREE
+SRT
+  local _burn_src="$_burn_dir/forced_src.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=gray:s=640x360:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -i "$_burn_dir/forced.srt" \
+    -map 0:v -map 1:a -map 2 \
+    -c:v libx264 -preset ultrafast -crf 24 -c:a aac -b:a 96k -ac 2 -c:s srt \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:s:0 language=eng -metadata:s:s:0 title="Forced" \
+    -disposition:s:0 forced \
+    "$_burn_src" 2>/dev/null || true
+  if [[ ! -s "$_burn_src" ]]; then
+    skip "3.3 burn-in: could not build forced-subtitle fixture (ffmpeg/libx264 unavailable)"
+  else
+    local _burned="$_burn_dir/burned.mkv" _plain="$_burn_dir/plain.mkv" _burn_log
+    _burn_log="$(run_muxm --sub-burn-forced --output-ext mkv --crf 24 --preset ultrafast "$_burn_src" "$_burned")"
+    run_muxm --no-sub-burn-forced --output-ext mkv --crf 24 --preset ultrafast "$_burn_src" "$_plain" >/dev/null 2>&1
+    # The fixture guarantees a forced track, so the burn must be attempted (else the comparison
+    # below is meaningless) — a missing attempt is a real regression here, not a host skip.
+    if ! printf '%s\n' "$_burn_log" | grep -qiF 'Burning forced subtitles'; then
+      fail "3.3 burn-in: --sub-burn-forced did not attempt a burn on a forced-track source"
+    elif [[ ! -s "$_burned" || ! -s "$_plain" ]]; then
+      fail "3.3 burn-in: burned and/or plain encode produced no output"
+    else
+      # PSNR of the bottom third (where SRT renders) between burned and plain video streams.
+      # Relative crop (iw, ih/3) is robust to any output resolution; both encodes share dims.
+      local _psnr_line _y
+      _psnr_line="$(ffmpeg -hide_banner -loglevel info -i "$_burned" -i "$_plain" -lavfi \
+        "[0:v]crop=iw:ih/3:0:2*ih/3[a];[1:v]crop=iw:ih/3:0:2*ih/3[b];[a][b]psnr" \
+        -f null - 2>&1 | grep -iE 'PSNR.*average' | tail -1)"
+      _y="$(printf '%s' "$_psnr_line" | grep -oE 'y:inf|y:[0-9.]+' | head -1 | cut -d: -f2)"
+      if [[ -z "$_y" ]]; then
+        fail "3.3 burn-in: could not compute band PSNR (ffmpeg psnr filter produced no value)"
+      elif [[ "$_y" == "inf" ]]; then
+        fail "3.3 burn-in: subtitle band is identical with/without --sub-burn-forced (y-PSNR=inf) — burn wrote no pixels"
+      elif awk "BEGIN{exit !($_y < 45)}"; then
+        pass "3.3 burn-in: --sub-burn-forced changes the subtitle-band pixels (y-PSNR=${_y}dB < 45)"
+      else
+        fail "3.3 burn-in: subtitle band barely changed (y-PSNR=${_y}dB ≥ 45) — forced text not rendered into pixels"
+      fi
+    fi
+  fi
+  rm -rf "$_burn_dir"
 }
 
 # === Suite: Output Features ===
@@ -4389,7 +4621,7 @@ test_output() {
     if [[ "$chap_count" -ge 1 ]]; then
       pass "Chapters preserved in output ($chap_count chapters)"
     else
-      skip "Chapters preserved: count=$chap_count (may not persist in short clips)"
+      fail "Chapters preserved: expected ≥1 chapter (with_chapters.mkv + --keep-chapters), got $chap_count"
     fi
   fi
 
@@ -4425,7 +4657,7 @@ test_output() {
         fail "--checksum: SHA-256 does not match output file"
       fi
     else
-      skip "--checksum: SHA-256 sidecar not found at $sha_file (check naming convention)"
+      fail "--checksum: SHA-256 sidecar not created at $sha_file"
     fi
   fi
 
@@ -4444,7 +4676,7 @@ test_output() {
           fail "--checksum-algo blake2b: BLAKE2b does not match output file"
         fi
       else
-        skip "--checksum-algo blake2b: .b2 sidecar not found at $b2_file"
+        fail "--checksum-algo blake2b: .b2 sidecar not created at $b2_file (b2sum is present)"
       fi
     fi
   else
@@ -4472,30 +4704,60 @@ test_output() {
       has_profile="$(jq 'has("profile")' "$json_file" 2>/dev/null)" || has_profile="false"
       has_output="$(jq 'has("output")' "$json_file" 2>/dev/null)" || has_output="false"
       has_timestamp="$(jq 'has("timestamp")' "$json_file" 2>/dev/null)" || has_timestamp="false"
-      if [[ "$has_tool" == "true" ]]; then pass "--report-json: contains tool/version key"; else skip "--report-json: tool/version key not found (key naming may differ)"; fi
-      if [[ "$has_source" == "true" ]]; then pass "--report-json: contains source/input key"; else skip "--report-json: source/input key not found (key naming may differ)"; fi
-      if [[ "$has_profile" == "true" ]]; then pass "--report-json: contains profile key"; else skip "--report-json: profile key not found (key naming may differ)"; fi
-      if [[ "$has_output" == "true" ]]; then pass "--report-json: contains output key"; else skip "--report-json: output key not found (key naming may differ)"; fi
-      if [[ "$has_timestamp" == "true" ]]; then pass "--report-json: contains timestamp key"; else skip "--report-json: timestamp key not found (key naming may differ)"; fi
+      if [[ "$has_tool" == "true" ]]; then pass "--report-json: contains tool/version key"; else fail "--report-json: tool/version key missing from JSON report"; fi
+      if [[ "$has_source" == "true" ]]; then pass "--report-json: contains source/input key"; else fail "--report-json: source/input key missing from JSON report"; fi
+      if [[ "$has_profile" == "true" ]]; then pass "--report-json: contains profile key"; else fail "--report-json: profile key missing from JSON report"; fi
+      if [[ "$has_output" == "true" ]]; then pass "--report-json: contains output key"; else fail "--report-json: output key missing from JSON report"; fi
+      if [[ "$has_timestamp" == "true" ]]; then pass "--report-json: contains timestamp key"; else fail "--report-json: timestamp key missing from JSON report"; fi
       # Validate content values
       local rj_content
       rj_content="$(cat "$json_file")"
       assert_contains "streaming" "JSON report contains profile name" "$rj_content"
       assert_contains "MuxMaster" "JSON report contains tool name" "$rj_content"
     else
-      skip "--report-json: report file not found at $json_file"
+      fail "--report-json: report file not created at $json_file"
     fi
   fi
 
-  # --skip-if-ideal with compliant source (#26, #51)
-  outfile="$TESTDIR/out_skip_ideal.mp4"
-  log "Testing --skip-if-ideal with compliant.mp4..."
-  run_muxm --skip-if-ideal --preset ultrafast \
-    "$TESTDIR/compliant.mp4" "$outfile" >/dev/null
-  if [[ -f "$outfile" && -s "$outfile" ]]; then
-    pass "--skip-if-ideal: produced output (may have encoded if not fully compliant)"
+  # 1.6: skip-if-ideal split — a COMPLIANT source must be recognized and remuxed (NOT
+  # re-encoded); a NON-COMPLIANT source must re-encode. --profile atv-directplay-hq
+  # (HEVC+EAC3, SKIP_IF_IDEAL + VIDEO_COPY_IF_COMPLIANT on) makes the compliance check
+  # deterministic — the default no-profile path has no copy-compliant spec, which is why the
+  # old single "--skip-if-ideal compliant.mp4" test could only say "may have encoded".
+  #
+  # Compliant: compliant.mp4 (HEVC 10-bit + EAC3 in MP4) already matches → muxm must SKIP
+  # (the "Source already matches … skipping" note fires; the video is stream-copied, stays HEVC).
+  local sii_ok_out="$TESTDIR/out_sii_compliant.mp4" sii_ok_log
+  log "skip-if-ideal: compliant source must be recognized + remuxed (not re-encoded)..."
+  sii_ok_log="$(run_muxm --profile atv-directplay-hq --skip-if-ideal \
+    "$TESTDIR/compliant.mp4" "$sii_ok_out")"
+  if echo "$sii_ok_log" | grep -qiE "already matches.*skip|skipping processing"; then
+    pass "skip-if-ideal compliant: recognized as ideal (skip-processing note fired)"
   else
-    skip "--skip-if-ideal: inconclusive (behavior depends on compliance check)"
+    fail "skip-if-ideal compliant: expected the 'source already matches … skipping' note, but muxm re-processed it"
+  fi
+  if [[ -f "$sii_ok_out" && -s "$sii_ok_out" ]]; then
+    assert_probe "skip-if-ideal compliant: video stream-copied (stays HEVC)" "$sii_ok_out" codec_name hevc
+  else
+    fail "skip-if-ideal compliant: no output produced"
+  fi
+
+  # Non-compliant: basic_sdr_subs.mkv is H.264 → does NOT match atv-directplay-hq, so
+  # --skip-if-ideal must NOT skip; muxm re-encodes H.264 → HEVC. (M-SII-1 forces
+  # check_skip_if_ideal always-ideal → this source is wrongly skipped/copied → both go red.)
+  local sii_no_out="$TESTDIR/out_sii_noncompliant.mkv" sii_no_log
+  log "skip-if-ideal: non-compliant source must re-encode (not skip)..."
+  sii_no_log="$(run_muxm --profile atv-directplay-hq --skip-if-ideal \
+    "$TESTDIR/basic_sdr_subs.mkv" "$sii_no_out")"
+  if echo "$sii_no_log" | grep -qiE "already matches.*skip|skipping processing"; then
+    fail "skip-if-ideal non-compliant: H.264 source was wrongly skipped (should re-encode)"
+  else
+    pass "skip-if-ideal non-compliant: source not skipped (re-encode proceeds)"
+  fi
+  if [[ -f "$sii_no_out" && -s "$sii_no_out" ]]; then
+    assert_probe "skip-if-ideal non-compliant: re-encoded H.264 → HEVC" "$sii_no_out" codec_name hevc
+  else
+    fail "skip-if-ideal non-compliant: no output produced"
   fi
 
   # ---- skip-if-ideal + multi-track: commentary triggers remux (not ideal) ----
@@ -4667,9 +4929,14 @@ test_containers() {
     skip "passthrough m4v→m4v: could not create m4v fixture"
   fi
 
-  # ---- Container passthrough: unsupported source extension → mkv fallback ----
-  # Sources with containers that can't be written as output (avi, ts, etc.) fall back
-  # to mkv. Verified via the dry-run log message from the passthrough resolution block.
+  # ---- 4.3: Container passthrough — unsupported source extension → mkv fallback (A-class) ----
+  # Sources whose container can't be written as output (avi, ts, …) fall back to mkv via the
+  # passthrough resolution block's `*) OUTPUT_EXT="mkv"` arm. The old test only grepped the
+  # --dry-run notice; this runs a REAL passthrough encode (no explicit output, so muxm derives the
+  # extension itself) and probes the derived file's container is matroska. Non-tautological:
+  # muxm's OUTPUT_EXT decision sets the muxer, not ffmpeg auto-copy. atv-directplay-hq stays a
+  # passthrough profile (archive now forces MKV unconditionally, so it wouldn't exercise this arm).
+  # M-AVIFB-1 breaks the fallback default (mkv→mp4) → muxm derives a .mp4, no .mkv → red.
   local avi_src="$TESTDIR/passthrough_fallback_test.avi"
   ffmpeg -hide_banner -loglevel error -y \
     -f lavfi -i "color=c=blue:s=160x120:r=24:d=1" \
@@ -4677,19 +4944,28 @@ test_containers() {
     -c:v libx264 -preset ultrafast -crf 28 \
     -c:a aac -b:a 64k -ac 2 \
     "$avi_src" 2>/dev/null
-  if [[ -f "$avi_src" ]]; then
-    local avi_out
-    # Use a still-passthrough profile (atv-directplay-hq) — archive now forces MKV (A2),
-    # so it no longer exercises the unsupported-container passthrough fallback path.
-    avi_out="$(run_muxm --dry-run --profile atv-directplay-hq "$avi_src")"
-    if echo "$avi_out" | grep -qiE "not supported for output|defaulting to .mkv"; then
-      pass "passthrough fallback: .avi source triggers mkv fallback notice"
-    else
-      assert_contains "container-passthrough" \
-        "passthrough fallback: .avi logs passthrough resolution block" "$avi_out"
-    fi
+  if [[ ! -s "$avi_src" ]]; then
+    skip "passthrough fallback .avi test: could not create avi fixture (ffmpeg avi muxer absent)"
   else
-    skip "passthrough fallback .avi test: could not create avi fixture"
+    local avi_log avi_derived="$TESTDIR/passthrough_fallback_test.mkv"
+    rm -f "$TESTDIR/passthrough_fallback_test.mkv"* "$TESTDIR/passthrough_fallback_test.mp4"*
+    avi_log="$(run_muxm --profile atv-directplay-hq --crf 28 --preset ultrafast "$avi_src")"
+    if printf '%s\n' "$avi_log" | grep -qiE "not supported for output|defaulting to .mkv"; then
+      pass "passthrough fallback: .avi source logs the unsupported→mkv fallback notice"
+    else
+      fail "passthrough fallback: .avi source did not log the unsupported-container fallback notice"
+    fi
+    if [[ -s "$avi_derived" ]]; then
+      local avi_fmt; avi_fmt="$(probe_format "$avi_derived" format_name)"
+      if echo "$avi_fmt" | grep -qi matroska; then
+        pass "passthrough fallback: .avi real encode produces a Matroska container ($avi_fmt)"
+      else
+        fail "passthrough fallback: expected matroska output for the .avi fallback, got '$avi_fmt'"
+      fi
+    else
+      fail "passthrough fallback: expected a derived .mkv output for the .avi source, none found"
+    fi
+    rm -f "$TESTDIR/passthrough_fallback_test.mkv"* "$TESTDIR/passthrough_fallback_test.mp4"*
   fi
 
   # ---- CLI --output-ext overrides container passthrough ----
@@ -4940,7 +5216,7 @@ test_metadata() {
     if [[ -n "$title" ]]; then
       pass "Metadata preserved: title='$title'"
     else
-      skip "Metadata preservation: title not found (may vary by pipeline)"
+      fail "Metadata preservation: expected source title preserved (rich_metadata.mkv, no --strip-metadata), got empty"
     fi
   fi
 
@@ -5158,6 +5434,20 @@ test_edge() {
     skip "Filesystem does not support tab in filename — control character test skipped"
   fi
 
+  # ---- 3.6: Control character rejection (OUTPUT filename) — distinct from the source check ----
+  # The source-filename control-char die is tested above; the separate OUT_ABS guard had no
+  # coverage. Pass a tab in the OUTPUT path (the source is clean) → muxm must die 11 with the
+  # output-specific message. M-CTRL-1 neuters the OUT_ABS regex → muxm sails past validation → both
+  # assertions go red. (The source check stays intact, so this isolates the output-path guard.)
+  local _octrl_out
+  _octrl_out="$(printf '%s/out\tname.mkv' "$TESTDIR")"
+  assert_exit "$EXIT_VALIDATION" "3.6 output control-char: tab in output path → exit $EXIT_VALIDATION" \
+    --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv" "$_octrl_out"
+  local _octrl_msg
+  _octrl_msg="$(run_muxm --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv" "$_octrl_out")"
+  assert_contains "Output filename contains control characters" \
+    "3.6 output control-char: OUT_ABS check names the output-filename risk" "$_octrl_msg"
+
   # ---- Source/output collision auto-versioning ----
   # When source and output point to the same file, muxm auto-versions the output
   # filename instead of dying (unless --replace-source / --force-replace-source).
@@ -5364,6 +5654,28 @@ assert_muxm_fn_stdout() {
   if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected '$expected', got '$actual'"; fi
 }
 
+# _extract_muxm_fns NAME... — echo the concatenated awk single-function extractions for each
+# NAME (a target decision function plus the pure helpers it calls), so the function can be
+# exercised in a subshell with its REAL formula and only its I/O boundary mocked. This is the
+# Phase 2 unit mechanism (see Test_Suite_Fixes.md §0.4 and the "rejected `source muxm`" note):
+# it needs no change to muxm. Same extraction as assert_muxm_fn_stdout, but it returns the
+# body so the caller drives the function directly. A name that isn't found emits nothing for
+# that name and makes the whole call return 1 — so a renamed dependency can't silently yield a
+# partial (and misleadingly passing) body.
+_extract_muxm_fns() {
+  local fn body rc=0
+  for fn in "$@"; do
+    body="$(awk "/^${fn}\\(\\)[[:space:]]*\\{/,/^\\}/" "$MUXM")"
+    if [[ -z "$body" ]]; then
+      printf 'ERROR: _extract_muxm_fns: function %s not found in %s\n' "$fn" "$MUXM" >&2
+      rc=1
+      continue
+    fi
+    printf '%s\n' "$body"
+  done
+  return "$rc"
+}
+
 # --- test_unit sub-functions ---
 # Organized by the muxm subsystem they exercise.  Each sub-function is
 # independently readable; they execute sequentially in the dispatcher and
@@ -5414,49 +5726,11 @@ _test_unit_audio_helpers() {
   assert_muxm_fn_stdout "_audio_codec_rank(truehd, animation)=1"  "1"  _audio_codec_rank "$anim_rank_env" "truehd"
   assert_muxm_fn_stdout "_audio_codec_rank(eac3, animation)=2"    "2"  _audio_codec_rank "$anim_rank_env" "eac3"
 
-  # ---- Scoring formula invariants (regression guards for codec-vs-bitrate bug) ----
-  # These validate the arithmetic properties of _score_audio_stream without needing
-  # ffprobe metadata, by computing score components directly from the formula.
-  #
-  # Invariant 1: One codec rank step MUST exceed the maximum bitrate bonus.
-  # The formula gives (10 - rank) * 10 per codec position and caps bitrate at 8.
-  # Adjacent codecs differ by rank=1 → 10 points. Bitrate max = 8 points.
-  # So a higher-ranked codec can never lose to bitrate alone.
-  local codec_step=10 max_br_bonus=8
-  if (( codec_step > max_br_bonus )); then
-    pass "Scoring invariant: codec rank step ($codec_step) > max bitrate bonus ($max_br_bonus)"
-  else
-    fail "Scoring invariant: codec rank step ($codec_step) must exceed max bitrate bonus ($max_br_bonus)"
-  fi
-
-  # Invariant 2: Lossless synthetic floor produces a non-trivial bitrate bonus.
-  # The floor is 1536000; at br/50000 capped to 8, that gives 8 points — same as
-  # any high-bitrate lossy codec, so lossless is never penalised for missing metadata.
-  local lossless_floor=1536000
-  local lossless_br_bonus=$(( lossless_floor / 50000 ))
-  (( lossless_br_bonus > max_br_bonus )) && lossless_br_bonus=$max_br_bonus
-  if (( lossless_br_bonus >= max_br_bonus )); then
-    pass "Scoring invariant: lossless floor produces max bitrate bonus ($lossless_br_bonus)"
-  else
-    fail "Scoring invariant: lossless floor bitrate bonus ($lossless_br_bonus) should reach cap ($max_br_bonus)"
-  fi
-
-  # Invariant 3: Simulated Arcane scenario — FLAC rank 0 vs AC3 rank 3 (animation pref).
-  # Both 6ch eng, FLAC br=0 (gets floor), AC3 br=640000.
-  # This is the exact scenario that was broken before the fix.
-  local flac_rank=0 ac3_rank=3
-  local flac_codec_score=$(( (10 - flac_rank) * 10 ))  # 100
-  local ac3_codec_score=$((  (10 - ac3_rank)  * 10 ))  # 70
-  local ac3_br_bonus=$(( 640000 / 50000 ))
-  (( ac3_br_bonus > max_br_bonus )) && ac3_br_bonus=$max_br_bonus
-  # FLAC gets max bitrate bonus from synthetic floor
-  local flac_total=$(( flac_codec_score + lossless_br_bonus ))
-  local ac3_total=$((  ac3_codec_score  + ac3_br_bonus ))
-  if (( flac_total > ac3_total )); then
-    pass "Scoring invariant: FLAC($flac_total) > AC3($ac3_total) in Arcane scenario"
-  else
-    fail "Scoring invariant: FLAC($flac_total) should beat AC3($ac3_total) — codec preference regression"
-  fi
+  # (Phase 2.1: the old "Scoring formula invariants" block was deleted — it computed score
+  #  components in the test (codec_step=10, max_br_bonus=8, …) and asserted arithmetic
+  #  tautologies (10>8, FLAC>AC3) that NEVER called _score_audio_stream, so a real scoring
+  #  break was invisible. Replaced by _test_unit_score_audio_stream, which exercises the real
+  #  function via _extract_muxm_fns. See Test_Suite_Fixes.md §2.1.)
 
   # ---- _audio_is_commentary ----
   assert_muxm_fn_exit "_audio_is_commentary('Director\\'s Commentary')=match"  0 _audio_is_commentary "" "Director's Commentary"
@@ -5899,6 +6173,68 @@ _test_unit_disk_fallback() {
   rm -f "$srcfile"
 }
 
+
+_test_unit_disk_output_volume() {
+  # 3.6: disk_free_warn's OUTPUT-VOLUME hard stop — the `od_dev != wd_dev` branch the review found
+  # is never reached by any e2e test (WORKDIR and OUT_DIR normally share a volume). Source the
+  # function with a df mock that puts OUT_DIR on a DIFFERENT, (nearly) full device while the workdir
+  # volume is roomy, so the workdir check passes and the output-volume `die 11` fires. A same-volume
+  # sanity case proves the die is specific to the cross-volume branch (not a blanket always-die).
+  # M-DISK-1 inverts the cross-volume guard (!= → ==) → the output check is skipped → no die → red.
+  local body
+  body="$(awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ -z "$body" ]]; then skip "disk_free_warn not found in muxm"; return; fi
+  local srcfile; srcfile="$(mktemp "$TESTDIR/disk_ov.XXXXXX")"
+  head -c 10485760 /dev/zero > "$srcfile"   # 10 MiB, so the stat-based estimate is non-degenerate
+
+  # Re-encode mode (peak_factor=2) so the DISK_FREE_WARN_GB floor (5 GiB) governs need_output —
+  # far above the 1 KiB we report free on the output volume. die() prints + exits with its code.
+  local common='
+    DISK_CHECK=1; VIDEO_CODEC=libx265; CRF_VALUE=28; PRESET_VALUE=medium
+    DISABLE_DV=1; AUDIO_MULTI_TRACK=0; AUDIO_FORCE_CODEC=""; METADATA_CACHE=""
+    DISK_FREE_WARN_GB=5; VIDEO_COPY_IF_COMPLIANT=0
+    WORKDIR=/tmp/muxm_ov_wd; OUT_DIR=/tmp/muxm_ov_od
+    _get_source_duration_secs(){ echo 100; }
+    _jq_cache(){ echo ""; }
+    _audio_stream_count(){ echo 0; }
+    _audio_stream_info(){ echo ""; }
+    _source_has_dv_metadata(){ return 1; }
+    _crf_ratio(){ echo 50; }
+    _preset_multiplier(){ echo 1000; }
+    _av1_preset_multiplier(){ echo 1000; }
+    _gb(){ echo 5; }
+    log(){ :; }
+    die(){ printf "DIE|%s|%s\n" "$1" "$2"; exit "$1"; }
+  '
+  # df field 1 is the device, field 4 the available KiB (awk NR==2 reads $1/$4). The cross-volume
+  # mock returns a DIFFERENT device + 1 KiB free for OUT_DIR; a roomy device for everything else.
+  local dfmock_diff='
+    df(){ local p="${@: -1}"
+      if [[ "$p" == "$OUT_DIR" ]]; then printf "FS 1K Used Avail Cap M\noddev 100 99 1 99%% /od\n"
+      else printf "FS 1K Used Avail Cap M\nwddev 99999999999 0 99999999999 0%% /wd\n"; fi; }
+  '
+  local dfmock_same='
+    df(){ printf "FS 1K Used Avail Cap M\nsamedev 99999999999 0 99999999999 0%% /\n"; }
+  '
+  local out rc
+
+  rc=0
+  out="$(bash -c "$common"$'\n'"$dfmock_diff"$'\n'"SRC_ABS='$srcfile'"$'\n'"$body"$'\n''disk_free_warn' 2>&1)" || rc=$?
+  if [[ "$rc" -eq 11 ]] && printf '%s\n' "$out" | grep -qiE 'output volume|output file'; then
+    pass "3.6 disk output-volume: full output volume on a different device → die 11"
+  else
+    fail "3.6 disk output-volume: expected die 11 on a full different output volume, got rc=$rc out='${out:0:120}'"
+  fi
+
+  rc=0
+  out="$(bash -c "$common"$'\n'"$dfmock_same"$'\n'"SRC_ABS='$srcfile'"$'\n'"$body"$'\n''disk_free_warn' 2>&1)" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    pass "3.6 disk output-volume: same roomy volume → no die (sanity: branch is volume-specific)"
+  else
+    fail "3.6 disk output-volume: same roomy volume should not die, got rc=$rc out='${out:0:120}'"
+  fi
+  rm -f "$srcfile"
+}
 
 _test_unit_av1_resolution_crf() {
   # WI-2: _apply_av1_resolution_crf — resolution/HDR-aware CRF for the AV1 profiles.
@@ -6345,6 +6681,453 @@ _test_unit_fps_helpers() {
   assert_muxm_fn_stdout "_fps_to_decimal(abc)=empty"          ""        _fps_to_decimal "" "abc"
 }
 
+_test_unit_extract_helper() {
+  # 0.4 self-test for _extract_muxm_fns. Its real consumers are Phase 2 (out of scope here),
+  # so this proves the helper works at all: extract a target plus a real pure-helper dep and
+  # run it with only its env mocked. _parse_ext_sub_filename calls _norm_lang_code — pull both
+  # and exercise the real parse (movie.en.srt → "eng<TAB>full").
+  local body got
+  body="$(_extract_muxm_fns _norm_lang_code _parse_ext_sub_filename)"
+  if [[ -z "$body" ]]; then
+    fail "_extract_muxm_fns: returned empty body for a known function pair"
+  else
+    got="$(bash -c "TAG_LANGUAGE_DEFAULT=und"$'\n'"$body"$'\n''_parse_ext_sub_filename "$1" "$2"' -- movie movie.en.srt)"
+    if [[ "$got" == "eng"$'\t'"full" ]]; then
+      pass "_extract_muxm_fns: target + pure-helper dep runs with the real formula (eng/full)"
+    else
+      fail "_extract_muxm_fns: expected 'eng<TAB>full', got '$got'"
+    fi
+  fi
+  # A missing function name must make the call return non-zero (never a silent partial body
+  # that would let a renamed dependency pass misleadingly).
+  if _extract_muxm_fns _definitely_not_a_real_fn_zzz >/dev/null 2>&1; then
+    fail "_extract_muxm_fns: should return non-zero for a missing function name"
+  else
+    pass "_extract_muxm_fns: missing function name → non-zero (no silent partial extraction)"
+  fi
+}
+
+_test_unit_score_audio_stream() {
+  # 2.1: direct unit test of _score_audio_stream — the function that decides which audio track
+  # every user gets, and which NO test exercised before (the deleted "invariants" block was an
+  # arithmetic tautology). Extract the function + its pure-helper deps via _extract_muxm_fns,
+  # mock the _audio_stream_info I/O boundary, and assert the emitted score equals an INDEPENDENT
+  # recompute of the documented components from CANONICAL constants. A formula edit OR a
+  # default-weight edit in muxm then diverges from the oracle.
+  #
+  # PLAN-vs-CODE (flagged): the plan says "set the AUDIO_SCORE_* weights in env_setup". Doing so
+  # would MASK M-AUD-3 — it mutates the top-level `declare -i AUDIO_SCORE_SURROUND_BONUS=30`, which
+  # _extract_muxm_fns never pulls in, so an injected value would override the mutated default and
+  # the test would pass under mutation. So we SOURCE muxm's actual default lines (^-anchored, to
+  # skip the indented profile-arm reassignments) and use canonical hardcoded constants as oracle.
+  local body
+  body="$(_extract_muxm_fns _score_audio_stream _normalize_codec_lang _audio_codec_rank \
+                            _audio_lang_matches audio_is_lossless _audio_is_commentary)" || {
+    fail "2.1: could not extract _score_audio_stream + helpers from muxm"; return; }
+  local defaults
+  defaults="$(grep -E '^(declare -i )?(AUDIO_SCORE_[A-Z_]+|AUDIO_CODEC_PREFERENCE|AUDIO_LANG_PREF|TAG_LANGUAGE_DEFAULT|_AUDIO_CODEC_RANK_PREF)=' "$MUXM")"
+
+  # muxm's emitted score for a mocked stream (codec ch lang br title). The mock ignores the idx
+  # arg and emits the canned tab-separated record _score_audio_stream expects.
+  local _mockrun='args=("$@")
+_audio_stream_info(){ printf "%s\t%s\t%s\t%s\t%s\n" "${args[0]}" "${args[1]}" "${args[2]}" "${args[3]}" "${args[4]}"; }
+_score_audio_stream 0 | cut -f1'
+  _su_score(){ bash -c "$defaults"$'\n'"$body"$'\n'"$_mockrun" -- "$1" "$2" "$3" "$4" "$5"; }
+
+  # Independent oracle — documented formula with CANONICAL constants (NOT muxm's current values).
+  # All-`if` (no `cond && action`) to stay set-e-safe inside the command substitution.
+  local C_CHMULT=20 C_SURR=30 C_LANG=150 C_COMM=200 C_DIV=50000 C_CAP=8 C_FLOOR=1536000
+  local C_PREF="eac3,ac3,aac,alac,other" C_LANGPREF="eng"
+  _su_expect(){
+    local codec="${1,,}" ch="$2" lang="${3,,}" br="$4" title="${5,,}" s=0 rank=10 i=0 p matched=0
+    if [[ -z "$lang" ]]; then lang="und"; fi
+    local -a _pa _lp; IFS=',' read -ra _pa <<<"$C_PREF"
+    for p in "${_pa[@]}"; do if [[ "$codec" == "$p" ]]; then rank=$i; break; fi; i=$(( i + 1 )); done
+    IFS=',' read -ra _lp <<<"$C_LANGPREF"
+    for p in "${_lp[@]}"; do if [[ "$lang" == "$p" ]]; then matched=1; break; fi; done
+    if (( matched )); then s=$(( s + C_LANG )); fi
+    s=$(( s + ch * C_CHMULT ))
+    if (( ch >= 6 )); then s=$(( s + C_SURR )); fi
+    local inv=$(( (10 - rank) * 10 )); if (( inv < 0 )); then inv=0; fi; s=$(( s + inv ))
+    local eff="$br"
+    if (( br == 0 )); then case "$codec" in truehd|dts|dca|flac|alac|pcm_s16le|pcm_s24le|pcm_s32le) eff=$C_FLOOR ;; esac; fi
+    if (( eff > 0 )); then local bb=$(( eff / C_DIV )); if (( bb > C_CAP )); then bb=$C_CAP; fi; s=$(( s + bb )); fi
+    if [[ "$title" =~ (commentary|comentario|kommentar|descriptive|audio.description|visually.impaired) ]]; then s=$(( s - C_COMM )); fi
+    echo "$s"
+  }
+  _su_assert(){
+    local label="$1"; shift; local got want
+    got="$(_su_score "$@")"; want="$(_su_expect "$@")"
+    if [[ "$got" == "$want" ]]; then pass "$label (score=$got)"; else fail "$label — muxm=$got, recomputed=$want"; fi
+  }
+
+  # Full-score oracle scenarios. ch<6 keeps them independent of the surround bonus, so the
+  # M-AUD-1 (rank-formula) signature stays distinct from M-AUD-3. eac3=rank 0 / aac=rank 2 (≠5),
+  # so M-AUD-1's (10-rank)*10 → rank*10 diverges here.
+  _su_assert "2.1 score: eac3 2ch eng 448k (rank+lang+bitrate)" eac3 2 eng 448000 ""
+  _su_assert "2.1 score: aac 2ch und 0k (rank 2, no lang/floor)"  aac 2 und 0 ""
+  _su_assert "2.1 score: flac 2ch eng 0k (lossless floor reaches cap)" flac 2 eng 0 ""
+  _su_assert "2.1 score: eac3 2ch eng + commentary (penalty)"     eac3 2 eng 448000 "Director's Commentary"
+  _su_assert "2.1 score: aac 8ch eng 256k (channels + bitrate cap)" aac 8 eng 256000 ""
+
+  # Surround-bonus isolation (M-AUD-3 signature): score(6ch) − score(5ch) for the SAME codec is
+  # exactly one channel step + the surround bonus. The rank component cancels (same codec), so
+  # M-AUD-1 does NOT move it — only M-AUD-3 (surround→0) or a CHANNEL_MULTIPLIER edit does.
+  local s6 s5 diff
+  s6="$(_su_score eac3 6 eng 448000 "")"; s5="$(_su_score eac3 5 eng 448000 "")"
+  diff=$(( s6 - s5 ))
+  if (( diff == C_CHMULT + C_SURR )); then
+    pass "2.1 surround: bonus at >=6ch verified (6ch-5ch = $diff = chmult+surround)"
+  else
+    fail "2.1 surround: bonus at >=6ch — expected 6ch-5ch=$(( C_CHMULT + C_SURR )), got $diff (surround/chmult regression)"
+  fi
+}
+
+_test_unit_decide_color_and_pixfmt() {
+  # 2.3: direct unit test of decide_color_and_pixfmt — chooses the output PROFILE + pixel format.
+  # Mock _probe_field (the source-color I/O boundary) and assert the PROFILE_DESC + TARGET_PIXFMT
+  # globals across SDR-8bit, --sdr-force-10bit, SDR-10bit-source auto, HDR10, HLG, tonemap.
+  # This asserts the decision function's output VARS (not an encoded file's tags), so unlike the
+  # 1.2 HDR-tag path there is no ffmpeg auto-copy to make a branch mutation un-catchable.
+  local body
+  body="$(_extract_muxm_fns decide_color_and_pixfmt _lower)" \
+    || { fail "2.3: could not extract decide_color_and_pixfmt + _lower"; return; }
+  # $1=pix $2=prim $3=trc $4=cspace $5=optional flags ("SDR_FORCE_10BIT=1" etc.). Emits PROF|PIXFMT.
+  _dcp(){
+    local pix="$1" prim="$2" trc="$3" cspace="$4" flags="${5:-}"
+    bash -c "HDR_TARGET_PIXFMT=yuv420p10le; FORCE_CHROMA_420=0; TONEMAP_HDR_TO_SDR=0; SDR_FORCE_10BIT=0; SDR_USE_10BIT_IF_SRC_10BIT=0
+$flags
+P_PIX=\"\$1\"; P_PRIM=\"\$2\"; P_TRC=\"\$3\"; P_CSPACE=\"\$4\"
+_probe_field(){ case \"\$1\" in pix_fmt) printf '%s' \"\$P_PIX\";; color_primaries) printf '%s' \"\$P_PRIM\";; color_transfer) printf '%s' \"\$P_TRC\";; color_space) printf '%s' \"\$P_CSPACE\";; esac; }
+warn(){ :; }; note(){ :; }
+$body
+decide_color_and_pixfmt
+printf '%s|%s' \"\$PROFILE_DESC\" \"\$TARGET_PIXFMT\"" -- "$pix" "$prim" "$trc" "$cspace"
+  }
+  _dcp_assert(){ local label="$1" want="$2" got="$3"; if [[ "$got" == "$want" ]]; then pass "$label ($got)"; else fail "$label — got '$got', expected '$want'"; fi; }
+
+  _dcp_assert "2.3 color: SDR 8-bit → SDR/yuv420p"             "SDR|yuv420p"          "$(_dcp yuv420p '' '' '')"
+  _dcp_assert "2.3 color: SDR --sdr-force-10bit → SDR/10le"    "SDR|yuv420p10le"      "$(_dcp yuv420p '' '' '' 'SDR_FORCE_10BIT=1')"
+  _dcp_assert "2.3 color: SDR 10-bit source auto → SDR/10le"   "SDR|yuv420p10le"      "$(_dcp yuv420p10le '' '' '' 'SDR_USE_10BIT_IF_SRC_10BIT=1')"
+  _dcp_assert "2.3 color: HDR10 (bt2020/pq) → HDR10/10le"      "HDR10|yuv420p10le"    "$(_dcp yuv420p10le bt2020 smpte2084 bt2020nc)"
+  _dcp_assert "2.3 color: HLG (arib-std-b67) → HLG/10le"       "HLG|yuv420p10le"      "$(_dcp yuv420p10le bt2020 arib-std-b67 bt2020nc)"
+  _dcp_assert "2.3 color: tonemap HDR→SDR → SDR-TONEMAP/yuv420p" "SDR-TONEMAP|yuv420p" "$(_dcp yuv420p10le bt2020 smpte2084 bt2020nc 'TONEMAP_HDR_TO_SDR=1')"
+}
+
+_test_unit_select_best_audio() {
+  # 2.2: direct unit test of select_best_audio — which audio track the user gets (never called by
+  # a test before). Mock the I/O boundary (_audio_stream_count + _audio_stream_info), source the
+  # AUDIO_SCORE_* defaults, run the REAL scorer, and assert the CHOSEN INDEX across the scenarios
+  # the review found untested (esp. invalid-override fallback and the all-fail guard).
+  local body defaults
+  body="$(_extract_muxm_fns select_best_audio _score_audio_stream _normalize_codec_lang \
+                            _audio_codec_rank _audio_lang_matches audio_is_lossless _audio_is_commentary)" \
+    || { fail "2.2: could not extract select_best_audio + helpers"; return; }
+  defaults="$(grep -E '^(declare -i )?(AUDIO_SCORE_[A-Z_]+|AUDIO_CODEC_PREFERENCE|AUDIO_LANG_PREF|TAG_LANGUAGE_DEFAULT|_AUDIO_CODEC_RANK_PREF)=' "$MUXM")"
+  _tr(){ printf '%s\t%s\t%s\t%s\t%s' "$1" "$2" "$3" "$4" "$5"; }   # one mocked stream record
+  # $1=tracks (newline-separated records) $2=override $3=optional scorer stub (all-fail scenario).
+  _sba_idx(){
+    local tracks="$1" override="${2:-}" scorer_stub="${3:-}"
+    bash -c "$defaults
+AUDIO_PREFER_STEREO=0; AUDIO_TRACK_OVERRIDE=\"\$2\"
+warn(){ :; }; note(){ :; }; log(){ :; }
+mapfile -t _TR <<< \"\$1\"
+_audio_stream_count(){ printf '%s\n' \"\${#_TR[@]}\"; }
+_audio_stream_info(){ printf '%s\n' \"\${_TR[\$1]}\"; }
+$body
+$scorer_stub
+select_best_audio | cut -f1" -- "$tracks" "$override"
+  }
+  _sba_assert(){ local label="$1" want="$2" got="$3"; if [[ "$got" == "$want" ]]; then pass "$label (idx=$got)"; else fail "$label — chose idx '$got', expected '$want'"; fi; }
+
+  local two; two="$(_tr aac 2 eng 128000 '')"$'\n'"$(_tr eac3 6 eng 448000 '')"
+  _sba_assert "2.2 select: highest score wins (eac3 6ch > aac 2ch)"            1 "$(_sba_idx "$two")"
+  _sba_assert "2.2 select: valid --audio-track 0 override honored"             0 "$(_sba_idx "$two" 0)"
+  _sba_assert "2.2 select: invalid --audio-track 5 → auto-selection fallback"  1 "$(_sba_idx "$two" 5)"
+  _sba_assert "2.2 select: all-tracks-fail → default-to-track-0 guard"         0 "$(_sba_idx "$two" '' '_score_audio_stream(){ echo nonnumeric; }')"
+  local comm; comm="$(_tr eac3 6 eng 448000 'Director Commentary')"$'\n'"$(_tr eac3 6 eng 448000 'Main')"
+  _sba_assert "2.2 select: commentary deprioritized vs identical main feature" 1 "$(_sba_idx "$comm")"
+}
+
+_test_unit_build_subtitle_lists() {
+  # 2.4: direct unit tests for the subtitle-selection decision functions.
+  #   _pick_direct_text_sub_relidx — had ZERO coverage; returns the relative index of the
+  #     first SUB_LANG_PREF-matching TEXT subtitle (skipping bitmap + wrong-language streams).
+  #   _build_subtitle_keep_list — multi-track keep list: language filter, type-inclusion flags,
+  #     and the SUB_MAX_TRACKS cap.
+  # Mock the probe I/O boundary (list_sub_indices / _sp_sub_lang / _sp_sub_field for the picker;
+  # the ALL_SUB_* arrays for the keep list) and assert the returned indices.
+  local body_pdt body_bskl
+  body_pdt="$(_extract_muxm_fns _pick_direct_text_sub_relidx _is_text_sub_codec)" \
+    || { fail "2.4: could not extract _pick_direct_text_sub_relidx + _is_text_sub_codec"; return; }
+  body_bskl="$(_extract_muxm_fns _build_subtitle_keep_list _is_text_sub_codec)" \
+    || { fail "2.4: could not extract _build_subtitle_keep_list + _is_text_sub_codec"; return; }
+
+  # $1=space-sep langs  $2=space-sep codecs (parallel). Emits the picked relidx (or empty).
+  _pdt(){
+    bash -c "SUB_LANG_PREF=eng
+_LANGS=(\$1); _CODECS=(\$2)
+list_sub_indices(){ local k; for k in \"\${!_LANGS[@]}\"; do echo \"\$k\"; done; }
+_sp_sub_lang(){ echo \"\${_LANGS[\$1]}\"; }
+_sp_sub_field(){ echo \"\${_CODECS[\$1]}\"; }
+$body_pdt
+_pick_direct_text_sub_relidx" -- "$1" "$2"
+  }
+  # $1=langs $2=types $3=SUB_MAX_TRACKS $4=extra flags. Codec=subrip, MUX=matroska (so text subs
+  # always clear the container filter). Emits the kept-index list.
+  _bskl(){
+    bash -c "SUB_LANG_PREF=eng; SUB_INCLUDE_FORCED=1; SUB_INCLUDE_FULL=1; SUB_INCLUDE_SDH=1
+MUX_FORMAT=matroska; SUB_ENABLE_OCR=0; OUTPUT_EXT=mkv; SUB_MAX_TRACKS=\$3
+$4
+_L=(\$1); _T=(\$2)
+ALL_SUB_LANGS=(\"\${_L[@]}\"); ALL_SUB_TYPES=(\"\${_T[@]}\")
+ALL_SUB_SOURCES=(); ALL_SUB_CODECS=()
+for k in \"\${!_L[@]}\"; do ALL_SUB_SOURCES+=(\"embedded:\$k\"); ALL_SUB_CODECS+=(subrip); done
+_source_label(){ echo \"\$1\"; }
+_log_dropped_tracks(){ :; }
+log(){ :; }
+$body_bskl
+_build_subtitle_keep_list" -- "$1" "$2" "$3" "$4"
+  }
+  _sub_assert(){ local label="$1" want="$2" got="$3"; if [[ "$got" == "$want" ]]; then pass "$label ($got)"; else fail "$label — got '$got', expected '$want'"; fi; }
+
+  _sub_assert "2.4 direct: picks first text sub matching lang (skips bitmap + fre)" 2  "$(_pdt 'eng fre eng' 'hdmv_pgs_subtitle subrip subrip')"
+  _sub_assert "2.4 direct: no text sub in pref lang → empty"                        "" "$(_pdt 'eng eng' 'hdmv_pgs_subtitle dvd_subtitle')"
+  _sub_assert "2.4 keep: lang+type filter keeps eng forced/full/sdh, drops fre"     "0 2 3" "$(_bskl 'eng fre eng eng' 'full full forced sdh' 3 '')"
+  _sub_assert "2.4 keep: SUB_INCLUDE_SDH=0 drops the sdh track"                     "0 1"   "$(_bskl 'eng eng eng' 'full forced sdh' 3 'SUB_INCLUDE_SDH=0')"
+  _sub_assert "2.4 keep: SUB_MAX_TRACKS caps 4→2"                                   "0 1"   "$(_bskl 'eng eng eng eng' 'full full full full' 2 '')"
+}
+
+_test_unit_report_add_escaping() {
+  # 2.5: report_add was stubbed to `:` in tests, so its JSON escaping was never exercised. Call it
+  # with a value containing quote/backslash/newline/tab/CR, emit the resulting object, and assert
+  # jq PARSES it and ROUND-TRIPS the value. A dropped escape step → invalid JSON → jq fails.
+  local body
+  body="$(_extract_muxm_fns report_add)" || { fail "2.5: could not extract report_add"; return; }
+  local key="track.title" val
+  printf -v val 'a"b\\c\nd\te\rf'   # quote, backslash, newline, tab, carriage-return
+  local got
+  got="$(bash -c "$body"$'\n''REPORT_ENTRIES=(); report_add "$1" "$2"; IFS=,; printf "{%s}\n" "${REPORT_ENTRIES[*]}"' -- "$key" "$val" 2>/dev/null | jq -r --arg k "$key" '.[$k]' 2>/dev/null)" || true
+  # Shared label prefix across pass/fail so the perturb signature (which keys on FAIL lines)
+  # matches when the escaping is broken — see MUT-REP-1 in tools/perturb_check.sh.
+  local label="2.5 report_add escaping: quote/backslash/newline/tab/CR round-trips through jq"
+  if [[ "$got" == "$val" ]]; then
+    pass "$label"
+  else
+    fail "$label — jq returned $(printf '%q' "$got"), expected $(printf '%q' "$val")"
+  fi
+}
+
+_test_unit_duration_tier3() {
+  # 3.4: tier-3 Matroska DURATION parse in _get_source_duration_secs. tiers 1/2 read a numeric
+  # stream/format `duration`; tier 3 parses a Matroska `tags.DURATION` of the form "HH:MM:SS.nnn"
+  # into integer seconds — the path the review found untested. We feed a METADATA_CACHE that has
+  # ONLY a video-stream tags.DURATION (no stream/format duration) so tiers 1+2 fall through and
+  # tier 3 fires, then assert the seconds. Extract the function + the REAL _jq_cache and run jq
+  # against the mocked cache (faithful parse, no I/O boundary faked away).
+  #
+  # PLAN-vs-CODE (flagged): the plan also suggests "one encode to exercise the progress path" with
+  # an MKV carrying only a DURATION tag. ffmpeg always writes a format-level duration, so a source
+  # that reaches tier 3 isn't deterministically buildable with ffmpeg — the mocked cache is the
+  # only hermetic way to exercise tier 3, and it is where the parse mutation (M-DUR-1) bites.
+  local body
+  body="$(_extract_muxm_fns _get_source_duration_secs _jq_cache)" \
+    || { fail "3.4: could not extract _get_source_duration_secs + _jq_cache"; return; }
+  # $1 = METADATA_CACHE JSON; emits the computed integer seconds.
+  _dur(){
+    bash -c 'METADATA_CACHE="$1"; _CACHED_SRC_DURATION_SECS=""; DEBUG=0
+log(){ :; }
+'"$body"'
+_get_source_duration_secs' -- "$1"
+  }
+  _dur_assert(){ local label="$1" want="$2" got="$3"; if [[ "$got" == "$want" ]]; then pass "$label ($got)"; else fail "$label — got '$got', expected '$want'"; fi; }
+
+  # Video stream carries ONLY a Matroska DURATION tag — no stream.duration, no format.duration —
+  # so tiers 1+2 yield 0 and tier 3 parses 01:02:03 → 1*3600 + 2*60 + 3 = 3723s. (M-DUR-1 breaks
+  # the HH:MM:SS multiplier so this diverges; the tier-1 sanity case below is unaffected by it.)
+  local j_tier3='{"streams":[{"codec_type":"video","tags":{"DURATION":"01:02:03.000000000"}}],"format":{}}'
+  _dur_assert "3.4 duration tier-3: Matroska tag 01:02:03 → 3723s" 3723 "$(_dur "$j_tier3")"
+  # Zero-padded hours/minutes must not be read as octal (10# guards it): 00:09:09 → 549s.
+  local j_octal='{"streams":[{"codec_type":"video","tags":{"DURATION":"00:09:09.000000000"}}],"format":{}}'
+  _dur_assert "3.4 duration tier-3: octal-safe 00:09:09 → 549s" 549 "$(_dur "$j_octal")"
+  # Sanity: a numeric stream.duration (tier 1) wins and tier 3 is never consulted — so the parse
+  # mutation must NOT move this one (keeps the M-DUR-1 signature isolated to the tier-3 case).
+  local j_tier1='{"streams":[{"codec_type":"video","duration":"42.0","tags":{"DURATION":"01:02:03.000000000"}}],"format":{}}'
+  _dur_assert "3.4 duration tier-1: stream duration 42.0 → 42s (tier-3 ignored)" 42 "$(_dur "$j_tier1")"
+}
+
+_test_unit_video_copy_compliant() {
+  # 3.5: direct unit test of _video_is_copy_compliant — decides whether the source video can be
+  # stream-COPIED (no re-encode). The review found its reject reasons untested. Mock the source
+  # I/O boundary (_probe_field) and assert (return-code, _COPY_REJECT_REASON) across a compliant
+  # source and each reject reason: codec mismatch, the 10-bit-pixfmt ceiling, tone-map-required,
+  # and the MAX_COPY_BITRATE ceiling. This is the decision function's OWN output (not an encoded
+  # file), so a neutered reject is caught directly — no fragile copy-vs-encode log heuristic.
+  #
+  # SCOPE NOTE: the plan pairs this with the skip-if-ideal multi-track branch, which is ALREADY
+  # covered e2e by the output suite (sii_mt: commentary forces remux; sii_subs: 5 subs preserved
+  # through the ideal path). Not duplicated here — this item adds the missing reject-reason cover.
+  local body
+  body="$(_extract_muxm_fns _video_is_copy_compliant _lower)" \
+    || { fail "3.5: could not extract _video_is_copy_compliant + _lower"; return; }
+  # $1=src_codec $2=src_pix $3=src_prim $4=src_trc $5=src_bitrate(bps) $6=extra global overrides.
+  # Emits "<rc>|<reject reason>". Bitrate is always a real number so the size/duration stat
+  # fallback in the ceiling check is never reached (keeps the ceiling scenario deterministic).
+  _vcc(){
+    local extra="${6:-}"
+    bash -c '_CLI_CRF_EXPLICIT=0; _CLI_PRESET_EXPLICIT=0
+VIDEO_CODEC=libx265; TARGET_PIXFMT=yuv420p; TONEMAP_HDR_TO_SDR=0
+IS_DV=0; DISABLE_DV=1; PROFILE_NAME=""; DV_SRC_PROFILE=""; MAX_COPY_BITRATE=""
+P_CODEC="$1"; P_PIX="$2"; P_PRIM="$3"; P_TRC="$4"; P_BR="$5"
+'"$extra"'
+_probe_field(){ case "$1" in codec_name) printf "%s" "$P_CODEC";; pix_fmt) printf "%s" "$P_PIX";; color_primaries) printf "%s" "$P_PRIM";; color_transfer) printf "%s" "$P_TRC";; bit_rate) printf "%s" "$P_BR";; esac; }
+warn(){ :; }
+'"$body"'
+if _video_is_copy_compliant; then printf "0|%s" "$_COPY_REJECT_REASON"; else printf "1|%s" "$_COPY_REJECT_REASON"; fi' -- "$1" "$2" "$3" "$4" "$5"
+  }
+  # label  expect_rc  reason_substr (empty = expect no reason)  got("rc|reason")
+  _vcc_assert(){
+    local label="$1" exp_rc="$2" sub="$3" got="$4"
+    local rc="${got%%|*}" reason="${got#*|}"
+    if [[ "$rc" == "$exp_rc" ]] && { [[ -z "$sub" ]] || [[ "$reason" == *"$sub"* ]]; }; then
+      pass "$label (rc=$rc)"
+    else
+      fail "$label — rc=$rc reason='$reason' (expected rc=$exp_rc, reason containing '$sub')"
+    fi
+  }
+
+  # Compliant: HEVC source, 8-bit target, no tonemap, no bitrate ceiling → copyable (rc 0).
+  _vcc_assert "3.5 copy-compliant: HEVC matches target → copyable"  0 ""               "$(_vcc hevc yuv420p '' '' 5000000)"
+  # Codec mismatch: libx265 target wants hevc; an h264 source must re-encode.
+  _vcc_assert "3.5 copy-compliant: codec mismatch (h264) → re-encode" 1 "video codec"  "$(_vcc h264 yuv420p '' '' 5000000)"
+  # 10-bit-pixfmt ceiling: 10-bit target, 8-bit source → re-encode. (M-VCC-1 neuters this reject.)
+  _vcc_assert "3.5 copy-compliant: 10-bit pixfmt ceiling → re-encode" 1 "pixel format" "$(_vcc hevc yuv420p '' '' 5000000 'TARGET_PIXFMT=yuv420p10le')"
+  # Tonemap-required: HDR source (bt2020/pq) with tone-map on → cannot copy.
+  _vcc_assert "3.5 copy-compliant: tonemap-required (HDR) → re-encode" 1 "tone-mapping" "$(_vcc hevc yuv420p10le bt2020 smpte2084 5000000 'TONEMAP_HDR_TO_SDR=1')"
+  # MAX_COPY_BITRATE ceiling: 20 Mbps source over a 10000k cap → re-encode. (M-VCC-2 neuters this.)
+  _vcc_assert "3.5 copy-compliant: bitrate ceiling exceeded → re-encode" 1 "MAX_COPY_BITRATE" "$(_vcc hevc yuv420p '' '' 20000000 'MAX_COPY_BITRATE=10000k')"
+  # Under the ceiling: 5 Mbps source below the 10000k cap → still copyable (the ceiling only
+  # rejects when exceeded — proves the guard isn't a blanket reject).
+  _vcc_assert "3.5 copy-compliant: bitrate under ceiling → copyable" 0 ""              "$(_vcc hevc yuv420p '' '' 5000000 'MAX_COPY_BITRATE=10000k')"
+
+  # 3.6: --max-copy-bitrate non-`k` rate formats. The `%k` strip makes the trailing 'k' optional,
+  # so a bare integer ("80000") is a valid kbps ceiling: 100 Mbps exceeds it → re-encode, 20 Mbps
+  # is under it → copyable. A non-numeric rate ("80M") is rejected by the validity guard — muxm
+  # WARNs and SKIPS the ceiling (does not crash, does not block the copy) → copyable.
+  _vcc_assert "3.6 copy-compliant: non-k ceiling '80000' exceeded → re-encode" 1 "MAX_COPY_BITRATE" "$(_vcc hevc yuv420p '' '' 100000000 'MAX_COPY_BITRATE=80000')"
+  _vcc_assert "3.6 copy-compliant: non-k ceiling '80000' not exceeded → copyable" 0 ""              "$(_vcc hevc yuv420p '' ''  20000000 'MAX_COPY_BITRATE=80000')"
+  _vcc_assert "3.6 copy-compliant: invalid rate '80M' → warn + ceiling skipped (copyable)" 0 ""      "$(_vcc hevc yuv420p '' '' 100000000 'MAX_COPY_BITRATE=80M')"
+}
+
+_test_unit_hdr10_static_metadata() {
+  # 3.1: direct unit test of _check_hdr10_static_metadata — the (previously untested) guard that
+  # warns when a DV source carries NO HDR10 static metadata (mastering-display / MaxCLL), which
+  # would yield a dim HDR10 stream after DV stripping. Mock the metadata cache (real jq parse) and
+  # stub warn/note/report_add, then assert the emitted report status across present / missing /
+  # partial. The fallback ffprobe is stubbed to emit nothing so the cache values fully decide.
+  #
+  # PLAN-vs-CODE (flagged): the catalog's M-HDR-2 was framed as "drop master-display/max-cll x265
+  # params → output side-data absent". Verified empirically (see tools/perturb_check.sh M-HDR-1
+  # note and the test_hdr smoke probe): muxm sets NO master-display/max-cll params — ffmpeg
+  # AUTO-FORWARDS the source frame side-data to libx265 regardless of the x265-params string (even
+  # with none), so the output-survival probe is tautological and has no muxm lever, exactly like
+  # M-HDR-1. M-HDR-2 is therefore re-pointed at the genuinely-mutable detection/warning path here.
+  local body
+  body="$(_extract_muxm_fns _check_hdr10_static_metadata _jq_cache)" \
+    || { fail "3.1: could not extract _check_hdr10_static_metadata + _jq_cache"; return; }
+  # $1 = METADATA_CACHE JSON. Emits stubbed REPORT/WARN/NOTE lines on stdout.
+  _hdrm(){
+    bash -c 'METADATA_CACHE="$1"; SRC_ABS=/dev/null; FFPROBE_FLAGS=(-v error); DEBUG=0
+warn(){ printf "WARN|%s\n" "$*"; }; note(){ printf "NOTE|%s\n" "$*"; }
+report_add(){ printf "REPORT|%s|%s\n" "$1" "$2"; }
+ffprobe(){ :; }
+'"$body"'
+_check_hdr10_static_metadata' -- "$1"
+  }
+  # $1=label  $2=expected report value (substring)  $3=expect a WARN? (1/0)  $4=JSON cache
+  _hdrm_assert(){
+    local label="$1" want_report="$2" want_warn="$3" out
+    out="$(_hdrm "$4")"
+    local report warned=0
+    report="$(printf '%s\n' "$out" | grep '^REPORT|hdr10_static_metadata|' | head -1 | cut -d'|' -f3-)"
+    printf '%s\n' "$out" | grep -q '^WARN|' && warned=1
+    if [[ "$report" == *"$want_report"* && "$warned" == "$want_warn" ]]; then
+      pass "$label (report='$report', warned=$warned)"
+    else
+      fail "$label — report='$report' warned=$warned (expected report~'$want_report', warned=$want_warn)"
+    fi
+  }
+
+  local vid_sd='{"streams":[{"codec_type":"video","side_data_list":['
+  # Both present → "present", no warning.
+  _hdrm_assert "3.1 hdr10-meta: mastering+CLL present → report present, no warn" "present" 0 \
+    "${vid_sd}{\"side_data_type\":\"Mastering display metadata\"},{\"side_data_type\":\"Content light level metadata\"}]}]}"
+  # Neither present (cache empty + ffprobe stubbed silent) → "missing", WARN fires. (M-HDR-2 target.)
+  _hdrm_assert "3.1 hdr10-meta: neither present → report missing + warn" "missing (mastering=0, cll=0)" 1 \
+    '{"streams":[{"codec_type":"video","side_data_list":[]}]}'
+  # Mastering only → "partial (mastering=1, cll=0)", a NOTE (not a warn).
+  _hdrm_assert "3.1 hdr10-meta: mastering only → report partial(m=1,c=0), no warn" "partial (mastering=1, cll=0)" 0 \
+    "${vid_sd}{\"side_data_type\":\"Mastering display metadata\"}]}]}"
+  # CLL only → "partial (mastering=0, cll=1)", WARN fires.
+  _hdrm_assert "3.1 hdr10-meta: CLL only → report partial(m=0,c=1) + warn" "partial (mastering=0, cll=1)" 1 \
+    "${vid_sd}{\"side_data_type\":\"Content light level metadata\"}]}]}"
+}
+
+_test_unit_ocr_dispatch() {
+  # 3.2: dispatch + track-production wiring for the PGS subtitle OCR path in _prepare_subtitle.
+  # muxm OCRs ONLY PGS (hdmv_pgs_subtitle); ffmpeg cannot ENCODE PGS and this host has no vobsub
+  # muxer, so the plan's "build a VobSub fixture and run muxm" is unreachable — muxm never OCRs
+  # VobSub (dvd_subtitle falls to the unsupported-codec arm). So we unit-test the REAL PGS branch:
+  # mock the codec probe (_sp_sub_field → hdmv_pgs_subtitle), stub ffmpeg to stage a .sup, force the
+  # no-vobsub-muxer fallback, and put a MOCK OCR tool on PATH that emits canned SRT. Assert (a) the
+  # OCR tool is INVOKED and (b) _prepare_subtitle returns the produced SRT track path.
+  # EXPLICIT NON-CLAIM: verifies dispatch + track production + wiring, NOT OCR text legibility.
+  #
+  # PLAN-vs-CODE (flagged): catalog 3.2 specified a VobSub/dvdsub fixture, but muxm's OCR branch is
+  # PGS-only and ffmpeg has no PGS encoder — the fixture route cannot reach the code under test.
+  local body
+  body="$(_extract_muxm_fns _prepare_subtitle)" || { fail "3.2: could not extract _prepare_subtitle"; return; }
+  local wd; wd="$(mktemp -d "${TMPDIR:-/tmp}/muxm-ocr.XXXXXX")" || { fail "3.2: mktemp failed"; return; }
+  local sentinel="$wd/ocr_invoked"
+  # Mock OCR tool: record the invocation, then emit a canned SRT beside the .sup (strip .sup→.srt),
+  # which is exactly where _prepare_subtitle's no-vobsub fallback looks for the OCR result.
+  local ocr="$wd/mock_ocr"
+  cat > "$ocr" <<MOCKOCR
+#!/usr/bin/env bash
+printf 'INVOKED %s\n' "\$*" >> "$sentinel"
+sup="\${@: -1}"
+printf '1\n00:00:00,000 --> 00:00:02,000\nOCR canned line\n' > "\${sup%.sup}.srt"
+MOCKOCR
+  chmod +x "$ocr"
+
+  local out rc=0
+  out="$(bash -c 'set +e
+WORKDIR="$1"; SUB_OCR_TOOL="$2"; SUB_OCR_LANG=eng; SUB_ENABLE_OCR=1
+SUB_PRESERVE_TEXT_FORMAT=0; SUB_PRESERVE_BITMAP=0; SUB_BURN_FORCED=0; DRY_RUN=0
+MUX_FORMAT=matroska; SRC_ABS=/dev/null; FFMPEG_FLAGS=(-v error); _ACTIVE_FFMPEG_PID=""
+warn(){ printf "WARN %s\n" "$*" >&2; }; note(){ printf "NOTE %s\n" "$*" >&2; }
+spinner(){ :; }
+_sp_sub_field(){ printf "hdmv_pgs_subtitle"; }     # codec_name probe → PGS
+ffmpeg_has_muxer(){ return 1; }                     # force the no-vobsub fallback OCR path
+ffmpeg(){ printf "sup" > "${@: -1}"; return 0; }    # stage the extracted .sup (exit 0)
+'"$body"'
+_prepare_subtitle 0' -- "$wd" "$ocr")" || rc=$?
+
+  # (a) dispatch: the OCR tool must have been invoked on the PGS bitmap.
+  if [[ -f "$sentinel" ]]; then
+    pass "3.2 OCR dispatch: PGS subtitle dispatched to the OCR tool (tool invoked)"
+  else
+    fail "3.2 OCR dispatch: OCR tool was NOT invoked for a PGS subtitle (rc=$rc)"
+  fi
+  # (b) track production: _prepare_subtitle must echo the produced SRT path carrying the OCR cues.
+  if [[ -n "$out" && -s "$out" ]] && grep -q 'OCR canned line' "$out" 2>/dev/null; then
+    pass "3.2 OCR dispatch: PGS bitmap produces an SRT text track ($(basename "$out"))"
+  else
+    fail "3.2 OCR dispatch: no SRT text track produced from the PGS bitmap (returned '$out', rc=$rc)"
+  fi
+  rm -rf "$wd"
+}
+
 test_unit() {
   section "Pure-Function Unit Tests"
   _test_unit_audio_helpers
@@ -6355,6 +7138,7 @@ test_unit() {
   _test_unit_misc_helpers
   _test_unit_disk_preflight
   _test_unit_disk_fallback
+  _test_unit_disk_output_volume
   _test_unit_av1_resolution_crf
   _test_unit_ignored_knobs
   _test_unit_h264_drops_dv
@@ -6363,6 +7147,16 @@ test_unit() {
   _test_unit_mapping_helpers
   _test_unit_av1_helpers
   _test_unit_fps_helpers
+  _test_unit_extract_helper
+  _test_unit_score_audio_stream
+  _test_unit_select_best_audio
+  _test_unit_decide_color_and_pixfmt
+  _test_unit_build_subtitle_lists
+  _test_unit_report_add_escaping
+  _test_unit_duration_tier3
+  _test_unit_video_copy_compliant
+  _test_unit_hdr10_static_metadata
+  _test_unit_ocr_dispatch
 }
 
 # === Suite: Profile End-to-End (real encodes with profiles) ===
@@ -6378,8 +7172,8 @@ test_profile_e2e() {
   #   codec="-"        → skip codec assertion (profile doesn't mandate a specific codec)
   #   extra_flags=""   → only --preset ultrafast is passed (always added by the loop)
   local -a E2E_PROFILES=(
-    "streaming|basic_sdr_subs.mkv|e2e_streaming.mp4|mp4|-|--crf 28"
-    "animation|multi_subs.mkv|e2e_animation.mkv|mkv|-|--crf 28"
+    "streaming|basic_sdr_subs.mkv|e2e_streaming.mp4|mp4|hevc|--crf 28"
+    "animation|multi_subs.mkv|e2e_animation.mkv|mkv|hevc|--crf 28"
     "universal|basic_sdr_subs.mkv|e2e_universal.mp4|mp4|h264|--crf 28"
     "archive|hevc_sdr_51.mkv|e2e_archive.mkv|mkv|hevc|"
     "hdr10-hq|hevc_hdr10_tagged.mkv|e2e_hdr10_hq.mkv|mkv|hevc|--crf 28"
@@ -6419,7 +7213,7 @@ test_profile_e2e() {
       # Profile-specific extra checks
       case "$profile" in
         archive|atv-directplay-hq)
-          assert_stream_count "$profile: audio present" "$outfile" a 1
+          assert_stream_count "$profile: audio present" "$outfile" a 1 1
           ;;
         hdr10-hq|animation)
           pix_fmt="$(probe_video "$outfile" pix_fmt)"
@@ -6466,7 +7260,7 @@ test_profile_e2e() {
         fail "av1-hq: expected .mkv, got .$av1hq_ext"
       fi
       assert_probe "av1-hq: video codec is av1" "$av1hq_e2e_out" codec_name av1
-      assert_stream_count "av1-hq: audio present" "$av1hq_e2e_out" a 1
+      assert_stream_count "av1-hq: audio present" "$av1hq_e2e_out" a 1 1
     fi
 
     # streaming-av1: CRF 30, MP4, Opus audio
@@ -6999,7 +7793,7 @@ test_ext_subs() {
        --output-ext mkv --crf 28 --preset ultrafast \
        --ext-subs-dir "$TESTDIR" \
        "$TESTDIR/ext_only_source.mkv"; then
-    assert_stream_count "ext-subs-dir: subtitle track present" "$outfile" s 1
+    assert_stream_count "ext-subs-dir: subtitle track present" "$outfile" s 1 1
   fi
 
   # ---- Multi-sidecar source: ext_sub_source has 9 sidecar .srt files ----
@@ -7059,7 +7853,7 @@ test_ext_subs() {
     if [[ "$spa_lang" == "spa" ]]; then
       pass "ext_lang_spa: subtitle tag is spa"
     else
-      skip "ext_lang_spa: subtitle tag '$spa_lang' (lang tag may not propagate from sidecar)"
+      fail "ext_lang_spa: expected language tag 'spa' from the .spa.srt sidecar, got '$spa_lang'"
     fi
   fi
 
@@ -7072,6 +7866,16 @@ test_ext_subs() {
        --sub-lang-pref eng \
        "$TESTDIR/ext_sub_source.mkv"; then
     assert_stream_count "ext_forced: subtitle track present" "$outfile" s 1
+    # 1.4: the .forced.en sidecar must surface as a sub track flagged forced
+    # (disposition.forced=1) — not merely "a sub exists". M-SUB-1 (ignore the .forced.
+    # infix) drops the flag, so this goes red.
+    local ef_forced
+    ef_forced="$(ffprobe -v error -select_streams s -show_entries stream_disposition=forced -of csv=p=0 "$outfile" 2>/dev/null | grep -c '^1$' || true)"
+    if [[ "${ef_forced:-0}" -ge 1 ]]; then
+      pass "ext_forced: a subtitle track carries the forced disposition (from .forced.en sidecar)"
+    else
+      fail "ext_forced: expected ≥1 sub with disposition.forced=1 from the .forced.en sidecar, got ${ef_forced:-0}"
+    fi
   fi
 
   # ---- Filename parsing: .en.sdh.srt → type=sdh ----
@@ -7082,6 +7886,14 @@ test_ext_subs() {
        --sub-lang-pref eng \
        "$TESTDIR/ext_sub_source.mkv"; then
     assert_stream_count "ext_sdh: subtitle track present" "$outfile" s 1
+    # 1.4: the .en.sdh sidecar must surface as an SDH-marked track (muxm sets title "SDH").
+    local es_sdh
+    es_sdh="$(ffprobe -v error -select_streams s -show_entries stream_tags=title -of csv=p=0 "$outfile" 2>/dev/null | grep -ci sdh || true)"
+    if [[ "${es_sdh:-0}" -ge 1 ]]; then
+      pass "ext_sdh: a subtitle track is marked SDH (title) from the .en.sdh sidecar"
+    else
+      fail "ext_sdh: expected an SDH-titled sub track from the .en.sdh sidecar, got none"
+    fi
   fi
 
   # ---- --no-sub-sdh excludes SDH sidecar (.en.sdh.srt) ----
@@ -7094,6 +7906,14 @@ test_ext_subs() {
        "$TESTDIR/ext_sub_source.mkv"; then
     # Should still find a non-SDH eng sub (.en.srt or .forced.en.srt)
     assert_stream_count "ext_no_sdh: subtitle present (non-SDH)" "$outfile" s 1
+    # 1.4: --no-sub-sdh must EXCLUDE the .en.sdh sidecar — the inverse the old test couldn't tell.
+    local ens_sdh
+    ens_sdh="$(ffprobe -v error -select_streams s -show_entries stream_tags=title -of csv=p=0 "$outfile" 2>/dev/null | grep -ci sdh || true)"
+    if [[ "${ens_sdh:-0}" -eq 0 ]]; then
+      pass "ext_no_sdh: --no-sub-sdh excluded the SDH sidecar (no SDH-titled track)"
+    else
+      fail "ext_no_sdh: --no-sub-sdh should exclude SDH, but found ${ens_sdh} SDH-titled track(s)"
+    fi
   fi
 
   # ---- SUB_MAX_TRACKS=1 limits external subtitle tracks ----
@@ -7421,6 +8241,47 @@ test_regression_p5() {
       "H8: FORCE_CHROMA_420=0 preserves 4:2:2 chroma" "$out"
     assert_contains "Target pixel format: yuv422p" \
       "H8: FORCE_CHROMA_420=0 target pixel format is yuv422p" "$out"
+
+    # ---- 4.2: real-encode chroma verification (A-class upgrade of the H8 dry-run above) ----
+    # muxm sets -pix_fmt from TARGET_PIXFMT, so the OUTPUT chroma is muxm's decision (not ffmpeg
+    # auto-copy) — a genuine probe. Needs a libx265 build with 4:2:2 OUTPUT support; gate on it
+    # (host-capability skip). Collect the encoder help into a variable first to avoid a
+    # `ffmpeg | grep -q` pipefail SIGPIPE false-skip. M-CHROMA-1 flips the 4:2:2 preserve branch to
+    # 4:2:0, so the FORCE_CHROMA_420=0 output comes out yuv420p → red (the default arm is unaffected).
+    local _x265_pf; _x265_pf="$(ffmpeg -hide_banner -h encoder=libx265 2>&1 || true)"
+    if [[ "$_x265_pf" != *yuv422p* ]]; then
+      skip "H8 real encode: libx265 build lacks 4:2:2 output support"
+    else
+      # FORCE_CHROMA_420=0 via .muxmrc → preserve source 4:2:2 in the output pixel format.
+      local ch_home="$TESTDIR/h8_real_home"; mkdir -p "$ch_home"
+      printf 'FORCE_CHROMA_420=0\n' > "$ch_home/.muxmrc"
+      local ch_out422="$TESTDIR/h8_real_422.mkv"; rm -f "$ch_out422"
+      (cd "$TESTDIR" && HOME="$ch_home" "$MUXM" -K --crf 28 --preset ultrafast --output-ext mkv \
+        "$TESTDIR/h264_422p_sdr.mkv" "$ch_out422" >/dev/null 2>&1) || true
+      if [[ -s "$ch_out422" ]]; then
+        local ch_pix422; ch_pix422="$(probe_video "$ch_out422" pix_fmt)"
+        if [[ "$ch_pix422" == yuv422p* ]]; then
+          pass "H8 real encode: FORCE_CHROMA_420=0 preserves 4:2:2 in output pix_fmt ($ch_pix422)"
+        else
+          fail "H8 real encode: FORCE_CHROMA_420=0 expected yuv422p output, got '$ch_pix422'"
+        fi
+      else
+        fail "H8 real encode: FORCE_CHROMA_420=0 produced no output"
+      fi
+      # Default (FORCE_CHROMA_420=1, isolated HOME) → downsample to 4:2:0. Sanity that the decision
+      # routes by the flag; M-CHROMA-1 must NOT move this one (it only flips the preserve branch).
+      local ch_out420="$TESTDIR/h8_real_420.mkv"
+      if assert_encode "H8 real encode: default downsample output produced" "$ch_out420" \
+           --crf 28 --preset ultrafast --output-ext mkv "$TESTDIR/h264_422p_sdr.mkv"; then
+        local ch_pix420; ch_pix420="$(probe_video "$ch_out420" pix_fmt)"
+        if [[ "$ch_pix420" == "yuv420p" ]]; then
+          pass "H8 real encode: default FORCE_CHROMA_420=1 downsamples to yuv420p ($ch_pix420)"
+        else
+          fail "H8 real encode: default expected yuv420p output, got '$ch_pix420'"
+        fi
+      fi
+      rm -f "$ch_out422" "$ch_out420"
+    fi
   else
     skip "H8: h264_422p_sdr.mkv fixture not found"
   fi
@@ -7833,6 +8694,7 @@ FBDOVISCRIPT
     (cd "$TESTDIR" && HOME="$ds_home" "$MUXM" -K --no-disk-check --crf 28 --preset ultrafast "hevc_sdr_51.mkv" "$ds_out2" >/dev/null 2>&1) || ds_code2=$?
     if [[ -f "$ds_out2" && -s "$ds_out2" ]]; then
       pass "DISKSTOP: --no-disk-check overrides the hard stop"
+      assert_probe "DISKSTOP override: output is a valid HEVC encode (not just a file)" "$ds_out2" codec_name hevc
     else
       fail "DISKSTOP: --no-disk-check should bypass the guard and produce output (exit $ds_code2)"
     fi
@@ -7847,6 +8709,7 @@ FBDOVISCRIPT
     (cd "$TESTDIR" && "$MUXM" -K --workdir "$wd_alt" --no-disk-check --crf 28 --preset ultrafast "hevc_sdr_51.mkv" "$wd_out" >/dev/null 2>&1) || wd_code=$?
     if [[ -f "$wd_out" && -s "$wd_out" ]]; then
       pass "WORKDIR: --workdir run produced output"
+      assert_probe "WORKDIR: output is a valid HEVC encode (not just a file)" "$wd_out" codec_name hevc
     else
       fail "WORKDIR: --workdir run failed (exit $wd_code)"
     fi
@@ -8091,6 +8954,78 @@ test_dv_vt() {
   fi
 }
 
+# === Suite: Software Dolby Vision round-trip (portable; no VideoToolbox) ===
+# Phase 5.1: a SOFTWARE libx265 re-encode of a real DV source exercises the full RPU pipeline
+# (extract → P5/P7→P8 convert-if-needed → inject → mp4box dvcC pre-wrap → verify_dv_container_record)
+# on ANY host with dovi_tool + MP4Box — no VideoToolbox or macOS needed (that leaves only the VT
+# *encode* macOS-gated, in dv_vt). Closes the "Linux hosts have zero real DV coverage" gap. The
+# bundled HDR1080p.MOV is a real DV Profile 8 source.
+# Like dv_vt this suite generates NO synthetic fixtures (it uses the bundled DV file) — it is in
+# MEDIA_FREE_SUITES and, in run_parallel, in the encode batch (it does a real, if short, encode).
+#   MUXM_DV_FIXTURE=/path/to/dv.mp4 ./tests/test_muxm.sh --suite dv_sw
+test_dv_sw() {
+  section "Software Dolby Vision round-trip (portable; no VideoToolbox)"
+
+  # --- Gates: DV tooling + software encoder present (positive host-capability guards) ---
+  if ! command -v dovi_tool >/dev/null 2>&1; then
+    skip "dv_sw: dovi_tool not on PATH (required for RPU extract/inject)"; return 0
+  fi
+  if ! command -v MP4Box >/dev/null 2>&1 && ! command -v mp4box >/dev/null 2>&1; then
+    skip "dv_sw: MP4Box/mp4box not on PATH (required to write the dvcC box)"; return 0
+  fi
+  if ! ffmpeg_has_encoder libx265; then
+    skip "dv_sw: ffmpeg lacks the libx265 software encoder"; return 0
+  fi
+
+  # --- Resolve the DV fixture: explicit MUXM_DV_FIXTURE wins, else the bundled DV P8 fixture,
+  # copied into $TESTDIR as .mp4 (ISOBMFF; ffmpeg refuses DV into .mov and the default output
+  # container is derived from the source extension, so .mov-in would mis-route). ---
+  local _dv_src="${MUXM_DV_FIXTURE:-}"
+  if [[ -z "$_dv_src" ]]; then
+    local _bundled
+    _bundled="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures/HDR1080p.MOV"
+    if [[ -f "$_bundled" && -r "$_bundled" ]] && cp "$_bundled" "$TESTDIR/dv_sw_source.mp4"; then
+      _dv_src="$TESTDIR/dv_sw_source.mp4"
+    fi
+  fi
+  if [[ -z "$_dv_src" || ! -f "$_dv_src" || ! -r "$_dv_src" ]]; then
+    skip "dv_sw: no readable DV fixture (bundled HDR1080p.MOV missing; set MUXM_DV_FIXTURE)"; return 0
+  fi
+
+  # --- Software re-encode through the DV pipeline. --crf forces a RE-ENCODE so extract→inject→dvcC
+  # actually runs (a stream-copy would pass DV through via container copy — tautological). Default
+  # codec is libx265 (software); no --hw-accel, so this never touches VideoToolbox. ---
+  local out="$TESTDIR/dv_sw_out.mp4"; rm -f "$out"
+  (cd "$TESTDIR" && "$MUXM" -K --crf 24 --preset ultrafast --output-ext mp4 "$_dv_src" "$out" >/dev/null 2>&1) || true
+  if [[ ! -s "$out" ]]; then
+    fail "dv_sw: software DV re-encode produced no output"; return 0
+  fi
+  pass "dv_sw: software libx265 DV re-encode produced output"
+
+  # --- Assertion 1: output carries a Dolby Vision configuration record (dvcC/dvvC / DOVI side-data) ---
+  local dv_probe
+  dv_probe="$(ffprobe -v error -show_streams -show_entries stream_side_data -select_streams v:0 "$out" 2>/dev/null)"
+  if printf '%s\n' "$dv_probe" | grep -qiE 'dovi|dv_profile|DOVI configuration|dvhe|dvh1'; then
+    pass "dv_sw: output carries a Dolby Vision configuration record (RPU survived the software round-trip)"
+  else
+    fail "dv_sw: no Dolby Vision configuration record in the software-encoded output (RPU extract/inject/dvcC broke)"
+  fi
+
+  # --- Assertion 2: frame-count parity between source and output (positive guard on countability). ---
+  local src_frames out_frames
+  src_frames="$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$_dv_src" 2>/dev/null | head -1)"
+  out_frames="$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$out" 2>/dev/null | head -1)"
+  src_frames="${src_frames//[^0-9]/}"; out_frames="${out_frames//[^0-9]/}"
+  if [[ ! "$src_frames" =~ ^[0-9]+$ || ! "$out_frames" =~ ^[0-9]+$ || "$src_frames" -le 0 ]]; then
+    skip "dv_sw: could not count frames (source='$src_frames', output='$out_frames')"
+  elif [[ "$src_frames" -eq "$out_frames" ]]; then
+    pass "dv_sw: frame-count parity (source=$src_frames, output=$out_frames)"
+  else
+    fail "dv_sw: frame-count mismatch — source=$src_frames, output=$out_frames"
+  fi
+  rm -f "$out"
+}
+
 # Phase 2.1: prose-doc profile drift guard. Mirrors the cli-suite VALID_PROFILES
 # cross-check (_test_cli_profile_crossref) but targets the *unguarded* prose docs the
 # docs review flagged: README's profile table and docs/config_profile.md's profile
@@ -8120,7 +9055,9 @@ _test_docs_prose_drift() {
     local table
     table="$(awk '/^\|[[:space:]]*Profile[[:space:]]*\|/{f=1} f{print} f&&/^[[:space:]]*$/{exit}' "$readme")"
     if [[ -z "$table" ]]; then
-      skip "README.md profile table (\"| Profile |\" header) not found — README cross-ref skipped"
+      # 0.2: a renamed/missing "| Profile |" header empties the capture. The README IS
+      # readable, so this is drift, not host optionality — fail, never skip (vacuous pass).
+      fail "README.md profile table (\"| Profile |\" header) not found — was the header renamed? prose-drift guard could not run"
     else
       local r_missing=0 p
       for p in $canonical; do
@@ -8130,7 +9067,7 @@ _test_docs_prose_drift() {
       (( r_missing )) || pass "README.md profile table lists all VALID_PROFILES"
     fi
   else
-    skip "README.md not readable — README profile cross-ref skipped"
+    fail "README.md not found/readable at $readme — prose-drift guard could not run"
   fi
 
   # ---- config_profile.md: a `### \`name\`` section heading per canonical profile ----
@@ -8150,8 +9087,20 @@ _test_docs_prose_drift() {
         && { fail "Deprecated alias '$a' used as a profile heading in docs/config_profile.md"; alias_hit=1; }
     done
     (( alias_hit )) || pass "docs/config_profile.md uses no deprecated alias (dv-archival/streaming) as a heading"
+
+    # 0.2 reverse direction: a `### `name`` heading that is NOT in VALID_PROFILES is stale
+    # (a profile renamed/removed in the script but left in the docs). Deprecated aliases are
+    # owned by the alias check above, so skip them here to avoid double-reporting.
+    local stale_hit=0 heading
+    while read -r heading; do
+      [[ -n "$heading" ]] || continue
+      [[ "$heading" == "dv-archival" || "$heading" == "streaming" ]] && continue
+      [[ " $canonical " == *" $heading "* ]] \
+        || { fail "Stale profile heading '$heading' in docs/config_profile.md — not in VALID_PROFILES"; stale_hit=1; }
+    done < <(grep -oE '^### `[a-z0-9][a-z0-9-]*`' "$cfgprofile" | sed -E 's/^### `//; s/`$//')
+    (( stale_hit )) || pass "docs/config_profile.md has no stale profile headings (all map to VALID_PROFILES)"
   else
-    skip "docs/config_profile.md not readable — config_profile cross-ref skipped"
+    fail "docs/config_profile.md not found/readable at $cfgprofile — prose-drift guard could not run"
   fi
 
   # ---- Stretch: AV1 _crf_ratio table in AV1_CALIBRATION.md matches the live function ----
@@ -8165,8 +9114,10 @@ _test_docs_prose_drift() {
     local body pairs
     body="$(awk '/^_crf_ratio\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
     pairs="$(grep -oE '[0-9]+\) echo [0-9]+' "$av1doc" | sed 's/) echo / /')"
-    if [[ -z "$body" || -z "$pairs" ]]; then
-      skip "_crf_ratio function or AV1 ratio table not found — AV1 ratio cross-check skipped"
+    if [[ -z "$body" ]]; then
+      skip "_crf_ratio not found in muxm — AV1 ratio cross-check skipped (script-side, not doc drift)"
+    elif [[ -z "$pairs" ]]; then
+      fail "docs/AV1_CALIBRATION.md is present but its _crf_ratio ratio table is gone — doc drift"
     else
       local av1_bad=0 crf ratio actual n=0
       while read -r crf ratio; do
@@ -8180,7 +9131,49 @@ _test_docs_prose_drift() {
       done <<< "$pairs"
       (( av1_bad )) || pass "AV1_CALIBRATION.md _crf_ratio table matches the script ($n values)"
     fi
+  else
+    # 0.2: a missing/renamed AV1 doc previously hit this `if [[ -r ]]` with no else → silent
+    # no-op (vacuous pass). It is a committed file, so absence is drift → fail.
+    fail "docs/AV1_CALIBRATION.md not found/readable at $av1doc — _crf_ratio cross-check could not run"
   fi
+}
+
+# 0.3: soft-skip anti-pattern guard (baseline ratchet). An `else` branch whose ONLY statement
+# is `skip` turns "the property the test setup guaranteed wasn't there" into a green pass
+# instead of a red fail — the exact false-confidence the review found. Phase 1 converts the
+# ~20 encode-suite offenders to `fail`; this guard's job is to stop NEW ones creeping in.
+#
+# DEVIATIONS from the plan's literal "defensible-only allow-list" (flagged in the report):
+#  • Phase 1 is out of scope here, so enforcing defensible-only would flag the ~20 un-converted
+#    soft-skips and ship a RED Phase 0. Instead this is a *count ratchet*: it tolerates the
+#    current snapshot and fails only when the count RISES (a newly-added soft-skip). Phase 1
+#    lowers SOFT_SKIP_BASELINE as it converts offenders.
+#  • Keyed on a *count*, not a per-message allow-list, because the skip strings carry dynamic
+#    content ($vars) and aren't stable literals to allow-list individually.
+#  • Scans the whole harness (not only encode-suite bodies) — a strict superset, so it also
+#    catches creep in the config/CLI suites.
+_test_meta_soft_skip() {
+  local self="${BASH_SOURCE[0]}"
+  local -i baseline=61   # 2026-06-17: 80→65 (Phase 1 converted 15 soft-skips to fail); 65→62 (Phase 4 replaced the R28/R29 tonemap dry-run skips with a real encode and converted the avi-fixture else-skip to a positive guard); 62→61 (Phase 5 replaced the host-gated NVENC-stub else-skip with a host-independent unit test). LOWER as more convert; never raise.
+  local -i found
+  found="$(awk '
+    function trim(s){ gsub(/^[ \t]+|[ \t]+$/,"",s); return s }
+    { t=trim($0)
+      if (t ~ /^else[ \t]+skip[ \t]/) { c++; next }                 # inline:  else skip "..."
+      if (t=="else") { ie=1; next }                                  # multiline: else \n skip \n fi
+      if (ie){ if(t==""||t~/^#/)next; if(ss){ if(t=="fi")c++; ie=0;ss=0;next } if(t~/^skip[ \t]/){ss=1;next} ie=0 } }
+    END{print c+0}' "$self")"
+  if (( found <= baseline )); then
+    pass "soft-skip ratchet: $found else-only-skip blocks ≤ baseline $baseline (no new soft-skips)"
+    # NB: plain `if`, not `(( found < baseline )) && log` — under `set -e` a false `(( ))`
+    # in an && list returns 1 and would abort the suite before its summary.
+    if (( found < baseline )); then
+      log "  ↳ soft-skips dropped to $found — lower SOFT_SKIP_BASELINE to $found in _test_meta_soft_skip to lock it in"
+    fi
+  else
+    fail "soft-skip ratchet: $found else-only-skip blocks > baseline $baseline — a new 'else → skip' crept in. Convert it to 'fail' where the setup guarantees the property (see Test_Suite_Fixes.md §1.1), or it's a genuine host/version skip that belongs in an 'if [[ ! cond ]]; then skip' guard, not an else."
+  fi
+  return 0
 }
 
 # ---- Suite: docs (generated-artifact parity) ----
@@ -8219,6 +9212,8 @@ test_docs_parity() {
   # Phase 2.1: cross-check the prose docs (README profile table + config_profile.md
   # sections, and the AV1 _crf_ratio table) against the canonical VALID_PROFILES / script.
   _test_docs_prose_drift
+  # Phase 0.3: ratchet against new `else → skip` soft-skip anti-patterns in the harness.
+  _test_meta_soft_skip
 }
 
 # ---- Run Suites ----
@@ -8267,6 +9262,7 @@ run_suites() {
       run_suite_tracked multi_profile test_multi_profile
       run_suite_tracked regression_p5 test_regression_p5
       run_suite_tracked dv_vt         test_dv_vt
+      run_suite_tracked dv_sw         test_dv_sw
       run_suite_tracked docs          test_docs_parity
       ;;
     cli)           test_cli ;;
@@ -8293,6 +9289,7 @@ run_suites() {
     multi_profile)   test_multi_profile ;;
     regression_p5)   test_regression_p5 ;;
     dv_vt)           test_dv_vt ;;
+    dv_sw)           test_dv_sw ;;
     docs)            test_docs_parity ;;
     *)
       echo "Unknown suite: $SUITE (run with --help to see available suites)"
@@ -8361,7 +9358,7 @@ summary() {
 # dv_vt is "media-free" only in the sense that it generates NO synthetic fixtures — it
 # either SKIPs (default) or encodes a real DV source supplied via MUXM_DV_FIXTURE, so it
 # needs none of the generated clips.
-readonly MEDIA_FREE_SUITES="^(toggles|completions|setup|config|profiles|conflicts|hw_accel|unit|dv_vt|docs)$"
+readonly MEDIA_FREE_SUITES="^(toggles|completions|setup|config|profiles|conflicts|hw_accel|unit|dv_vt|dv_sw|docs)$"
 readonly EXTENDED_SUITES="^(collision|dryrun|video|hdr|audio|subs|ext_subs|output|containers|metadata|edge|e2e|multi_profile|regression_p5|all)$"
 
 auto_cleanup_test_dirs

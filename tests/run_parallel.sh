@@ -96,7 +96,7 @@ CAP="${_cap_arg:-${CAP:-$(( _cores / 2 < 1 ? 1 : _cores / 2 ))}}"
 # Phase 1 — fast, no real encodes (mirrors test_muxm.sh MEDIA_FREE_SUITES + cli).
 CONFIG_SUITES=(unit cli toggles completions setup config profiles conflicts hw_accel dv_vt docs)
 # Phase 2 — real-encode suites.
-ENCODE_SUITES=(collision dryrun video hdr audio subs ext_subs output containers metadata edge e2e multi_profile regression_p5)
+ENCODE_SUITES=(collision dryrun video hdr audio subs ext_subs output containers metadata edge e2e multi_profile regression_p5 dv_sw)
 
 # ---- Drift guard ----
 # The union of the two batches MUST equal the canonical set of suites that

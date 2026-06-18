@@ -302,8 +302,8 @@ Validates filename collision auto-versioning and source replacement flags. Uses 
 |---|------|-----------|------|
 | 115 | HDR10-tagged source encode | HEVC output, BT.2020 primaries and SMPTE 2084 transfer preserved | ✅ |
 | 116 | `--no-tonemap` config flag | TONEMAP_HDR_TO_SDR = 0 in effective config | ✅ |
-| 117 | `--tonemap` + HDR source | Tonemap filter chain (SDR-TONEMAP/zscale) present in dry-run | ✅ |
-| 118 | `--profile universal` + HDR source | Tonemap filter chain present in dry-run (profile implies tonemap) | ✅ |
+| 117 | `--tonemap` + HDR source (4.1: real encode) | Real `--tonemap` encode of the HDR fixture → output is SDR-tagged: `color_transfer` and `color_primaries` are `bt709` (not PQ/HLG/BT.2020). Gated on zscale/libzimg. (Replaced the old dry-run grep + soft-skip.) | ✅ |
+| 118 | `--profile universal` implies tonemap | universal sets `TONEMAP_HDR_TO_SDR=1` (verified in the `profiles` suite); the resulting SDR-tagged output is verified by the #117 real encode | ✅ |
 
 ### 1.12 Audio Pipeline (suite: `audio`)
 
@@ -913,39 +913,40 @@ whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
 | Conflict warnings | ✅ Full | — | 40+ combinations tested, incl. archive/animation multi-track audio+sub conflicts (--audio-track, --audio-force-codec, --stereo-fallback, --sub-burn-forced, --sub-export-external), hdr10-hq+DV, universal+DV, AV1+DV, and burn-forced+no-subtitles. Warning *text* (not just presence) asserted after the Phase 8 needle hardening. Plus the silently-ignored-flag warnings C1–C5,C7–C10 (`_warn_ignored_knobs` + av1-hq/streaming-av1 profile arms): C5/C7/C8/C9/C10 e2e in `--suite conflicts`; C1–C4 (VideoToolbox-only) deterministically in `--suite unit` (`_test_unit_ignored_knobs`) and e2e-gated on a VT host |
 | Dry-run mode | ✅ Full | — | Includes HDR source dry-run |
 | Video encode (SDR) | ✅ Full | — | Includes x265-params, threads, video-copy-if-compliant, --level VBV |
-| Video encode (HDR) | ⚠️ Tagged only | Real HDR quality (M8–M15) | Synthetic clips have HDR tags but no real HDR content; tonemap filter chain verified in dry-run |
-| Container formats | ✅ Full | — | MOV, M4V, and MKV validated |
+| Video encode (HDR) | ✅ Color tags automated | Real HDR quality (M8–M15) | Synthetic clips have HDR tags but no real HDR content (visual quality stays manual). **Added 2026-06-17 (Phase 4.1):** a real `--tonemap` encode probes the output is SDR-tagged (`color_transfer`/`color_primaries` == bt709), upgrading the old dry-run-only tonemap check |
+| Chroma subsampling (4:2:2) | ✅ Automated (probe) | — | **Added 2026-06-17 (Phase 4.2):** real encode of `h264_422p_sdr.mkv` probes output `pix_fmt` — `FORCE_CHROMA_420=0` preserves `yuv422p`, the default downsamples to `yuv420p` (upgraded from the H8 dry-run). Gated on a libx265 build with 4:2:2 output |
+| Container formats | ✅ Full | — | MOV, M4V, and MKV validated. **Added 2026-06-17 (Phase 4.3):** a real passthrough encode of an unsupported `.avi` source probes the derived container is matroska (upgraded the avi→mkv-fallback dry-run check) |
 | Metadata stripping | ✅ Full | — | Strip and preserve verified with ffprobe; --ffprobe-loglevel tested |
 | Audio titles | ✅ Full | — | --audio-titles and --no-audio-titles both tested with real encodes |
 | Subtitle track limiting | ✅ Full | — | SUB_MAX_TRACKS=1 via config file and --sub-lang-pref multilang tested |
 | SDR 10-bit forcing | ✅ Automated (probe) | Visual only (M71–M74) | **Added 2026-06-12:** video suite encodes an 8-bit SDR source and probes `pix_fmt` — `yuv420p10le` with `--sdr-force-10bit`, `yuv420p` with `--no-sdr-force-10bit`. `SDR_USE_10BIT_IF_SRC_10BIT` (src-10bit auto path) still relies on the HDR/10-bit encode fixtures |
-| Max copy bitrate | ❌ None | Bitrate-gated copy (M75–M77) | --max-copy-bitrate ceiling logic untested |
+| Max copy bitrate | ✅ Automated (unit) | — | **Added 2026-06-17 (Phase 3.5/3.6):** `_test_unit_video_copy_compliant` asserts the MAX_COPY_BITRATE ceiling rejects an over-cap source (incl. bare-integer non-`k` rates) and accepts an under-cap one; an invalid rate warns and skips the ceiling |
 | Multi-track audio (archive) | ✅ Full | — | `hevc_multi_audio.mkv` fixture (eng main + eng commentary + spa) drives dry-run keep-list assertions ("keeping 2 of 3", ✗ drop marker, commentary dropped), AUDIO_MULTI_TRACK/AUDIO_KEEP_COMMENTARY profile defaults, --stereo-fallback interaction, and e2e archive encodes |
 | Multi-track subtitles (archival/animation) | ✅ Full | — | `hevc_multi_subs.mkv` fixture (5 subs: eng forced/full/SDH, spa, fra) drives multi-track announce, SUB_MULTI_TRACK defaults, language/type filtering, demotion-on-conflict, and e2e encodes |
 | Source replacement & collision | ✅ Full | Interactive prompt (M59–M60) | Auto-versioning, --force-replace-source, non-TTY rejection, --help/config registration all tested; interactive --replace-source confirmation requires TTY |
-| Dolby Vision | ❌ None | Full DV pipeline (M1–M7, M64–M70) | Requires real DV source + dovi_tool + MP4Box. C6 (H.264 drops DV) post-probe warning: predicate covered deterministically in `--suite unit` (`_test_unit_h264_drops_dv`); end-to-end gated on `MUXM_DV_FIXTURE` in `--suite dv_vt` (libx264 warns; libx265 / `--no-dv` do not) |
-| DV container verification | ❌ None | dvcC box checks (M64–M68) | verify_dv_container_record, pre-wrap, mp4box fallback untested |
-| DV P7/P5→P8.1 conversion | ❌ None | Profile conversion (M69–M70) | dovi_tool convert pipeline untested |
-| HDR10 static metadata check | ❌ None | M7 | _check_hdr10_static_metadata untested |
+| Dolby Vision | ✅ Round-trip automated (probe) | VT encode + visual (M1–M7, M64–M70) | **Added 2026-06-17 (Phase 5.1):** the portable `dv_sw` suite does a real **software** libx265 re-encode of the bundled DV P8 fixture and probes the output carries a DOVI configuration record + frame parity — on **any** host with dovi_tool + MP4Box (no VideoToolbox). The VT *encode* path stays macOS-gated (`dv_vt`). C6 (H.264 drops DV) post-probe warning: predicate in `--suite unit` (`_test_unit_h264_drops_dv`), e2e in `dv_vt` |
+| DV container verification | ✅ Automated (probe) | — | **Added 2026-06-17 (Phase 5.1):** the `dv_sw` round-trip exercises `verify_dv_container_record` + the mp4box dvcC pre-wrap and asserts the DOVI/dvcC record is present in the output. (The give-up-branch mp4box *fallback* re-mux is still only mock-exercised.) |
+| DV P7/P5→P8.1 conversion | ⚠️ Failure-path mocked | Real P7/P5 convert (M69–M70) | The bundled DV fixture is Profile 8, so `dv_sw` does not run a real convert. The convert-*failure* + `ALLOW_DV_FALLBACK` handling is covered by the H10 regression mock (`regression_p5`); a real P7→P8.1 conversion still needs a P7/P5 source fixture |
+| HDR10 static metadata check | ✅ Automated (unit) | Real-source survival auto-forwarded (M7) | **Added 2026-06-17 (Phase 3.1):** `_test_unit_hdr10_static_metadata` drives `_check_hdr10_static_metadata` across present/partial/missing and asserts the warning + report status. Output MaxCLL/MDCV *survival* is a smoke probe only — ffmpeg auto-forwards source side-data to libx265, so it has no muxm lever (cf. M-HDR-1) |
 | Tone-mapping quality | ❌ None | Visual evaluation (M13–M15) | Requires HDR source + human judgment |
 | Audio scoring | ✅ Partial | Complex multi-track (M16–M22) | Auto-selection, track override, language pref, force-codec, commentary detection tested; subjective quality not covered |
 | Audio quality | ❌ None | Listening test (M22) | Subjective |
 | Subtitle pipeline | ✅ Partial | PGS OCR, burn-in, styling (M23–M29) | Config flags, external export, track counts, and lang selection verified; OCR and visual burn-in require real media |
-| Subtitle OCR | ❌ None | PGS → SRT (M23) | Requires pgsrip/tesseract + PGS source |
-| Subtitle burn-in | ❌ None | Visual verification (M25) | Requires forced-sub source + eyes |
+| Subtitle OCR | ✅ Dispatch automated (unit) | Text legibility (M23) | **Added 2026-06-17 (Phase 3.2):** `_test_unit_ocr_dispatch` drives `_prepare_subtitle`'s PGS branch with a mock OCR tool, asserting OCR dispatch + SRT-track production. ffmpeg has no PGS encoder (and no vobsub muxer here), so legibility on a real PGS source stays manual |
+| Subtitle burn-in | ✅ Pixels automated (subs) | Positioning/styling (M25) | **Added 2026-06-17 (Phase 3.3):** the subs suite encodes the same forced-sub source with and without `--sub-burn-forced` and PSNRs the subtitle band, asserting the burn changes pixels (y-PSNR ≪ ∞). Placement/styling fidelity stays visual |
 | ASS/SSA styling | ❌ None | Visual verification (M24) | Requires styled ASS source + eyes |
-| Skip-if-ideal | ⚠️ Partial | Full roundtrip (M30–M32) | Basic compliant-source test exists; multi-track audio/sub filtering in ideal-check untested |
+| Skip-if-ideal | ✅ Full (probe) | Full roundtrip (M30–M32) | Compliant-remux + non-compliant-re-encode (output suite); multi-track ideal branch covered by `sii_mt`/`sii_subs`. **Added 2026-06-17 (Phase 3.5):** `_test_unit_video_copy_compliant` covers the copy-reject reasons (codec, 10-bit pixfmt, tone-map, bitrate ceiling) |
 | Output features | ✅ Full | — | Chapters, checksum (with validation), JSON report (content + key checks), keep-temp all tested |
 | Edge cases & security | ✅ Full | — | Includes permissions, control chars, collision prevention, double-dash terminator, auto-generated output path, injection prevention |
 | E2E profiles | ✅ Full | — | All 10 profiles validated with real encodes (av1-hq & streaming-av1 gated on a functional AV1 encoder) |
 | VALID_PROFILES drift | ✅ Full | — | Cross-reference test verifies --help and installed completions match canonical constant |
 | Locale regression | ✅ Full | — | Static audit complete; CI step: `LANG=C LC_ALL=C tests/test_muxm.sh` |
-| Duration detection | ⚠️ Indirect | M82 (tier 3) | `_get_source_duration_secs` tiers 1–2 (stream / format duration) are exercised by every encode's progress path; tier 3 (Matroska `DURATION` tag) still lacks a dedicated fixture |
+| Duration detection | ✅ Full (unit) | — | Tiers 1–2 via every encode's progress path. **Added 2026-06-17 (Phase 3.4):** `_test_unit_duration_tier3` exercises the tier-3 Matroska `DURATION` `HH:MM:SS` parse via a mocked metadata cache (ffmpeg always writes a format duration, so a tier-3-only fixture isn't buildable) |
 | `ffmpeg_has_muxer` | ✅ Full | — | **Added 2026-06-12:** matroska/mp4/mov → present, bogus name → absent. Doubles as the regression guard for the `$1`→`$2` awk-field fix |
 | `DEBUG=1` trace mode | ✅ Full | — | **Added 2026-06-12:** cli suite — dry-run exits 0 with `set -x` on, trace lands on stderr (does not corrupt stdout) |
 | bash 4.3+ version guard | ✅ Automated (macOS) | Linux w/ old bash | **Added 2026-06-12:** rejects macOS `/bin/bash` 3.2 with "requires bash 4.3+" and nonzero exit; skips when only a modern bash is present |
 | Progress bar / spinner | ❌ None | Visual | ffmpeg_progress_bar, spinner, run_with_spinner — UI functions requiring a TTY |
-| Disk space preflight | ❌ None | M78–M79 | DISK_FREE_WARN_GB threshold and warning untested |
+| Disk space preflight | ✅ Partial (unit) | M78–M79 | **Added 2026-06-17 (Phase 3.6):** `_test_unit_disk_output_volume` mocks a full output volume on a separate device and asserts the cross-volume `die 11` (the `od_dev != wd_dev` branch the audit found unreached). `disk_free_warn` now *die*s rather than warns; real low-disk behavior on a live volume stays manual |
 | macOS APFS hidden flag | ❌ None | M81 | chflags nohidden after atomic move untested |
 | Error recovery | ❌ None | SIGINT, disk full (M33–M38) | Requires manual intervention |
 | Cross-platform | ❌ None | macOS + Linux (M39–M42) | Requires both platforms |
@@ -974,22 +975,25 @@ for the assertions added on 2026-06-12; the rest were closed by prior work):
 - **`_detect_mp4box`** PATH-mock (MP4Box / mp4box / neither) and **`_validate_media_file`** stream-layout (video-only accepted, audio-only rejected with exit 41) *(added 2026-06-12)*.
 - **`--no-stereo-fallback`** toggle *(added 2026-06-12)*; **`--preset bogus` rejection** (cli suite), **`--create-config user`** (config suite), **`AUDIO_CODEC_PREFERENCE` custom ordering** (via `_audio_codec_rank` env).
 
+#### ✅ Resolved by Phase 3 (2026-06-17)
+
+1. **`_get_source_duration_secs()` tier 3** — resolved: `_test_unit_duration_tier3` parses a Matroska `DURATION` `HH:MM:SS` via a mocked metadata cache (M-DUR-1).
+2. **`check_skip_if_ideal()` multi-track path** — already covered e2e by the output suite's `sii_mt` (commentary forces remux) and `sii_subs` (5 subs preserved through the ideal path); the copy-reject reasons are now unit-tested by `_test_unit_video_copy_compliant` (M-VCC-1/M-VCC-2).
+4. **Disk-space preflight threshold (`disk_free_warn`)** — partially resolved: `_test_unit_disk_output_volume` asserts the cross-volume output `die 11` (M-DISK-1). The workdir-volume branch on a live disk stays manual.
+
 #### ❌ Remaining — automatable (fixture or mock needed)
 
-1. **`_get_source_duration_secs()` tier 3** — a synthetic MKV carrying *only* a Matroska `DURATION` tag (no stream/format duration) would exercise the tier-3 `HH:MM:SS` parse specifically. Tiers 1–2 are covered indirectly.
-2. **`check_skip_if_ideal()` multi-track path** — needs an "ideal" multi-track source (compliant codecs + multiple audio/sub tracks) to hit the multi-track branch of the ideal check.
-3. **`select_best_audio()` / `build_subtitle_plan()` / `decide_color_and_pixfmt()` direct unit tests** — currently covered *indirectly* by the audio/subs/hdr e2e suites; direct unit tests with mock probe input would pinpoint regressions but are lower-value given the integration coverage.
-4. **Disk-space preflight threshold (`disk_free_warn` / `DISK_FREE_WARN_GB`)** — the size-estimation helpers (`_crf_ratio`, `_preset_multiplier`) are unit-tested, but the warning threshold itself needs a mocked `df`/free-space value.
+3. **`select_best_audio()` / `build_subtitle_plan()` / `decide_color_and_pixfmt()` direct unit tests** — `select_best_audio` and `decide_color_and_pixfmt` now have direct unit tests (Phase 2); `build_subtitle_plan` is still covered only *indirectly* by the subs e2e suite.
 5. **Multi-pass config layering with profile conflicts** — user config sets a profile, project config overrides a conflicting variable, CLI adds a third; assert every expected warning.
 
 #### ❌ Remaining — genuinely manual (real content / hardware / human judgment)
 
 8. **`--create-config system` scope** — writes to `/etc/.muxmrc`; needs root and pollutes the system, so left manual.
 9. **`--install-man` standalone** — resolves its target via `brew --prefix` (writes to the real `share/man`), so it cannot be cleanly isolated; the man installer is exercised via `--setup`.
-10. **`_check_hdr10_static_metadata()`** — needs a real DV/HDR source with mastering-display / MaxCLL side data (manual M7).
+10. **`_check_hdr10_static_metadata()`** — the detection/warning path is now automated (`_test_unit_hdr10_static_metadata`, M-HDR-2, 2026-06-17). What remains manual: the real-source MaxCLL/MDCV *survival* through an encode is tautological (ffmpeg auto-forwards source side-data to libx265, no muxm lever), so it is only a smoke probe (manual M7).
 11. **Progress bar / spinner** (`ffmpeg_progress_bar`, `run_with_spinner`, `spinner`) — TTY/UI; visual only.
 12. **macOS APFS hidden flag** (`chflags nohidden`) — macOS + APFS only (M81).
-13. Everything already filed under §2 manual procedures: full DV pipeline, tone-mapping quality, OCR, subtitle burn-in, ASS styling, audio listening tests, SIGINT/disk-full recovery, cross-platform, and device playback.
+13. Everything already filed under §2 manual procedures: tone-mapping quality, OCR, subtitle burn-in, ASS styling, audio listening tests, SIGINT/disk-full recovery, cross-platform, and device playback. (The DV RPU round-trip is now automated portably by `dv_sw` (Phase 5.1); only the VideoToolbox *encode* path and on-device DV playback remain manual.)
 
 ---
 
