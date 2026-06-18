@@ -984,6 +984,9 @@ _test_cli_error_codes() {
 
   # Invalid preset
   assert_exit $EXIT_VALIDATION "Invalid preset exits $EXIT_VALIDATION" --preset fake "$TESTDIR/basic_sdr_subs.mkv"
+  # D10: the error states the fix (lists the valid presets), not just the rejected value.
+  assert_contains "Valid presets:" "Invalid preset error lists the valid presets (D10)" \
+    "$(run_muxm --preset fake "$TESTDIR/basic_sdr_subs.mkv")"
 
   # Invalid video codec
   assert_exit $EXIT_VALIDATION "Invalid video codec exits $EXIT_VALIDATION" --video-codec vp9 "$TESTDIR/basic_sdr_subs.mkv"
@@ -1008,6 +1011,10 @@ _test_cli_error_codes() {
 
   # Too many positional args
   assert_exit $EXIT_VALIDATION "Too many args exits $EXIT_VALIDATION" a.mkv b.mp4 c.mp4
+  # D10: the error names the unexpected extra token(s) (the too-many-args check fires before
+  # source-existence, so nonexistent paths are fine here). Guards the ${POSITIONALS[*]:2} slice.
+  assert_contains "unexpected: c.mp4" "Too many arguments error names the extra token (D10)" \
+    "$(run_muxm a.mkv b.mp4 c.mp4)"
 
   # Source = output auto-versioning (collision no longer dies; auto-versions instead)
   out="$(run_muxm --output-ext mkv "$TESTDIR/basic_sdr_subs.mkv" "$TESTDIR/basic_sdr_subs.mkv")"
@@ -1693,6 +1700,8 @@ EOF
     fail "Invalid FFMPEG_LOGLEVEL in config — expected exit $EXIT_VALIDATION, got $ll_code"
   fi
   assert_contains "Invalid FFMPEG_LOGLEVEL" "Error message names the bad variable" "$ll_out"
+  # D13: the error names the offending config file (not just "in config").
+  assert_contains ".muxmrc" "Invalid FFMPEG_LOGLEVEL error names the offending config file (D13)" "$ll_out"
 
   # ---- Invalid FFPROBE_LOGLEVEL in config file ----
   cat > "$loglevel_home/.muxmrc" <<'EOF'
@@ -5473,6 +5482,8 @@ test_edge() {
   _octrl_msg="$(run_muxm --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv" "$_octrl_out")"
   assert_contains "Output filename contains control characters" \
     "3.6 output control-char: OUT_ABS check names the output-filename risk" "$_octrl_msg"
+  # D10: the security die now states the fix (rename the file).
+  assert_contains "Rename the file" "output control-char error states the remedy (D10)" "$_octrl_msg"
 
   # ---- Source/output collision auto-versioning ----
   # When source and output point to the same file, muxm auto-versions the output
@@ -5510,6 +5521,8 @@ test_edge() {
   local noow_msg
   noow_msg="$(run_muxm --no-overwrite --crf 28 --preset ultrafast "$noow_src" "$noow_out")"
   assert_contains "already exists" "Error mentions file already exists" "$noow_msg"
+  # D10: the --no-overwrite die states the fix.
+  assert_contains "remove --no-overwrite" "--no-overwrite error states the remedy (D10)" "$noow_msg"
   rm -f "$noow_out"
 
   # Control characters in output extension are rejected
@@ -8872,10 +8885,26 @@ FBDOVISCRIPT
     local c3_bundle="$lp_dir/c3.muxm-debug"
     if (( c3_code != 0 )) && [[ -d "$c3_bundle" ]] \
        && ls "$c3_bundle"/muxm.*.log >/dev/null 2>&1 && [[ -s "$c3_bundle/encode.err" ]] \
-       && printf '%s' "$c3_log" | grep -qF "Diagnostics saved: $c3_bundle/"; then
+       && printf '%s' "$c3_log" | grep -qF "Diagnostics: $c3_bundle/"; then
       pass "LOGPERSIST/failure: bundle holds the log + encode.err and the message points at it"
     else
-      fail "LOGPERSIST/failure: expected $c3_bundle/ with log + encode.err and a matching 'Diagnostics saved' line (exit $c3_code)"
+      fail "LOGPERSIST/failure: expected $c3_bundle/ with log + encode.err and a matching 'Diagnostics:' line (exit $c3_code)"
+    fi
+    # FATALDEDUP (Phase 4 / D7): on a pipeline failure the cause is printed exactly ONCE (by
+    # die() as "❌ ERROR: <cause>"), the on_exit summary is terse ("❌ Build FAILED (exit N).
+    # Diagnostics: …/") and no line contains the old nested "Fatal:". The counts are trustworthy
+    # because ffmpeg/x265 stderr goes to encode.err (a file) and the run log is separate — so the
+    # captured stream carries only muxm's own ❌ lines.
+    # `grep -c` exits 1 on zero matches; `|| true` keeps the count capture set -e-safe (the
+    # harness runs under set -e, and the expected Fatal: count IS zero).
+    local c3_fatal c3_cause
+    c3_fatal="$(printf '%s\n' "$c3_log" | grep -cF 'Fatal:' || true)"
+    c3_cause="$(printf '%s\n' "$c3_log" | grep -cF 'Base video encode failed' || true)"
+    if (( c3_code != 0 && c3_fatal == 0 && c3_cause == 1 )) \
+       && printf '%s\n' "$c3_log" | grep -qE 'Build FAILED \(exit [0-9]+\)\. Diagnostics:'; then
+      pass "FATALDEDUP: failure cause printed once, no 'Fatal:', terse Build-FAILED summary (D7)"
+    else
+      fail "FATALDEDUP: expected one cause + no 'Fatal:' + terse summary (Fatal=$c3_fatal, cause=$c3_cause, exit=$c3_code)"
     fi
 
     # CASE 4 (persist-copy fails): the bundle path is pre-occupied by a regular file so the

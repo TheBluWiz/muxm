@@ -139,6 +139,9 @@ _ACTIVE_FFMPEG_PID="" # PID of the current backgrounded ffmpeg or long-running s
 _BURN_SRT_FILTER=""   # temp file for subtitle burn-in (inside WORKDIR; cleaned in on_exit)
 FAILED=0
 FAIL_MSG=""
+_ERROR_PRINTED=0      # set by die()/on_error() once the cause is on screen, so on_exit's failure
+                      # summary stays terse and never re-prints the cause (D7). SIGINT/SIGTERM and
+                      # the no-output fallback leave it 0, so on_exit surfaces their cause itself.
 EXIT_CODE=1
 PRINT_EFFCONF=0
 
@@ -736,9 +739,12 @@ _jq_cache() {
 die()  {
   local code=1
   if [[ $# -gt 1 && "$1" =~ ^[0-9]+$ ]]; then code="$1"; shift; fi
-  FAILED=1; EXIT_CODE="$code"; FAIL_MSG="Fatal: $*"
+  # FAIL_MSG carries no "Fatal:" prefix (D7): the "❌ ERROR:" / "❌ Build FAILED" prefixes
+  # already convey severity, and on_exit must not echo the cause a second time (see _ERROR_PRINTED).
+  FAILED=1; EXIT_CODE="$code"; FAIL_MSG="$*"
   printf "❌ ERROR: %s\n" "$FAIL_MSG" >&2
   [[ "${_LOG_READY:-0}" == "1" ]] || _log_buffer_mirror "❌ ERROR: " "$FAIL_MSG"
+  _ERROR_PRINTED=1   # the cause is now on screen; on_exit keeps its summary terse
   exit "$code"
 }
 
@@ -748,6 +754,7 @@ on_error(){
   EXIT_CODE="$status"
   FAIL_MSG="Command failed at line $lineno: $cmd (exit $status)"
   printf "❌ ERROR: %s\n" "$FAIL_MSG" >&2
+  _ERROR_PRINTED=1   # cause printed here; on_exit will not echo it again (D7)
   # Note: This trap does not call exit directly. Under set -e, the shell
   # exits after the ERR trap returns, which triggers the EXIT trap (on_exit)
   # where FAILED/EXIT_CODE/FAIL_MSG are used for cleanup and reporting.
@@ -1192,12 +1199,12 @@ fi
 
 # Validate loglevel values from config files (catch typos early, before ffmpeg sees them)
 [[ -n "$FFMPEG_LOGLEVEL" ]] && ! is_valid_loglevel "$FFMPEG_LOGLEVEL" && \
-  die 11 "Invalid FFMPEG_LOGLEVEL=\"$FFMPEG_LOGLEVEL\" in config. Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
+  die 11 "Invalid FFMPEG_LOGLEVEL=\"$FFMPEG_LOGLEVEL\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
 [[ -n "$FFPROBE_LOGLEVEL" ]] && ! is_valid_loglevel "$FFPROBE_LOGLEVEL" && \
-  die 11 "Invalid FFPROBE_LOGLEVEL=\"$FFPROBE_LOGLEVEL\" in config. Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
+  die 11 "Invalid FFPROBE_LOGLEVEL=\"$FFPROBE_LOGLEVEL\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
 # Validate HW_ACCEL set via .muxmrc (CLI validation happens in the parser).
 [[ -n "${HW_ACCEL:-}" ]] && ! is_valid_hw_accel "$HW_ACCEL" && \
-  die 11 "Invalid HW_ACCEL=\"$HW_ACCEL\" in config. Valid values: none, auto, videotoolbox, nvenc"
+  die 11 "Invalid HW_ACCEL=\"$HW_ACCEL\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: none, auto, videotoolbox, nvenc"
 
 # ===== Section 7: Dependency installer ========================================================
 # Invoked via --install-dependencies. Checks for all tools required by muxm and
@@ -4739,7 +4746,7 @@ while [[ $# -gt 0 ]]; do
       CRF_VALUE="$_crf_in"; _CLI_CRF_EXPLICIT=1; shift 2 ;;
     -p|--preset)
       _require_val "$1" "$#" "${2:-}"; PRESET_VALUE="$2"; _CLI_PRESET_EXPLICIT=1
-      is_valid_preset "$PRESET_VALUE" || die 11 "Invalid preset: $PRESET_VALUE"
+      is_valid_preset "$PRESET_VALUE" || die 11 "Invalid preset: $PRESET_VALUE. Valid presets: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo."
       shift 2
       ;;
     --x265-params) _require_val "$1" "$#" "${2:-}"; X265_PARAMS_BASE="$2"; _CLI_X265_PARAMS_EXPLICIT=1; shift 2 ;;
@@ -5464,7 +5471,7 @@ fi
 # ===== Section 15: Input validation & security checks =========================================
 SRC="${POSITIONALS[0]:-}"
 OUT="${POSITIONALS[1]:-}"
-(( ${#POSITIONALS[@]} > 2 )) && die 11 "Too many arguments. $USAGE_SHORT"
+(( ${#POSITIONALS[@]} > 2 )) && die 11 "Too many arguments — unexpected: ${POSITIONALS[*]:2}. $USAGE_SHORT"
 [[ -z "$SRC" ]] && { print_usage; exit 0; }
 
 # Validate output extension (security: prevent command injection)
@@ -5481,15 +5488,15 @@ fi
 
 # Resolve and validate source file
 SRC_ABS="$(realpath_fallback "$SRC")"
-[[ -f "$SRC_ABS" ]] || die 11 "Source file not found: $SRC_ABS"
-[[ -s "$SRC_ABS" ]] || die 11 "Source file is empty: $SRC_ABS"
-[[ -r "$SRC_ABS" ]] || die 11 "Source file not readable: $SRC_ABS"
+[[ -f "$SRC_ABS" ]] || die 11 "Source file not found: $SRC_ABS — check the path (and quoting) and try again."
+[[ -s "$SRC_ABS" ]] || die 11 "Source file is empty: $SRC_ABS — zero bytes on disk (incomplete download or failed export?)."
+[[ -r "$SRC_ABS" ]] || die 11 "Source file not readable: $SRC_ABS — check the file's read permissions."
 
 # Validate filename doesn't contain control characters (security)
 # This catches newlines, tabs, null bytes, and other chars that could cause
 # field-splitting issues in the printf '%s\n' patterns used throughout.
 if [[ "$SRC_ABS" =~ [[:cntrl:]] ]]; then
-  die 11 "Source filename contains control characters - potential security risk"
+  die 11 "Source filename contains control characters - potential security risk. Rename the file to remove control characters."
 fi
 
 # ---- Multi-profile dispatch ------------------------------------------------------------------
@@ -5572,7 +5579,7 @@ OUT="$OUT_ABS"
 
 # Validate output doesn't contain control characters (security)
 if [[ "$OUT_ABS" =~ [[:cntrl:]] ]]; then
-  die 11 "Output filename contains control characters - potential security risk"
+  die 11 "Output filename contains control characters - potential security risk. Rename the file to remove control characters."
 fi
 
 # Prevent overwriting source file (security/safety)
@@ -5610,7 +5617,7 @@ fi
 
 # --no-overwrite: refuse if final output already exists
 if (( ! FFMPEG_OVERWRITE )) && [[ -f "$OUT_ABS" ]]; then
-  die 11 "Output file already exists (--no-overwrite): $OUT_ABS"
+  die 11 "Output file already exists (--no-overwrite): $OUT_ABS — remove --no-overwrite to overwrite, or choose a different output path."
 fi
 
 # Security: Use unpredictable temp file name.
@@ -5953,13 +5960,18 @@ on_exit() {
     (( _persist_ok )) && _cleanup_workdir 0
     exit 0
   else
-    [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely earlier parse/runtime error)."
-    printf "❌ Build FAILED. %s\n" "$FAIL_MSG"
-    # Announce the durable diagnostics location BEFORE draining the tee, so this line is
-    # itself captured in the copied log — the bundle then self-documents where it lives.
-    # (Replaces the old "See log: $LOGFILE", which named a file inside the about-to-be-
-    # deleted WORKDIR.) The bundle is kept on every failure, regardless of --keep-log.
-    echo "Diagnostics saved: $DEBUG_BUNDLE_DIR/"
+    # Failure summary (D7): the detailed cause is printed ONCE — by die()/on_error() at the
+    # failure site (_ERROR_PRINTED=1) — so this line stays terse and just folds in the exit code
+    # and the durable diagnostics location. Only when no cause was printed (SIGINT/SIGTERM, or no
+    # output produced) do we surface the reason here. Printed BEFORE the tee drains so it is
+    # captured in the copied log — the bundle then self-documents where it lives. The bundle is
+    # kept on every failure, regardless of --keep-log.
+    if (( ${_ERROR_PRINTED:-0} )); then
+      printf "❌ Build FAILED (exit %s). Diagnostics: %s/\n" "${EXIT_CODE:-1}" "$DEBUG_BUNDLE_DIR"
+    else
+      [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely an earlier parse/runtime error)."
+      printf "❌ Build FAILED (exit %s): %s — Diagnostics: %s/\n" "${EXIT_CODE:-1}" "$FAIL_MSG" "$DEBUG_BUNDLE_DIR"
+    fi
 
     _print_completed_steps
 
