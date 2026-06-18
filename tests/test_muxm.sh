@@ -7128,6 +7128,68 @@ _prepare_subtitle 0' -- "$wd" "$ocr")" || rc=$?
   rm -rf "$wd"
 }
 
+# Phase 0 (log/diagnostics persistence): the two on_exit copy helpers, exercised in
+# isolation so the file-selection contract is verified deterministically (no real encode).
+# _persist_failure_bundle's selection IS the "additional troubleshooting files" decision:
+# the run log + every *.err/*.log, and NONE of the multi-GB binary intermediates.
+_test_unit_persist_helpers() {
+  # ---- _persist_failure_bundle: copies text diagnostics, excludes binaries ----
+  local wd="$TESTDIR/pb_workdir" dest="$TESTDIR/pb_bundle" log
+  log="$wd/muxm.20260101-000000.log"
+  rm -rf "$wd" "$dest"; mkdir -p "$wd"
+  printf 'run log\n'    > "$log"
+  printf 'x265 error\n' > "$wd/encode.err"
+  printf 'ocr ran\n'    > "$wd/sub_0_ocr.log"
+  printf 'probe\n'      > "$wd/probe_meta.err"
+  # Binary intermediates that must NOT end up in the bundle (the disk hogs).
+  printf 'BIN' > "$wd/video_base.hevc"
+  printf 'BIN' > "$wd/video_mixed.mkv"
+  printf 'BIN' > "$wd/rpu_final.bin"
+  printf 'BIN' > "$wd/audio_stereo.aac"
+
+  assert_muxm_fn_exit "_persist_failure_bundle: returns 0 when the bundle is written" 0 \
+    _persist_failure_bundle "LOGFILE='$log'; WORKDIR='$wd'; DEBUG_BUNDLE_DIR='$dest'"
+
+  local want_ok=1 _f
+  for _f in muxm.20260101-000000.log encode.err sub_0_ocr.log probe_meta.err; do
+    [[ -f "$dest/$_f" ]] || { want_ok=0; break; }
+  done
+  local no_bin=1
+  for _f in video_base.hevc video_mixed.mkv rpu_final.bin audio_stereo.aac; do
+    [[ -e "$dest/$_f" ]] && { no_bin=0; break; }
+  done
+  if (( want_ok && no_bin )); then
+    pass "_persist_failure_bundle: copies log + all .err/.log, excludes binary intermediates"
+  else
+    fail "_persist_failure_bundle: wrong selection (text-present=$want_ok binaries-absent=$no_bin) — got: $(ls "$dest" 2>/dev/null | tr '\n' ' ')"
+  fi
+
+  # mkdir failure (bundle path already occupied by a regular file) → returns nonzero so
+  # on_exit keeps WORKDIR instead of destroying the only surviving diagnostics.
+  local destfile="$TESTDIR/pb_bundle_file"; rm -rf "$destfile"; : > "$destfile"
+  assert_muxm_fn_exit "_persist_failure_bundle: returns nonzero when the bundle dir can't be created" 1 \
+    _persist_failure_bundle "LOGFILE='$log'; WORKDIR='$wd'; DEBUG_BUNDLE_DIR='$destfile'"
+  rm -rf "$wd" "$dest" "$destfile"
+
+  # ---- _persist_log: copy the run log to its durable path ----
+  local pl_src="$TESTDIR/pl_src.log" pl_dst="$TESTDIR/pl_dst.log"
+  printf 'log body\n' > "$pl_src"; rm -f "$pl_dst"
+  assert_muxm_fn_exit "_persist_log: returns 0 on a successful copy" 0 \
+    _persist_log "LOGFILE='$pl_src'; LOG_PERSIST_PATH='$pl_dst'"
+  if [[ -s "$pl_dst" ]]; then
+    pass "_persist_log: log copied to the durable path"
+  else
+    fail "_persist_log: durable copy missing at $pl_dst"
+  fi
+  # No log present (e.g. DEBUG=1 created none) → clean no-op, returns 0.
+  assert_muxm_fn_exit "_persist_log: absent log is a clean no-op (returns 0)" 0 \
+    _persist_log "LOGFILE='$TESTDIR/pl_absent.log'; LOG_PERSIST_PATH='$pl_dst'"
+  # Copy target unwritable (parent dir missing) → returns nonzero so caller keeps WORKDIR.
+  assert_muxm_fn_exit "_persist_log: returns nonzero when the copy fails" 1 \
+    _persist_log "LOGFILE='$pl_src'; LOG_PERSIST_PATH='$TESTDIR/pl_no_such_dir/out.muxm.log'"
+  rm -f "$pl_src" "$pl_dst"
+}
+
 test_unit() {
   section "Pure-Function Unit Tests"
   _test_unit_audio_helpers
@@ -7157,6 +7219,7 @@ test_unit() {
   _test_unit_video_copy_compliant
   _test_unit_hdr10_static_metadata
   _test_unit_ocr_dispatch
+  _test_unit_persist_helpers
 }
 
 # === Suite: Profile End-to-End (real encodes with profiles) ===
@@ -8728,6 +8791,70 @@ FBDOVISCRIPT
     fi
   else
     skip "WORKDIR: hevc_sdr_51.mkv fixture not found"
+  fi
+
+  # ---- LOGPERSIST: --keep-log + failure-diagnostics persistence (Phase 0) ----
+  # The run log lives inside WORKDIR (deleted by default), so by default it never survived
+  # — on success OR failure. Phase 0: --keep-log copies the log out on a clean run, and EVERY
+  # failure leaves a self-contained <output>.muxm-debug/ bundle (log + the *.err/*.log that
+  # the in-log "See: …" breadcrumbs name) beside the output; a failed persist-copy keeps the
+  # workdir rather than destroying the only surviving diagnostics. Driven via "$MUXM" DIRECTLY
+  # (not run_muxm, which injects -K) so default cleanup is actually exercised. The forced
+  # failure is an invalid x265 ctu= value, which aborts the base encode (exit 40) after the
+  # logfile/tee and EXIT trap are live — i.e. it routes through on_exit's failure path.
+  if [[ ! -f "$TESTDIR/hevc_sdr_51.mkv" ]]; then
+    skip "LOGPERSIST: hevc_sdr_51.mkv fixture not found"
+  else
+    local lp_dir="$TESTDIR/logpersist"; mkdir -p "$lp_dir"
+    cp "$TESTDIR/hevc_sdr_51.mkv" "$lp_dir/src.mkv"
+    # --no-video-copy-if-compliant forces a real libx265 re-encode (so the bad x265 param
+    # actually bites instead of the HEVC source being stream-copied).
+    local -a lp_common=(--no-dv --skip-audio --skip-subs --no-disk-check --no-video-copy-if-compliant
+                        --video-codec libx265 --crf 30 --preset ultrafast)
+
+    # CASE 1 (default): clean run, no --keep-log, no -k/-K → persist nothing, remove workdir.
+    local c1_out="$lp_dir/c1.mkv" c1_code=0
+    ( cd "$lp_dir" && "$MUXM" "${lp_common[@]}" src.mkv "$c1_out" >/dev/null 2>&1 ) || c1_code=$?
+    if [[ -s "$c1_out" ]] && [[ ! -e "$lp_dir/c1.muxm.log" ]] && [[ ! -e "$lp_dir/c1.muxm-debug" ]] \
+       && ! find "$lp_dir" -maxdepth 1 -name '.muxm.tmp.*' 2>/dev/null | grep -q .; then
+      pass "LOGPERSIST/default: clean run persists nothing and removes the workdir"
+    else
+      fail "LOGPERSIST/default: expected output + no .muxm.log/.muxm-debug + no leftover workdir (exit $c1_code)"
+    fi
+
+    # CASE 2 (--keep-log): clean run copies the log to <output>.muxm.log, non-empty.
+    local c2_out="$lp_dir/c2.mkv" c2_code=0
+    ( cd "$lp_dir" && "$MUXM" --keep-log "${lp_common[@]}" src.mkv "$c2_out" >/dev/null 2>&1 ) || c2_code=$?
+    if [[ -s "$c2_out" && -s "$lp_dir/c2.muxm.log" ]]; then
+      pass "LOGPERSIST/--keep-log: clean run copies the log to <output>.muxm.log"
+    else
+      fail "LOGPERSIST/--keep-log: expected a non-empty c2.muxm.log beside the output (exit $c2_code)"
+    fi
+
+    # CASE 3 (failure): bundle holds the log AND the relevant .err, and the message points at it.
+    local c3_out="$lp_dir/c3.mkv" c3_log c3_code=0
+    c3_log="$(cd "$lp_dir" && "$MUXM" "${lp_common[@]}" --x265-params "ctu=999" src.mkv "$c3_out" 2>&1)" || c3_code=$?
+    local c3_bundle="$lp_dir/c3.muxm-debug"
+    if (( c3_code != 0 )) && [[ -d "$c3_bundle" ]] \
+       && ls "$c3_bundle"/muxm.*.log >/dev/null 2>&1 && [[ -s "$c3_bundle/encode.err" ]] \
+       && printf '%s' "$c3_log" | grep -qF "Diagnostics saved: $c3_bundle/"; then
+      pass "LOGPERSIST/failure: bundle holds the log + encode.err and the message points at it"
+    else
+      fail "LOGPERSIST/failure: expected $c3_bundle/ with log + encode.err and a matching 'Diagnostics saved' line (exit $c3_code)"
+    fi
+
+    # CASE 4 (persist-copy fails): the bundle path is pre-occupied by a regular file so the
+    # copy can't be written (stands in for 'output volume full'); the workdir must survive and
+    # the surviving location must be printed — the only triage artifact is never destroyed.
+    local c4_out="$lp_dir/c4.mkv" c4_log c4_code=0
+    : > "$lp_dir/c4.muxm-debug"
+    c4_log="$(cd "$lp_dir" && "$MUXM" "${lp_common[@]}" --x265-params "ctu=999" src.mkv "$c4_out" 2>&1)" || c4_code=$?
+    if (( c4_code != 0 )) && printf '%s' "$c4_log" | grep -qiE 'preserving workdir' \
+       && find "$lp_dir" -maxdepth 1 -name '.muxm.tmp.*' 2>/dev/null | grep -q .; then
+      pass "LOGPERSIST/persist-fail: a failed bundle copy keeps the workdir (log not destroyed)"
+    else
+      fail "LOGPERSIST/persist-fail: expected workdir preserved + 'preserving workdir' message (exit $c4_code)"
+    fi
   fi
 
   # ---- CFGGEN: HW_ACCEL is tracked, emitted as a commented default (not leaked) ----

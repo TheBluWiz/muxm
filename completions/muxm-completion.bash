@@ -108,7 +108,7 @@ _muxm_completions() {
             --no-overwrite
             --replace-source --force-replace-source
 
-            -k --keep-temp -K --keep-temp-always
+            -k --keep-temp -K --keep-temp-always --keep-log
             --ffmpeg-loglevel --ffprobe-loglevel --no-hide-banner
             --threads --workdir
         "
