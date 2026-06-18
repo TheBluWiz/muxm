@@ -297,6 +297,18 @@ assert_no_file() {
   fi
 }
 
+# _keepworkdir_logfile CAPTURED_OUTPUT — echo the path of a run's workdir logfile, located via the
+# "Keeping workdir:" line a -K run prints (run_muxm always passes -K). Empty (return 1) if absent.
+# Phase 2 routed muxm's internal log() lines to the logfile instead of leaking them to the
+# terminal, so tests that need to observe those decisions read the kept workdir log (same pattern
+# the H9 x265-params test uses).
+_keepworkdir_logfile() {
+  local wd
+  wd="$(printf '%s\n' "$1" | grep 'Keeping workdir:' | head -1 | awk '{print $NF}')"
+  [[ -n "$wd" && -d "$wd" ]] || return 1
+  find "$wd" -maxdepth 1 -name 'muxm.*.log' 2>/dev/null | head -1
+}
+
 # Probe a video field from output file (returns value via stdout).
 # head -1: ffprobe may return multiple lines for multi-segment files.
 # tr -d ',': ffprobe's csv output can include trailing commas in multi-value fields.
@@ -2991,69 +3003,83 @@ test_dryrun() {
   assert_contains "multi-track" "Dry-run archive multi-subs: announces multi-track mode" "$out"
   assert_contains "keeping" "Dry-run archive multi-subs: subtitle filter summary logged" "$out"
 
-  # ---- Container passthrough resolution (dry-run log messages) ----
+  # ---- Container passthrough resolution + ATV MKV subtitle adjustment (now LOG-only) ----
+  # These [container-passthrough]/[<profile>] decision lines are emitted via log() during §15
+  # output resolution. Phase 2 routes log() to the logfile (buffered pre-§17), NOT the terminal,
+  # so the assertions read the kept workdir log (run_muxm passes -K) and also prove the lines no
+  # longer leak to the terminal — the Phase 2 acceptance criterion. (archive forces MKV directly
+  # per A2; atv-directplay-hq/animation are passthrough, so they exercise the resolution logging.)
+  local cpass_log
 
-  # Passthrough profile (atv-directplay-hq) + mkv source drives all of these in one dry-run:
-  # resolves OUTPUT_EXT=mkv and logs the resolution, and because OUTPUT_EXT=mkv the MKV subtitle
-  # adjustment fires (native ASS/SSA + PGS bitmap preservation; forced subs are already soft by
-  # profile default). A single invocation feeds every assertion below — re-running the identical
-  # dry-run gained nothing. (archive no longer exercises this — it forces MKV directly per A2;
-  # atv-directplay-hq is still passthrough, so it verifies the resolution logging.)
+  # atv-directplay-hq + mkv source → OUTPUT_EXT=mkv (passthrough) → MKV subtitle adjustment fires.
   out="$(run_muxm --dry-run --profile atv-directplay-hq "$TESTDIR/basic_sdr_subs.mkv")"
-  assert_contains "[container-passthrough] Source .mkv" \
-    "dry-run passthrough profile + mkv source: logs mkv resolution" "$out"
-  assert_contains "[container-passthrough] Source .mkv" \
-    "dry-run atv + mkv source: passthrough logs mkv resolution" "$out"
-  assert_contains "[atv-directplay-hq] MKV output: enabling native ASS/SSA" \
-    "dry-run atv + mkv source: MKV subtitle adjustment fires (ASS/SSA preservation enabled)" "$out"
+  cpass_log="$(_keepworkdir_logfile "$out" || true)"
+  if [[ -n "$cpass_log" ]] && grep -qF "[container-passthrough] Source .mkv" "$cpass_log"; then
+    pass "passthrough hq + mkv: container resolution logged (to the logfile, not the terminal)"
+  else
+    fail "passthrough hq + mkv: '[container-passthrough] Source .mkv' not found in the run log ($cpass_log)"
+  fi
+  if [[ -n "$cpass_log" ]] && grep -qF "[atv-directplay-hq] MKV output: enabling native ASS/SSA" "$cpass_log"; then
+    pass "passthrough hq + mkv: MKV subtitle adjustment (ASS/SSA preservation) logged"
+  else
+    fail "passthrough hq + mkv: MKV subtitle adjustment line not found in the run log"
+  fi
+  if printf '%s' "$out" | grep -qF "[container-passthrough]"; then
+    fail "passthrough hq + mkv: internal [container-passthrough] line leaked to the terminal (Phase 2 leak-fix regressed)"
+  else
+    pass "passthrough hq + mkv: internal decision lines no longer leak to the terminal"
+  fi
 
   # atv-directplay-hq + mp4 source: passthrough → OUTPUT_EXT=mp4 → NO MKV subtitle adjustment.
   out="$(run_muxm --dry-run --profile atv-directplay-hq "$TESTDIR/compliant.mp4")"
-  assert_contains "[container-passthrough] Source .mp4" \
-    "dry-run atv + mp4 source: passthrough logs mp4 resolution" "$out"
-  if ! echo "$out" | grep -qF "[atv-directplay-hq] MKV output: enabling native ASS/SSA"; then
-    pass "dry-run atv + mp4 source: MKV subtitle adjustment does NOT fire (mp4 passthrough)"
+  cpass_log="$(_keepworkdir_logfile "$out" || true)"
+  if [[ -n "$cpass_log" ]] && grep -qF "[container-passthrough] Source .mp4" "$cpass_log"; then
+    pass "passthrough hq + mp4: mp4 container resolution logged"
   else
-    fail "dry-run atv + mp4 source: MKV subtitle adjustment fired unexpectedly for mp4 output"
+    fail "passthrough hq + mp4: '[container-passthrough] Source .mp4' not found in the run log"
+  fi
+  if [[ -n "$cpass_log" ]] && ! grep -qF "[atv-directplay-hq] MKV output:" "$cpass_log"; then
+    pass "passthrough hq + mp4: MKV subtitle adjustment does NOT fire (mp4 output)"
+  else
+    fail "passthrough hq + mp4: MKV subtitle adjustment unexpectedly logged for mp4 output"
   fi
 
-  # atv-directplay-hq + mkv source + --sub-burn-forced: CLI flag overrides profile default (burn=0)
-  # and keeps SUB_BURN_FORCED=1; ASS/SSA preservation still fires for MKV.
+  # atv-directplay-hq + mkv + --sub-burn-forced: CLI overrides profile burn default; ASS/SSA on.
   out2="$(run_muxm --profile atv-directplay-hq --sub-burn-forced --print-effective-config)"
   assert_contains "SUB_BURN_FORCED           = 1" \
     "atv + --sub-burn-forced: CLI flag overrides profile default (burn active)" "$out2"
   out="$(run_muxm --dry-run --profile atv-directplay-hq --sub-burn-forced "$TESTDIR/basic_sdr_subs.mkv")"
-  assert_contains "[atv-directplay-hq] MKV output: enabling native ASS/SSA" \
-    "dry-run atv + mkv + --sub-burn-forced: ASS preservation still enabled regardless" "$out"
+  cpass_log="$(_keepworkdir_logfile "$out" || true)"
+  if [[ -n "$cpass_log" ]] && grep -qF "[atv-directplay-hq] MKV output: enabling native ASS/SSA" "$cpass_log"; then
+    pass "atv + mkv + --sub-burn-forced: ASS/SSA preservation still logged regardless"
+  else
+    fail "atv + mkv + --sub-burn-forced: ASS/SSA preservation line not found in the run log"
+  fi
 
   # ---- atv-directplay-animation passthrough + MKV subtitle adjustment ----
-
-  # atv-directplay-animation + mkv source: passthrough → OUTPUT_EXT=mkv → MKV subtitle adjustment fires
-  # (enables ASS/SSA + PGS bitmap preservation; forced subs are already soft by profile default).
   out="$(run_muxm --dry-run --profile atv-directplay-animation "$TESTDIR/basic_sdr_subs.mkv")"
-  assert_contains "[container-passthrough] Source .mkv" \
-    "dry-run atv-directplay-animation + mkv source: passthrough logs mkv resolution" "$out"
-  assert_contains "[atv-directplay-animation] MKV output: enabling native ASS/SSA" \
-    "dry-run atv-directplay-animation + mkv source: MKV subtitle adjustment fires (ASS/SSA preservation enabled)" "$out"
+  cpass_log="$(_keepworkdir_logfile "$out" || true)"
+  if [[ -n "$cpass_log" ]] && grep -qF "[container-passthrough] Source .mkv" "$cpass_log" \
+     && grep -qF "[atv-directplay-animation] MKV output: enabling native ASS/SSA" "$cpass_log"; then
+    pass "passthrough animation + mkv: resolution + MKV subtitle adjustment logged"
+  else
+    fail "passthrough animation + mkv: resolution/adjustment lines not found in the run log"
+  fi
 
   # atv-directplay-animation + mp4 source: passthrough → OUTPUT_EXT=mp4 → NO MKV subtitle adjustment.
   out="$(run_muxm --dry-run --profile atv-directplay-animation "$TESTDIR/compliant.mp4")"
-  assert_contains "[container-passthrough] Source .mp4" \
-    "dry-run atv-directplay-animation + mp4 source: passthrough logs mp4 resolution" "$out"
-  if ! echo "$out" | grep -qF "[atv-directplay-animation] MKV output: enabling native ASS/SSA"; then
-    pass "dry-run atv-directplay-animation + mp4 source: MKV subtitle adjustment does NOT fire"
+  cpass_log="$(_keepworkdir_logfile "$out" || true)"
+  if [[ -n "$cpass_log" ]] && grep -qF "[container-passthrough] Source .mp4" "$cpass_log" \
+     && ! grep -qF "[atv-directplay-animation] MKV output:" "$cpass_log"; then
+    pass "passthrough animation + mp4: mp4 resolution logged, no MKV adjustment"
   else
-    fail "dry-run atv-directplay-animation + mp4 source: MKV subtitle adjustment fired unexpectedly"
+    fail "passthrough animation + mp4: unexpected resolution/adjustment state in the run log"
   fi
 
-  # atv-directplay-animation + mkv source + --sub-burn-forced: CLI flag overrides profile default
-  # (burn=0) and keeps SUB_BURN_FORCED=1; ASS/SSA preservation still fires for MKV.
+  # atv-directplay-animation + mkv source + --sub-burn-forced: CLI overrides burn default.
   out2="$(run_muxm --profile atv-directplay-animation --sub-burn-forced --print-effective-config)"
   assert_contains "SUB_BURN_FORCED           = 1" \
     "atv-directplay-animation + --sub-burn-forced: CLI flag overrides profile default (burn active)" "$out2"
-  out="$(run_muxm --dry-run --profile atv-directplay-animation --sub-burn-forced "$TESTDIR/basic_sdr_subs.mkv")"
-  assert_contains "[atv-directplay-animation] MKV output: enabling native ASS/SSA" \
-    "dry-run atv-directplay-animation + mkv + --sub-burn-forced: ASS preservation still enabled" "$out"
 
   # ---- Disk space preflight (--no-disk-check / DISK_CHECK=0) ----
   # Use DISK_FREE_WARN_GB=99999 (≈1 petabyte floor) to ensure the warning fires
@@ -8854,6 +8880,53 @@ FBDOVISCRIPT
       pass "LOGPERSIST/persist-fail: a failed bundle copy keeps the workdir (log not destroyed)"
     else
       fail "LOGPERSIST/persist-fail: expected workdir preserved + 'preserving workdir' message (exit $c4_code)"
+    fi
+  fi
+
+  # ---- LOGCONTENT: Phase 2 — the persisted log tells the whole story ----
+  # A --keep-log run with a profile/flag conflict must persist a log that contains: the decision
+  # narrative (conflict/ignored-knob warnings, captured pre-§17 → D6/D2), the effective-config
+  # block (self-describing), a monotonic [+Ns] time prefix on log() lines (D8), and a per-step
+  # "done in Ns" timing line (D8). Internal log() lines must NOT leak to the terminal (D5).
+  # archive + --crf triggers the ignored-knob warnings; --no-video-copy-if-compliant forces a real
+  # libx265 re-encode so the encode step is actually timed.
+  if [[ ! -f "$TESTDIR/hevc_sdr_51.mkv" ]]; then
+    skip "LOGCONTENT: hevc_sdr_51.mkv fixture not found"
+  else
+    local lc_dir="$TESTDIR/logcontent"; mkdir -p "$lc_dir"
+    cp "$TESTDIR/hevc_sdr_51.mkv" "$lc_dir/src.mkv"
+    local lc_out="$lc_dir/out.mkv" lc_log="$lc_dir/out.muxm.log" lc_term lc_code=0
+    lc_term="$(cd "$lc_dir" && "$MUXM" --keep-log --no-disk-check --no-dv --skip-audio --skip-subs \
+                 --no-video-copy-if-compliant --video-codec libx265 --crf 30 --preset ultrafast \
+                 --profile archive src.mkv "$lc_out" 2>&1)" || lc_code=$?
+    if [[ -s "$lc_out" && -s "$lc_log" ]]; then
+      if grep -qF "Profile 'archive' + --crf" "$lc_log"; then
+        pass "LOGCONTENT: conflict/ignored-knob warning captured in the persisted log (D6/D2)"
+      else
+        fail "LOGCONTENT: conflict warning missing from the persisted log"
+      fi
+      if grep -qF "Effective config" "$lc_log"; then
+        pass "LOGCONTENT: effective-config block written to the log (self-describing)"
+      else
+        fail "LOGCONTENT: effective-config block missing from the log"
+      fi
+      if grep -qE '^\[\+[0-9]+s\] ' "$lc_log"; then
+        pass "LOGCONTENT: log() lines carry a monotonic [+Ns] time prefix (D8)"
+      else
+        fail "LOGCONTENT: no [+Ns] time prefix found on log lines"
+      fi
+      if grep -qE 'step "[^"]+" done in [0-9]+s' "$lc_log"; then
+        pass "LOGCONTENT: per-step 'done in Ns' timing present (D8)"
+      else
+        fail "LOGCONTENT: no per-step 'done in Ns' timing line found"
+      fi
+      if printf '%s' "$lc_term" | grep -qF "[output] Inferred"; then
+        fail "LOGCONTENT: internal '[output] Inferred' line leaked to the terminal (D5 regressed)"
+      else
+        pass "LOGCONTENT: internal log() lines do not leak to the terminal (D5)"
+      fi
+    else
+      fail "LOGCONTENT: --keep-log run produced no output/log (exit $lc_code)"
     fi
   fi
 

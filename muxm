@@ -129,6 +129,11 @@ WORKDIR_BASE=""        # --workdir DIR: parent dir for the .muxm.tmp.* workdir.
 LOGFILE=""
 LOG_PERSIST_PATH=""   # Durable copy target for the run log under --keep-log; set once in Section 15
 DEBUG_BUNDLE_DIR=""   # Durable diagnostics-bundle dir kept on failure; set once in Section 15
+_LOG_BUFFER=""        # In-memory capture of pre-§17 narrative (config/profile/conflict/validation),
+                      # flushed into $LOGFILE the moment it is created in Section 17. Lets the log
+                      # tell the WHOLE story, and stops log() leaking internal lines to the terminal.
+_LOG_READY=0          # 0 until the tee logfile is live (Section 17); gates buffer-vs-file routing.
+_STEP_T0=0            # $SECONDS at the last completed step; mark_done logs per-step elapsed from it.
 TEE_PID=""            # PID of the tee logger process (Section 17); waited on in on_exit
 _ACTIVE_FFMPEG_PID="" # PID of the current backgrounded ffmpeg or long-running subprocess; SIGKILL'd in on_exit to release the tee pipe
 _BURN_SRT_FILTER=""   # temp file for subtitle burn-in (inside WORKDIR; cleaned in on_exit)
@@ -428,17 +433,36 @@ declare -i REPORT_JSON=0
 # warn() — warning with ⚠️  prefix
 # die()  — fatal error with ❌ prefix; exits with code (default 1)
 #           Usage: die "message" or die <code> "message"
-say()  { printf "%s\n" "$@" >&2; }
-note() { printf "ℹ️  %s\n" "$@" >&2; }
-warn() { printf "⚠️  %s\n" "$@" >&2; }
+# _log_buffer_mirror — append terminal-message text to the pre-§17 _LOG_BUFFER so it survives
+# into the logfile once that exists (Section 17 flush). Called by note/warn/die ONLY while the
+# tee is not yet live (_LOG_READY=0); once live, the tee captures stderr into the log directly,
+# so mirroring would double-write. No-op under DEBUG (the buffer is never flushed there).
+# Args: $1 = emoji/prefix to match the terminal form; $2.. = message lines.
+_log_buffer_mirror() {
+  local _pfx="$1"; shift
+  local _l
+  for _l in "$@"; do _LOG_BUFFER+="${_pfx}${_l}"$'\n'; done
+}
 
-# log() — write ONLY to the log file, not to the terminal.
-# Falls back to say() if LOGFILE isn't set yet (pre–Section 17).
+say()  { printf "%s\n" "$@" >&2; }
+note() { printf "ℹ️  %s\n" "$@" >&2; [[ "${_LOG_READY:-0}" == "1" ]] || _log_buffer_mirror "ℹ️  " "$@"; }
+warn() { printf "⚠️  %s\n" "$@" >&2; [[ "${_LOG_READY:-0}" == "1" ]] || _log_buffer_mirror "⚠️  " "$@"; }
+
+# log() — write ONLY to the log file, never the terminal.
+#   • After Section 17 (_LOG_READY=1): append to $LOGFILE with a cheap monotonic time prefix
+#     ([+Ns] from $SECONDS — no per-line date fork). The write is `|| true` so a transient
+#     append failure can't trip `set -e` mid-encode.
+#   • DEBUG=1 (no logfile is ever created): preserve the historical say() fallback to the terminal.
+#   • Pre-§17 (the common path during config/profile/validation): append to _LOG_BUFFER instead of
+#     leaking to the terminal — the buffer is flushed into $LOGFILE the instant it is created.
 log() {
-  if [[ -n "${LOGFILE:-}" && -w "${LOGFILE:-}" ]]; then
-    printf "%s\n" "$@" >> "$LOGFILE"
+  local _l
+  if [[ "${_LOG_READY:-0}" == "1" && -n "${LOGFILE:-}" && -w "${LOGFILE:-}" ]]; then
+    for _l in "$@"; do printf '[+%ss] %s\n' "$SECONDS" "$_l" >> "$LOGFILE" || true; done
+  elif [[ "${_LOG_READY:-0}" == "1" || "${DEBUG:-0}" == "1" ]]; then
+    say "$@"                       # ready-but-unwritable, or DEBUG (no logfile) → terminal fallback
   else
-    say "$@"
+    for _l in "$@"; do _LOG_BUFFER+="[+${SECONDS}s] $_l"$'\n'; done   # pre-§17: buffer, don't leak
   fi
 }
 
@@ -571,6 +595,7 @@ _ffmpeg_run_with_ui() {
                                # forced-sub burn-in, whose -vf references burn.srt
                                # relatively so no user path needs filtergraph escaping).
   local _ffui_pipe="$WORKDIR/_ffui.$$.pipe"
+  local _ffui_t0=$SECONDS      # for log-only per-op timing (D8: where did the run hang?)
 
   # When a cwd is requested, launch ffmpeg inside a subshell that cd's first. `exec`
   # replaces the subshell with ffmpeg, so $! is ffmpeg's own PID (not the subshell's) —
@@ -588,6 +613,7 @@ _ffmpeg_run_with_ui() {
     local _ffui_rc=$?
     _ACTIVE_FFMPEG_PID=""
     rm -f "$_ffui_pipe" 2>/dev/null || true
+    log "ffmpeg op \"$_ffui_label\" finished in $(( SECONDS - _ffui_t0 ))s (exit $_ffui_rc)"
     return $_ffui_rc
   else
     if [[ -n "$_ffui_cwd" ]]; then
@@ -601,6 +627,7 @@ _ffmpeg_run_with_ui() {
     wait "$_ffui_pid" 2>/dev/null
     local _ffui_rc=$?
     _ACTIVE_FFMPEG_PID=""
+    log "ffmpeg op \"$_ffui_label\" finished in $(( SECONDS - _ffui_t0 ))s (exit $_ffui_rc)"
     return $_ffui_rc
   fi
 }
@@ -711,6 +738,7 @@ die()  {
   if [[ $# -gt 1 && "$1" =~ ^[0-9]+$ ]]; then code="$1"; shift; fi
   FAILED=1; EXIT_CODE="$code"; FAIL_MSG="Fatal: $*"
   printf "❌ ERROR: %s\n" "$FAIL_MSG" >&2
+  [[ "${_LOG_READY:-0}" == "1" ]] || _log_buffer_mirror "❌ ERROR: " "$FAIL_MSG"
   exit "$code"
 }
 
@@ -725,7 +753,13 @@ on_error(){
   # where FAILED/EXIT_CODE/FAIL_MSG are used for cleanup and reporting.
 }
 
-mark_done(){ COMPLETED_STEPS+=("$1"); }
+mark_done(){
+  COMPLETED_STEPS+=("$1")
+  # Log-only per-step timing (D8): elapsed since the previous completed step (or the §17
+  # baseline) so the log shows where time went / where it hung. Cheap ($SECONDS, no fork).
+  log "step \"$1\" done in $(( SECONDS - ${_STEP_T0:-0} ))s"
+  _STEP_T0=$SECONDS
+}
 
 need(){
   command -v "$1" >/dev/null 2>&1 || die 10 "Missing required tool: $1"
@@ -5657,6 +5691,14 @@ LOGFILE="$WORKDIR/muxm.$(date +%Y%m%d-%H%M%S).log"
 #   FD 3          → raw terminal (bypasses tee)
 if [[ "${DEBUG:-0}" != "1" ]]; then
   : > "$LOGFILE" 2>/dev/null || true
+  # Flush the pre-§17 narrative captured in _LOG_BUFFER (config/profile/conflict/ignored-knob/
+  # validation messages) into the freshly-created logfile, so the log tells the WHOLE story —
+  # the "why", not just the post-banner pipeline. One-shot direct append; then drop the buffer.
+  if [[ -n "$_LOG_BUFFER" ]]; then
+    printf '%s' "$_LOG_BUFFER" >> "$LOGFILE" 2>/dev/null || true
+    _LOG_BUFFER=""
+  fi
+  _STEP_T0=$SECONDS   # baseline for per-step timing (mark_done)
   # Preserve a raw terminal FD for spinner / progress-bar output.
   # After the exec redirect, stdout and stderr both go through tee → log + terminal.
   # FD 3 bypasses tee so \r-based progress UI doesn't pollute the log file.
@@ -5670,7 +5712,15 @@ if [[ "${DEBUG:-0}" != "1" ]]; then
   # Fixed fd number (not the {var}> form) for bash 3.2 portability.
   exec 4> >(tee -a "$LOGFILE"); TEE_PID=$!
   exec 1>&4 2>&4
+  _LOG_READY=1   # tee is live: note/warn/say now reach the log via the tee; log() appends directly
   note "Logging to $(realpath_fallback "$LOGFILE")"
+  # Self-describing log: dump the resolved effective config (log-only, captured via $() so it
+  # never reaches the terminal) so "why did it do X" is answerable from the file alone.
+  # NOTE: as of Phase 2 print_effective_config runs on EVERY normal run (not just under
+  # --print-effective-config), so it is on the hot path — every variable it references must stay
+  # ${x:-}-guarded (set -u-safe), or an unguarded addition would crash every run, not just the
+  # diagnostic flag. Keep it side-effect-free.
+  log "$(print_effective_config)"
 fi
 
 # ===== Section 18: Traps ======================================================================
