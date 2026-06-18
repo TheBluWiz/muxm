@@ -1293,7 +1293,7 @@ _dep_check_only(){
     printf "  %-14s %-24s %-24s %s\n" "pgsrip"     "pipx install pgsrip"    "pipx install pgsrip"    "pipx install pgsrip"
     printf '\n'
     say "After installing, re-run: ${CLI_NAME} --install-dependencies"
-    say "ℹ️  Advisory check — $missing tool(s) missing. No automatic install available on this platform."
+    note "Advisory check — $missing tool(s) missing. No automatic install available on this platform."
     exit 0  # Advisory: report only, not a failure (M8)
   fi
 
@@ -1582,12 +1582,12 @@ _dep_install_dependencies(){
     ffmpeg -encoders 2>/dev/null | grep -q 'libaom-av1' || _missing_av1=1
     if (( _missing_av1 )); then
       say ""
-      warn "ffmpeg is installed but one or more AV1 encoders are still missing."
-      warn "  The automated install attempted: homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass --with-svt-av1 --with-libaom"
-      warn "  If that tap or build failed, try manually:"
-      warn "    brew tap homebrew-ffmpeg/ffmpeg"
-      warn "    brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass --with-svt-av1 --with-libaom"
-      warn "  AV1 profiles (--video-codec libsvtav1 / libaom-av1) will not work without this."
+      # One ⚠️ + an indented plain-text block (not six warns).
+      warn "ffmpeg is installed but one or more AV1 encoders are still missing — AV1 profiles (--video-codec libsvtav1 / libaom-av1) will not work until they are available."
+      say "     The automated install attempted: homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass --with-svt-av1 --with-libaom"
+      say "     If that tap or build failed, try manually:"
+      say "       brew tap homebrew-ffmpeg/ffmpeg"
+      say "       brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass --with-svt-av1 --with-libaom"
     fi
   fi
 
@@ -3830,9 +3830,8 @@ _create_config() {
       --ffmpeg-loglevel)            _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[FFMPEG_LOGLEVEL]="$_cc_val";           (( _cc_oi += 2 )) ;;
       --ffprobe-loglevel)           _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[FFPROBE_LOGLEVEL]="$_cc_val";          (( _cc_oi += 2 )) ;;
       *)
-        printf '❌ ERROR: Unknown config override: %s\n' "$_cc_flag" >&2
-        printf '   Use --create-config without extra flags to generate a default template.\n' >&2
-        exit 11
+        die 11 "Unknown config override: $_cc_flag
+   Use --create-config without extra flags to generate a default template."
         ;;
     esac
   done
@@ -3847,12 +3846,11 @@ _create_config() {
     user)    target_path="$HOME/.muxmrc" ;;
     project) target_path="$PWD/.muxmrc" ;;
     *)
-      printf '❌ ERROR: Invalid scope: %s\n' "$scope" >&2
-      printf '   Valid scopes: system, user, project\n' >&2
-      printf '   system  → /etc/.muxmrc\n' >&2
-      printf '   user    → ~/.muxmrc\n' >&2
-      printf '   project → %s/.muxmrc\n' "$PWD" >&2
-      exit 11
+      die 11 "Invalid scope: $scope
+   Valid scopes: system, user, project
+   system  → /etc/.muxmrc
+   user    → ~/.muxmrc
+   project → $PWD/.muxmrc"
       ;;
   esac
 
@@ -3863,13 +3861,12 @@ _create_config() {
     local _cc_mp _cc_mp_list=() _cc_norm_list=()
     IFS=',' read -ra _cc_mp_list <<< "$profile"
     for _cc_mp in "${_cc_mp_list[@]}"; do
-      [[ -z "$_cc_mp" ]] && { printf '❌ ERROR: Empty profile name in list: %s\n' "$profile" >&2; exit 11; }
+      [[ -z "$_cc_mp" ]] && die 11 "Empty profile name in list: $profile"
       # Normalize deprecated aliases per element (L4: single call site via _normalize_profile).
       _normalize_profile _cc_mp
       if ! _is_valid_profile "$_cc_mp"; then
-        printf '❌ ERROR: Unknown profile: %s\n' "$_cc_mp" >&2
-        printf '   Valid profiles: %s\n' "$(_valid_profiles_display)" >&2
-        exit 11
+        die 11 "Unknown profile: $_cc_mp
+   Valid profiles: $(_valid_profiles_display)"
       fi
       _cc_norm_list+=("$_cc_mp")
     done
@@ -3877,29 +3874,26 @@ _create_config() {
     local _cc_IFS_save="$IFS"; IFS=','; profile="${_cc_norm_list[*]}"; IFS="$_cc_IFS_save"
   else
     if ! _is_valid_profile "$profile"; then
-      printf '❌ ERROR: Unknown profile: %s\n' "$profile" >&2
-      printf '   Valid profiles: %s\n' "$(_valid_profiles_display)" >&2
-      exit 11
+      die 11 "Unknown profile: $profile
+   Valid profiles: $(_valid_profiles_display)"
     fi
   fi
 
   # Check for existing file (refuse unless --force-create-config)
   if [[ -f "$target_path" ]] && (( ! force )); then
-    printf '❌ ERROR: Config file already exists: %s\n' "$target_path" >&2
-    printf '   To overwrite, use --force-create-config instead of --create-config.\n' >&2
-    printf '   Or remove the file manually:  rm %s\n' "$target_path" >&2
-    exit 1
+    die 1 "Config file already exists: $target_path
+   To overwrite, use --force-create-config instead of --create-config.
+   Or remove the file manually:  rm $target_path"
   fi
 
   # Check write permissions
   local target_dir
   target_dir="$(dirname "$target_path")"
   if [[ ! -w "$target_dir" ]]; then
-    printf '❌ ERROR: No write permission for %s\n' "$target_dir" >&2
-    if [[ "$scope" == "system" ]]; then
-      printf '   Try: sudo muxm --create-config system %s\n' "$profile" >&2
-    fi
-    exit 1
+    local _np_msg="No write permission for $target_dir"
+    [[ "$scope" == "system" ]] && _np_msg+="
+   Try: sudo muxm --create-config system $profile"
+    die 1 "$_np_msg"
   fi
 
   # Generate the config file
@@ -4429,9 +4423,8 @@ apply_profile() {
     universal)                   apply_profile_universal ;;
     youtube-upload)              apply_profile_youtube_upload ;;
     *)
-      printf "❌ ERROR: Unknown profile: %s\n" "$PROFILE_NAME" >&2
-      printf "   Valid profiles: %s\n" "$(_valid_profiles_display)" >&2
-      exit 11
+      die 11 "Unknown profile: $PROFILE_NAME
+   Valid profiles: $(_valid_profiles_display)"
       ;;
   esac
   note "Applied profile: $PROFILE_NAME (source: ${_PROFILE_SOURCE:-unknown})"
@@ -4460,9 +4453,8 @@ _create_config_prescan() {
         [[ "${_cc_args[$_cc_i]}" == "--force-create-config" ]] && _cc_force=1
         # Next arg must be scope
         if (( _cc_i + 1 >= ${#_cc_args[@]} )); then
-          printf '❌ ERROR: %s requires a scope: system, user, or project\n' "${_cc_args[$_cc_i]}" >&2
-          printf '   Usage: muxm %s <system|user|project> [profile]\n' "${_cc_args[$_cc_i]}" >&2
-          exit 11
+          die 11 "${_cc_args[$_cc_i]} requires a scope: system, user, or project
+   Usage: muxm ${_cc_args[$_cc_i]} <system|user|project> [profile]"
         fi
         _cc_scope="${_cc_args[$((_cc_i + 1))]}"
         # Optional: profile as third arg (only if it doesn't start with -)
@@ -5210,15 +5202,15 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
   fi
 
   if (( VIDEO_COPY_IF_COMPLIANT )) && (( TONEMAP_HDR_TO_SDR )); then
-    warn "VIDEO_COPY_IF_COMPLIANT + TONEMAP_HDR_TO_SDR: copy will be skipped when tone-mapping is needed."
+    warn "Copy-if-compliant + tone-mapping: the source video copy will be skipped whenever tone-mapping is needed (tone-mapping requires a re-encode)."
   fi
 
   if (( SUB_BURN_FORCED )) && (( ! SUB_INCLUDE_FORCED )); then
-    warn "SUB_BURN_FORCED=1 but SUB_INCLUDE_FORCED=0: no forced subtitles to burn."
+    warn "[Subs] Forced-subtitle burn-in is enabled, but forced subtitles are excluded — there is nothing to burn."
   fi
 
   if (( SUB_EXPORT_EXTERNAL )) && [[ "$OUTPUT_EXT" == "mkv" ]]; then
-    warn "SUB_EXPORT_EXTERNAL with MKV: MKV natively supports multiple subtitle tracks. External SRT export is unnecessary but will proceed as requested."
+    warn "[Subs] --sub-export-external with MKV: Matroska already carries multiple subtitle tracks natively, so external SRT export is unnecessary — proceeding as requested."
   fi
 fi
 
@@ -5263,7 +5255,7 @@ if [[ -n "${PROFILE_NAME:-}" ]] && [[ "$HW_ACCEL_RESOLVED" != "none" ]]; then
           "VideoToolbox has no AV1 encoder on Apple Silicon. Falling back to libsvt-av1 (software)."
       elif [[ "$HW_ACCEL_RESOLVED" == "nvenc" ]] && ! ffmpeg_has_encoder av1_nvenc; then
         _warn_conflict "$PROFILE_NAME" "--hw-accel nvenc" \
-          "av1_nvenc not available (requires Ada Lovelace / RTX 40-series or newer). Falling back to libsvt-av1 (software)."
+          "NVENC AV1 encoding needs an RTX 40-series (Ada Lovelace) GPU or newer; using software (libsvt-av1) instead."
       fi
       ;;
   esac
@@ -5460,10 +5452,10 @@ if (( SUB_ENABLE_OCR )); then
   # injection via --ocr-tool or a malicious .muxmrc. Allows alphanumerics,
   # dots, hyphens, underscores, and forward slashes (for paths).
   if [[ "$SUB_OCR_TOOL" =~ [^a-zA-Z0-9_./-] ]]; then
-    warn "SUB_OCR_TOOL '${SUB_OCR_TOOL}' contains disallowed characters — OCR disabled for safety."
+    warn "[Subs] The configured OCR tool '${SUB_OCR_TOOL}' contains disallowed characters — OCR disabled for safety."
     SUB_ENABLE_OCR=0
   elif ! command -v "$SUB_OCR_TOOL" >/dev/null 2>&1; then
-    warn "SUB_ENABLE_OCR=1 but '${SUB_OCR_TOOL}' not found in PATH — PGS OCR will be skipped."
+    warn "[Subs] OCR is enabled but '${SUB_OCR_TOOL}' is not in PATH — PGS OCR will be skipped."
     SUB_ENABLE_OCR=0
   fi
 fi
@@ -6593,13 +6585,13 @@ decide_color_and_pixfmt() {
     tgt_pix="$HDR_TARGET_PIXFMT"
     COLOR_ARGS=(-color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc)
     (( ! FORCE_CHROMA_420 )) && [[ "$chroma" != "420" ]] && \
-      note "FORCE_CHROMA_420=0 has no effect on HLG — 4:2:0 is enforced for Direct Play compatibility."
+      note "4:2:0 chroma is enforced for HLG (Direct Play compatibility) regardless of the chroma-preservation setting."
   elif [[ "$prim" == "bt2020" || "$cspace" == "bt2020nc" || "$trc" == "smpte2084" ]]; then
     profile="HDR10"
     tgt_pix="$HDR_TARGET_PIXFMT"
     COLOR_ARGS=(-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc)
     (( ! FORCE_CHROMA_420 )) && [[ "$chroma" != "420" ]] && \
-      note "FORCE_CHROMA_420=0 has no effect on HDR — 4:2:0 is enforced for Direct Play compatibility."
+      note "4:2:0 chroma is enforced for HDR (Direct Play compatibility) regardless of the chroma-preservation setting."
   else
     profile="SDR"
     if (( SDR_FORCE_10BIT )); then
@@ -6617,7 +6609,7 @@ decide_color_and_pixfmt() {
         444) tgt_pix="yuv444${_cbit}" ;;
         422) tgt_pix="yuv422${_cbit}" ;;
       esac
-      note "FORCE_CHROMA_420=0: preserving source 4:${chroma} chroma."
+      note "Preserving source 4:${chroma} chroma (4:2:0 not forced)."
     fi
     [[ -z "$prim" ]] && prim="bt709"
     [[ -z "$trc" ]] && trc="bt709"
@@ -6814,7 +6806,7 @@ resolve_video_encoder() {
 
   # Gate 3: NVENC AV1 requires Ada Lovelace (RTX 40+) — probe for av1_nvenc.
   if [[ "$HW_ACCEL_RESOLVED" == "nvenc" && "$VIDEO_CODEC" == "libsvt-av1" ]] && ! ffmpeg_has_encoder av1_nvenc; then
-    HW_ACCEL_FALLBACK_REASON="av1_nvenc not available (requires RTX 40-series or newer)"
+    HW_ACCEL_FALLBACK_REASON="NVENC AV1 needs an RTX 40-series (Ada) GPU or newer"
     note "Hardware acceleration disabled for this encode: $HW_ACCEL_FALLBACK_REASON."
     return 0
   fi
@@ -6837,8 +6829,8 @@ resolve_video_encoder() {
       esac
       ;;
     nvenc)
-      # NVENC dispatch not yet implemented; fall back to software.
-      HW_ACCEL_FALLBACK_REASON="NVENC encoder dispatch not yet implemented; software fallback."
+      # NVENC dispatch is not wired up in this build; fall back to software.
+      HW_ACCEL_FALLBACK_REASON="NVENC is not supported in this build; using software encoding"
       warn "Hardware acceleration disabled for this encode: $HW_ACCEL_FALLBACK_REASON."
       # VIDEO_ENCODER_FFMPEG is already set to the normalized software codec name.
       ;;
@@ -6857,7 +6849,8 @@ apply_level_vbv() {
   case "$VIDEO_ENCODER_FFMPEG" in
     hevc_videotoolbox|h264_videotoolbox)
       if [[ -n "${LEVEL_VALUE:-}" ]] || (( ${CONSERVATIVE_VBV:-0} )); then
-        warn "VideoToolbox does not enforce x265 level/VBV constraints (LEVEL_VALUE=${LEVEL_VALUE:-unset}, CONSERVATIVE_VBV=${CONSERVATIVE_VBV:-0}) — Apple TV Direct Play compliance is not guaranteed for this encode."
+        warn "VideoToolbox does not enforce H.265 level / bitrate-cap constraints — Apple TV Direct Play compliance is not guaranteed for this encode."
+        log  "VT level/VBV not enforced: LEVEL_VALUE=${LEVEL_VALUE:-unset}, CONSERVATIVE_VBV=${CONSERVATIVE_VBV:-0}"
       fi
       return 0 ;;
   esac
@@ -7344,7 +7337,7 @@ _video_is_copy_compliant() {
       max_br_kbps="${MAX_COPY_BITRATE%k}"
       # Guard: validate numeric before arithmetic to prevent bash error on bad config
       if [[ ! "$max_br_kbps" =~ ^[0-9]+$ ]]; then
-        warn "MAX_COPY_BITRATE='${MAX_COPY_BITRATE}' is not a valid rate (expected e.g. '80000k') — skipping bitrate ceiling check."
+        warn "--max-copy-bitrate '${MAX_COPY_BITRATE}' is not a valid rate (expected e.g. '80000k') — skipping the bitrate ceiling check."
       else
         max_br_bps=$(( max_br_kbps * 1000 ))
         if (( src_br_bps > max_br_bps )); then
@@ -7563,7 +7556,7 @@ run_video_pipeline() {
     note "→ Burning forced subtitles into video stream"
     report_add "sub_burn_forced" "true"
   elif (( SUB_BURN_FORCED )); then
-    warn "SUB_BURN_FORCED requested but no forced subtitle was prepared — encoding without burn-in."
+    warn "[Subs] Forced-subtitle burn-in was requested but no forced subtitle was prepared — encoding without burn-in."
     report_add "sub_burn_forced" "skipped (no forced subtitle available)"
   fi
 
@@ -7627,7 +7620,7 @@ run_video_pipeline() {
       # VideoToolbox uses `-q:v` (assembled by build_videotoolbox_params into
       # VIDEOTOOLBOX_ARGS) instead of -crf, and does not accept -preset.
       if [[ "$TARGET_PIXFMT" == *"10"* ]]; then
-        warn "h264_videotoolbox does not support 10-bit output — TARGET_PIXFMT=${TARGET_PIXFMT} overridden to yuv420p."
+        warn "h264_videotoolbox does not support 10-bit output — the target pixel format (${TARGET_PIXFMT}) is overridden to yuv420p."
       fi
       log "→ Encoding video (H.264/SDR via VideoToolbox, q:v ${VIDEOTOOLBOX_ARGS[1]:-?}) → $V_BASE"
       encode_args=(
@@ -7847,7 +7840,7 @@ run_video_pipeline() {
       fi
     else
       warn "Source DV is Profile ${DV_SRC_PROFILE} (dual-layer) but conversion is disabled"
-      warn "  (DV_CONVERT_TO_P81_IF_FAIL=0). Using raw RPU — DV playback will likely fail."
+      warn "  (profile-8.1 conversion is disabled via --no-dv-convert-p81). Using the raw RPU — DV playback will likely fail."
       report_add "dv_rpu_action" "passthrough (P${DV_SRC_PROFILE}, conversion disabled)"
     fi
 
@@ -7928,7 +7921,7 @@ run_video_pipeline() {
       warn "dovi_tool convert failed (P${DV_SRC_PROFILE} → P8.1). See: $WORKDIR/rpu_convert.log"
       report_add "dv_rpu_action" "convert failed — P${DV_SRC_PROFILE} RPU cannot be used for single-layer output"
       if (( ALLOW_DV_FALLBACK )); then
-        warn "  Falling back to base video without DV (ALLOW_DV_FALLBACK=1)."
+        warn "  Falling back to base video without Dolby Vision (DV fallback is allowed)."
         V_MIXED="$V_BASE"
         OUTPUT_HAS_DV=0
         _reclaim "$V_INJECTED" "convert failed — using base"
@@ -7968,7 +7961,7 @@ run_video_pipeline() {
         if (( ! ALLOW_DV_FALLBACK )); then
           die 44 "DV RPU/frame mismatch — refusing to ship desynced Dolby Vision (ALLOW_DV_FALLBACK=0)"
         fi
-        warn "  Falling back to base video without DV (ALLOW_DV_FALLBACK=1)."
+        warn "  Falling back to base video without Dolby Vision (DV fallback is allowed)."
         # The fully injected/converted DV video (the current V_MIXED, e.g.
         # video_mixed.hevc — full-size on a real title) is dead now that we're reverting
         # to the base encode. Reclaim it BEFORE aliasing V_MIXED to V_BASE, so we don't
@@ -8478,12 +8471,12 @@ select_best_audio(){
     if [[ -n "$ps_best_line" ]]; then
       local ps_idx
       ps_idx="${ps_best_line#*$'\t'}"; ps_idx="${ps_idx%%$'\t'*}"
-      note "[Audio] AUDIO_PREFER_STEREO: native 2ch track found at stream #${ps_idx}. Selecting over scored best."
+      note "[Audio] Prefer-stereo: native stereo track found at stream #${ps_idx} — selecting it over the scored best."
       # Output full record (score prefix stripped): idx\tcodec\tch\tlang\ttitle\traw_br (L2b).
       printf '%s\n' "${ps_best_line#*$'\t'}"
       return 0
     fi
-    note "[Audio] AUDIO_PREFER_STEREO: no qualifying native 2ch track found. Falling through to score-all pass."
+    note "[Audio] Prefer-stereo: no suitable native stereo track found — selecting the best track by score instead."
   fi
 
   # Score all tracks, select best, and collect summary in one pass
@@ -8844,9 +8837,9 @@ run_audio_pipeline(){
   # Demote to single-track if the user set overrides that are incompatible.
   if (( AUDIO_MULTI_TRACK )); then
     if [[ -n "${AUDIO_TRACK_OVERRIDE:-}" ]]; then
-      note "[Audio] AUDIO_MULTI_TRACK demoted to single-track: --audio-track override is set."
+      note "[Audio] Keeping a single audio track: --audio-track override is set (multi-track mode off)."
     elif [[ -n "${AUDIO_FORCE_CODEC:-}" ]]; then
-      note "[Audio] AUDIO_MULTI_TRACK demoted to single-track: --audio-force-codec is set."
+      note "[Audio] Keeping a single audio track: --audio-force-codec is set (multi-track mode off)."
     else
       run_audio_pipeline_multi
       return $?
@@ -8893,7 +8886,7 @@ run_audio_pipeline(){
   # Enforce MAX_AUDIO_CHANNELS
   local effective_ch="$ch"
   if (( ch > MAX_AUDIO_CHANNELS )); then
-    note "Capping audio channels from $ch to $MAX_AUDIO_CHANNELS (MAX_AUDIO_CHANNELS)"
+    note "[Audio] Capping audio channels from $ch to $MAX_AUDIO_CHANNELS (the configured maximum)."
     effective_ch="$MAX_AUDIO_CHANNELS"
   fi
 
@@ -9078,7 +9071,7 @@ run_audio_pipeline(){
         mark_done "Stereo fallback prepared"
       fi
     else
-      note "[Audio] Native stereo track found (stream #${_native_si}, ${_native_sc} 2ch). Preferring over synthetic downmix."
+      note "[Audio] Native stereo track found (stream #${_native_si}, ${_native_sc} 2ch); using it instead of creating a stereo downmix."
       # Copy if codec is compatible with the output container; otherwise transcode to AAC (M2).
       local _ns_do_copy=0
       _sii_audio_is_container_safe "$_native_sc" && _ns_do_copy=1
@@ -9259,7 +9252,7 @@ _prepare_subtitle(){
   local idx="$1" codec srt sup vob_base
 
   if [[ ! -d "$WORKDIR" ]]; then
-    warn "Workdir disappeared — cannot extract subtitle #$idx"
+    warn "[Subs] Workdir disappeared — cannot extract subtitle #$idx"
     return 1
   fi
 
@@ -9313,7 +9306,7 @@ _prepare_subtitle(){
         echo "$srt"
         return 0
       fi
-      warn "Failed to extract SRT subtitle #$idx. See: $WORKDIR/sub_${idx}.err"
+      warn "[Subs] Failed to extract SRT subtitle #$idx. See: $WORKDIR/sub_${idx}.err"
       ;;
 
     ass|ssa|webvtt|vtt)
@@ -9329,7 +9322,7 @@ _prepare_subtitle(){
           echo "$native_out"
           return 0
         fi
-        warn "Failed to extract native ${codec} subtitle #$idx. See: $WORKDIR/sub_${idx}.err"
+        warn "[Subs] Failed to extract native ${codec} subtitle #$idx. See: $WORKDIR/sub_${idx}.err"
       else
         # Convert to SRT (legacy behavior)
         ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" "$srt" 2>"$WORKDIR/sub_${idx}.err" &
@@ -9341,7 +9334,7 @@ _prepare_subtitle(){
           echo "$srt"
           return 0
         fi
-        warn "Failed to convert subtitle #$idx to SRT. See: $WORKDIR/sub_${idx}.err"
+        warn "[Subs] Failed to convert subtitle #$idx to SRT. See: $WORKDIR/sub_${idx}.err"
       fi
       ;;
 
@@ -9355,7 +9348,7 @@ _prepare_subtitle(){
       spinner "$sup_pid" "Extracting PGS subtitle #${idx} to SUP"
       wait "$sup_pid" 2>/dev/null; local _sup_ok=$?; _ACTIVE_FFMPEG_PID=""
       if (( _sup_ok != 0 )); then
-        warn "Failed extracting PGS #$idx to .sup — skipping. See: $WORKDIR/sub_${idx}_extract.err"
+        warn "[Subs] Failed extracting PGS #$idx to .sup — skipping. See: $WORKDIR/sub_${idx}_extract.err"
         echo ""
         return 0
       fi
@@ -9367,7 +9360,7 @@ _prepare_subtitle(){
       fi
 
       if (( ! SUB_ENABLE_OCR )); then
-        warn "PGS subtitle #$idx requires OCR but OCR is disabled — skipping."
+        warn "[Subs] PGS subtitle #$idx requires OCR but OCR is disabled — skipping."
         echo ""
         return 0
       fi
@@ -9391,7 +9384,7 @@ _prepare_subtitle(){
         spinner "$vob_pid" "Converting PGS #${idx} to VobSub"
         wait "$vob_pid" 2>/dev/null; local _vob_ok=$?; _ACTIVE_FFMPEG_PID=""
         if (( _vob_ok != 0 )); then
-          warn "PGS→VobSub conversion failed for #$idx. See: $WORKDIR/sub_${idx}_vobsub.err"
+          warn "[Subs] PGS→VobSub conversion failed for #$idx. See: $WORKDIR/sub_${idx}_vobsub.err"
           echo ""
           return 0
         fi
@@ -9412,7 +9405,7 @@ _prepare_subtitle(){
           echo "$srt"
           return 0
         fi
-        warn "OCR tool ('$SUB_OCR_TOOL') ran on VobSub but produced no SRT for subtitle #$idx. See: $WORKDIR/sub_${idx}_ocr.log"
+        warn "[Subs] OCR tool ('$SUB_OCR_TOOL') ran on VobSub but produced no SRT for subtitle #$idx. See: $WORKDIR/sub_${idx}_ocr.log"
         echo ""
         return 0
       fi
@@ -9441,11 +9434,11 @@ _prepare_subtitle(){
 
       # Provide specific diagnostic based on what failed
       if ! ffmpeg_has_muxer vobsub; then
-        warn "PGS subtitle #$idx: ffmpeg lacks the 'vobsub' muxer (common on macOS Homebrew builds)."
+        warn "[Subs] PGS subtitle #$idx: ffmpeg lacks the 'vobsub' muxer (common on macOS Homebrew builds)."
         warn "  '$SUB_OCR_TOOL' also could not process .sup directly. See: $WORKDIR/sub_${idx}_ocr_sup.log"
         warn "  Fix: install a PGS-capable OCR tool (e.g., pgsrip) or rebuild ffmpeg with vobsub."
       else
-        warn "PGS OCR failed for subtitle #$idx — '$SUB_OCR_TOOL' produced no output."
+        warn "[Subs] PGS OCR failed for subtitle #$idx — '$SUB_OCR_TOOL' produced no output."
         warn "  See: $WORKDIR/sub_${idx}_ocr_sup.log"
       fi
       echo ""
@@ -9453,7 +9446,7 @@ _prepare_subtitle(){
       ;;
       
     *)
-      warn "Unsupported subtitle codec '$codec' for #$idx — skipping."
+      warn "[Subs] Unsupported subtitle codec '$codec' for #$idx — skipping."
       ;;
   esac
 
@@ -10101,7 +10094,7 @@ run_subtitle_pipeline_multi(){
       esac
     done
     if (( _ass_convert_count > 0 )); then
-      note "[Subs] Multi-track: ${_ass_convert_count} ASS/SSA track(s) will be converted to SRT (SUB_PRESERVE_TEXT_FORMAT=0)"
+      note "[Subs] Multi-track: ${_ass_convert_count} ASS/SSA track(s) will be converted to SRT (native-format preservation is off)."
       report_add "sub_ass_convert" "$_ass_convert_count"
     fi
   fi
@@ -10146,7 +10139,7 @@ build_subtitle_plan(){
   # Demote to single-track if the user set overrides that are incompatible.
   if (( SUB_MULTI_TRACK )); then
     if (( SUB_BURN_FORCED )); then
-      note "[Subs] SUB_MULTI_TRACK demoted to single-track: --sub-burn-forced is set."
+      note "[Subs] Keeping a single subtitle track: --sub-burn-forced is set (multi-track mode off)."
     elif (( SUB_EXPORT_EXTERNAL )); then
       note "[Subs] Multi-track mode: --sub-export-external ignored (all subs embedded via stream-copy)."
       run_subtitle_pipeline_multi
@@ -10720,7 +10713,8 @@ mux_final() {
   # iPad) — Apple's player ignores dvhe/hev1 tagged DV streams.
   if (( OUTPUT_HAS_DV )) && [[ "$MUX_FORMAT" != "matroska" ]]; then
     ff_codec+=( -strict unofficial -tag:v dvh1 )
-    note "Adding DV container signalling: -strict unofficial -tag:v dvh1"
+    note "Adding Dolby Vision container signalling (so Apple devices recognise the DV stream)."
+    log  "DV container signalling flags: -strict unofficial -tag:v dvh1"
     report_add "dv_mux_flags" "strict unofficial + dvh1 tag"
   elif (( OUTPUT_HAS_DV )) && [[ "$MUX_FORMAT" == "matroska" ]] && [[ -n "${V_DV_MP4:-}" ]]; then
     # The DV video is sourced from a pre-wrapped MP4 (needed to give the raw HEVC
@@ -10735,7 +10729,8 @@ mux_final() {
     # in-band RPU without the dvcC box. -strict unofficial allows ffmpeg to emit
     # the DV side data when present.
     ff_codec+=( -strict unofficial -tag:v hvc1 )
-    note "Matroska DV mux: overriding video tag → hvc1 (dvh1 is MP4-only and rejected by MKV)."
+    note "Matroska DV mux: overriding video tag for MKV compatibility (the MP4 DV tag is rejected by Matroska)."
+    log  "Matroska DV mux: video tag dvh1 → hvc1 (Matroska rejects the dvh1 fourcc); -strict unofficial"
     report_add "dv_mux_flags" "matroska: strict unofficial + hvc1 tag"
   fi
 
@@ -11095,7 +11090,7 @@ main() {
       esac
     done
     if (( _has_ass_sub )); then
-      warn "ASS/SSA subtitle preservation requested (SUB_PRESERVE_TEXT_FORMAT=1) but output container .${OUTPUT_EXT,,} cannot carry native ASS. Subtitles will be converted to mov_text (plain text — formatting, positioning, and styling will be lost)."
+      warn "[Subs] ASS/SSA subtitle preservation was requested, but the .${OUTPUT_EXT,,} output container cannot carry native ASS. Subtitles will be converted to mov_text (plain text — formatting, positioning, and styling will be lost)."
     fi
   fi
 
@@ -11144,7 +11139,7 @@ main() {
   # convert to SDR instead. (youtube-upload accepts this as a known limitation —
   # see docs/VIDEOTOOLBOX_CALIBRATION.md §5.)
   if (( _H264_HDR_WARN_PENDING )) && [[ "$PROFILE_DESC" == "HDR10" || "$PROFILE_DESC" == "HLG" ]]; then
-    warn "H.264 + HDR source ($PROFILE_DESC) + TONEMAP_HDR_TO_SDR=0: encoder ($VIDEO_ENCODER_FFMPEG) produces 8-bit yuv420p — output will carry HDR metadata but video data is 8-bit and will appear washed out. Use --tonemap for correct SDR output."
+    warn "H.264 + HDR source ($PROFILE_DESC) without tone-mapping: the encoder ($VIDEO_ENCODER_FFMPEG) produces 8-bit yuv420p — output will carry HDR metadata but the video data is 8-bit and will appear washed out. Use --tonemap for correct SDR output."
   fi
 
   # Deferred warning (C6): H.264 cannot carry Dolby Vision. Post-probe, so IS_DV is known.

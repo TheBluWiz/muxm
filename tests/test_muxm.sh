@@ -2498,13 +2498,13 @@ test_conflicts() {
 
   # --- Cross-profile flag combinations ---
   out="$(run_muxm --profile archive --video-copy-if-compliant --tonemap --print-effective-config)"
-  assert_contains "VIDEO_COPY_IF_COMPLIANT + TONEMAP" "Cross: copy + tonemap warns (#41)" "$out"
+  assert_contains "Copy-if-compliant + tone-mapping" "Cross: copy + tonemap warns (#41)" "$out"
 
   out="$(run_muxm --profile animation --sub-export-external --output-ext mkv --print-effective-config)"
-  assert_contains "SUB_EXPORT_EXTERNAL with MKV" "Cross: sub-export + mkv warns (#42)" "$out"
+  assert_contains "--sub-export-external with MKV" "Cross: sub-export + mkv warns (#42)" "$out"
 
   out="$(run_muxm --profile streaming --sub-burn-forced --no-subtitles --print-effective-config 2>&1)" || true
-  assert_contains "no forced subtitles to burn" "Cross: burn-forced + no-forced warns (#43)" "$out"
+  assert_contains "nothing to burn" "Cross: burn-forced + no-forced warns (#43)" "$out"
 
   # --- archive + --crf conflict ---
   # archive is copy-only; specifying --crf from CLI triggers a warning
@@ -2567,7 +2567,7 @@ test_conflicts() {
   # --no-sub-sdh sets SUB_INCLUDE_SDH=0. To reproduce "no forced subs to burn", pair
   # --sub-burn-forced with --no-subtitles which sets SUB_INCLUDE_FORCED=0.
   out="$(run_muxm --profile streaming --sub-burn-forced --no-subtitles --print-effective-config 2>&1)" || true
-  assert_contains "no forced subtitles to burn" "cross: --sub-burn-forced + --no-subtitles warns (101o)" "$out"
+  assert_contains "nothing to burn" "cross: --sub-burn-forced + --no-subtitles warns (101o)" "$out"
 
   # --- AV1 conflicts ---
 
@@ -2998,7 +2998,7 @@ test_dryrun() {
 
   # Dry-run with animation + --sub-burn-forced demotes to single-track
   out="$(run_muxm --dry-run --profile animation --sub-burn-forced "$TESTDIR/hevc_multi_subs.mkv")"
-  assert_contains "demoted" "Dry-run animation + --sub-burn-forced: multi-track demoted to single-track" "$out"
+  assert_contains "single subtitle track" "Dry-run animation + --sub-burn-forced: multi-track collapses to a single subtitle track" "$out"
 
   # Dry-run with archive multi-track audio
   out="$(run_muxm --dry-run --profile archive "$TESTDIR/hevc_multi_audio.mkv")"
@@ -3971,13 +3971,13 @@ test_audio() {
   log "Testing multi-track demotion on --audio-track..."
   local mt_demote_at
   mt_demote_at="$(run_muxm --dry-run --profile archive --audio-track 0 "$TESTDIR/hevc_multi_audio.mkv")"
-  assert_contains "demoted" "Multi-track + --audio-track: demoted to single-track" "$mt_demote_at"
+  assert_contains "single audio track" "Multi-track + --audio-track: collapses to a single audio track" "$mt_demote_at"
 
   # Multi-track demotion: --audio-force-codec forces single-track
   log "Testing multi-track demotion on --audio-force-codec..."
   local mt_demote_fc
   mt_demote_fc="$(run_muxm --dry-run --profile archive --audio-force-codec aac "$TESTDIR/hevc_multi_audio.mkv")"
-  assert_contains "demoted" "Multi-track + --audio-force-codec: demoted to single-track" "$mt_demote_fc"
+  assert_contains "single audio track" "Multi-track + --audio-force-codec: collapses to a single audio track" "$mt_demote_fc"
 
   # Multi-track + --stereo-fallback: warns but does NOT demote.
   # --stereo-fallback generates a conflict warning (⚠, tested in test_conflicts)
@@ -4217,15 +4217,15 @@ _test_audio_native_stereo() {
   # be selected as the primary (logged as "AUDIO_PREFER_STEREO: native 2ch track found").
   log "Testing AUDIO_PREFER_STEREO: native 2ch preferred as primary..."
   out="$(run_muxm --crf 51 --preset ultrafast --output-ext mp4 --prefer-stereo "$TESTDIR/native_stereo.mkv")"
-  assert_contains "AUDIO_PREFER_STEREO: native 2ch track found" \
+  assert_contains "Prefer-stereo: native stereo track found" \
     "--prefer-stereo: native stereo selected as primary" "$out"
 
   # Test 7: AUDIO_PREFER_STEREO fallthrough on surround-only source.
   # No native stereo exists; must log fallthrough and still produce output.
   log "Testing AUDIO_PREFER_STEREO fallthrough: surround-only source..."
   out="$(run_muxm --crf 51 --preset ultrafast --output-ext mp4 --prefer-stereo "$TESTDIR/surround_only.mkv")"
-  assert_contains "AUDIO_PREFER_STEREO: no qualifying native 2ch track found" \
-    "--prefer-stereo fallthrough: surround-only source falls back to score-all" "$out"
+  assert_contains "selecting the best track by score" \
+    "--prefer-stereo fallthrough: surround-only source falls back to score-based selection" "$out"
 }
 
 # === Suite: Subtitle Pipeline ===
@@ -4501,7 +4501,7 @@ EOF
   log "Testing multi-track subtitle demotion on --sub-burn-forced..."
   local mt_sub_demote
   mt_sub_demote="$(run_muxm --dry-run --no-skip-if-ideal --profile archive --sub-burn-forced "$TESTDIR/hevc_multi_subs.mkv")"
-  assert_contains "demoted" "Multi-track sub + --sub-burn-forced: demoted to single-track" "$mt_sub_demote"
+  assert_contains "single subtitle track" "Multi-track sub + --sub-burn-forced: collapses to a single subtitle track" "$mt_sub_demote"
 
   # Multi-track + --sub-export-external: stays in multi-track, logs note
   # --no-skip-if-ideal: source is ideal, would skip before export note is printed.
@@ -4528,7 +4528,7 @@ EOF
   log "Testing animation multi-track subtitle demotion on --sub-burn-forced..."
   local mt_sub_anim_demote
   mt_sub_anim_demote="$(run_muxm --dry-run --profile animation --sub-burn-forced "$TESTDIR/hevc_multi_subs.mkv")"
-  assert_contains "demoted" "animation multi-track sub + --sub-burn-forced: demoted to single-track" "$mt_sub_anim_demote"
+  assert_contains "single subtitle track" "animation multi-track sub + --sub-burn-forced: collapses to a single subtitle track" "$mt_sub_anim_demote"
 
   # Animation multi-track + language filter override: --sub-lang-pref "" keeps all 5
   log "Testing animation multi-track subtitle language filter override..."
@@ -8339,8 +8339,8 @@ test_regression_p5() {
     mkdir -p "$h8_home"
     printf 'FORCE_CHROMA_420=0\n' > "$h8_home/.muxmrc"
     out="$(MUXM_HOME="$h8_home" run_muxm_in "$TESTDIR" --dry-run "h264_422p_sdr.mkv")"
-    assert_contains "preserving source 4:422 chroma" \
-      "H8: FORCE_CHROMA_420=0 preserves 4:2:2 chroma" "$out"
+    assert_contains "Preserving source 4:422 chroma" \
+      "H8: --force-chroma-420 off preserves 4:2:2 chroma" "$out"
     assert_contains "Target pixel format: yuv422p" \
       "H8: FORCE_CHROMA_420=0 target pixel format is yuv422p" "$out"
 
@@ -8562,6 +8562,15 @@ DVMKVSCRIPT
     local dvmkv_wd dvmkv_logf
     dvmkv_wd="$(printf '%s\n' "$dvmkv_log" | sed -n 's/^=== Workdir[[:space:]]*: //p' | head -1)"
     dvmkv_logf="$(find "$dvmkv_wd" -maxdepth 1 -name 'muxm.*.log' 2>/dev/null | head -1)"
+    # SCRUB (Phase 5 / D11): the user-facing DV-mux note must NOT carry the raw ffmpeg tag swap
+    # ("video tag dvh1 → hvc1") — that detail belongs only in the log.
+    if [[ -n "$dvmkv_logf" ]] \
+       && ! printf '%s\n' "$dvmkv_log" | grep -qF "dvh1 → hvc1" \
+       && grep -qF "dvh1 → hvc1" "$dvmkv_logf"; then
+      pass "SCRUB: raw DV tag swap kept out of the terminal note, retained in the log (D11)"
+    else
+      fail "SCRUB: 'dvh1 → hvc1' should be log-only (terminal clean, log retains it)"
+    fi
     # Option 1: the multi-GB source ES must be demuxed lazily, never eagerly (log-only line).
     if [[ -n "$dvmkv_logf" ]] && grep -qF "Raw ES demux deferred" "$dvmkv_logf"; then
       pass "DVMKV: source ES demux deferred, not eager (Option 1)"
@@ -9018,6 +9027,20 @@ FBDOVISCRIPT
         pass "BANNERPLAN: audio transcode detail (channels=) present in the log"
       else
         fail "BANNERPLAN: audio transcode detail missing from the log (did the transcode run?)"
+      fi
+      # SCRUB (Phase 5 / D11): no raw ffmpeg flags, internal env-var names, control-flow jargon,
+      # or developer-status text may reach the terminal. Most of these tokens belong to DV / VT /
+      # NVENC / multi-track paths not exercised by this SDR software encode, so this is primarily a
+      # regression guard — it fails loudly if any future change routes one of them to the terminal.
+      local _scrub_hit="" _tok
+      for _tok in '-strict unofficial' 'LEVEL_VALUE=' 'CONSERVATIVE_VBV=' 'demoted to single-track' \
+                  'not yet implemented' 'av1_nvenc' 'Falling through to score-all'; do
+        if printf '%s\n' "$bp_term" | grep -qF "$_tok"; then _scrub_hit+="[$_tok] "; fi
+      done
+      if [[ -z "$_scrub_hit" ]]; then
+        pass "BANNERPLAN: no raw flags / internal var names / control-flow jargon on the terminal (D11)"
+      else
+        fail "BANNERPLAN: internal vocabulary leaked to the terminal: $_scrub_hit"
       fi
     else
       fail "BANNERPLAN: --keep-log encode produced no output/log (exit $bp_code)"
