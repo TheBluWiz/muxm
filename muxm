@@ -7507,10 +7507,10 @@ run_video_pipeline() {
       : > "$V_SRC_ES" 2>/dev/null || true
       mark_done "Demux raw ES → video_src.es (dry-run)"
     else
-      note "Raw ES demux deferred — produced on demand only if piped DV RPU extraction fails."
+      log "Raw ES demux deferred — produced on demand only if piped DV RPU extraction fails."
     fi
   else
-    note "Skipping ES demux (DV injection not applicable for this encode)."
+    log "Skipping ES demux (DV injection not applicable for this encode)."
   fi
 
   # Build encode command based on VIDEO_CODEC and PROFILE_DESC
@@ -8923,7 +8923,8 @@ run_audio_pipeline(){
         tgt_br="256k"
       fi
       [[ -n "${AUDIO_FORCE_BITRATE:-}" ]] && tgt_br="$AUDIO_FORCE_BITRATE"
-      note "Force transcoding audio: $codec → $tgt_codec (${effective_ch}ch, ${tgt_br})"
+      note "Force transcoding audio: $codec → $tgt_codec"
+      log  "audio transcode (forced): channels=${effective_ch}ch, bitrate=$tgt_br"
       report_add "audio_action" "transcode to $tgt_codec"
     fi
   # Step 2: Lossless passthrough (if enabled and codec is lossless)
@@ -8946,7 +8947,8 @@ run_audio_pipeline(){
   # Step 4: Fallback → transcode to eac3 (surround) or aac (stereo)
   else
     read -r tgt_codec tgt_br <<< "$(audio_transcode_target "$effective_ch")"
-    note "Transcoding audio: $codec → $tgt_codec (channels=${effective_ch}ch, bitrate=$tgt_br)"
+    note "Transcoding audio: $codec → $tgt_codec"
+    log  "audio transcode: channels=${effective_ch}ch, bitrate=$tgt_br"
     report_add "audio_action" "transcode $codec → $tgt_codec"
   fi
 
@@ -10844,14 +10846,58 @@ _check_multitrack_container_safety() {
    Use --output-ext mkv — MKV carries all of them losslessly (or drop the affected track(s))."
 }
 
+# _video_codec_label — short human label for a logical or ffmpeg video codec id (banner/Plan).
+_video_codec_label() {
+  case "$1" in
+    libx265|hevc_videotoolbox|hevc_nvenc) echo "HEVC" ;;
+    libx264|h264_videotoolbox|h264_nvenc) echo "H.264" ;;
+    libsvt-av1|libsvtav1|libaom-av1|av1_nvenc) echo "AV1" ;;
+    *) echo "$1" ;;
+  esac
+}
+
 # ===== Section 30: Main =======================================================================
 main() {
+  # ---- Startup banner: confirm the impactful decisions up front (Phase 3). ----
+  # Two parts: this banner echoes the resolved POLICY (config + profile + CLI — all known now),
+  # and a single "▶ Plan:" line printed later (post-probe, before the video pipeline) reports the
+  # CONCRETE facts that aren't known yet here — actual encoder, target pixfmt, color class, DV
+  # status. Keep "=== Workdir    : <path>" verbatim: the test harness sed-extracts the workdir
+  # from it. Mid-pipeline narration stays stage/progress focused; parameter detail lives in the log.
   say "=== ${APP_NAME} v${VERSION} — CLI: ${CLI_NAME}"
   say "=== Input      : $SRC_ABS"
   say "=== Output     : $OUT"
   say "=== Workdir    : $WORKDIR"
-  say "=== Defaults   : CRF=$CRF_VALUE  StereoBitrate=$STEREO_BITRATE  Preset=$PRESET_VALUE"
   [[ -n "${PROFILE_NAME:-}" ]] && say "=== Profile    : $PROFILE_NAME"
+
+  local _b_hw=""; [[ "$HW_ACCEL" != "none" ]] && _b_hw=" · HW: $HW_ACCEL"
+  say "=== Video      : $(_video_codec_label "$VIDEO_CODEC") ($VIDEO_CODEC)$_b_hw · CRF $CRF_VALUE · preset $PRESET_VALUE"
+  say "=== Container  : ${OUTPUT_EXT^^}"
+
+  local _b_codecs _b_stereo=""
+  if [[ -n "${AUDIO_FORCE_CODEC:-}" ]]; then _b_codecs="force $AUDIO_FORCE_CODEC"
+  else _b_codecs="codecs $AUDIO_CODEC_PREFERENCE"; fi
+  if   (( AUDIO_PREFER_STEREO ));  then _b_stereo=" · stereo-only"
+  elif (( ADD_STEREO_IF_MULTICH )); then _b_stereo=" · +stereo downmix @ $STEREO_BITRATE"; fi
+  say "=== Audio      : prefer lang $AUDIO_LANG_PREF · $_b_codecs$_b_stereo"
+
+  local _b_sub
+  if   (( SKIP_SUBS )); then _b_sub="disabled (--skip-subs)"
+  elif (( ! SUB_INCLUDE_FORCED && ! SUB_INCLUDE_FULL && ! SUB_INCLUDE_SDH )); then _b_sub="none (--no-subtitles)"
+  else
+    _b_sub="prefer lang $SUB_LANG_PREF"
+    (( SUB_ENABLE_OCR ))      && _b_sub+=" · OCR"
+    (( SUB_BURN_FORCED ))     && _b_sub+=" · burn-forced"
+    (( SUB_EXPORT_EXTERNAL )) && _b_sub+=" · export-external"
+  fi
+  say "=== Subtitles  : $_b_sub"
+
+  local _b_tm _b_dv
+  (( TONEMAP_HDR_TO_SDR )) && _b_tm="HDR→SDR" || _b_tm="off"
+  if   (( DISABLE_DV ));        then _b_dv="disabled (--no-dv)"
+  elif (( ALLOW_DV_FALLBACK )); then _b_dv="keep (P8.1 fallback ok)"
+  else _b_dv="keep (strict)"; fi
+  say "=== Color/DV   : tonemap $_b_tm · DV $_b_dv"
 
   (( DRY_RUN )) && note "DRY-RUN is ON"
   [[ ${#MUXM_CONFIG_LOADED[@]} -gt 0 ]] && note "Loaded config: ${MUXM_CONFIG_LOADED[*]}"
@@ -11093,6 +11139,15 @@ main() {
   _warn_h264_drops_dv
 
   [[ -n "$LEVEL_VALUE" ]] && apply_level_vbv "$LEVEL_VALUE"
+
+  # ▶ Plan line (Phase 3): the CONCRETE facts now known post-probe/resolution — actual ffmpeg
+  # encoder, target pixfmt (+ bit depth), color class, and DV in/out intent. Complements the
+  # policy banner above (which echoed config-resolved intent before any of this was known).
+  # Audio/subtitle concretes are decided in their pipelines below and narrated there.
+  local _p_bits _p_dv
+  case "$TARGET_PIXFMT" in *10le|*10be|*10) _p_bits=" 10-bit" ;; *) _p_bits=" 8-bit" ;; esac
+  if (( IS_DV )); then (( DISABLE_DV )) && _p_dv="drop" || _p_dv="keep"; else _p_dv="none"; fi
+  say "▶ Plan: $(_video_codec_label "$VIDEO_ENCODER_FFMPEG")${_p_bits} (${VIDEO_ENCODER_FFMPEG}, ${TARGET_PIXFMT}) · ${OUTPUT_EXT^^} · ${PROFILE_DESC} · DV: ${_p_dv}"
 
   # When burning forced subs, we need the subtitle plan BEFORE video encode
   if (( SUB_BURN_FORCED && ! SKIP_SUBS )); then

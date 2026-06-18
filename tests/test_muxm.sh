@@ -8542,13 +8542,22 @@ DVMKVSCRIPT
     assert_contains "overriding video tag" "DVMKV: hvc1 tag override applied for Matroska DV mux" "$dvmkv_log"
 
     # ---- Disk-streamlining guards (Options 1 & 2) ----
-    # Option 1: the multi-GB source ES must be demuxed lazily, never eagerly.
-    assert_contains "Raw ES demux deferred" "DVMKV: source ES demux deferred, not eager (Option 1)" "$dvmkv_log"
+    # The workdir (kept by -K) is parsed from the banner line in the captured output; its logfile
+    # carries the log-only narration. Phase 3 demoted "Raw ES demux deferred" from a terminal note
+    # to a log() line, so the Option-1 guard now greps the kept workdir logfile, not the captured
+    # stdout/stderr.
+    local dvmkv_wd dvmkv_logf
+    dvmkv_wd="$(printf '%s\n' "$dvmkv_log" | sed -n 's/^=== Workdir[[:space:]]*: //p' | head -1)"
+    dvmkv_logf="$(find "$dvmkv_wd" -maxdepth 1 -name 'muxm.*.log' 2>/dev/null | head -1)"
+    # Option 1: the multi-GB source ES must be demuxed lazily, never eagerly (log-only line).
+    if [[ -n "$dvmkv_logf" ]] && grep -qF "Raw ES demux deferred" "$dvmkv_logf"; then
+      pass "DVMKV: source ES demux deferred, not eager (Option 1)"
+    else
+      fail "DVMKV: 'Raw ES demux deferred' not found in the run log ($dvmkv_logf)"
+    fi
     # Option 2: dead intermediates are reclaimed mid-run — even though -K was passed.
     # -K keeps the workdir, so the proof is direct: the big intermediates are gone
     # while the actual mux input + final output survive. (assert_no_file is PATH LABEL.)
-    local dvmkv_wd
-    dvmkv_wd="$(printf '%s\n' "$dvmkv_log" | sed -n 's/^=== Workdir[[:space:]]*: //p' | head -1)"
     if [[ -n "$dvmkv_wd" && -d "$dvmkv_wd" ]]; then
       assert_no_file "$dvmkv_wd/video_base.hevc"  "DVMKV: video_base.hevc reclaimed mid-run despite -K (Option 2)"
       assert_no_file "$dvmkv_wd/video_mixed.hevc" "DVMKV: video_mixed.hevc reclaimed mid-run despite -K (Option 2)"
@@ -8927,6 +8936,62 @@ FBDOVISCRIPT
       fi
     else
       fail "LOGCONTENT: --keep-log run produced no output/log (exit $lc_code)"
+    fi
+  fi
+
+  # ---- BANNERPLAN: Phase 3 — banner policy summary + resolved ▶ Plan line; stage-focused stream ----
+  # The startup banner must confirm the resolved POLICY (codec/container/audio/subtitles/color-DV),
+  # a single "▶ Plan:" line must report the CONCRETE encoder + target pixfmt, and the mid-pipeline
+  # terminal must stay stage-focused: encode parameters and audio channel/bitrate detail go to the
+  # LOG only, never the terminal. --audio-force-codec aac forces a real transcode (the AC3 5.1
+  # fixture would otherwise be copied), exercising the audio stage-focus split.
+  if [[ ! -f "$TESTDIR/hevc_sdr_51.mkv" ]]; then
+    skip "BANNERPLAN: hevc_sdr_51.mkv fixture not found"
+  else
+    local bp_dir="$TESTDIR/bannerplan"; mkdir -p "$bp_dir"
+    cp "$TESTDIR/hevc_sdr_51.mkv" "$bp_dir/src.mkv"
+    local bp_out="$bp_dir/out.mkv" bp_log="$bp_dir/out.muxm.log" bp_term bp_code=0
+    bp_term="$(cd "$bp_dir" && "$MUXM" --keep-log --no-disk-check --no-video-copy-if-compliant \
+                 --video-codec libx265 --crf 28 --preset ultrafast --audio-force-codec aac \
+                 --no-stereo-fallback src.mkv "$bp_out" 2>&1)" || bp_code=$?
+    if [[ -s "$bp_out" && -s "$bp_log" ]]; then
+      # Banner policy summary present on the terminal.
+      if printf '%s\n' "$bp_term" | grep -qE '^=== Video ' && printf '%s\n' "$bp_term" | grep -qE '^=== Container '; then
+        pass "BANNERPLAN: banner confirms the resolved policy (=== Video / === Container / …)"
+      else
+        fail "BANNERPLAN: banner policy lines missing from the terminal"
+      fi
+      # Resolved Plan line on the terminal, with the concrete encoder + pixfmt.
+      if printf '%s\n' "$bp_term" | grep -qF "▶ Plan:" \
+         && printf '%s\n' "$bp_term" | grep -qE '▶ Plan:.*libx265.*yuv420p'; then
+        pass "BANNERPLAN: resolved '▶ Plan:' line reports the concrete encoder + target pixfmt"
+      else
+        fail "BANNERPLAN: '▶ Plan:' line missing or lacks encoder/pixfmt"
+      fi
+      # Stage focus: encode parameters are log-only, NOT dumped to the mid-pipeline terminal.
+      if printf '%s\n' "$bp_term" | grep -qF "→ Encoding video ("; then
+        fail "BANNERPLAN: encode-parameter line leaked to the mid-pipeline terminal"
+      else
+        pass "BANNERPLAN: encode parameters not dumped to the mid-pipeline terminal"
+      fi
+      if grep -qF "→ Encoding video (" "$bp_log"; then
+        pass "BANNERPLAN: encode-parameter detail still present in the persisted log"
+      else
+        fail "BANNERPLAN: encode-parameter detail missing from the log"
+      fi
+      # Stage focus: audio transcode channel/bitrate detail is log-only.
+      if printf '%s\n' "$bp_term" | grep -qF "channels="; then
+        fail "BANNERPLAN: audio channel/bitrate detail leaked to the terminal"
+      else
+        pass "BANNERPLAN: audio transcode detail (channels=) not on the terminal"
+      fi
+      if grep -qF "channels=" "$bp_log"; then
+        pass "BANNERPLAN: audio transcode detail (channels=) present in the log"
+      else
+        fail "BANNERPLAN: audio transcode detail missing from the log (did the transcode run?)"
+      fi
+    else
+      fail "BANNERPLAN: --keep-log encode produced no output/log (exit $bp_code)"
     fi
   fi
 
