@@ -7337,6 +7337,13 @@ verify_dv_container_record() {
       remux_cmd+=(-map 0:v:0)          # Video from mp4box mux
       remux_cmd+=(-map 1:a? -map 1:s?) # Audio + subs from original mux
       remux_cmd+=(-c copy)
+      # D9 (verified non-issue): no -map_metadata/-map_chapters override is needed here even
+      # under --strip-metadata / --no-keep-chapters. Input 0 ($dv_video_mp4) is a *raw HEVC ES*
+      # wrapped by mp4box, so it carries no source-origin global metadata and no chapters (only
+      # mp4box's own major_brand/encoder/creation_time tags, the GPAC analogue of ffmpeg's
+      # muxer tags on the normal path). Input 1 ($TMP_OUT) was already produced by mux_final in
+      # the post-strip state, so ffmpeg's default chapter copy reflects the flag too. The earlier
+      # audit (D9) suspected an input-0 leak; ffprobe of a real wrapped ES confirmed none.
       remux_cmd+=(-strict unofficial -tag:v dvh1)
       remux_cmd+=(-movflags +faststart)
       remux_cmd+=(-f "$MUX_FORMAT" "$dv_final")
@@ -11183,7 +11190,15 @@ main() {
   # Skip-if-ideal: check early and exit if source is already compliant
   if (( SKIP_IF_IDEAL )); then
     if check_skip_if_ideal; then
-      # Source is ideal — write report and exit clean
+      # Source is ideal — write report and exit clean.
+      # Record the metadata/chapters disposition for --report-json, mirroring mux_final's
+      # report_add on the normal path (same "stripped"/"preserved" values and order). The
+      # skip-if-ideal remux below honors --strip-metadata / --no-keep-chapters (D2), and the
+      # raw-hardlink branch only runs when neither flag demands a change, so these flag-driven
+      # values always match the actual output. Must precede write_json_report, which serializes
+      # REPORT_ENTRIES immediately below (the skip-if-ideal path returns before mux_final runs).
+      if (( ! KEEP_CHAPTERS )); then report_add "chapters" "stripped"; else report_add "chapters" "preserved"; fi
+      if (( STRIP_METADATA )); then report_add "metadata" "stripped"; else report_add "metadata" "preserved"; fi
       write_json_report
       if (( ! DRY_RUN )); then
         # Determine if a remux is needed (metadata stamping or stream filtering)
@@ -11196,6 +11211,11 @@ main() {
         _sii_total_s="$(_sub_count)"
         (( ${#SII_AUDIO_INDICES[@]} < _sii_total_a )) && _sii_needs_remux=1
         (( ${#SII_SUB_INDICES[@]} < _sii_total_s )) && _sii_needs_remux=1
+        # D2: --strip-metadata / --no-keep-chapters must reach the output even on the
+        # skip-the-encode path. Force the copy-remux branch (never the raw hardlink, which
+        # would ship the source verbatim) whenever either flag demands a change.
+        (( STRIP_METADATA )) && _sii_needs_remux=1
+        (( ! KEEP_CHAPTERS )) && _sii_needs_remux=1
 
         if (( _sii_needs_remux )); then
           # Build explicit per-stream maps from validated keep-lists
@@ -11217,6 +11237,18 @@ main() {
           done
 
           _sii_meta+=( -c copy )
+
+          # D2: honor --no-keep-chapters / --strip-metadata on the skip-if-ideal remux,
+          # reusing mux_final's exact tokens AND order (chapters, then metadata, then the
+          # profile comment below) so our own comment metadata survives the strip.
+          if (( ! KEEP_CHAPTERS )); then
+            _sii_meta+=( -map_chapters -1 )
+            note "Stripping chapter markers from output."
+          fi
+          if (( STRIP_METADATA )); then
+            _sii_meta+=( -map_metadata -1 )
+            note "Stripping non-essential metadata from output."
+          fi
 
           # Audio titles: use output indices (sequential) not source indices
           if (( INCLUDE_AUDIO_TITLES )) && (( ${#SII_AUDIO_INDICES[@]} > 0 )); then

@@ -730,6 +730,52 @@ CHAP
     -metadata:s:a:0 language=eng
   pass "compliant.mp4 created"
 
+  # 7b/7c) Skip-if-ideal fixtures carrying GLOBAL metadata + chapters, for the D2 regression
+  #   (--strip-metadata / --no-keep-chapters must reach the output even on the skip-the-encode
+  #   path). A shared ffmetadata sidecar supplies a global title/comment + two chapters; the
+  #   complaint here is multi-input so we use raw ffmpeg, not gen_media.
+  #   • compliant_meta.mp4    — HEVC 10-bit + EAC3 in MP4 → ideal for atv-directplay-hq.
+  #   • compliant_archive.mkv — HEVC + lossless FLAC in MKV → ideal for archive (so the archive
+  #                             conflict-note truthfulness check exercises the skip-if-ideal path).
+  cat > "$TESTDIR/sii_meta.ffmeta" <<'FFMETA'
+;FFMETADATA1
+title=Original Source Title
+comment=should-be-stripped
+[CHAPTER]
+TIMEBASE=1/1000
+START=0
+END=1000
+title=Chapter One
+[CHAPTER]
+TIMEBASE=1/1000
+START=1000
+END=2000
+title=Chapter Two
+FFMETA
+  log "Creating compliant_meta.mp4 (compliant for atv-directplay-hq + global metadata + chapters)"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=white:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -i "$TESTDIR/sii_meta.ffmeta" -map_metadata 2 -map_chapters 2 \
+    -map 0:v -map 1:a \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le -tag:v hvc1 \
+    -c:a eac3 -b:a 448k -ac 6 \
+    -metadata:s:a:0 language=eng \
+    "$TESTDIR/compliant_meta.mp4"
+  pass "compliant_meta.mp4 created"
+
+  log "Creating compliant_archive.mkv (compliant for archive: HEVC + FLAC + metadata + chapters)"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=white:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -i "$TESTDIR/sii_meta.ffmeta" -map_metadata 2 -map_chapters 2 \
+    -map 0:v -map 1:a \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -c:a flac -ac 2 \
+    -metadata:s:a:0 language=eng \
+    "$TESTDIR/compliant_archive.mkv"
+  pass "compliant_archive.mkv created"
+
   # 8) Multi-language audio file (English + Spanish)
   #    2 audio inputs require explicit maps — raw ffmpeg.
   log "Creating multi_lang_audio.mkv (eng + spa audio)"
@@ -4950,6 +4996,151 @@ test_output() {
       "$sii_subs_out" a 1 1
   else
     skip "skip-if-ideal per-stream: no output file (encode may have failed)"
+  fi
+
+  # ---- D2: --strip-metadata / --no-keep-chapters honored under skip-if-ideal ----
+  # On a compliant source, skip-if-ideal copy-remuxes (or raw-hardlinks) instead of re-encoding.
+  # Both flags must still reach the output on that path; previously they were silently dropped
+  # (metadata/chapters shipped intact; the hardlink branch bypassed ffmpeg entirely).
+  # compliant_meta.mp4 is ideal for atv-directplay-hq and carries a global title + 2 chapters.
+  local d2_home="$TESTDIR/d2_home"; mkdir -p "$d2_home"
+  local d2_title d2_chaps
+
+  # --strip-metadata → the source 'title' tag must be gone. (The profile comment is applied
+  # AFTER the strip and is intentionally retained — that's muxm's own metadata, not source junk.)
+  local d2_strip_out="$TESTDIR/out_d2_strip.mp4" d2_strip_log
+  log "Testing D2: --strip-metadata under skip-if-ideal strips source metadata..."
+  d2_strip_log="$(MUXM_HOME="$d2_home" run_muxm --profile atv-directplay-hq --skip-if-ideal \
+    --strip-metadata "$TESTDIR/compliant_meta.mp4" "$d2_strip_out")"
+  if [[ -f "$d2_strip_out" && -s "$d2_strip_out" ]]; then
+    d2_title="$(ffprobe -v error -show_entries format_tags=title -of default=nw=1:nk=1 "$d2_strip_out" 2>/dev/null)"
+    if [[ -z "$d2_title" ]]; then
+      pass "D2: --strip-metadata under skip-if-ideal removes source global metadata"
+    else
+      fail "D2: --strip-metadata under skip-if-ideal left title='$d2_title' (flag dropped)"
+    fi
+  else
+    fail "D2: --strip-metadata under skip-if-ideal produced no output"
+  fi
+  # The copy-remux branch (not the raw hardlink) must be taken so the strip can apply.
+  if echo "$d2_strip_log" | grep -qiF "copy-remux"; then
+    pass "D2: --strip-metadata forces the copy-remux branch (not the raw hardlink)"
+  else
+    fail "D2: --strip-metadata did not take the copy-remux branch"
+  fi
+
+  # --no-keep-chapters → output must have 0 chapters.
+  local d2_chap_out="$TESTDIR/out_d2_chap.mp4"
+  log "Testing D2: --no-keep-chapters under skip-if-ideal strips chapters..."
+  MUXM_HOME="$d2_home" run_muxm --profile atv-directplay-hq --skip-if-ideal \
+    --no-keep-chapters "$TESTDIR/compliant_meta.mp4" "$d2_chap_out" >/dev/null
+  if [[ -f "$d2_chap_out" && -s "$d2_chap_out" ]]; then
+    # `grep -c` exits 1 on zero matches; `|| true` keeps the capture set -e-safe — and 0 IS
+    # the expected/pass count here (mirrors the documented pattern elsewhere in this harness).
+    d2_chaps="$(ffprobe -v error -show_chapters "$d2_chap_out" 2>/dev/null | grep -c '\[CHAPTER\]' || true)"
+    if [[ "$d2_chaps" -eq 0 ]]; then
+      pass "D2: --no-keep-chapters under skip-if-ideal removes chapters"
+    else
+      fail "D2: --no-keep-chapters under skip-if-ideal left $d2_chaps chapters"
+    fi
+  else
+    fail "D2: --no-keep-chapters under skip-if-ideal produced no output"
+  fi
+
+  # Hardlink→remux switch: with the profile comment + audio titles disabled, a no-flag run
+  # has no remux trigger and raw-hardlinks (ships source verbatim). Adding --strip-metadata
+  # must flip it to a copy-remux that actually strips — isolating the flag as the sole trigger.
+  local d2_hl_out="$TESTDIR/out_d2_hardlink.mp4" d2_hl_log
+  d2_hl_log="$(MUXM_HOME="$d2_home" run_muxm --profile atv-directplay-hq --no-profile-comment \
+    --no-audio-titles --skip-if-ideal "$TESTDIR/compliant_meta.mp4" "$d2_hl_out")"
+  if echo "$d2_hl_log" | grep -qiF "Linked/copied"; then
+    pass "D2: no-flag compliant source still raw-hardlinks (skip-the-encode win preserved)"
+  else
+    fail "D2: expected the raw-hardlink branch for a no-flag compliant source"
+  fi
+  local d2_sw_out="$TESTDIR/out_d2_switch.mp4" d2_sw_log d2_sw_title
+  d2_sw_log="$(MUXM_HOME="$d2_home" run_muxm --profile atv-directplay-hq --no-profile-comment \
+    --no-audio-titles --skip-if-ideal --strip-metadata "$TESTDIR/compliant_meta.mp4" "$d2_sw_out")"
+  if echo "$d2_sw_log" | grep -qiF "Linked/copied"; then
+    fail "D2: --strip-metadata still raw-hardlinked (flag silently dropped)"
+  else
+    pass "D2: --strip-metadata flips the hardlink path to a copy-remux"
+  fi
+  if [[ -f "$d2_sw_out" && -s "$d2_sw_out" ]]; then
+    d2_sw_title="$(ffprobe -v error -show_entries format_tags=title -of default=nw=1:nk=1 "$d2_sw_out" 2>/dev/null)"
+    [[ -z "$d2_sw_title" ]] && pass "D2: switched-path output has metadata stripped" \
+      || fail "D2: switched-path output retained title='$d2_sw_title'"
+  fi
+
+  # Also (D2): the archive conflict note "Metadata will be stripped as requested" is now truthful.
+  # compliant_archive.mkv (HEVC + FLAC) is ideal for archive, so this exercises the skip-if-ideal
+  # path under archive — before the fix the note promised a strip the skip path never delivered.
+  local d2_arch_out="$TESTDIR/out_d2_archive.mkv" d2_arch_log d2_arch_title
+  d2_arch_log="$(MUXM_HOME="$d2_home" run_muxm --profile archive --skip-if-ideal \
+    --strip-metadata "$TESTDIR/compliant_archive.mkv" "$d2_arch_out" 2>&1)"
+  if echo "$d2_arch_log" | grep -qiF "stripped as requested"; then
+    pass "D2: archive emits the 'metadata stripped as requested' conflict note"
+  else
+    fail "D2: archive did not emit the strip-metadata conflict note"
+  fi
+  if echo "$d2_arch_log" | grep -qiF "copy-remux"; then
+    pass "D2: archive + --strip-metadata takes the skip-if-ideal copy-remux path"
+  else
+    fail "D2: archive + --strip-metadata did not take the skip-if-ideal path (fixture not ideal?)"
+  fi
+  if [[ -f "$d2_arch_out" && -s "$d2_arch_out" ]]; then
+    d2_arch_title="$(ffprobe -v error -show_entries format_tags=title -of default=nw=1:nk=1 "$d2_arch_out" 2>/dev/null)"
+    [[ -z "$d2_arch_title" ]] && pass "D2: archive 'stripped as requested' note is now truthful (title gone)" \
+      || fail "D2: archive promised a strip but title='$d2_arch_title' survived"
+  else
+    fail "D2: archive skip-if-ideal produced no output"
+  fi
+
+  # ---- D2 (report): skip-if-ideal records the metadata/chapters disposition in --report-json ----
+  # mux_final records report_add "metadata"/"chapters" on the normal path; the skip-if-ideal path
+  # now mirrors it (same "stripped"/"preserved" values), so --report-json reflects the strip on the
+  # skip-the-encode path too. Previously these keys were absent whenever skip-if-ideal fired.
+  local d2r_home="$TESTDIR/d2r_home"; mkdir -p "$d2r_home"
+
+  # --strip-metadata (remux) → metadata=stripped, chapters=preserved (kept by default).
+  local d2r_strip="$TESTDIR/out_d2r_strip.mp4" d2r_json
+  MUXM_HOME="$d2r_home" run_muxm --profile atv-directplay-hq --skip-if-ideal --report-json \
+    --strip-metadata "$TESTDIR/compliant_meta.mp4" "$d2r_strip" >/dev/null
+  d2r_json="${d2r_strip%.mp4}.report.json"
+  if [[ -f "$d2r_json" ]]; then
+    if jq -e . "$d2r_json" >/dev/null 2>&1; then
+      pass "D2 report: skip-if-ideal --report-json is valid JSON"
+    else
+      fail "D2 report: skip-if-ideal report is not valid JSON"
+    fi
+    assert_contains '"metadata": "stripped"' "D2 report: --strip-metadata records metadata=stripped" "$(cat "$d2r_json")"
+    assert_contains '"chapters": "preserved"' "D2 report: default chapters records chapters=preserved" "$(cat "$d2r_json")"
+  else
+    fail "D2 report: no report.json written for --strip-metadata skip-if-ideal"
+  fi
+
+  # --no-keep-chapters (remux) → chapters=stripped, metadata=preserved (kept by default).
+  local d2r_chap="$TESTDIR/out_d2r_chap.mp4" d2r_json2
+  MUXM_HOME="$d2r_home" run_muxm --profile atv-directplay-hq --skip-if-ideal --report-json \
+    --no-keep-chapters "$TESTDIR/compliant_meta.mp4" "$d2r_chap" >/dev/null
+  d2r_json2="${d2r_chap%.mp4}.report.json"
+  if [[ -f "$d2r_json2" ]]; then
+    assert_contains '"chapters": "stripped"' "D2 report: --no-keep-chapters records chapters=stripped" "$(cat "$d2r_json2")"
+    assert_contains '"metadata": "preserved"' "D2 report: default metadata records metadata=preserved" "$(cat "$d2r_json2")"
+  else
+    fail "D2 report: no report.json written for --no-keep-chapters skip-if-ideal"
+  fi
+
+  # Raw-hardlink branch (no remux) still records the disposition (both preserved).
+  local d2r_hl="$TESTDIR/out_d2r_hardlink.mp4" d2r_json3
+  MUXM_HOME="$d2r_home" run_muxm --profile atv-directplay-hq --no-profile-comment --no-audio-titles \
+    --skip-if-ideal --report-json "$TESTDIR/compliant_meta.mp4" "$d2r_hl" >/dev/null
+  d2r_json3="${d2r_hl%.mp4}.report.json"
+  if [[ -f "$d2r_json3" ]]; then
+    assert_contains '"metadata": "preserved"' "D2 report: hardlink branch records metadata=preserved" "$(cat "$d2r_json3")"
+    assert_contains '"chapters": "preserved"' "D2 report: hardlink branch records chapters=preserved" "$(cat "$d2r_json3")"
+  else
+    fail "D2 report: no report.json written for hardlink skip-if-ideal"
   fi
 
   # --keep-temp-always (#27)
