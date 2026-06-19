@@ -4112,6 +4112,60 @@ test_audio() {
     fi
   fi
 
+  # --- Step-2 (lossless-incompatible transcode) bitrate logging + >6ch channel-cap survival ---
+  # A lossless source that can't mux into the target container (FLAC → MP4 with
+  # --audio-lossless-passthrough) takes the Step-2 transcode, which now logs its bitrate like the
+  # other transcode branches (item 2b). The bitrate log is emitted AFTER the encoder channel cap,
+  # so a forced bitrate survives the >6ch→eac3 cap (item 1) and the log reflects the final layout.
+  # A shared 7.1 FLAC fixture exercises the cap; a stereo FLAC fixture exercises the aac path.
+  local flac_st="$TESTDIR/flac_stereo_src.mkv" flac_71="$TESTDIR/flac_71_src.mkv"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=white:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" -map 0:v -map 1:a \
+    -c:v libx265 -preset ultrafast -crf 28 -c:a flac -ac 2 "$flac_st" 2>/dev/null || true
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=white:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" -map 0:v -map 1:a \
+    -c:v libx265 -preset ultrafast -crf 28 -c:a flac -ac 8 "$flac_71" 2>/dev/null || true
+  if [[ ! -s "$flac_st" || ! -s "$flac_71" ]]; then
+    # Genuine host skip: FLAC encoding must be available (skip-first guard, not an else-skip —
+    # see the soft-skip ratchet, _test_meta_soft_skip).
+    skip "Step-2/cap tests: could not create FLAC fixtures (ffmpeg lacks the flac encoder?)"
+  else
+    local s2_log s2_lf
+    # item 2b: the Step-2 transcode honors --audio-force-bitrate AND now logs its bitrate.
+    s2_log="$(run_muxm --audio-lossless-passthrough --audio-force-bitrate 320k --crf 28 --preset ultrafast "$flac_st" "$TESTDIR/s2_fb.mp4")"
+    s2_lf="$(_keepworkdir_logfile "$s2_log" || true)"
+    if [[ -n "$s2_lf" ]] && grep -qiE 'audio transcode: .*bitrate=320k' "$s2_lf"; then
+      pass "Step 2: --audio-force-bitrate 320k honored + bitrate logged on the lossless-incompatible transcode"
+    else
+      fail "Step 2: --audio-force-bitrate 320k not applied/logged on the lossless-incompatible transcode (log: $s2_lf)"
+    fi
+    # item 2b: --stereo-bitrate (D7) also reaches the Step-2 aac transcode.
+    s2_log="$(run_muxm --audio-lossless-passthrough --stereo-bitrate 320k --crf 28 --preset ultrafast "$flac_st" "$TESTDIR/s2_sb.mp4")"
+    s2_lf="$(_keepworkdir_logfile "$s2_log" || true)"
+    if [[ -n "$s2_lf" ]] && grep -qiE 'audio transcode: .*bitrate=320k' "$s2_lf"; then
+      pass "Step 2: --stereo-bitrate 320k honored on the lossless-incompatible aac transcode"
+    else
+      fail "Step 2: --stereo-bitrate 320k not applied on the lossless-incompatible transcode (log: $s2_lf)"
+    fi
+    # item 1: a forced bitrate SURVIVES the >6ch→eac3 channel cap (8ch FLAC → eac3, capped to 6).
+    # Assert both channels=6ch (the cap fired) and bitrate=500k (the forced value was not re-derived).
+    s2_log="$(run_muxm --audio-lossless-passthrough --audio-force-bitrate 500k --no-stereo-fallback --crf 28 --preset ultrafast "$flac_71" "$TESTDIR/cap_fb.mp4")"
+    s2_lf="$(_keepworkdir_logfile "$s2_log" || true)"
+    if [[ -n "$s2_lf" ]] && grep -qiE 'audio transcode: channels=6ch, bitrate=500k' "$s2_lf"; then
+      pass "Item 1: --audio-force-bitrate survives the >6ch→eac3 channel cap (500k, not re-derived)"
+    else
+      fail "Item 1: forced bitrate did not survive the channel cap (expected channels=6ch bitrate=500k; log: $s2_lf)"
+    fi
+    # item 1 regression: WITHOUT a forced bitrate, the cap re-derives the auto bitrate (768k 7.1 → 640k 5.1).
+    s2_log="$(run_muxm --audio-lossless-passthrough --no-stereo-fallback --crf 28 --preset ultrafast "$flac_71" "$TESTDIR/cap_def.mp4")"
+    s2_lf="$(_keepworkdir_logfile "$s2_log" || true)"
+    if [[ -n "$s2_lf" ]] && grep -qiE 'audio transcode: channels=6ch, bitrate=640k' "$s2_lf"; then
+      pass "Item 1: auto bitrate is re-derived for the capped layout (640k 5.1) without a forced bitrate"
+    else
+      fail "Item 1: capped auto bitrate not 640k (log: $s2_lf)"
+    fi
+  fi
+
   # --stereo-bitrate via effective config (#11)
   out="$(run_muxm --stereo-bitrate 192k --print-effective-config)"
   assert_contains "STEREO_BITRATE            = 192k" "--stereo-bitrate: config shows 192k" "$out"

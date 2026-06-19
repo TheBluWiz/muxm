@@ -9209,7 +9209,6 @@ run_audio_pipeline(){
       fi
       [[ -n "${AUDIO_FORCE_BITRATE:-}" ]] && tgt_br="$AUDIO_FORCE_BITRATE"
       note "Force transcoding audio: $codec → $tgt_codec"
-      log  "audio transcode (forced): channels=${effective_ch}ch, bitrate=$tgt_br"
       report_add "audio_action" "transcode to $tgt_codec"
     fi
   # Step 2: Lossless passthrough (if enabled and codec is lossless)
@@ -9237,12 +9236,10 @@ run_audio_pipeline(){
   else
     read -r tgt_codec tgt_br <<< "$(audio_transcode_target "$effective_ch")"
     # D3: --audio-force-bitrate overrides the auto bitrate here too (standalone, no forced
-    # codec) — applied before the log below so it reflects the override. Separate elif from
-    # Step 1, so no double-apply. (Edge: a channel-cap re-derivation downstream can still
-    # re-derive tgt_br for >6ch→eac3 sources, matching the force-codec path's behavior.)
+    # codec). Separate elif from Step 1, so no double-apply. (The bitrate is logged once after
+    # the channel cap below, so it reflects the final post-cap value.)
     [[ -n "${AUDIO_FORCE_BITRATE:-}" ]] && tgt_br="$AUDIO_FORCE_BITRATE"
     note "Transcoding audio: $codec → $tgt_codec"
-    log  "audio transcode: channels=${effective_ch}ch, bitrate=$tgt_br"
     report_add "audio_action" "transcode $codec → $tgt_codec"
   fi
 
@@ -9265,10 +9262,15 @@ run_audio_pipeline(){
     if (( effective_ch > codec_max )); then
       note "Capping channels from $effective_ch to $codec_max ($tgt_codec encoder limit)"
       effective_ch="$codec_max"
-      # Re-derive bitrate for the capped channel count so it matches the actual
-      # output layout (e.g., 768k 7.1 → 640k 5.1).
-      read -r _ tgt_br <<< "$(audio_transcode_target "$effective_ch")"
+      # Re-derive the AUTO bitrate for the capped layout (e.g., 768k 7.1 → 640k 5.1) — but a
+      # user-forced bitrate (--audio-force-bitrate) must SURVIVE the cap, so don't re-derive
+      # over it (item 1). Mirrors the force-bitrate override applied in Steps 1/2/4 above.
+      [[ -n "${AUDIO_FORCE_BITRATE:-}" ]] || read -r _ tgt_br <<< "$(audio_transcode_target "$effective_ch")"
     fi
+    # Single bitrate log for every transcode path (Steps 1/2/4), emitted AFTER the cap so it
+    # reflects the final channel count + bitrate (item 1: accuracy; item 2b: Step 2 now logs its
+    # bitrate too, consistent with the other transcode branches). log-only — kept off the terminal.
+    log "audio transcode: channels=${effective_ch}ch, bitrate=$tgt_br"
   fi
 
   A_PRIMARY_CHANNELS="$effective_ch"
