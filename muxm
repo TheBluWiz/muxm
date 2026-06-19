@@ -349,11 +349,15 @@ OUTPUT_EXT="mp4"               # supports mp4|m4v|mov
 TAG_LANGUAGE_DEFAULT="und"
 declare -i INCLUDE_AUDIO_TITLES=1  # Generate descriptive titles for audio streams (e.g., "5.1 Surround (E-AC-3)")
 
-# ---- Terminal verbosity & color (Phase 6) ----
-# VERBOSITY gates what muxm's OWN narration prints to the TERMINAL — the LOG always stays
-# complete (quiet routes suppressed lines to the log only). 0=quiet (warnings+errors only,
-# good for scripts/cron), 1=normal, 2=verbose (also echo the otherwise log-only detail).
-declare -i VERBOSITY=1
+# ---- Terminal verbosity & color (Phase 6; Phase 7 made VERBOSITY a .muxmrc knob) ----
+# VERBOSITY gates what muxm's OWN narration prints to the TERMINAL — the LOG always stays complete
+# (quiet routes suppressed lines to the log only). It is the human-facing enum quiet|normal|verbose
+# (the tracked .muxmrc knob, default normal); the hot-path helpers gate on the derived numeric
+# _VERBOSITY_N (0=quiet, 1=normal, 2=verbose) so a string can't sneak into an (( )). The CLI pre-scan
+# below touches only _VERBOSITY_N, never VERBOSITY, so the _MUXM_PRE_CONFIG snapshot (§6) still
+# captures the script default — a generated config emits the default, not the invoking CLI choice.
+VERBOSITY="normal"
+declare -i _VERBOSITY_N=1
 # USE_COLOR=0 strips muxm's emoji prefixes (no ANSI is emitted) for CI/plain logs. Honour the
 # NO_COLOR convention (https://no-color.org); --no-color also sets it. _PFX_* are referenced by
 # say/note/warn/die via ${_PFX_-default} so they are set -u-safe even before this resolves.
@@ -366,8 +370,8 @@ if (( ! USE_COLOR )); then _PFX_NOTE=""; _PFX_WARN="Warning: "; _PFX_ERR="ERROR:
 # the main arg loop (§12) hasn't run yet. The main loop still handles these flags (drift guard).
 for _va in "$@"; do
   case "$_va" in
-    --quiet)    VERBOSITY=0 ;;
-    --verbose)  VERBOSITY=2 ;;
+    --quiet)    _VERBOSITY_N=0 ;;
+    --verbose)  _VERBOSITY_N=2 ;;
     --no-color) USE_COLOR=0; _PFX_NOTE=""; _PFX_WARN="Warning: "; _PFX_ERR="ERROR: "; _PFX_FAIL="" ;;
   esac
 done
@@ -492,7 +496,7 @@ _to_log() {
 # ${_PFX_-default} (set -u-safe even before the prefix globals resolve). All helpers return 0 — they
 # are bare statements under `set -e`, so a nonzero tail would abort the run at the call site.
 say()  {
-  if (( VERBOSITY >= 1 )); then
+  if (( _VERBOSITY_N >= 1 )); then
     printf "%s\n" "$@" >&2
     (( ${_LOG_READY:-0} )) || _log_buffer_mirror "" "$@"
   else
@@ -501,7 +505,7 @@ say()  {
   return 0
 }
 note() {
-  if (( VERBOSITY >= 1 )); then
+  if (( _VERBOSITY_N >= 1 )); then
     printf "${_PFX_NOTE-ℹ️  }%s\n" "$@" >&2
     (( ${_LOG_READY:-0} )) || _log_buffer_mirror "${_PFX_NOTE-ℹ️  }" "$@"
   else
@@ -531,9 +535,24 @@ log() {
   else
     for _l in "$@"; do _LOG_BUFFER+="[+${SECONDS}s] $_l"$'\n'; done
   fi
-  if (( VERBOSITY >= 2 )); then
+  if (( _VERBOSITY_N >= 2 )); then
     for _l in "$@"; do printf '%s\n' "$_l" >&"${TERM_FD:-2}"; done
   fi
+  return 0
+}
+
+# is_valid_verbosity / _resolve_verbosity — VERBOSITY is the human enum (quiet|normal|verbose, also
+# accepts 0|1|2 for convenience); the helpers gate on the numeric _VERBOSITY_N. _resolve_verbosity
+# maps the current VERBOSITY to _VERBOSITY_N and normalises the string. Defined here (before the §6
+# validation and §12 parser call sites) so it is always available when called.
+is_valid_verbosity() { case "$1" in quiet|normal|verbose|0|1|2) return 0 ;; *) return 1 ;; esac; }
+_resolve_verbosity() {
+  case "${VERBOSITY:-normal}" in
+    quiet|0)   VERBOSITY="quiet";   _VERBOSITY_N=0 ;;
+    normal|1)  VERBOSITY="normal";  _VERBOSITY_N=1 ;;
+    verbose|2) VERBOSITY="verbose"; _VERBOSITY_N=2 ;;
+    *) die 11 "Invalid VERBOSITY=\"$VERBOSITY\" (expected quiet, normal, or verbose)" ;;
+  esac
   return 0
 }
 
@@ -1240,7 +1259,7 @@ readonly CONFIG_TRACKED_VARS=(
   # so _create_config_emit emits their live defaults (no drift from the Section-4 values).
   AUDIO_SCORE_CHANNEL_MULTIPLIER AUDIO_SCORE_SURROUND_BONUS AUDIO_SCORE_LANG_BONUS AUDIO_SCORE_COMMENTARY_PENALTY
   TAG_LANGUAGE_DEFAULT DISK_FREE_WARN_GB TONEMAP_FILTER
-  DRY_RUN KEEP_TEMP KEEP_TEMP_ALWAYS REPLACE_SOURCE FORCE_REPLACE_SOURCE
+  DRY_RUN KEEP_TEMP KEEP_TEMP_ALWAYS KEEP_LOG VERBOSITY REPLACE_SOURCE FORCE_REPLACE_SOURCE
   FFMPEG_HIDE_BANNER FFMPEG_OVERWRITE
 )
 
@@ -1273,6 +1292,10 @@ fi
 # Validate HW_ACCEL set via .muxmrc (CLI validation happens in the parser).
 [[ -n "${HW_ACCEL:-}" ]] && ! is_valid_hw_accel "$HW_ACCEL" && \
   die 11 "Invalid HW_ACCEL=\"$HW_ACCEL\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: none, auto, videotoolbox, nvenc"
+# Validate VERBOSITY set via .muxmrc (Phase 7); the numeric _VERBOSITY_N is derived after the CLI
+# parse so an explicit --quiet/--verbose still wins. Catches config typos early, like the loglevels.
+[[ -n "${VERBOSITY:-}" ]] && ! is_valid_verbosity "$VERBOSITY" && \
+  die 11 "Invalid VERBOSITY=\"$VERBOSITY\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: quiet, normal, verbose"
 
 # ===== Section 7: Dependency installer ========================================================
 # Invoked via --install-dependencies. Checks for all tools required by muxm and
@@ -3762,6 +3785,15 @@ HEADER
   echo "# Keep temporary workdir even on success"
   _V KEEP_TEMP_ALWAYS
   printf '\n'
+  echo "# On a clean run, copy the run log to <output>.muxm.log (--keep-log). A failure always keeps"
+  echo "# a diagnostics bundle regardless. 1 = enabled, 0 = disabled."
+  _V KEEP_LOG
+  printf '\n'
+  echo "# Terminal narration level for muxm's own messages: quiet (warnings/errors only) | normal |"
+  echo "# verbose (also show the log-only detail). The log stays complete regardless. CLI --quiet/"
+  echo "# --verbose override this."
+  _V VERBOSITY quoted
+  printf '\n'
   echo "# Replace the original source file with the output (requires interactive TTY)"
   _V REPLACE_SOURCE
   printf '\n'
@@ -4791,8 +4823,8 @@ while [[ $# -gt 0 ]]; do
     -k|--keep-temp) KEEP_TEMP=1; shift ;;
     -K|--keep-temp-always) KEEP_TEMP_ALWAYS=1; shift ;;
     --keep-log) KEEP_LOG=1; shift ;;
-    --quiet)   VERBOSITY=0; shift ;;
-    --verbose) VERBOSITY=2; shift ;;
+    --quiet)   VERBOSITY="quiet";   _VERBOSITY_N=0; shift ;;
+    --verbose) VERBOSITY="verbose"; _VERBOSITY_N=2; shift ;;
     --no-color) USE_COLOR=0; _PFX_NOTE=""; _PFX_WARN="Warning: "; _PFX_ERR="ERROR: "; _PFX_FAIL=""; shift ;;
 
     --dry-run) DRY_RUN=1; shift ;;
@@ -4939,6 +4971,11 @@ while [[ $# -gt 0 ]]; do
     *) POSITIONALS+=("$1"); shift ;;
   esac
 done
+
+# Resolve the final verbosity now that config (§6) and the CLI (above) have both been applied —
+# CLI wins because the parser overwrote any .muxmrc VERBOSITY. Maps the enum to _VERBOSITY_N for
+# the rest of the run (covers the config-only case, where no --quiet/--verbose flag ran).
+_resolve_verbosity
 
 # Validate CHECKSUM_ALGO
 case "${CHECKSUM_ALGO:-sha256}" in

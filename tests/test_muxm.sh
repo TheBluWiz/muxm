@@ -1550,6 +1550,31 @@ EOF
   out="$(MUXM_HOME="$cfg_var_home" run_muxm_in "$cfg_var_dir" --print-effective-config)"
   assert_contains "CRF_VALUE                 = 14" "Config file CRF_VALUE override" "$out"
   assert_contains "PRESET_VALUE              = slower" "Config file PRESET_VALUE override" "$out"
+
+  # ---- Phase 7: KEEP_LOG + VERBOSITY are tracked .muxmrc knobs; CLI overrides them ----
+  local ck_dir="$TESTDIR/config_knob_test" ck_home="$TESTDIR/config_knob_home"
+  mkdir -p "$ck_dir" "$ck_home"
+  cat > "$ck_dir/.muxmrc" <<'EOF'
+KEEP_LOG=1
+VERBOSITY="quiet"
+EOF
+  out="$(MUXM_HOME="$ck_home" run_muxm_in "$ck_dir" --print-effective-config)"
+  assert_contains "KEEP_LOG                  = 1"     ".muxmrc KEEP_LOG=1 is read into effective config" "$out"
+  assert_contains "VERBOSITY                 = quiet" ".muxmrc VERBOSITY=quiet is read into effective config" "$out"
+  # CLI wins over the config value (no --no-keep-log exists, so test the VERBOSITY override).
+  out="$(MUXM_HOME="$ck_home" run_muxm_in "$ck_dir" --verbose --print-effective-config)"
+  assert_contains "VERBOSITY                 = verbose" "CLI --verbose overrides .muxmrc VERBOSITY=quiet" "$out"
+  # An invalid VERBOSITY in config is rejected early, naming the offending file.
+  printf 'VERBOSITY="loud"\n' > "$ck_dir/.muxmrc"
+  local ck_bad ck_code=0
+  ck_bad="$(MUXM_HOME="$ck_home" run_muxm_in "$ck_dir" "$TESTDIR/basic_sdr_subs.mkv")"; ck_code=$?
+  assert_contains "Invalid VERBOSITY" "invalid .muxmrc VERBOSITY is rejected with a clear error" "$ck_bad"
+  assert_contains ".muxmrc" "invalid VERBOSITY error names the offending config file" "$ck_bad"
+  # An empty .muxmrc leaves the defaults untouched (criterion 4).
+  printf '\n' > "$ck_dir/.muxmrc"
+  out="$(MUXM_HOME="$ck_home" run_muxm_in "$ck_dir" --print-effective-config)"
+  assert_contains "KEEP_LOG                  = 0"      "empty .muxmrc keeps KEEP_LOG default" "$out"
+  assert_contains "VERBOSITY                 = normal" "empty .muxmrc keeps VERBOSITY default" "$out"
 }
 
 _test_config_create() {
@@ -9058,8 +9083,8 @@ FBDOVISCRIPT
     cp "$TESTDIR/hevc_sdr_51.mkv" "$vb_dir/src.mkv"
 
     # Flags register in the effective config.
-    assert_contains "VERBOSITY                 = 0" "VERBOSITY/--quiet: sets VERBOSITY=0" "$(run_muxm --quiet --print-effective-config)"
-    assert_contains "VERBOSITY                 = 2" "VERBOSITY/--verbose: sets VERBOSITY=2" "$(run_muxm --verbose --print-effective-config)"
+    assert_contains "VERBOSITY                 = quiet" "VERBOSITY/--quiet: sets VERBOSITY=quiet" "$(run_muxm --quiet --print-effective-config)"
+    assert_contains "VERBOSITY                 = verbose" "VERBOSITY/--verbose: sets VERBOSITY=verbose" "$(run_muxm --verbose --print-effective-config)"
     assert_contains "USE_COLOR                 = 0" "VERBOSITY/--no-color: sets USE_COLOR=0" "$(run_muxm --no-color --print-effective-config)"
 
     # (acceptance) --quiet reduces the terminal to warnings/errors, but the LOG stays complete.
@@ -9124,6 +9149,57 @@ FBDOVISCRIPT
       pass "VERBOSITY/DEBUG: DEBUG=1 produces a persistent log with no set -x xtrace pollution"
     else
       fail "VERBOSITY/DEBUG: expected a clean persistent log (exit=$vdbg_code, log='$vdbg_log', xtrace_lines=$vdbg_xtrace)"
+    fi
+  fi
+
+  # ---- CONFIGKNOB: Phase 7 — KEEP_LOG/VERBOSITY set in .muxmrc drive a REAL run (end-to-end) ----
+  # A .muxmrc with KEEP_LOG=1 + VERBOSITY=quiet and NO CLI flags must: persist <output>.muxm.log
+  # (KEEP_LOG honoured from config), keep the terminal quiet (VERBOSITY from config), and keep the
+  # persisted log COMPLETE. Also confirm --create-config emits the script DEFAULTS (commented), not
+  # this machine's .muxmrc values (H1 leak guard).
+  if [[ ! -f "$TESTDIR/hevc_sdr_51.mkv" ]]; then
+    skip "CONFIGKNOB: hevc_sdr_51.mkv fixture not found"
+  else
+    local ckb_dir="$TESTDIR/configknob" ckb_home="$TESTDIR/configknob_home"
+    mkdir -p "$ckb_dir" "$ckb_home"
+    cp "$TESTDIR/hevc_sdr_51.mkv" "$ckb_dir/src.mkv"
+    printf 'KEEP_LOG=1\nVERBOSITY="quiet"\n' > "$ckb_home/.muxmrc"
+    local ckb_out="$ckb_dir/out.mkv" ckb_log="$ckb_dir/out.muxm.log" ckb_term ckb_code=0
+    ckb_term="$(cd "$ckb_dir" && HOME="$ckb_home" "$MUXM" --no-disk-check --no-dv --skip-audio --skip-subs \
+                 --no-video-copy-if-compliant --video-codec libx265 --crf 32 --preset ultrafast src.mkv "$ckb_out" 2>&1)" || ckb_code=$?
+    if [[ -s "$ckb_out" ]]; then
+      if [[ -s "$ckb_log" ]]; then
+        pass "CONFIGKNOB: .muxmrc KEEP_LOG=1 persists <output>.muxm.log with no --keep-log flag"
+      else
+        fail "CONFIGKNOB: .muxmrc KEEP_LOG=1 did not persist the log (exit $ckb_code)"
+      fi
+      # Config-only quiet silences the POST-parse pipeline (where _resolve_verbosity has run);
+      # the §6→§12 pre-parse window is only silenced by CLI --quiet (via the early pre-scan). This
+      # fixture sets NO profile on purpose, so there is no "Applied profile" note in that window —
+      # don't add a profile to ckb_home/.muxmrc or this zero-note assertion will start failing.
+      local ckb_emoji
+      ckb_emoji="$(printf '%s\n' "$ckb_term" | grep -cF "ℹ️" || true)"
+      if (( ckb_emoji == 0 )); then
+        pass "CONFIGKNOB: .muxmrc VERBOSITY=quiet silences the terminal with no --quiet flag"
+      else
+        fail "CONFIGKNOB: .muxmrc VERBOSITY=quiet left notes on the terminal ($ckb_emoji)"
+      fi
+      if [[ -s "$ckb_log" ]] && grep -qF "Build SUCCEEDED" "$ckb_log"; then
+        pass "CONFIGKNOB: the persisted log stays complete under config-driven quiet"
+      else
+        fail "CONFIGKNOB: persisted log incomplete under config-driven quiet"
+      fi
+    else
+      fail "CONFIGKNOB: config-driven run produced no output (exit $ckb_code)"
+    fi
+    # H1: --create-config emits the defaults, not this machine's KEEP_LOG=1/VERBOSITY=verbose.
+    printf 'KEEP_LOG=1\nVERBOSITY="verbose"\n' > "$ckb_home/.muxmrc"
+    local ckb_gen="$ckb_dir/gen"; mkdir -p "$ckb_gen"
+    ( cd "$ckb_gen" && HOME="$ckb_home" "$MUXM" --create-config project >/dev/null 2>&1 ) || true
+    if grep -qE '^#KEEP_LOG=0' "$ckb_gen/.muxmrc" && grep -qE '^#VERBOSITY="normal"' "$ckb_gen/.muxmrc"; then
+      pass "CONFIGKNOB: --create-config emits KEEP_LOG/VERBOSITY at script defaults, commented (H1)"
+    else
+      fail "CONFIGKNOB: generated config leaked the machine's KEEP_LOG/VERBOSITY values (H1)"
     fi
   fi
 
