@@ -1317,6 +1317,17 @@ _test_cli_value_flag_no_value() {
     fail "M2: '--threads --crf' → expected exit 11 'not a flag', got exit $_code"
   fi
 
+  # --threads must be a positive integer — non-numeric, zero, fractional, and empty
+  # values exit 11 cleanly (zero/fractional would be meaningless as a core cap).
+  for _bad in abc 0 2.5 ""; do
+    _out="$(cd "$TESTDIR" && "$MUXM" --threads "$_bad" 2>&1)" && _code=$? || _code=$?
+    if [[ "$_code" -eq 11 ]] && printf '%s' "$_out" | grep -qiE 'Invalid --threads|requires a value'; then
+      pass "M2: '--threads ${_bad:-<empty>}' rejected (positive integer required)"
+    else
+      fail "M2: '--threads ${_bad:-<empty>}' → expected exit 11, got exit $_code"
+    fi
+  done
+
   # L5: the action prescans (--install-man, --setup, --create-config, …) must stop at the
   # `--` end-of-options marker, so an action flag AFTER `--` is treated as a positional,
   # not invoked. Pre-fix the prescan loops scanned all of "$@" and fired the installer.
@@ -2255,7 +2266,9 @@ test_profiles() {
 
   # atv-directplay-hq specifics
   out="$(run_muxm --profile atv-directplay-hq --print-effective-config)"
-  assert_matches '^[[:space:]]*OUTPUT_EXT[[:space:]]+=[[:space:]]*$' "atv-directplay: passthrough container (empty = resolve from source)" "$out"
+  # D4: passthrough profile with NO source → container is unresolved; diagnostic says so
+  # explicitly instead of printing a bare blank (which read as "mp4" / a bug).
+  assert_contains "OUTPUT_EXT                = <pending: needs source>" "atv-directplay: passthrough container pending without a source (D4)" "$out"
   assert_contains "SUB_BURN_FORCED           = 0" "atv-directplay: soft forced subs (not burned)" "$out"
   assert_contains "SKIP_IF_IDEAL             = 1" "atv-directplay: skip-if-ideal on" "$out"
   assert_contains "MAX_COPY_BITRATE          = 50000k" "atv-directplay: bitrate ceiling" "$out"
@@ -2264,7 +2277,7 @@ test_profiles() {
 
   # atv-directplay-animation specifics
   out="$(run_muxm --profile atv-directplay-animation --print-effective-config)"
-  assert_matches '^[[:space:]]*OUTPUT_EXT[[:space:]]+=[[:space:]]*$' "atv-directplay-animation: passthrough container (empty = resolve from source)" "$out"
+  assert_contains "OUTPUT_EXT                = <pending: needs source>" "atv-directplay-animation: passthrough container pending without a source (D4)" "$out"
   assert_contains "CRF_VALUE                 = 16"  "atv-directplay-animation: CRF 16 (animation quality)" "$out"
   assert_contains "AUDIO_LOSSLESS_PASSTHROUGH = 0"  "atv-directplay-animation: lossless passthrough disabled (EAC3 for ATV)" "$out"
   assert_contains "EAC3_BITRATE_5_1          = 640k" "atv-directplay-animation: EAC3 5.1 bitrate" "$out"
@@ -2276,6 +2289,49 @@ test_profiles() {
   assert_contains "LEVEL_VALUE               = 5.1" "atv-directplay-animation: Level 5.1 VBV cap" "$out"
   assert_contains "CONSERVATIVE_VBV          = 1"   "atv-directplay-animation: conservative VBV active" "$out"
   assert_contains "SKIP_IF_IDEAL             = 1"   "atv-directplay-animation: skip-if-ideal on" "$out"
+
+  # ---- Phase 1: D4 (resolved --print-effective-config) + D1 (ATV sub-preserve precedence) ----
+  # --print-effective-config now resolves the output container + ATV subtitle policy BEFORE
+  # printing (mirroring Section 15), so the diagnostic reports what the encode will actually do.
+  # These pass a SOURCE path; the diagnostic never opens the file (path-only extension probe),
+  # so a synthetic name works in this media-free suite. mkv/mp4 keep stderr clean (the
+  # unsupported-ext fallback uses note(); recognized exts use buffered log()).
+
+  # D4: passthrough profile + mkv source → OUTPUT_EXT resolves to mkv (was printed blank).
+  out="$(run_muxm --profile atv-directplay-hq --print-effective-config source.mkv)"
+  assert_contains "OUTPUT_EXT                = mkv" "D4: atv-directplay-hq + .mkv source resolves OUTPUT_EXT=mkv in diagnostic" "$out"
+  # ATV MKV adjustment fires by default (no explicit --no-… flag) → both preserves enabled.
+  assert_contains "SUB_PRESERVE_TEXT_FORMAT  = 1" "D4: atv-directplay-hq + .mkv: ASS/SSA preservation reflected post-resolution" "$out"
+  assert_contains "SUB_PRESERVE_BITMAP       = 1" "D4: atv-directplay-hq + .mkv: PGS bitmap preservation reflected post-resolution" "$out"
+
+  # D4: passthrough profile + mp4 source → OUTPUT_EXT=mp4, ATV MKV adjustment does NOT fire.
+  out="$(run_muxm --profile atv-directplay-hq --print-effective-config source.mp4)"
+  assert_contains "OUTPUT_EXT                = mp4" "D4: atv-directplay-hq + .mp4 source resolves OUTPUT_EXT=mp4" "$out"
+  assert_contains "SUB_PRESERVE_TEXT_FORMAT  = 0" "D4: atv-directplay-hq + .mp4: no MKV adjustment (text-format stays default)" "$out"
+
+  # D4: explicit output filename without --output-ext → container inferred from it (was 'mp4').
+  out="$(run_muxm --print-effective-config source.mkv out.mkv)"
+  assert_contains "OUTPUT_EXT                = mkv" "D4: explicit out.mkv (no --output-ext) infers OUTPUT_EXT=mkv" "$out"
+  assert_contains "_OUTPUT_EXT_EXPLICIT          = 1" "D4: inferred container marks _OUTPUT_EXT_EXPLICIT" "$out"
+
+  # D1: explicit --no-sub-preserve-bitmap must survive the ATV MKV adjustment (precedence).
+  # Before the fix the ATV block clobbered it back to 1; the diagnostic masked this by printing
+  # the pre-clobber value. With D4+D1 the diagnostic resolves first AND the flag is honored.
+  # (No e2e bitmap path exists — ffmpeg cannot synthesize a PGS fixture — so this is the
+  # authoritative regression for --no-sub-preserve-bitmap; see muxm `_is_text_sub_codec`.)
+  out="$(run_muxm --profile atv-directplay-hq --no-sub-preserve-bitmap --print-effective-config source.mkv)"
+  assert_contains "SUB_PRESERVE_BITMAP       = 0" "D1: --no-sub-preserve-bitmap wins over atv-directplay-hq (mkv)" "$out"
+  assert_contains "_CLI_SUB_PRESERVE_BITMAP_EXPLICIT = 1" "D1: --no-sub-preserve-bitmap records the explicit-CLI tracker" "$out"
+
+  # D1: explicit --no-sub-preserve-format must likewise survive the ATV MKV adjustment.
+  out="$(run_muxm --profile atv-directplay-hq --no-sub-preserve-format --print-effective-config source.mkv)"
+  assert_contains "SUB_PRESERVE_TEXT_FORMAT  = 0" "D1: --no-sub-preserve-format wins over atv-directplay-hq (mkv)" "$out"
+  assert_contains "_CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT = 1" "D1: --no-sub-preserve-format records the explicit-CLI tracker" "$out"
+
+  # D1: the explicit-flag trackers default to 0 when the user does not type the flags.
+  out="$(run_muxm --profile atv-directplay-hq --print-effective-config source.mkv)"
+  assert_contains "_CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT = 0" "D1: text-format tracker is 0 without the flag" "$out"
+  assert_contains "_CLI_SUB_PRESERVE_BITMAP_EXPLICIT = 0" "D1: bitmap tracker is 0 without the flag" "$out"
 
   # dv-archival alias: deprecated, maps to archive profile + emits deprecation warning
   out="$(run_muxm --profile dv-archival --print-effective-config 2>&1)"
@@ -3120,6 +3176,29 @@ test_dryrun() {
   out2="$(run_muxm --profile atv-directplay-animation --sub-burn-forced --print-effective-config)"
   assert_contains "SUB_BURN_FORCED           = 1" \
     "atv-directplay-animation + --sub-burn-forced: CLI flag overrides profile default (burn active)" "$out2"
+
+  # ---- D1 (behavioral): explicit --no-sub-preserve-format wins over the ATV MKV adjustment ----
+  # atv-directplay-hq + .mkv source forces native ASS/SSA preservation by default; an explicit
+  # --no-sub-preserve-format must override that so the ASS sub is CONVERTED to SRT instead of
+  # extracted natively. The "extract … as native ass (preserving styling)" note (muxm
+  # `_prepare_subtitle`, dry-run branch) is the observable signal. --no-skip-if-ideal keeps the
+  # pipeline from short-circuiting before subtitle prep (the profile sets SKIP_IF_IDEAL=1).
+  # NOTE: the bitmap analogue (--no-sub-preserve-bitmap → OCR) has no behavioral test — ffmpeg
+  # cannot synthesize a PGS fixture (see muxm `_is_text_sub_codec`); the profiles suite asserts
+  # it via --print-effective-config instead.
+  local _natass='native ass (preserving styling)'
+  out="$(run_muxm --dry-run --no-skip-if-ideal --profile atv-directplay-hq "$TESTDIR/ass_subs.mkv")"
+  if printf '%s' "$out" | grep -qF "$_natass"; then
+    pass "D1 baseline: atv-directplay-hq preserves ASS natively when no override flag is passed"
+  else
+    fail "D1 baseline: expected native ASS preservation note (got none) — fixture/path issue?"
+  fi
+  out="$(run_muxm --dry-run --no-skip-if-ideal --no-sub-preserve-format --profile atv-directplay-hq "$TESTDIR/ass_subs.mkv")"
+  if printf '%s' "$out" | grep -qF "$_natass"; then
+    fail "D1: --no-sub-preserve-format ignored — ASS still extracted natively (ATV clobbered the explicit flag)"
+  else
+    pass "D1: --no-sub-preserve-format converts ASS→SRT (explicit flag wins over atv-directplay-hq)"
+  fi
 
   # ---- Disk space preflight (--no-disk-check / DISK_CHECK=0) ----
   # Use DISK_FREE_WARN_GB=99999 (≈1 petabyte floor) to ensure the warning fires

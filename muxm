@@ -207,6 +207,7 @@ declare -i _CLI_X265_PARAMS_EXPLICIT=0   # --x265-params
 declare -i _CLI_X264_PARAMS_EXPLICIT=0   # --x264-params
 declare -i _CLI_AV1_PARAMS_EXPLICIT=0    # --av1-params
 declare -i _CLI_LEVEL_EXPLICIT=0         # --level / -l
+declare -i _CLI_THREADS_EXPLICIT=0       # --threads (drives the HW/copy "no effect" advisory)
 declare -i CONSERVATIVE_VBV=1
 LEVEL_VBV_4_1_MAXRATE=10000k; LEVEL_VBV_4_1_BUFSIZE=20000k
 LEVEL_VBV_5_0_MAXRATE=25000k; LEVEL_VBV_5_0_BUFSIZE=50000k
@@ -326,6 +327,12 @@ declare -i SUB_PRESERVE_TEXT_FORMAT=0
 # Preserve PGS/VobSub bitmap subtitles via stream-copy when the output container supports them (MKV).
 # When 0, always OCR to text. Only effective for MKV output; ignored for MP4/MOV.
 declare -i SUB_PRESERVE_BITMAP=1
+# Explicit-tracking for the sub-preserve flags (mirrors _CLI_CRF_EXPLICIT): 1 when the user
+# typed --sub-preserve-format/--no-sub-preserve-format or --sub-preserve-bitmap/--no-…-bitmap
+# on the CLI. Gates the ATV MKV subtitle adjustment (_resolve_output_and_sub_policy) so an
+# explicit --no-… is not clobbered by the profile (D1). Surfaced in print_effective_config.
+declare -i _CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT=0
+declare -i _CLI_SUB_PRESERVE_BITMAP_EXPLICIT=0
 
 # ---- Multi-track subtitles (archive profile)
 # Keep all matching subtitle tracks instead of selecting one per type.
@@ -2024,7 +2031,37 @@ Enable/disable VBV guardrails that cap bitrate and buffer size per x265
 level. Default: enabled.
 .TP
 .BR \-\-threads " " \fIN\fR
-Number of threads for ffmpeg encoding.
+Cap CPU core usage during the video encode (\fIN\fR must be a positive integer).
+Because ffmpeg's own
+.B \-threads
+option does not size the internal thread pools of
+.B libx265
+or
+.BR libsvtav1 ,
+muxm translates
+.B \-\-threads
+into the encoder's real core knob:
+.B pools=\fIN\fR
+for
+.BR libx265 ,
+.B lp=\fIN\fR:pin=1
+for
+.BR libsvtav1 .
+For
+.B libx264
+and
+.B libaom\-av1
+the value is passed through as ffmpeg
+.BR \-threads .
+An explicit
+.B pools=
+/
+.B lp=
+in
+.BR \-\-x265\-params / \-\-av1\-params
+takes precedence. The flag has no effect on a VideoToolbox hardware encode or
+when the source video is copied (no re\-encode). Blank = let the encoder use all
+cores.
 .SS Hardware Acceleration
 .TP
 .BR \-\-hw\-accel " " none|auto|videotoolbox|nvenc
@@ -3517,7 +3554,10 @@ HEADER
   echo "# Threads / parallelism"
   echo "# ========================="
   printf '\n'
-  echo "# Threads for ffmpeg (empty = let ffmpeg decide)"
+  echo "# Cap encoder core usage (positive integer; empty = use all cores)."
+  echo "# Mapped to the encoder's real thread knob: pools=N (libx265), lp=N:pin=1"
+  echo "# (libsvtav1), or ffmpeg -threads N (libx264/libaom-av1). No effect on a"
+  echo "# VideoToolbox hardware encode or a stream-copy/passthrough."
   _V THREADS
   printf '\n'
 
@@ -4844,7 +4884,10 @@ while [[ $# -gt 0 ]]; do
       _require_val "$1" "$#" "${2:-}"; FFPROBE_LOGLEVEL="$2"
       is_valid_loglevel "$FFPROBE_LOGLEVEL" || die 11 "Invalid --ffprobe-loglevel: \"$FFPROBE_LOGLEVEL\". Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
       shift 2 ;;
-    --threads) _require_val "$1" "$#" "${2:-}"; THREADS="$2"; shift 2 ;;
+    --threads)
+      _require_val "$1" "$#" "${2:-}"
+      [[ "$2" =~ ^[1-9][0-9]*$ ]] || die 11 "Invalid --threads: \"$2\". Must be a positive integer (number of CPU threads/cores; e.g. 4)."
+      THREADS="$2"; _CLI_THREADS_EXPLICIT=1; shift 2 ;;
     --workdir) _require_val "$1" "$#" "${2:-}"; WORKDIR_BASE="$2"; shift 2 ;;
 
     --crf)
@@ -4927,10 +4970,10 @@ while [[ $# -gt 0 ]]; do
     --no-sub-burn-forced) SUB_BURN_FORCED=0; shift ;;
     --sub-export-external) SUB_EXPORT_EXTERNAL=1; shift ;;
     --no-sub-export-external) SUB_EXPORT_EXTERNAL=0; shift ;;
-    --sub-preserve-format) SUB_PRESERVE_TEXT_FORMAT=1; shift ;;
-    --no-sub-preserve-format) SUB_PRESERVE_TEXT_FORMAT=0; shift ;;
-    --sub-preserve-bitmap)    SUB_PRESERVE_BITMAP=1; shift ;;
-    --no-sub-preserve-bitmap) SUB_PRESERVE_BITMAP=0; shift ;;
+    --sub-preserve-format) SUB_PRESERVE_TEXT_FORMAT=1; _CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT=1; shift ;;
+    --no-sub-preserve-format) SUB_PRESERVE_TEXT_FORMAT=0; _CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT=1; shift ;;
+    --sub-preserve-bitmap)    SUB_PRESERVE_BITMAP=1; _CLI_SUB_PRESERVE_BITMAP_EXPLICIT=1; shift ;;
+    --no-sub-preserve-bitmap) SUB_PRESERVE_BITMAP=0; _CLI_SUB_PRESERVE_BITMAP_EXPLICIT=1; shift ;;
 
     --no-ext-subs)  EXT_SUB_ENABLED=0; shift ;;
     --ext-subs)     EXT_SUB_ENABLED=1; shift ;;
@@ -5071,6 +5114,15 @@ _warn_ignored_knobs() {
   if (( _CLI_HW_ACCEL_QUALITY_EXPLICIT )) \
      && [[ "$HW_ACCEL_RESOLVED" != "videotoolbox" && "$HW_ACCEL_RESOLVED" != "nvenc" ]]; then
     warn "--hw-accel-quality has no effect without a hardware backend (current backend: ${HW_ACCEL_RESOLVED:-none})."
+  fi
+
+  # C10: --threads caps the software encoder's thread pool (pools= for libx265,
+  # lp= for libsvtav1). A VideoToolbox encode is fixed-function hardware with no
+  # software pool to size, so the flag does nothing there. (AV1 + videotoolbox
+  # falls back to software libsvtav1, where --threads *does* apply — so this only
+  # fires for the HEVC/H.264 codecs that actually route to a VT encoder.)
+  if (( _CLI_THREADS_EXPLICIT && _vt && _is_x26x )); then
+    warn "--threads has no effect on a VideoToolbox hardware encode (fixed-function; no software thread pool to cap)."
   fi
 
   # C7: --av1-params / --av1-maxrate / --av1-bufsize apply only to AV1 encodes.
@@ -5389,6 +5441,67 @@ fi
 _warn_ignored_knobs
 
 
+# _resolve_output_and_sub_policy — resolve the final output container and the ATV subtitle
+# policy from the source/output filenames and the active profile. Extracted from Section 15
+# so --print-effective-config (Section 13) can resolve the same way and report the RESOLVED
+# config (D4) instead of pre-resolution globals. Called exactly once per run (the diagnostic
+# path exits before Section 15; the normal path skips the diagnostic block), but each sub-block
+# is self-gating so a repeat call would be a no-op.
+# Reads/writes globals: OUTPUT_EXT, _OUTPUT_EXT_EXPLICIT, SUB_PRESERVE_TEXT_FORMAT,
+# SUB_PRESERVE_BITMAP. Requires SRC_ABS set (and reads OUT, PROFILE_NAME, _CLI_SUB_PRESERVE_*).
+_resolve_output_and_sub_policy(){
+  # ---- Infer output container from explicit output filename ----
+  # If the user provided an explicit output filename with a recognized extension, infer
+  # OUTPUT_EXT from it (as if --output-ext was passed). This prevents a mismatch where
+  # passthrough would derive the container from the source, but the output file has a
+  # different extension (e.g., muxm --profile archive movie.mkv output.mp4).
+  # --output-ext flag wins if already set.
+  if [[ -n "${OUT:-}" ]] && (( ! _OUTPUT_EXT_EXPLICIT )); then
+    local _out_inferred_ext; _out_inferred_ext="$(_lower "${OUT##*.}")"
+    case "$_out_inferred_ext" in
+      mp4|m4v|mov|mkv)
+        OUTPUT_EXT="$_out_inferred_ext"
+        _OUTPUT_EXT_EXPLICIT=1
+        log "[output] Inferred output container .$_out_inferred_ext from explicit output filename"
+        ;;
+    esac
+  fi
+
+  # ---- Container passthrough resolution ----
+  # If OUTPUT_EXT is empty (set by a profile or left at default), derive the container from the
+  # source file extension. This implements "passthrough" mode: mkv→mkv, mp4→mp4, etc.
+  # --output-ext on the CLI always wins (_OUTPUT_EXT_EXPLICIT=1 skips this block).
+  if [[ -z "$OUTPUT_EXT" ]] && (( ! _OUTPUT_EXT_EXPLICIT )); then
+    local _src_passthrough_ext; _src_passthrough_ext="$(_lower "${SRC_ABS##*.}")"
+    case "$_src_passthrough_ext" in
+      mp4|m4v|mov|mkv)
+        OUTPUT_EXT="$_src_passthrough_ext"
+        log "[container-passthrough] Source .$_src_passthrough_ext → output .$OUTPUT_EXT"
+        ;;
+      *)
+        OUTPUT_EXT="mkv"
+        note "[container-passthrough] Source container .$_src_passthrough_ext is not supported for output — defaulting to .mkv"
+        ;;
+    esac
+  fi
+
+  # ---- atv-directplay-hq / atv-directplay-animation: MKV-output subtitle adjustment ----
+  # When either ATV profile produces MKV output (via passthrough or explicit --output-ext mkv),
+  # enable native ASS/SSA format and PGS bitmap preservation — UNLESS the user explicitly asked
+  # otherwise on the CLI (D1: gate on _CLI_SUB_PRESERVE_*_EXPLICIT so --no-… is not clobbered).
+  if [[ "${PROFILE_NAME:-}" == "atv-directplay-hq" || "${PROFILE_NAME:-}" == "atv-directplay-animation" ]] \
+      && [[ "$OUTPUT_EXT" == "mkv" ]]; then
+    if (( ! _CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT )); then
+      SUB_PRESERVE_TEXT_FORMAT=1
+      log "[${PROFILE_NAME}] MKV output: enabling native ASS/SSA format preservation."
+    fi
+    if (( ! _CLI_SUB_PRESERVE_BITMAP_EXPLICIT )); then
+      SUB_PRESERVE_BITMAP=1
+      log "[${PROFILE_NAME}] MKV output: enabling PGS bitmap preservation (stream-copy)."
+    fi
+  fi
+}
+
 # Display the resolved configuration from all sources (config files + profile + CLI).
 # Called when --print-effective-config is passed. Exits after printing.
 print_effective_config(){
@@ -5475,7 +5588,7 @@ Effective config (post config-files + profile + CLI):
   SUB_SOLE_EXT_FALLBACK     = $SUB_SOLE_EXT_FALLBACK
 
   [Output / Muxing]
-  OUTPUT_EXT                = $OUTPUT_EXT
+  OUTPUT_EXT                = ${OUTPUT_EXT:-<pending: needs source>}
   INCLUDE_AUDIO_TITLES      = $INCLUDE_AUDIO_TITLES
   KEEP_CHAPTERS             = $KEEP_CHAPTERS
   STRIP_METADATA            = $STRIP_METADATA
@@ -5510,11 +5623,30 @@ Effective config (post config-files + profile + CLI):
   _CLI_HW_ACCEL_EXPLICIT        = $_CLI_HW_ACCEL_EXPLICIT
   _CLI_HW_ACCEL_QUALITY_EXPLICIT = $_CLI_HW_ACCEL_QUALITY_EXPLICIT
   _OUTPUT_EXT_EXPLICIT          = $_OUTPUT_EXT_EXPLICIT
+  _CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT = $_CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT
+  _CLI_SUB_PRESERVE_BITMAP_EXPLICIT = $_CLI_SUB_PRESERVE_BITMAP_EXPLICIT
 EOF
   exit 0
 }
 
-(( PRINT_EFFCONF )) && print_effective_config
+# D4: when --print-effective-config is requested, resolve the output container + ATV subtitle
+# policy FIRST (mirroring Section 15) so the diagnostic reports what the encode will actually do
+# — not pre-resolution globals (which mis-reported OUTPUT_EXT and masked the D1 SUB_PRESERVE_*
+# clobber). Resolution needs a source path to derive passthrough/inferred containers; with no
+# source we leave OUTPUT_EXT empty and print_effective_config shows "<pending: needs source>".
+# Multi-profile mode prints per child downstream, so skip resolution there (each child resolves
+# its own container). Stays before Section 14 so the diagnostic still runs without ffmpeg/jq/bc.
+if (( PRINT_EFFCONF )); then
+  if (( ! _MULTI_PROFILE_MODE )); then
+    SRC="${POSITIONALS[0]:-}"
+    OUT="${POSITIONALS[1]:-}"
+    if [[ -n "$SRC" ]]; then
+      SRC_ABS="$(realpath_fallback "$SRC")"
+      _resolve_output_and_sub_policy
+    fi
+  fi
+  print_effective_config
+fi
 
 # ===== Section 14: Tool validation ============================================================
 need ffmpeg
@@ -5626,56 +5758,13 @@ if (( _MULTI_PROFILE_MODE )); then
 fi
 # ---- End multi-profile dispatch --------------------------------------------------------------
 
-# ---- Infer output container from explicit output filename -----------------------------------
-# If the user provided an explicit output filename with a recognized extension, infer
-# OUTPUT_EXT from it (as if --output-ext was passed). This prevents a mismatch where
-# passthrough would derive the container from the source, but the output file has a
-# different extension (e.g., muxm --profile archive movie.mkv output.mp4).
-# Only applies in single-profile mode; --output-ext flag wins if already set.
-if [[ -n "${OUT:-}" ]] && (( ! _OUTPUT_EXT_EXPLICIT )); then
-  _out_inferred_ext="$(_lower "${OUT##*.}")"
-  case "$_out_inferred_ext" in
-    mp4|m4v|mov|mkv)
-      OUTPUT_EXT="$_out_inferred_ext"
-      _OUTPUT_EXT_EXPLICIT=1
-      log "[output] Inferred output container .$_out_inferred_ext from explicit output filename"
-      ;;
-  esac
-  unset _out_inferred_ext
-fi
-# ---- End output filename inference ----------------------------------------------------------
-
-# ---- Container passthrough resolution -------------------------------------------------------
-# If OUTPUT_EXT is empty (set by a profile or left at default), derive the container from the
-# source file extension. This implements "passthrough" mode: mkv→mkv, mp4→mp4, etc.
-# --output-ext on the CLI always wins (_OUTPUT_EXT_EXPLICIT=1 skips this block).
-if [[ -z "$OUTPUT_EXT" ]] && (( ! _OUTPUT_EXT_EXPLICIT )); then
-  _src_passthrough_ext="$(_lower "${SRC_ABS##*.}")"
-  case "$_src_passthrough_ext" in
-    mp4|m4v|mov|mkv)
-      OUTPUT_EXT="$_src_passthrough_ext"
-      log "[container-passthrough] Source .$_src_passthrough_ext → output .$OUTPUT_EXT"
-      ;;
-    *)
-      OUTPUT_EXT="mkv"
-      note "[container-passthrough] Source container .$_src_passthrough_ext is not supported for output — defaulting to .mkv"
-      ;;
-  esac
-  unset _src_passthrough_ext
-fi
-# ---- End container passthrough resolution ---------------------------------------------------
-
-# ---- atv-directplay-hq / atv-directplay-animation: MKV-output subtitle adjustment ----------
-# When either ATV profile produces MKV output (via passthrough or explicit --output-ext mkv),
-# enable native ASS/SSA format and PGS bitmap preservation.
-if [[ "${PROFILE_NAME:-}" == "atv-directplay-hq" || "${PROFILE_NAME:-}" == "atv-directplay-animation" ]] \
-    && [[ "$OUTPUT_EXT" == "mkv" ]]; then
-  SUB_PRESERVE_TEXT_FORMAT=1
-  log "[${PROFILE_NAME}] MKV output: enabling native ASS/SSA format preservation."
-  SUB_PRESERVE_BITMAP=1
-  log "[${PROFILE_NAME}] MKV output: enabling PGS bitmap preservation (stream-copy)."
-fi
-# ---- End ATV MKV subtitle adjustment -------------------------------------------------------
+# ---- Resolve output container + ATV subtitle policy -----------------------------------------
+# Output-filename inference, container passthrough, and the ATV MKV subtitle adjustment all live
+# in _resolve_output_and_sub_policy (Section 13) so --print-effective-config can resolve the same
+# way and report the post-resolution config (D4). Only runs in single-profile mode (multi-profile
+# dispatched and exited above); SRC_ABS is validated, OUT is set.
+_resolve_output_and_sub_policy
+# ---- End output container + subtitle policy resolution --------------------------------------
 
 # Determine output path
 if [[ -z "${OUT:-}" ]]; then
@@ -6798,10 +6887,31 @@ build_x265_params() {
        s/:range=[^:]*//g; s/^range=[^:]*://')"
     X265_PARAMS="${X265_PARAMS}:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited"
   fi
+
+  # --threads N → genuinely cap core usage by sizing x265's worker thread pool.
+  # ffmpeg's -threads does NOT size that pool (it defaults to all logical cores),
+  # so -threads alone leaves CPU pinned near 100%×ncores regardless of value;
+  # `pools=N` is the real cap. Gated on the concrete encoder (libx265 only — NOT
+  # the hevc_videotoolbox HW arm, which also routes through this builder) and
+  # skipped when the user already set pools= via --x265-params (explicit wins).
+  if [[ "$VIDEO_ENCODER_FFMPEG" == "libx265" && "${THREADS:-}" =~ ^[1-9][0-9]*$ ]] \
+     && [[ ":${X265_PARAMS}" != *":pools="* ]]; then
+    X265_PARAMS="${X265_PARAMS:+${X265_PARAMS}:}pools=${THREADS}"
+  fi
 }
 
 build_av1_params() {
   SVT_AV1_PARAMS="$SVT_AV1_PARAMS_BASE"
+
+  # --threads N → cap SVT-AV1 parallelism. ffmpeg's -threads is ignored by
+  # libsvtav1; `lp=N` (logical processors) plus `pin=1` is the real cap. lp/pin
+  # are SVT-AV1-only params, so this is gated to the concrete libsvtav1 encoder —
+  # NOT libaom-av1, whose shared param string feeds -aom-params (which would
+  # reject lp=). Skipped when the user already set lp= via --av1-params.
+  if [[ "$VIDEO_ENCODER_FFMPEG" == "libsvtav1" && "${THREADS:-}" =~ ^[1-9][0-9]*$ ]] \
+     && [[ ":${SVT_AV1_PARAMS}" != *":lp="* ]]; then
+    SVT_AV1_PARAMS="${SVT_AV1_PARAMS:+${SVT_AV1_PARAMS}:}lp=${THREADS}:pin=1"
+  fi
 }
 
 # build_videotoolbox_params — assemble VIDEOTOOLBOX_ARGS[] for hevc_videotoolbox
@@ -7563,6 +7673,11 @@ run_video_pipeline() {
     else
       note "→ Source video is compliant for target profile — will copy directly from source during mux."
       report_add "video_action" "copy (compliant)"
+
+      # --threads only governs the software video *encoder*; a stream copy runs no
+      # encoder, so the flag has no effect on this path. Advise once when typed.
+      (( _CLI_THREADS_EXPLICIT )) && \
+        warn "--threads has no effect here — the source video is being copied, not re-encoded."
 
       # Flag for mux_final to map video directly from source file.
       # This preserves container-level metadata (DOVI configuration record,

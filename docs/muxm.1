@@ -309,7 +309,37 @@ Enable/disable VBV guardrails that cap bitrate and buffer size per x265
 level. Default: enabled.
 .TP
 .BR \-\-threads " " \fIN\fR
-Number of threads for ffmpeg encoding.
+Cap CPU core usage during the video encode (\fIN\fR must be a positive integer).
+Because ffmpeg's own
+.B \-threads
+option does not size the internal thread pools of
+.B libx265
+or
+.BR libsvtav1 ,
+muxm translates
+.B \-\-threads
+into the encoder's real core knob:
+.B pools=\fIN\fR
+for
+.BR libx265 ,
+.B lp=\fIN\fR:pin=1
+for
+.BR libsvtav1 .
+For
+.B libx264
+and
+.B libaom\-av1
+the value is passed through as ffmpeg
+.BR \-threads .
+An explicit
+.B pools=
+/
+.B lp=
+in
+.BR \-\-x265\-params / \-\-av1\-params
+takes precedence. The flag has no effect on a VideoToolbox hardware encode or
+when the source video is copied (no re\-encode). Blank = let the encoder use all
+cores.
 .SS Hardware Acceleration
 .TP
 .BR \-\-hw\-accel " " none|auto|videotoolbox|nvenc
