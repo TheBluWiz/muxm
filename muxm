@@ -308,6 +308,13 @@ STEREO_BITRATE="192k"
 declare -i MAX_AUDIO_CHANNELS=8
 declare -i ADD_STEREO_IF_MULTICH=1
 declare -i AUDIO_PREFER_STEREO=0
+# Explicit-tracking for the stereo flags (mirrors _CLI_CRF_EXPLICIT): 1 when the user typed
+# --stereo-fallback/--no-… or --prefer-stereo/--no-… on the CLI. The multi-track-audio
+# "does not apply" warnings (run_audio_pipeline) gate on these so a value carried by a
+# profile/config/default (ADD_STEREO_IF_MULTICH defaults to 1) never names a flag the user
+# didn't type. Surfaced in print_effective_config.
+declare -i _CLI_ADD_STEREO_IF_MULTICH_EXPLICIT=0
+declare -i _CLI_AUDIO_PREFER_STEREO_EXPLICIT=0
 EAC3_BITRATE_5_1="640k"
 EAC3_BITRATE_7_1="768k"
 
@@ -4949,10 +4956,10 @@ while [[ $# -gt 0 ]]; do
     --audio-track)        _require_val "$1" "$#" "${2:-}"; AUDIO_TRACK_OVERRIDE="$2"; shift 2 ;;
     --audio-lang-pref)    _require_val "$1" "$#" "${2:-}"; AUDIO_LANG_PREF="$2"; shift 2 ;;
     --stereo-bitrate)     _require_val "$1" "$#" "${2:-}"; STEREO_BITRATE="$2"; shift 2 ;;
-    --prefer-stereo) AUDIO_PREFER_STEREO=1; shift ;;
-    --no-prefer-stereo) AUDIO_PREFER_STEREO=0; shift ;;
-    --stereo-fallback) ADD_STEREO_IF_MULTICH=1; shift ;;
-    --no-stereo-fallback) ADD_STEREO_IF_MULTICH=0; shift ;;
+    --prefer-stereo) AUDIO_PREFER_STEREO=1; _CLI_AUDIO_PREFER_STEREO_EXPLICIT=1; shift ;;
+    --no-prefer-stereo) AUDIO_PREFER_STEREO=0; _CLI_AUDIO_PREFER_STEREO_EXPLICIT=1; shift ;;
+    --stereo-fallback) ADD_STEREO_IF_MULTICH=1; _CLI_ADD_STEREO_IF_MULTICH_EXPLICIT=1; shift ;;
+    --no-stereo-fallback) ADD_STEREO_IF_MULTICH=0; _CLI_ADD_STEREO_IF_MULTICH_EXPLICIT=1; shift ;;
     --audio-force-codec)   _require_val "$1" "$#" "${2:-}"; AUDIO_FORCE_CODEC="$2"; shift 2 ;;
     --audio-force-bitrate) _require_val "$1" "$#" "${2:-}"; AUDIO_FORCE_BITRATE="$2"; shift 2 ;;
     --audio-lossless-passthrough) AUDIO_LOSSLESS_PASSTHROUGH=1; shift ;;
@@ -5625,6 +5632,8 @@ Effective config (post config-files + profile + CLI):
   _OUTPUT_EXT_EXPLICIT          = $_OUTPUT_EXT_EXPLICIT
   _CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT = $_CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT
   _CLI_SUB_PRESERVE_BITMAP_EXPLICIT = $_CLI_SUB_PRESERVE_BITMAP_EXPLICIT
+  _CLI_AUDIO_PREFER_STEREO_EXPLICIT = $_CLI_AUDIO_PREFER_STEREO_EXPLICIT
+  _CLI_ADD_STEREO_IF_MULTICH_EXPLICIT = $_CLI_ADD_STEREO_IF_MULTICH_EXPLICIT
 EOF
   exit 0
 }
@@ -9102,11 +9111,13 @@ run_audio_pipeline(){
     else
       # D5: --prefer-stereo / --stereo-fallback are single-track intents; multi-track mode
       # copies all source audio tracks as-is and cannot honor them. Announce rather than
-      # silently ignore (says == does). Each fires only when the user set the flag; the
+      # silently ignore (says == does). Gated on _CLI_*_EXPLICIT so the warning fires ONLY when
+      # the user actually typed the flag — never for a value carried by a profile/config or the
+      # ADD_STEREO_IF_MULTICH=1 default (which would name a flag the user didn't pass). The
       # archive profile also surfaces --stereo-fallback as a config-time conflict advisory.
-      (( AUDIO_PREFER_STEREO )) && \
+      (( _CLI_AUDIO_PREFER_STEREO_EXPLICIT && AUDIO_PREFER_STEREO )) && \
         warn "[Audio] --prefer-stereo does not apply in multi-track audio mode (AUDIO_MULTI_TRACK=1); all source audio tracks are kept as-is."
-      (( ADD_STEREO_IF_MULTICH )) && \
+      (( _CLI_ADD_STEREO_IF_MULTICH_EXPLICIT && ADD_STEREO_IF_MULTICH )) && \
         warn "[Audio] --stereo-fallback does not apply in multi-track audio mode (AUDIO_MULTI_TRACK=1); all source audio tracks are kept as-is (no stereo downmix added)."
       run_audio_pipeline_multi
       return $?

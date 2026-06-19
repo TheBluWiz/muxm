@@ -2379,6 +2379,15 @@ test_profiles() {
   assert_contains "_CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT = 0" "D1: text-format tracker is 0 without the flag" "$out"
   assert_contains "_CLI_SUB_PRESERVE_BITMAP_EXPLICIT = 0" "D1: bitmap tracker is 0 without the flag" "$out"
 
+  # D5 (explicit-flag gating): the stereo flags track CLI-typing the same way (gating the
+  # multi-track "does not apply" warnings so a profile/config/default value never warns).
+  out="$(run_muxm --stereo-fallback --prefer-stereo --print-effective-config source.mkv)"
+  assert_contains "_CLI_ADD_STEREO_IF_MULTICH_EXPLICIT = 1" "D5: --stereo-fallback records its CLI tracker" "$out"
+  assert_contains "_CLI_AUDIO_PREFER_STEREO_EXPLICIT = 1" "D5: --prefer-stereo records its CLI tracker" "$out"
+  out="$(run_muxm --print-effective-config source.mkv)"
+  assert_contains "_CLI_ADD_STEREO_IF_MULTICH_EXPLICIT = 0" "D5: stereo-fallback tracker is 0 without the flag (default ADD_STEREO_IF_MULTICH=1)" "$out"
+  assert_contains "_CLI_AUDIO_PREFER_STEREO_EXPLICIT = 0" "D5: prefer-stereo tracker is 0 without the flag" "$out"
+
   # dv-archival alias: deprecated, maps to archive profile + emits deprecation warning
   out="$(run_muxm --profile dv-archival --print-effective-config 2>&1)"
   assert_contains "deprecated" "dv-archival alias: emits deprecation warning" "$out"
@@ -3184,6 +3193,24 @@ test_dryrun() {
   else
     pass "D6: no OCR warning for non-MKV multi-track output (MKV-gated)"
   fi
+
+  # D5 (explicit-flag gating): a bare AUDIO_MULTI_TRACK=1 from a .muxmrc — without the archive
+  # profile, which would set ADD_STEREO_IF_MULTICH=0 — must NOT surface the --stereo-fallback
+  # warning. ADD_STEREO_IF_MULTICH defaults to 1, so without _CLI_*_EXPLICIT gating the warning
+  # would name a flag the user never typed. Uses an isolated project dir so the .muxmrc doesn't
+  # leak to other tests; the suite's HOME is already isolated (no ~/.muxmrc).
+  local d5_cfg="$TESTDIR/d5_multitrack_muxmrc"; mkdir -p "$d5_cfg"
+  printf 'AUDIO_MULTI_TRACK=1\n' > "$d5_cfg/.muxmrc"
+  out="$(run_muxm_in "$d5_cfg" --dry-run --no-skip-if-ideal "$TESTDIR/hevc_multi_audio.mkv")"
+  assert_contains "multi-track" "D5 gating: .muxmrc AUDIO_MULTI_TRACK=1 activates multi-track audio (no profile)" "$out"
+  if echo "$out" | grep -qiF "does not apply in multi-track"; then
+    fail "D5 gating: bare AUDIO_MULTI_TRACK=1 (.muxmrc) spuriously warned about an untyped stereo flag"
+  else
+    pass "D5 gating: no stereo warning for .muxmrc multi-track without an explicit stereo flag"
+  fi
+  # But an explicit --stereo-fallback on top of the .muxmrc multi-track still warns.
+  out="$(run_muxm_in "$d5_cfg" --dry-run --no-skip-if-ideal --stereo-fallback "$TESTDIR/hevc_multi_audio.mkv")"
+  assert_contains "does not apply in multi-track" "D5 gating: explicit --stereo-fallback still warns over .muxmrc multi-track" "$out"
 
   # ---- Container passthrough resolution + ATV MKV subtitle adjustment (now LOG-only) ----
   # These [container-passthrough]/[<profile>] decision lines are emitted via log() during §15
