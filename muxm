@@ -9100,6 +9100,14 @@ run_audio_pipeline(){
     elif [[ -n "${AUDIO_FORCE_CODEC:-}" ]]; then
       note "[Audio] Keeping a single audio track: --audio-force-codec is set (multi-track mode off)."
     else
+      # D5: --prefer-stereo / --stereo-fallback are single-track intents; multi-track mode
+      # copies all source audio tracks as-is and cannot honor them. Announce rather than
+      # silently ignore (says == does). Each fires only when the user set the flag; the
+      # archive profile also surfaces --stereo-fallback as a config-time conflict advisory.
+      (( AUDIO_PREFER_STEREO )) && \
+        warn "[Audio] --prefer-stereo does not apply in multi-track audio mode (AUDIO_MULTI_TRACK=1); all source audio tracks are kept as-is."
+      (( ADD_STEREO_IF_MULTICH )) && \
+        warn "[Audio] --stereo-fallback does not apply in multi-track audio mode (AUDIO_MULTI_TRACK=1); all source audio tracks are kept as-is (no stereo downmix added)."
       run_audio_pipeline_multi
       return $?
     fi
@@ -10241,6 +10249,16 @@ run_subtitle_pipeline_multi(){
     note "[Subs] Multi-track filter: no subtitle tracks survived filtering."
     SUB_COPY_FROM_SOURCE=0
     return 0
+  fi
+
+  # D6: --no-sub-preserve-bitmap requests OCR of bitmap (PGS/VobSub) subs to text, but
+  # multi-track subtitle mode stream-copies every kept track and never OCRs (documented).
+  # Announce that the OCR request is inert here rather than silently ignoring it (says ==
+  # does). Container is MKV-gated (bitmap subs only survive into Matroska) and only fires on
+  # an explicit --no-sub-preserve-bitmap (no profile sets SUB_PRESERVE_BITMAP=0). Known limit:
+  # the skip-if-ideal copy path (_build_subtitle_keep_list at the skip check) does not warn.
+  if (( ! SUB_PRESERVE_BITMAP )) && [[ "$MUX_FORMAT" == "matroska" ]]; then
+    warn "[Subs] --no-sub-preserve-bitmap requests OCR, but multi-track subtitle mode does not OCR — any PGS/VobSub tracks are stream-copied as-is. Use single-track mode (the default) to OCR bitmap subs to text."
   fi
 
   # Reset single-track vars (not used in multi-track mode)

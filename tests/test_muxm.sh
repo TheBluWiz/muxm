@@ -3145,6 +3145,46 @@ test_dryrun() {
   assert_contains "multi-track" "Dry-run archive multi-subs: announces multi-track mode" "$out"
   assert_contains "keeping" "Dry-run archive multi-subs: subtitle filter summary logged" "$out"
 
+  # ---- Phase 3: multi-track flag parity warnings (D5 audio, D6 subtitles) ----
+  # Multi-track modes copy all source tracks and cannot honor several single-track-only flags.
+  # Rather than silently dropping them, muxm now warns (warn-only — no behavior change).
+  # --no-skip-if-ideal forces the pipeline so the warning sites (run_audio_pipeline /
+  # run_subtitle_pipeline_multi) are reached. Assertions grep the message substring (more
+  # robust than the ⚠ emoji, which collides with unrelated warnings in the same run).
+
+  # D5: --prefer-stereo is a single-track intent; multi-track audio mode warns it won't apply.
+  out="$(run_muxm --dry-run --no-skip-if-ideal --profile archive --prefer-stereo "$TESTDIR/hevc_multi_audio.mkv")"
+  assert_contains "does not apply in multi-track" "D5: --prefer-stereo warns in multi-track audio mode" "$out"
+  # D5: --stereo-fallback warns at the pipeline too (in addition to the archive config advisory).
+  out="$(run_muxm --dry-run --no-skip-if-ideal --profile archive --stereo-fallback "$TESTDIR/hevc_multi_audio.mkv")"
+  assert_contains "does not apply in multi-track" "D5: --stereo-fallback warns in multi-track audio mode" "$out"
+  # D5 regression: neither stereo flag → no multi-track stereo warning.
+  out="$(run_muxm --dry-run --no-skip-if-ideal --profile archive "$TESTDIR/hevc_multi_audio.mkv")"
+  if echo "$out" | grep -qiF "does not apply in multi-track"; then
+    fail "D5: multi-track audio warned without --prefer-stereo/--stereo-fallback"
+  else
+    pass "D5: no stereo warning when neither flag is set (multi-track audio)"
+  fi
+
+  # D6: --no-sub-preserve-bitmap requests OCR, but multi-track + MKV stream-copies subs (no OCR) → warn.
+  out="$(run_muxm --dry-run --no-skip-if-ideal --profile archive --no-sub-preserve-bitmap "$TESTDIR/hevc_multi_subs.mkv")"
+  assert_contains "does not OCR" "D6: --no-sub-preserve-bitmap warns in multi-track MKV mode" "$out"
+  # D6 regression: default (preserve bitmap) → no OCR warning.
+  out="$(run_muxm --dry-run --no-skip-if-ideal --profile archive "$TESTDIR/hevc_multi_subs.mkv")"
+  if echo "$out" | grep -qiF "does not OCR"; then
+    fail "D6: multi-track MKV warned without --no-sub-preserve-bitmap"
+  else
+    pass "D6: no OCR warning when bitmap preservation is on (default)"
+  fi
+  # D6 MKV gate (differential — same fixture/profile/flag, only the container differs): the
+  # subtitle multi-track path still runs for MP4, but bitmap subs can't go there, so no warning.
+  out="$(run_muxm --dry-run --no-skip-if-ideal --profile archive --output-ext mp4 --no-sub-preserve-bitmap "$TESTDIR/hevc_multi_subs.mkv")"
+  if echo "$out" | grep -qiF "does not OCR"; then
+    fail "D6: warned for non-MKV multi-track output (MKV gate failed)"
+  else
+    pass "D6: no OCR warning for non-MKV multi-track output (MKV-gated)"
+  fi
+
   # ---- Container passthrough resolution + ATV MKV subtitle adjustment (now LOG-only) ----
   # These [container-passthrough]/[<profile>] decision lines are emitted via log() during §15
   # output resolution. Phase 2 routes log() to the logfile (buffered pre-§17), NOT the terminal,
