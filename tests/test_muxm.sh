@@ -4070,6 +4070,48 @@ test_audio() {
     fi
   fi
 
+  # --- D3: --audio-force-bitrate works standalone (no --audio-force-codec) ---
+  # Step 4 (fallback transcode) must honor --audio-force-bitrate for any transcoded non-lossless
+  # output (matches the README). An mp3 stereo source → MP4 forces a transcode to aac (mp3 is not
+  # MP4-container-safe). We assert the precise target from muxm's transcode log: the *encoded*
+  # bit_rate is unreliable here (a sine tone compresses well below the -b:a target), but the log
+  # records the exact value handed to ffmpeg.  D7 is unit-tested above (audio_transcode_target).
+  local d3_src="$TESTDIR/d3_mp3_stereo.mkv"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=white:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" -map 0:v -map 1:a \
+    -c:v libx265 -preset ultrafast -crf 28 -c:a mp3 -b:a 128k -ac 2 "$d3_src" 2>/dev/null || true
+  if [[ ! -s "$d3_src" ]]; then
+    # Genuine host skip: mp3 encoding needs libmp3lame, which a minimal ffmpeg build may lack.
+    # (Skip-first guard, not an else-skip — see the soft-skip ratchet, _test_meta_soft_skip.)
+    skip "D3: could not create mp3 stereo fixture (ffmpeg lacks an mp3/libmp3lame encoder?)"
+  else
+    local d3_log d3_lf
+    # Standalone --audio-force-bitrate → -b:a 320k (was silently ignored before the fix → 192k).
+    d3_log="$(run_muxm --audio-force-bitrate 320k --crf 28 --preset ultrafast "$d3_src" "$TESTDIR/d3_out.mp4")"
+    d3_lf="$(_keepworkdir_logfile "$d3_log" || true)"
+    if [[ -n "$d3_lf" ]] && grep -qiE 'audio transcode: .*bitrate=320k' "$d3_lf"; then
+      pass "D3: --audio-force-bitrate 320k honored standalone (Step 4 fallback transcode)"
+    else
+      fail "D3: --audio-force-bitrate 320k not applied to the standalone transcode (log: $d3_lf)"
+    fi
+    # Regression: default transcode bitrate unchanged (192k) without the flag.
+    d3_log="$(run_muxm --crf 28 --preset ultrafast "$d3_src" "$TESTDIR/d3_def.mp4")"
+    d3_lf="$(_keepworkdir_logfile "$d3_log" || true)"
+    if [[ -n "$d3_lf" ]] && grep -qiE 'audio transcode: .*bitrate=192k' "$d3_lf"; then
+      pass "D3: default transcode bitrate unchanged (192k) without the flag"
+    else
+      fail "D3: default transcode bitrate not 192k (log: $d3_lf)"
+    fi
+    # Copy path unaffected: a copyable codec (eac3 in compliant.mp4) is copied, not transcoded,
+    # so --audio-force-bitrate does not apply (bitrate is meaningless for -c copy).
+    d3_log="$(run_muxm --audio-force-bitrate 320k --crf 28 --preset ultrafast "$TESTDIR/compliant.mp4" "$TESTDIR/d3_copy.mp4")"
+    if echo "$d3_log" | grep -qiE 'Copying|Direct Play|lossless passthrough'; then
+      pass "D3: --audio-force-bitrate does not force a transcode on copy paths"
+    else
+      fail "D3: --audio-force-bitrate unexpectedly transcoded a copyable source"
+    fi
+  fi
+
   # --stereo-bitrate via effective config (#11)
   out="$(run_muxm --stereo-bitrate 192k --print-effective-config)"
   assert_contains "STEREO_BITRATE            = 192k" "--stereo-bitrate: config shows 192k" "$out"
@@ -6207,6 +6249,14 @@ _test_unit_audio_helpers() {
   if [[ "$at8_result" == *"768k"* ]]; then pass "audio_transcode_target(8ch) uses EAC3_BITRATE_7_1=768k"; else fail "audio_transcode_target(8ch) expected 768k in '$at8_result'"; fi
   at6_result="$(bash -c "$transcode_env"$'\n'"$transcode_body"$'\n'"audio_transcode_target 6")"
   if [[ "$at6_result" == *"640k"* ]]; then pass "audio_transcode_target(6ch) uses EAC3_BITRATE_5_1=640k"; else fail "audio_transcode_target(6ch) expected 640k in '$at6_result'"; fi
+
+  # D7: the ≤2ch (stereo/mono) aac branch honors STEREO_BITRATE instead of a hard-coded 192k.
+  # Default STEREO_BITRATE is "192k" → unchanged; an explicit value flows through.
+  local at2_def at2_320
+  at2_def="$(bash -c "$transcode_env"$'\n'"$transcode_body"$'\n'"audio_transcode_target 2")"
+  if [[ "$at2_def" == "aac 192k" ]]; then pass "D7: audio_transcode_target(2ch) default = aac 192k (unchanged)"; else fail "D7: audio_transcode_target(2ch) default expected 'aac 192k', got '$at2_def'"; fi
+  at2_320="$(bash -c "$transcode_env"$'\n'"STEREO_BITRATE=320k"$'\n'"$transcode_body"$'\n'"audio_transcode_target 2")"
+  if [[ "$at2_320" == "aac 320k" ]]; then pass "D7: audio_transcode_target(2ch) honors STEREO_BITRATE=320k"; else fail "D7: audio_transcode_target(2ch) with STEREO_BITRATE=320k expected 'aac 320k', got '$at2_320'"; fi
 
   # ---- _codec_max_channels ----
   # Returns the maximum channel count supported by ffmpeg's native encoder for a
