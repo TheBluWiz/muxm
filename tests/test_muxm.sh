@@ -9047,6 +9047,86 @@ FBDOVISCRIPT
     fi
   fi
 
+  # ---- VERBOSITY: Phase 6 — --quiet/--verbose/--no-color, disk-OK, and the DEBUG-log decouple ----
+  # --quiet drops info narration from the TERMINAL while the persistent log stays COMPLETE;
+  # --verbose surfaces the otherwise log-only detail; NO_COLOR strips emoji; DEBUG=1 now produces a
+  # persistent logfile that set -x xtrace does NOT pollute (BASH_XTRACEFD → raw terminal).
+  if [[ ! -f "$TESTDIR/hevc_sdr_51.mkv" ]]; then
+    skip "VERBOSITY: hevc_sdr_51.mkv fixture not found"
+  else
+    local vb_dir="$TESTDIR/verbosity"; mkdir -p "$vb_dir"
+    cp "$TESTDIR/hevc_sdr_51.mkv" "$vb_dir/src.mkv"
+
+    # Flags register in the effective config.
+    assert_contains "VERBOSITY                 = 0" "VERBOSITY/--quiet: sets VERBOSITY=0" "$(run_muxm --quiet --print-effective-config)"
+    assert_contains "VERBOSITY                 = 2" "VERBOSITY/--verbose: sets VERBOSITY=2" "$(run_muxm --verbose --print-effective-config)"
+    assert_contains "USE_COLOR                 = 0" "VERBOSITY/--no-color: sets USE_COLOR=0" "$(run_muxm --no-color --print-effective-config)"
+
+    # (acceptance) --quiet reduces the terminal to warnings/errors, but the LOG stays complete.
+    local vq_out="$vb_dir/q.mkv" vq_log="$vb_dir/q.muxm.log" vq_term
+    vq_term="$(cd "$vb_dir" && "$MUXM" --quiet --keep-log --no-disk-check --no-dv --skip-audio --skip-subs \
+                --no-video-copy-if-compliant --video-codec libx265 --crf 32 --preset ultrafast src.mkv "$vq_out" 2>&1)" || true
+    if [[ -s "$vq_out" && -s "$vq_log" ]]; then
+      # Count-based (not `grep -q`): grep -q exits on first match → SIGPIPE → pipefail would make
+      # an absence check false-pass on a regression. -c reads all input, so the count is honest.
+      local _vq_note _vq_emoji
+      _vq_note="$(printf '%s\n' "$vq_term" | grep -cF "Build SUCCEEDED" || true)"
+      _vq_emoji="$(printf '%s\n' "$vq_term" | grep -cF "ℹ️" || true)"
+      if (( _vq_note == 0 && _vq_emoji == 0 )); then
+        pass "VERBOSITY/--quiet: info narration suppressed on the terminal"
+      else
+        fail "VERBOSITY/--quiet: a note leaked to the quiet terminal (SUCCEEDED=$_vq_note, ℹ️=$_vq_emoji)"
+      fi
+      if grep -qF "Build SUCCEEDED" "$vq_log"; then
+        pass "VERBOSITY/--quiet: the persistent log stays complete despite the quiet terminal"
+      else
+        fail "VERBOSITY/--quiet: narration missing from the persisted log (quiet stripped the log)"
+      fi
+    else
+      fail "VERBOSITY/--quiet: --keep-log encode produced no output/log"
+    fi
+
+    # --verbose surfaces otherwise log-only detail to the terminal. Use the effective-config dump
+    # ("Effective config", emitted via log() at §17 on every run) as a fixture-independent marker:
+    # verbose echoes it to the terminal; normal mode keeps it log-only.
+    local _vv_n _vn_n
+    _vv_n="$(printf '%s\n' "$(run_muxm --verbose --dry-run --no-disk-check "$vb_dir/src.mkv")" | grep -cF "Effective config" || true)"
+    _vn_n="$(printf '%s\n' "$(run_muxm --dry-run --no-disk-check "$vb_dir/src.mkv")" | grep -cF "Effective config" || true)"
+    if (( _vv_n >= 1 && _vn_n == 0 )); then
+      pass "VERBOSITY/--verbose: log-only detail surfaces on the terminal (absent in normal mode)"
+    else
+      fail "VERBOSITY/--verbose: log-only detail not surfaced (verbose=$_vv_n, normal=$_vn_n)"
+    fi
+
+    # NO_COLOR strips muxm's emoji prefixes from the terminal.
+    local vc_term vc_emoji
+    vc_term="$(cd "$vb_dir" && NO_COLOR=1 "$MUXM" --dry-run --no-disk-check src.mkv 2>&1)" || true
+    vc_emoji="$(printf '%s\n' "$vc_term" | grep -cE 'ℹ️|⚠️|❌' || true)"
+    if (( vc_emoji == 0 )); then
+      pass "VERBOSITY/NO_COLOR: emoji prefixes stripped from the terminal"
+    else
+      fail "VERBOSITY/NO_COLOR: emoji still present on the terminal ($vc_emoji)"
+    fi
+
+    # Disk-OK preflight success line (D15) — a note, so it shows on a normal run.
+    assert_contains "Disk OK" "VERBOSITY/disk-OK: preflight prints a success line on a normal run" \
+      "$(run_muxm --dry-run "$vb_dir/src.mkv")"
+
+    # (acceptance) DEBUG=1 yields a persistent log that set -x xtrace does NOT pollute.
+    local vdbg_out="$vb_dir/dbg.mkv" vdbg_term vdbg_code=0
+    vdbg_term="$(cd "$vb_dir" && DEBUG=1 "$MUXM" -K --no-disk-check --no-dv --skip-audio --skip-subs \
+                  --no-video-copy-if-compliant --video-codec libx265 --crf 32 --preset ultrafast src.mkv "$vdbg_out" 2>&1)" || vdbg_code=$?
+    local vdbg_wd vdbg_log vdbg_xtrace=0
+    vdbg_wd="$(printf '%s\n' "$vdbg_term" | grep 'Keeping workdir:' | head -1 | awk '{print $NF}')"
+    vdbg_log="$(find "$vdbg_wd" -maxdepth 1 -name 'muxm.*.log' 2>/dev/null | head -1)"
+    [[ -n "$vdbg_log" ]] && vdbg_xtrace="$(grep -cE '^\+ ' "$vdbg_log" || true)"
+    if (( vdbg_code == 0 )) && [[ -n "$vdbg_log" ]] && grep -qF "Build SUCCEEDED" "$vdbg_log" && (( vdbg_xtrace == 0 )); then
+      pass "VERBOSITY/DEBUG: DEBUG=1 produces a persistent log with no set -x xtrace pollution"
+    else
+      fail "VERBOSITY/DEBUG: expected a clean persistent log (exit=$vdbg_code, log='$vdbg_log', xtrace_lines=$vdbg_xtrace)"
+    fi
+  fi
+
   # ---- CFGGEN: HW_ACCEL is tracked, emitted as a commented default (not leaked) ----
   # HW_ACCEL must be part of CONFIG_TRACKED_VARS so --create-config emits it at all (it
   # was once omitted entirely). Because no built-in profile sets HW_ACCEL, it is

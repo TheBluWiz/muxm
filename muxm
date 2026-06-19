@@ -349,6 +349,30 @@ OUTPUT_EXT="mp4"               # supports mp4|m4v|mov
 TAG_LANGUAGE_DEFAULT="und"
 declare -i INCLUDE_AUDIO_TITLES=1  # Generate descriptive titles for audio streams (e.g., "5.1 Surround (E-AC-3)")
 
+# ---- Terminal verbosity & color (Phase 6) ----
+# VERBOSITY gates what muxm's OWN narration prints to the TERMINAL — the LOG always stays
+# complete (quiet routes suppressed lines to the log only). 0=quiet (warnings+errors only,
+# good for scripts/cron), 1=normal, 2=verbose (also echo the otherwise log-only detail).
+declare -i VERBOSITY=1
+# USE_COLOR=0 strips muxm's emoji prefixes (no ANSI is emitted) for CI/plain logs. Honour the
+# NO_COLOR convention (https://no-color.org); --no-color also sets it. _PFX_* are referenced by
+# say/note/warn/die via ${_PFX_-default} so they are set -u-safe even before this resolves.
+declare -i USE_COLOR=1
+[[ -n "${NO_COLOR:-}" ]] && USE_COLOR=0
+_PFX_NOTE="ℹ️  "; _PFX_WARN="⚠️  "; _PFX_ERR="❌ ERROR: "; _PFX_FAIL="❌ "
+if (( ! USE_COLOR )); then _PFX_NOTE=""; _PFX_WARN="Warning: "; _PFX_ERR="ERROR: "; _PFX_FAIL=""; fi
+# Early pre-scan: resolve verbosity/color from the CLI NOW, before config-load/profile narration
+# (§6/§11) fires — otherwise --quiet/--no-color couldn't suppress those pre-parse messages because
+# the main arg loop (§12) hasn't run yet. The main loop still handles these flags (drift guard).
+for _va in "$@"; do
+  case "$_va" in
+    --quiet)    VERBOSITY=0 ;;
+    --verbose)  VERBOSITY=2 ;;
+    --no-color) USE_COLOR=0; _PFX_NOTE=""; _PFX_WARN="Warning: "; _PFX_ERR="ERROR: "; _PFX_FAIL="" ;;
+  esac
+done
+unset _va
+
 # ---- Operational defaults
 declare -i CHECKSUM=0
 CHECKSUM_ALGO="sha256"  # Checksum algorithm: sha256 | blake2b | auto (auto prefers b2sum, falls back to sha256)
@@ -445,28 +469,72 @@ _log_buffer_mirror() {
   local _pfx="$1"; shift
   local _l
   for _l in "$@"; do _LOG_BUFFER+="${_pfx}${_l}"$'\n'; done
+  return 0
 }
 
-say()  { printf "%s\n" "$@" >&2; }
-note() { printf "ℹ️  %s\n" "$@" >&2; [[ "${_LOG_READY:-0}" == "1" ]] || _log_buffer_mirror "ℹ️  " "$@"; }
-warn() { printf "⚠️  %s\n" "$@" >&2; [[ "${_LOG_READY:-0}" == "1" ]] || _log_buffer_mirror "⚠️  " "$@"; }
+# _to_log PREFIX LINE… — record message lines in the LOG only (never the terminal), so --quiet can
+# suppress terminal narration WITHOUT ever stripping it from the persistent log (Phases 1–2).
+# Pre-§17 → the flush buffer; post-§17 → $LOGFILE directly (un-timestamped, to match tee'd lines).
+_to_log() {
+  local _pfx="$1"; shift
+  if (( ${_LOG_READY:-0} )); then
+    if [[ -n "${LOGFILE:-}" && -w "${LOGFILE:-}" ]]; then
+      local _l; for _l in "$@"; do printf '%s%s\n' "$_pfx" "$_l" >> "$LOGFILE" || true; done
+    fi
+  else
+    _log_buffer_mirror "$_pfx" "$@"
+  fi
+  return 0
+}
 
-# log() — write ONLY to the log file, never the terminal.
-#   • After Section 17 (_LOG_READY=1): append to $LOGFILE with a cheap monotonic time prefix
-#     ([+Ns] from $SECONDS — no per-line date fork). The write is `|| true` so a transient
-#     append failure can't trip `set -e` mid-encode.
-#   • DEBUG=1 (no logfile is ever created): preserve the historical say() fallback to the terminal.
-#   • Pre-§17 (the common path during config/profile/validation): append to _LOG_BUFFER instead of
-#     leaking to the terminal — the buffer is flushed into $LOGFILE the instant it is created.
+# say/note — informational narration. VERBOSITY gates the TERMINAL only (0=quiet suppresses these,
+# routing them to the log via _to_log so the log stays complete). Emoji prefixes obey USE_COLOR via
+# ${_PFX_-default} (set -u-safe even before the prefix globals resolve). All helpers return 0 — they
+# are bare statements under `set -e`, so a nonzero tail would abort the run at the call site.
+say()  {
+  if (( VERBOSITY >= 1 )); then
+    printf "%s\n" "$@" >&2
+    (( ${_LOG_READY:-0} )) || _log_buffer_mirror "" "$@"
+  else
+    _to_log "" "$@"
+  fi
+  return 0
+}
+note() {
+  if (( VERBOSITY >= 1 )); then
+    printf "${_PFX_NOTE-ℹ️  }%s\n" "$@" >&2
+    (( ${_LOG_READY:-0} )) || _log_buffer_mirror "${_PFX_NOTE-ℹ️  }" "$@"
+  else
+    _to_log "${_PFX_NOTE-ℹ️  }" "$@"
+  fi
+  return 0
+}
+# warn — never suppressed (shows even under --quiet); always terminal + log.
+warn() {
+  printf "${_PFX_WARN-⚠️  }%s\n" "$@" >&2
+  (( ${_LOG_READY:-0} )) || _log_buffer_mirror "${_PFX_WARN-⚠️  }" "$@"
+  return 0
+}
+
+# log() — log-only detail.
+#   • Post-§17 (_LOG_READY=1): append to $LOGFILE with a cheap [+Ns] prefix (no per-line date fork).
+#   • Pre-§17: buffer for the §17 flush.
+#   • --verbose (VERBOSITY≥2): ALSO echo the line to the raw terminal FD (bypassing the tee, so it
+#     is not double-written to the logfile) — this is how verbose surfaces the otherwise-log-only
+#     narration. DEBUG no longer needs a special case here: post-decouple it has a real logfile.
 log() {
   local _l
-  if [[ "${_LOG_READY:-0}" == "1" && -n "${LOGFILE:-}" && -w "${LOGFILE:-}" ]]; then
-    for _l in "$@"; do printf '[+%ss] %s\n' "$SECONDS" "$_l" >> "$LOGFILE" || true; done
-  elif [[ "${_LOG_READY:-0}" == "1" || "${DEBUG:-0}" == "1" ]]; then
-    say "$@"                       # ready-but-unwritable, or DEBUG (no logfile) → terminal fallback
+  if (( ${_LOG_READY:-0} )); then
+    if [[ -n "${LOGFILE:-}" && -w "${LOGFILE:-}" ]]; then
+      for _l in "$@"; do printf '[+%ss] %s\n' "$SECONDS" "$_l" >> "$LOGFILE" || true; done
+    fi
   else
-    for _l in "$@"; do _LOG_BUFFER+="[+${SECONDS}s] $_l"$'\n'; done   # pre-§17: buffer, don't leak
+    for _l in "$@"; do _LOG_BUFFER+="[+${SECONDS}s] $_l"$'\n'; done
   fi
+  if (( VERBOSITY >= 2 )); then
+    for _l in "$@"; do printf '%s\n' "$_l" >&"${TERM_FD:-2}"; done
+  fi
+  return 0
 }
 
 # ---- Terminal FD for interactive UI (spinner / progress bar) ----
@@ -742,8 +810,8 @@ die()  {
   # FAIL_MSG carries no "Fatal:" prefix (D7): the "❌ ERROR:" / "❌ Build FAILED" prefixes
   # already convey severity, and on_exit must not echo the cause a second time (see _ERROR_PRINTED).
   FAILED=1; EXIT_CODE="$code"; FAIL_MSG="$*"
-  printf "❌ ERROR: %s\n" "$FAIL_MSG" >&2
-  [[ "${_LOG_READY:-0}" == "1" ]] || _log_buffer_mirror "❌ ERROR: " "$FAIL_MSG"
+  printf "${_PFX_ERR-❌ ERROR: }%s\n" "$FAIL_MSG" >&2
+  [[ "${_LOG_READY:-0}" == "1" ]] || _log_buffer_mirror "${_PFX_ERR-❌ ERROR: }" "$FAIL_MSG"
   _ERROR_PRINTED=1   # the cause is now on screen; on_exit keeps its summary terse
   exit "$code"
 }
@@ -753,7 +821,7 @@ on_error(){
   FAILED=1
   EXIT_CODE="$status"
   FAIL_MSG="Command failed at line $lineno: $cmd (exit $status)"
-  printf "❌ ERROR: %s\n" "$FAIL_MSG" >&2
+  printf "${_PFX_ERR-❌ ERROR: }%s\n" "$FAIL_MSG" >&2
   _ERROR_PRINTED=1   # cause printed here; on_exit will not echo it again (D7)
   # Note: This trap does not call exit directly. Under set -e, the shell
   # exits after the ERR trap returns, which triggers the EXIT trap (on_exit)
@@ -2364,6 +2432,19 @@ regardless of this flag. Unlike
 which preserve the entire multi\-GB workdir, this keeps only the small
 log and diagnostics.
 .TP
+.B \-\-quiet
+Reduce muxm's own terminal narration to warnings and errors only (good for scripts
+and cron). The persistent log stays complete regardless.
+.TP
+.B \-\-verbose
+Also surface the otherwise log\-only detail (encode parameters, per\-step timing, etc.)
+on the terminal.
+.TP
+.B \-\-no\-color
+Strip muxm's emoji prefixes from terminal output (CI/plain\-log friendly). The
+.B NO_COLOR
+environment variable (see no\-color.org) does the same.
+.TP
 .BR \-\-workdir " " \fIDIR\fR
 Stage temporary intermediates (the
 .I .muxm.tmp.*
@@ -2942,6 +3023,7 @@ _muxm_completions() {
             --replace-source --force-replace-source
 
             -k --keep-temp -K --keep-temp-always --keep-log
+            --quiet --verbose --no-color
             --ffmpeg-loglevel --ffprobe-loglevel --no-hide-banner
             --threads --workdir
         "
@@ -4709,6 +4791,9 @@ while [[ $# -gt 0 ]]; do
     -k|--keep-temp) KEEP_TEMP=1; shift ;;
     -K|--keep-temp-always) KEEP_TEMP_ALWAYS=1; shift ;;
     --keep-log) KEEP_LOG=1; shift ;;
+    --quiet)   VERBOSITY=0; shift ;;
+    --verbose) VERBOSITY=2; shift ;;
+    --no-color) USE_COLOR=0; _PFX_NOTE=""; _PFX_WARN="Warning: "; _PFX_ERR="ERROR: "; _PFX_FAIL=""; shift ;;
 
     --dry-run) DRY_RUN=1; shift ;;
     --checksum) CHECKSUM=1; shift ;;
@@ -5369,6 +5454,8 @@ Effective config (post config-files + profile + CLI):
   KEEP_TEMP                 = $KEEP_TEMP
   KEEP_TEMP_ALWAYS          = $KEEP_TEMP_ALWAYS
   KEEP_LOG                  = $KEEP_LOG
+  VERBOSITY                 = $VERBOSITY
+  USE_COLOR                 = $USE_COLOR
   REPLACE_SOURCE            = $REPLACE_SOURCE
   FORCE_REPLACE_SOURCE      = $FORCE_REPLACE_SOURCE
 
@@ -5688,39 +5775,46 @@ LOGFILE="$WORKDIR/muxm.$(date +%Y%m%d-%H%M%S).log"
 # After this section:
 #   stdout/stderr → tee → log file + terminal
 #   FD 3          → raw terminal (bypasses tee)
-if [[ "${DEBUG:-0}" != "1" ]]; then
-  : > "$LOGFILE" 2>/dev/null || true
-  # Flush the pre-§17 narrative captured in _LOG_BUFFER (config/profile/conflict/ignored-knob/
-  # validation messages) into the freshly-created logfile, so the log tells the WHOLE story —
-  # the "why", not just the post-banner pipeline. One-shot direct append; then drop the buffer.
-  if [[ -n "$_LOG_BUFFER" ]]; then
-    printf '%s' "$_LOG_BUFFER" >> "$LOGFILE" 2>/dev/null || true
-    _LOG_BUFFER=""
-  fi
-  _STEP_T0=$SECONDS   # baseline for per-step timing (mark_done)
-  # Preserve a raw terminal FD for spinner / progress-bar output.
-  # After the exec redirect, stdout and stderr both go through tee → log + terminal.
-  # FD 3 bypasses tee so \r-based progress UI doesn't pollute the log file.
-  exec 3>&2
-  TERM_FD=3
-  # Hold the tee on an explicit descriptor (fd 4) so _drain_tee can close it deterministically.
-  # With the bare `exec > >(tee …)` form, the shell keeps an unnamed write-end to the process
-  # substitution open until it exits, so at drain time tee never sees EOF and `wait $TEE_PID`
-  # blocks until the watchdog kills it (~5s of dead wait on every run). Owning the write-end on
-  # a named fd lets us close it explicitly → tee gets EOF immediately → wait returns at once.
-  # Fixed fd number (not the {var}> form) for bash 3.2 portability.
-  exec 4> >(tee -a "$LOGFILE"); TEE_PID=$!
-  exec 1>&4 2>&4
-  _LOG_READY=1   # tee is live: note/warn/say now reach the log via the tee; log() appends directly
-  note "Logging to $(realpath_fallback "$LOGFILE")"
-  # Self-describing log: dump the resolved effective config (log-only, captured via $() so it
-  # never reaches the terminal) so "why did it do X" is answerable from the file alone.
-  # NOTE: as of Phase 2 print_effective_config runs on EVERY normal run (not just under
-  # --print-effective-config), so it is on the hot path — every variable it references must stay
-  # ${x:-}-guarded (set -u-safe), or an unguarded addition would crash every run, not just the
-  # diagnostic flag. Keep it side-effect-free.
-  log "$(print_effective_config)"
+# The tee block now runs UNCONDITIONALLY — including under DEBUG=1 (Phase 6 decouple). Previously
+# DEBUG skipped it entirely so `set -x` xtrace wouldn't flood the logfile through the tee, which
+# left the one mode you most want a persistent log producing none. Instead we keep the tee and
+# siphon xtrace to the raw terminal FD (see BASH_XTRACEFD below), so the logfile stays clean.
+: > "$LOGFILE" 2>/dev/null || true
+# Flush the pre-§17 narrative captured in _LOG_BUFFER (config/profile/conflict/ignored-knob/
+# validation messages) into the freshly-created logfile, so the log tells the WHOLE story —
+# the "why", not just the post-banner pipeline. One-shot direct append; then drop the buffer.
+if [[ -n "$_LOG_BUFFER" ]]; then
+  printf '%s' "$_LOG_BUFFER" >> "$LOGFILE" 2>/dev/null || true
+  _LOG_BUFFER=""
 fi
+_STEP_T0=$SECONDS   # baseline for per-step timing (mark_done)
+# Preserve a raw terminal FD for spinner / progress-bar output.
+# After the exec redirect, stdout and stderr both go through tee → log + terminal.
+# FD 3 bypasses tee so \r-based progress UI doesn't pollute the log file.
+exec 3>&2
+TERM_FD=3
+# DEBUG decouple (Phase 6, option a): point `set -x` xtrace at the raw terminal (FD 3) so the trace
+# stays on screen as before, but does NOT flow through the tee into the logfile. Must be set before
+# the tee redirect below; on_exit runs `set +x` before closing FD 3 so no traced command writes to
+# a closing descriptor.
+[[ "${DEBUG:-0}" == "1" ]] && BASH_XTRACEFD=3
+# Hold the tee on an explicit descriptor (fd 4) so _drain_tee can close it deterministically.
+# With the bare `exec > >(tee …)` form, the shell keeps an unnamed write-end to the process
+# substitution open until it exits, so at drain time tee never sees EOF and `wait $TEE_PID`
+# blocks until the watchdog kills it (~5s of dead wait on every run). Owning the write-end on
+# a named fd lets us close it explicitly → tee gets EOF immediately → wait returns at once.
+# Fixed fd number (not the {var}> form) for bash 3.2 portability.
+exec 4> >(tee -a "$LOGFILE"); TEE_PID=$!
+exec 1>&4 2>&4
+_LOG_READY=1   # tee is live: note/warn/say now reach the log via the tee; log() appends directly
+note "Logging to $(realpath_fallback "$LOGFILE")"
+# Self-describing log: dump the resolved effective config (log-only, captured via $() so it
+# never reaches the terminal) so "why did it do X" is answerable from the file alone.
+# NOTE: as of Phase 2 print_effective_config runs on EVERY normal run (not just under
+# --print-effective-config), so it is on the hot path — every variable it references must stay
+# ${x:-}-guarded (set -u-safe), or an unguarded addition would crash every run, not just the
+# diagnostic flag. Keep it side-effect-free.
+log "$(print_effective_config)"
 
 # ===== Section 18: Traps ======================================================================
 trap 'on_error $LINENO "$BASH_COMMAND" "$?"' ERR
@@ -5902,6 +5996,7 @@ _persist_failure_bundle() {
 
 on_exit() {
   trap '' INT TERM EXIT  # prevent re-entrancy: cleanup must run atomically (M10)
+  set +x 2>/dev/null || true   # stop DEBUG xtrace before the FD teardown closes BASH_XTRACEFD (FD 3)
   # Clean up subtitle burn-in temp file (lives inside WORKDIR; explicit removal before workdir cleanup)
   [[ -n "${_BURN_SRT_FILTER:-}" && -f "$_BURN_SRT_FILTER" ]] && rm -f "$_BURN_SRT_FILTER"
 
@@ -5959,10 +6054,10 @@ on_exit() {
     # captured in the copied log — the bundle then self-documents where it lives. The bundle is
     # kept on every failure, regardless of --keep-log.
     if (( ${_ERROR_PRINTED:-0} )); then
-      printf "❌ Build FAILED (exit %s). Diagnostics: %s/\n" "${EXIT_CODE:-1}" "$DEBUG_BUNDLE_DIR"
+      printf "%sBuild FAILED (exit %s). Diagnostics: %s/\n" "${_PFX_FAIL-❌ }" "${EXIT_CODE:-1}" "$DEBUG_BUNDLE_DIR"
     else
       [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely an earlier parse/runtime error)."
-      printf "❌ Build FAILED (exit %s): %s — Diagnostics: %s/\n" "${EXIT_CODE:-1}" "$FAIL_MSG" "$DEBUG_BUNDLE_DIR"
+      printf "%sBuild FAILED (exit %s): %s — Diagnostics: %s/\n" "${_PFX_FAIL-❌ }" "${EXIT_CODE:-1}" "$FAIL_MSG" "$DEBUG_BUNDLE_DIR"
     fi
 
     _print_completed_steps
@@ -6249,6 +6344,11 @@ disk_free_warn() {
    Free space, choose an output path on a roomier volume, or pass --no-disk-check to override this guard."
     fi
   fi
+
+  # D15: confirm the preflight passed (a note → suppressed by --quiet, shown otherwise). The
+  # workdir volume holds the multi-GB intermediates, so its free space is the meaningful figure.
+  [[ -n "${wd_avail_kb:-}" ]] && note "Disk OK — ~$(_gb "$(( wd_avail_kb * 1024 ))")GB free on the working volume."
+  return 0
 }
 
 # ===== Section 20: Metadata caching & ffprobe helpers =========================================

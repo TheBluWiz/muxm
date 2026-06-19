@@ -109,6 +109,7 @@ _muxm_completions() {
             --replace-source --force-replace-source
 
             -k --keep-temp -K --keep-temp-always --keep-log
+            --quiet --verbose --no-color
             --ffmpeg-loglevel --ffprobe-loglevel --no-hide-banner
             --threads --workdir
         "

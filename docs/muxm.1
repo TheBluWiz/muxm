@@ -740,6 +740,19 @@ regardless of this flag. Unlike
 which preserve the entire multi\-GB workdir, this keeps only the small
 log and diagnostics.
 .TP
+.B \-\-quiet
+Reduce muxm's own terminal narration to warnings and errors only (good for scripts
+and cron). The persistent log stays complete regardless.
+.TP
+.B \-\-verbose
+Also surface the otherwise log\-only detail (encode parameters, per\-step timing, etc.)
+on the terminal.
+.TP
+.B \-\-no\-color
+Strip muxm's emoji prefixes from terminal output (CI/plain\-log friendly). The
+.B NO_COLOR
+environment variable (see no\-color.org) does the same.
+.TP
 .BR \-\-workdir " " \fIDIR\fR
 Stage temporary intermediates (the
 .I .muxm.tmp.*
