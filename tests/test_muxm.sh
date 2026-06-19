@@ -1564,10 +1564,16 @@ EOF
   # CLI wins over the config value (no --no-keep-log exists, so test the VERBOSITY override).
   out="$(MUXM_HOME="$ck_home" run_muxm_in "$ck_dir" --verbose --print-effective-config)"
   assert_contains "VERBOSITY                 = verbose" "CLI --verbose overrides .muxmrc VERBOSITY=quiet" "$out"
-  # An invalid VERBOSITY in config is rejected early, naming the offending file.
+  # An invalid VERBOSITY in config is rejected early (exit EXIT_VALIDATION), naming the file.
   printf 'VERBOSITY="loud"\n' > "$ck_dir/.muxmrc"
-  local ck_bad ck_code=0
-  ck_bad="$(MUXM_HOME="$ck_home" run_muxm_in "$ck_dir" "$TESTDIR/basic_sdr_subs.mkv")"; ck_code=$?
+  local ck_bad ck_code
+  # Raw capture (not run_muxm_in) — we need the real exit code, which run_muxm_in's || true swallows.
+  ck_bad="$(cd "$ck_dir" && HOME="$ck_home" "$MUXM" --print-effective-config 2>&1)" && ck_code=$? || ck_code=$?
+  if [[ "$ck_code" -eq "$EXIT_VALIDATION" ]]; then
+    pass "invalid .muxmrc VERBOSITY → exit $EXIT_VALIDATION"
+  else
+    fail "invalid .muxmrc VERBOSITY — expected exit $EXIT_VALIDATION, got $ck_code"
+  fi
   assert_contains "Invalid VERBOSITY" "invalid .muxmrc VERBOSITY is rejected with a clear error" "$ck_bad"
   assert_contains ".muxmrc" "invalid VERBOSITY error names the offending config file" "$ck_bad"
   # An empty .muxmrc leaves the defaults untouched (criterion 4).
@@ -6253,6 +6259,7 @@ _test_unit_disk_output_volume() {
 
   # Re-encode mode (peak_factor=2) so the DISK_FREE_WARN_GB floor (5 GiB) governs need_output —
   # far above the 1 KiB we report free on the output volume. die() prints + exits with its code.
+  # shellcheck disable=SC2016  # literal env-setup body; $-refs must expand later inside `bash -c`, not now
   local common='
     DISK_CHECK=1; VIDEO_CODEC=libx265; CRF_VALUE=28; PRESET_VALUE=medium
     DISABLE_DV=1; AUDIO_MULTI_TRACK=0; AUDIO_FORCE_CODEC=""; METADATA_CACHE=""
@@ -6272,6 +6279,7 @@ _test_unit_disk_output_volume() {
   '
   # df field 1 is the device, field 4 the available KiB (awk NR==2 reads $1/$4). The cross-volume
   # mock returns a DIFFERENT device + 1 KiB free for OUT_DIR; a roomy device for everything else.
+  # shellcheck disable=SC2016  # literal mock df() body; ${@:-1}/$OUT_DIR must expand inside `bash -c`, not now
   local dfmock_diff='
     df(){ local p="${@: -1}"
       if [[ "$p" == "$OUT_DIR" ]]; then printf "FS 1K Used Avail Cap M\noddev 100 99 1 99%% /od\n"
@@ -6793,6 +6801,7 @@ _test_unit_score_audio_stream() {
 
   # muxm's emitted score for a mocked stream (codec ch lang br title). The mock ignores the idx
   # arg and emits the canned tab-separated record _score_audio_stream expects.
+  # shellcheck disable=SC2016  # literal mock script body; $@/${args[N]} must expand inside `bash -c`, not now
   local _mockrun='args=("$@")
 _audio_stream_info(){ printf "%s\t%s\t%s\t%s\t%s\n" "${args[0]}" "${args[1]}" "${args[2]}" "${args[3]}" "${args[4]}"; }
 _score_audio_stream 0 | cut -f1'
@@ -7225,6 +7234,7 @@ _test_unit_persist_helpers() {
   if (( want_ok && no_bin )); then
     pass "_persist_failure_bundle: copies log + all .err/.log, excludes binary intermediates"
   else
+    # shellcheck disable=SC2012  # $dest is a test-controlled tmp dir with alphanumeric fixture names; ls is fine in this fail-only diagnostic
     fail "_persist_failure_bundle: wrong selection (text-present=$want_ok binaries-absent=$no_bin) — got: $(ls "$dest" 2>/dev/null | tr '\n' ' ')"
   fi
 
@@ -9565,6 +9575,7 @@ _test_docs_prose_drift() {
     # (a profile renamed/removed in the script but left in the docs). Deprecated aliases are
     # owned by the alias check above, so skip them here to avoid double-reporting.
     local stale_hit=0 heading
+    # shellcheck disable=SC2016  # the grep/sed feeding this loop use literal regex (backtick + `$` end-anchor) — must NOT shell-expand
     while read -r heading; do
       [[ -n "$heading" ]] || continue
       [[ "$heading" == "dv-archival" || "$heading" == "streaming" ]] && continue
