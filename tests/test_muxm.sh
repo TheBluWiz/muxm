@@ -1253,6 +1253,15 @@ _test_cli_flag_drift() {
     else
       fail "Flags accepted by parser but missing from the man page: ${undoc_man}"
     fi
+
+    # D8: the --sub-lang-pref man-page entry must state the inclusion-filter / source-order
+    # semantics (not a ranking). "source order" is the single distinctive anchor — red→green for
+    # the doc edit; the behavioral lock lives in _test_unit_build_subtitle_lists.
+    if grep -qF 'source order' "$man_src"; then
+      pass "D8: man page documents --sub-lang-pref source-order (inclusion-filter) semantics"
+    else
+      fail "D8: man page missing the --sub-lang-pref 'source order' clarification"
+    fi
   fi
 
   # ---- Assertion B: every --create-config override var is tracked (else silently dropped) ----
@@ -7377,15 +7386,16 @@ _test_unit_build_subtitle_lists() {
   body_bskl="$(_extract_muxm_fns _build_subtitle_keep_list _is_text_sub_codec)" \
     || { fail "2.4: could not extract _build_subtitle_keep_list + _is_text_sub_codec"; return; }
 
-  # $1=space-sep langs  $2=space-sep codecs (parallel). Emits the picked relidx (or empty).
+  # $1=space-sep langs  $2=space-sep codecs (parallel)  [$3=SUB_LANG_PREF, default eng].
+  # Emits the picked relidx (or empty).
   _pdt(){
-    bash -c "SUB_LANG_PREF=eng
+    bash -c "SUB_LANG_PREF=\"\$3\"
 _LANGS=(\$1); _CODECS=(\$2)
 list_sub_indices(){ local k; for k in \"\${!_LANGS[@]}\"; do echo \"\$k\"; done; }
 _sp_sub_lang(){ echo \"\${_LANGS[\$1]}\"; }
 _sp_sub_field(){ echo \"\${_CODECS[\$1]}\"; }
 $body_pdt
-_pick_direct_text_sub_relidx" -- "$1" "$2"
+_pick_direct_text_sub_relidx" -- "$1" "$2" "${3:-eng}"
   }
   # $1=langs $2=types $3=SUB_MAX_TRACKS $4=extra flags. Codec=subrip, MUX=matroska (so text subs
   # always clear the container filter). Emits the kept-index list.
@@ -7410,6 +7420,14 @@ _build_subtitle_keep_list" -- "$1" "$2" "$3" "$4"
   _sub_assert "2.4 keep: lang+type filter keeps eng forced/full/sdh, drops fre"     "0 2 3" "$(_bskl 'eng fre eng eng' 'full full forced sdh' 3 '')"
   _sub_assert "2.4 keep: SUB_INCLUDE_SDH=0 drops the sdh track"                     "0 1"   "$(_bskl 'eng eng eng' 'full forced sdh' 3 'SUB_INCLUDE_SDH=0')"
   _sub_assert "2.4 keep: SUB_MAX_TRACKS caps 4→2"                                   "0 1"   "$(_bskl 'eng eng eng eng' 'full full full full' 2 '')"
+
+  # D8: --sub-lang-pref is an inclusion FILTER, not a ranking — locks the semantics documented
+  # in the man page / README (Phase 5, option A). With "fra,eng" listed but eng appearing first
+  # in SOURCE order, the single-track picker returns eng (index 0): list order does NOT prefer
+  # French. If anyone ever implements list-order ranking, this assertion flips and forces a doc
+  # update. The companion man-page wording check lives in the cli/docs flag-drift test.
+  _sub_assert "D8: sub-lang-pref is source-order, not list-order (fra,eng → eng at 0)" 0 "$(_pdt 'eng fra' 'subrip subrip' 'fra,eng')"
+  _sub_assert "D8: sub-lang-pref filters to the listed set (fra only → fra at 1)"      1 "$(_pdt 'eng fra' 'subrip subrip' 'fra')"
 }
 
 _test_unit_report_add_escaping() {

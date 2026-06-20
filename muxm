@@ -2099,7 +2099,10 @@ On Linux, \fB\-\-hw\-accel\fR is accepted but encoding always runs in software.
 Select specific audio stream index (0\-based).
 .TP
 .BR \-\-audio\-lang\-pref " " \fILIST\fR
-Preferred audio languages (comma\-separated, e.g., eng,spa).
+Preferred audio languages (comma\-separated, e.g., eng,spa). In single\-track
+selection a language match adds a scoring bonus (see \(lqAudio Track Selection\(rq
+below) \(em it feeds scoring rather than dropping tracks like the
+\fB\-\-sub\-lang\-pref\fR inclusion filter.
 .TP
 .BR \-\-audio\-force\-codec " " \fICODEC\fR
 Force all audio to a specific codec (e.g., aac).
@@ -2186,7 +2189,13 @@ is set on the CLI (the explicit flag wins).
 Disable all subtitle processing.
 .TP
 .BR \-\-sub\-lang\-pref " " \fILIST\fR
-Preferred subtitle languages (comma\-separated).
+Subtitle language inclusion filter (comma\-separated set): keep only tracks whose
+language is in the list; empty keeps all languages. This is a set, not a ranked
+preference \(em in single\-track mode the track chosen per type is the first match
+in source order, not the first language listed (so
+.B \-\-sub\-lang\-pref fra,eng
+does not prefer French over an English track that appears earlier in the source).
+Contrast \fB\-\-audio\-lang\-pref\fR, which feeds the audio scoring algorithm.
 .TP
 .BR \-\-sub\-burn\-forced " , " \-\-no\-sub\-burn\-forced
 Burn/don't burn forced subtitles into the video stream.
