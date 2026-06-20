@@ -5240,8 +5240,11 @@ test_output() {
   fi
   if [[ -f "$d2_sw_out" && -s "$d2_sw_out" ]]; then
     d2_sw_title="$(ffprobe -v error -show_entries format_tags=title -of default=nw=1:nk=1 "$d2_sw_out" 2>/dev/null)"
-    [[ -z "$d2_sw_title" ]] && pass "D2: switched-path output has metadata stripped" \
-      || fail "D2: switched-path output retained title='$d2_sw_title'"
+    if [[ -z "$d2_sw_title" ]]; then
+      pass "D2: switched-path output has metadata stripped"
+    else
+      fail "D2: switched-path output retained title='$d2_sw_title'"
+    fi
   fi
 
   # Also (D2): the archive conflict note "Metadata will be stripped as requested" is now truthful.
@@ -5262,8 +5265,11 @@ test_output() {
   fi
   if [[ -f "$d2_arch_out" && -s "$d2_arch_out" ]]; then
     d2_arch_title="$(ffprobe -v error -show_entries format_tags=title -of default=nw=1:nk=1 "$d2_arch_out" 2>/dev/null)"
-    [[ -z "$d2_arch_title" ]] && pass "D2: archive 'stripped as requested' note is now truthful (title gone)" \
-      || fail "D2: archive promised a strip but title='$d2_arch_title' survived"
+    if [[ -z "$d2_arch_title" ]]; then
+      pass "D2: archive 'stripped as requested' note is now truthful (title gone)"
+    else
+      fail "D2: archive promised a strip but title='$d2_arch_title' survived"
+    fi
   else
     fail "D2: archive skip-if-ideal produced no output"
   fi
