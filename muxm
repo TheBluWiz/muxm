@@ -8801,12 +8801,19 @@ select_best_audio(){
   printf '%s\n' "${best_line#*$'\t'}"
 }
 
-# Check if audio codec can be direct-play copied to MP4
-# SYNC: Codecs listed here can reach do_copy=1 in run_audio_pipeline.
-#   Any codec added here MUST have a valid ffmpeg muxer extension — if not,
-#   add a mapping in _audio_copy_ext().  See also: audio_is_lossless().
+# Check whether a TARGET DEVICE can Direct Play this audio codec — independent of MUX_FORMAT.
+# This answers the device-capability question ("will Apple TV / Plex Direct Play stream-copy this
+# track untouched?"), NOT the container question ("can this container physically hold the codec?").
+# The two were conflated (F1): aliasing _sii_audio_is_container_safe() made EVERY codec "copyable"
+# on a matroska target, so atv-directplay-* / streaming-* (MKV) would stream-copy TrueHD/DTS-HD MA
+# the device cannot Direct Play, instead of transcoding to E-AC-3 as documented. The whitelist
+# below is the real device set; container fitness stays in _sii_audio_is_container_safe() /
+# audio_lossless_muxable() (used by the lossless-passthrough and native-stereo copy paths).
+# SYNC: Codecs listed here can reach do_copy=1 via Step 3 of run_audio_pipeline. Each MUST have a
+#   valid ffmpeg muxer extension in _audio_copy_ext() (aac/ac3/eac3 pass through; alac→m4a).
+#   See also: audio_is_lossless() (lossless-passthrough path), _sii_audio_is_container_safe().
 audio_is_direct_play_copyable(){
-  _sii_audio_is_container_safe "$1"
+  case "$1" in aac|ac3|eac3|alac) return 0 ;; *) return 1 ;; esac
 }
 
 # Check if audio codec is lossless (for AUDIO_LOSSLESS_PASSTHROUGH)

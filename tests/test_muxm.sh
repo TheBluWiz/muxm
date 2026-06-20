@@ -4436,6 +4436,177 @@ EOF
   rm -f "$_l6_src"
 
   _test_audio_native_stereo
+  _test_audio_f1_directplay
+}
+
+# F1: device Direct-Play correctness on MKV targets. audio_is_direct_play_copyable() used to
+# alias the container-fitness predicate (_sii_audio_is_container_safe), which returns true for
+# EVERY codec on a matroska target — so atv-directplay-* / streaming-* (MKV) stream-copied
+# TrueHD/DTS-HD MA the device cannot Direct Play, instead of transcoding to E-AC-3 as documented.
+# These real-encode cases assert the OUTPUT audio codec (ground truth): eac3 means Step 3 fell
+# through to the transcode AND skip-if-ideal did not short-circuit (a wrongful copy/remux would
+# surface the original truehd/dts). Pre-fix, (a)/(b)/(c) produced truehd/dts and went red.
+_test_audio_f1_directplay() {
+  section "F1: audio Direct-Play transcode on MKV targets"
+
+  # 5.1 (6ch) surround sources in MKV. dca's ffprobe name is "dts" (a faithful DTS-HD MA proxy:
+  # the predicate rejects "dts" regardless of the HD-MA extension ffmpeg can't synthesize).
+  local _thd="$TESTDIR/f1_truehd_51.mkv" _dts="$TESTDIR/f1_dts_51.mkv" _eac="$TESTDIR/f1_eac3_51.mkv"
+  local _spec
+  for _spec in "truehd:$_thd:truehd" "dca:$_dts:dts" "eac3:$_eac:eac3"; do
+    local _enc="${_spec%%:*}" _rest="${_spec#*:}"; local _f="${_rest%%:*}"
+    if ffmpeg_has_encoder "$_enc" && [[ ! -f "$_f" ]]; then
+      ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=green:s=320x240:r=24:d=1" \
+        -f lavfi -i "sine=duration=1" -c:v libx265 -preset ultrafast -crf 30 \
+        -strict -2 -c:a "$_enc" -ac 6 -metadata:s:a:0 language=eng "$_f" 2>/dev/null || true
+    fi
+  done
+
+  local _out _ac
+
+  # (a) PRIMARY: atv-directplay-hq + TrueHD/MKV → eac3 (not stream-copied). eac3 also proves
+  #     skip-if-ideal did not short-circuit (a remux would have surfaced truehd in the output).
+  # Skip-first guard (not an else-skip) per the soft-skip ratchet, _test_meta_soft_skip.
+  if [[ ! -s "$_thd" ]]; then
+    skip "F1: TrueHD 5.1 fixture unavailable (ffmpeg truehd encoder)"
+  else
+    _out="$TESTDIR/f1_atv_thd.mkv"; rm -f "$_out"
+    if assert_encode "F1: atv-directplay-hq + TrueHD/MKV encodes" "$_out" \
+         --profile atv-directplay-hq --preset ultrafast --crf 30 "$_thd"; then
+      _ac="$(probe_audio "$_out" codec_name 0)"
+      if [[ "$_ac" == "eac3" ]]; then
+        pass "F1: atv-directplay-hq + TrueHD/MKV → transcoded to eac3 (not Direct-Play copied)"
+      else
+        fail "F1: atv-directplay-hq + TrueHD/MKV → expected eac3, got '${_ac:-none}' (TrueHD wrongly copied?)"
+      fi
+    fi
+    rm -f "$_out"
+  fi
+
+  # (b) atv-directplay-hq + DTS/MKV → eac3 (same pre-fix failure as TrueHD).
+  # Skip-first guard (not an else-skip) per the soft-skip ratchet, _test_meta_soft_skip.
+  if [[ ! -s "$_dts" ]]; then
+    skip "F1: DTS 5.1 fixture unavailable (ffmpeg dca encoder)"
+  else
+    _out="$TESTDIR/f1_atv_dts.mkv"; rm -f "$_out"
+    if assert_encode "F1: atv-directplay-hq + DTS/MKV encodes" "$_out" \
+         --profile atv-directplay-hq --preset ultrafast --crf 30 "$_dts"; then
+      _ac="$(probe_audio "$_out" codec_name 0)"
+      if [[ "$_ac" == "eac3" ]]; then
+        pass "F1: atv-directplay-hq + DTS/MKV → transcoded to eac3 (not Direct-Play copied)"
+      else
+        fail "F1: atv-directplay-hq + DTS/MKV → expected eac3, got '${_ac:-none}'"
+      fi
+    fi
+    rm -f "$_out"
+  fi
+
+  # (c) Regression guard: streaming-hevc forced to MKV + TrueHD → eac3 (shares the matroska risk).
+  if [[ -s "$_thd" ]]; then
+    _out="$TESTDIR/f1_streaming_thd.mkv"; rm -f "$_out"
+    if assert_encode "F1: streaming-hevc --output-ext mkv + TrueHD encodes" "$_out" \
+         --profile streaming-hevc --output-ext mkv --preset ultrafast --crf 30 "$_thd"; then
+      _ac="$(probe_audio "$_out" codec_name 0)"
+      if [[ "$_ac" == "eac3" ]]; then
+        pass "F1: streaming-hevc(mkv) + TrueHD → transcoded to eac3"
+      else
+        fail "F1: streaming-hevc(mkv) + TrueHD → expected eac3, got '${_ac:-none}'"
+      fi
+    fi
+    rm -f "$_out"
+  fi
+
+  # (d) MP4-target sanity (existing-correct path, unchanged by the fix): streaming-hevc default
+  #     mp4 + TrueHD source → eac3. The mp4 whitelist already rejected truehd pre- and post-fix.
+  if [[ -s "$_thd" ]]; then
+    _out="$TESTDIR/f1_streaming_thd.mp4"; rm -f "$_out"
+    if assert_encode "F1: streaming-hevc(mp4) + TrueHD encodes" "$_out" \
+         --profile streaming-hevc --preset ultrafast --crf 30 "$_thd"; then
+      _ac="$(probe_audio "$_out" codec_name 0)"
+      if [[ "$_ac" == "eac3" ]]; then
+        pass "F1: streaming-hevc(mp4) + TrueHD → eac3 (mp4 path still correct)"
+      else
+        fail "F1: streaming-hevc(mp4) + TrueHD → expected eac3, got '${_ac:-none}'"
+      fi
+    fi
+    rm -f "$_out"
+  fi
+
+  # (e) No-regression: a genuine Direct-Play codec (eac3) on an MKV target STILL copies — the
+  #     whitelist must not force a needless re-encode. --no-skip-if-ideal makes the audio
+  #     pipeline run so Step 3's copy decision is observable in the log.
+  if [[ -s "$_eac" ]]; then
+    _out="$TESTDIR/f1_atv_eac3.mkv"; rm -f "$_out"
+    local _log _code=0
+    _log="$(cd "$TESTDIR" && "$MUXM" -K --no-skip-if-ideal --profile atv-directplay-hq \
+      --preset ultrafast --crf 30 "$_eac" "$_out" 2>&1)" || _code=$?
+    if [[ "$_code" -eq 0 && -s "$_out" ]]; then
+      _ac="$(probe_audio "$_out" codec_name 0)"
+      if [[ "$_ac" == "eac3" ]] && printf '%s' "$_log" | grep -qiE 'Direct Play audio codec detected|Copying without conversion'; then
+        pass "F1: atv-directplay-hq + EAC-3/MKV → stream-copied (no needless transcode)"
+      else
+        fail "F1: atv-directplay-hq + EAC-3/MKV → expected copied eac3, got '${_ac:-none}' (transcoded?)"
+      fi
+    else
+      fail "F1: atv-directplay-hq + EAC-3/MKV → encode failed (exit $_code)"
+    fi
+    rm -f "$_out"
+  fi
+
+  # (f) Exercise the skip-if-ideal AUDIO gate itself (check_skip_if_ideal's
+  #     audio_is_direct_play_copyable call) — cases (a)-(c) above can't, because their explicit
+  #     --crf/--preset force non-ideal at the CLI-override check before the audio gate is reached.
+  _test_audio_f1_sii_gate "$_thd"
+
+  rm -f "$_thd" "$_dts" "$_eac"
+}
+
+# F1 — skip-if-ideal AUDIO gate (check_skip_if_ideal, the audio_is_direct_play_copyable call).
+# With copy-compliant video and skip-if-ideal ENABLED, a TrueHD track must mark the source
+# non-ideal so the pipeline runs and transcodes to eac3. Pre-fix the gate saw truehd as "ideal"
+# on matroska, fired the skip, and remuxed TrueHD untouched — the release-blocker scenario for a
+# compliant source. The eac3 control proves the source is genuinely ideal-eligible (so the truehd
+# case can't pass for the wrong reason). NOTE: never pass --crf/--preset to the skip-if-ideal
+# runs — an explicit CRF/preset forces non-ideal at the CLI-override check, short-circuiting
+# before the audio gate. Skip-first guards (with return), not else-skips, per the soft-skip ratchet.
+_test_audio_f1_sii_gate() {
+  local _thd="$1"
+  if [[ ! -s "$_thd" ]]; then
+    skip "F1: skip-if-ideal gate — TrueHD fixture unavailable"
+    return
+  fi
+  # One-time real encode → a known atv-directplay-hq-compliant base (HEVC video + eac3 audio).
+  local _base="$TESTDIR/f1_sii_base.mkv"; rm -f "$_base"
+  run_muxm --no-skip-if-ideal --profile atv-directplay-hq --preset ultrafast "$_thd" "$_base" >/dev/null 2>&1 || true
+  # Control: the compliant eac3 base must SKIP — proving it's ideal-eligible and the gate runs.
+  local _ctrl_out="$TESTDIR/f1_sii_ctrl.mkv"; rm -f "$_ctrl_out"
+  local _ctrl_log
+  _ctrl_log="$(cd "$TESTDIR" && "$MUXM" -K --profile atv-directplay-hq "$_base" "$_ctrl_out" 2>&1)" || true
+  if ! printf '%s' "$_ctrl_log" | grep -qE 'Source already matches profile|skipping processing'; then
+    skip "F1: skip-if-ideal gate — could not build an ideal-eligible source on this host"
+    rm -f "$_base" "$_ctrl_out"
+    return
+  fi
+  pass "F1: skip-if-ideal control — compliant eac3 source skips processing (audio gate reached)"
+  # Swap a TrueHD track onto the same compliant video (stream-copy, no re-encode).
+  local _thd_base="$TESTDIR/f1_sii_thd.mkv"; rm -f "$_thd_base"
+  ffmpeg -hide_banner -loglevel error -y -i "$_base" -i "$_thd" -map 0:v:0 -map 1:a:0 \
+    -c copy -metadata:s:a:0 language=eng "$_thd_base" 2>/dev/null || true
+  if [[ ! -s "$_thd_base" ]]; then
+    skip "F1: skip-if-ideal gate — could not mux TrueHD onto the compliant base"
+    rm -f "$_base" "$_ctrl_out"
+    return
+  fi
+  local _gate_out="$TESTDIR/f1_sii_thd_out.mkv"; rm -f "$_gate_out"
+  local _gate_log _gate_ac
+  _gate_log="$(cd "$TESTDIR" && "$MUXM" -K --profile atv-directplay-hq "$_thd_base" "$_gate_out" 2>&1)" || true
+  _gate_ac="$(probe_audio "$_gate_out" codec_name 0)"
+  if [[ "$_gate_ac" == "eac3" ]] && ! printf '%s' "$_gate_log" | grep -qE 'Source already matches profile|skipping processing'; then
+    pass "F1: skip-if-ideal + compliant video + TrueHD → gate forces transcode to eac3 (no skip)"
+  else
+    fail "F1: skip-if-ideal + compliant video + TrueHD → expected eac3 with no skip, got '${_gate_ac:-none}' (skip-if-ideal wrongly short-circuited TrueHD?)"
+  fi
+  rm -f "$_base" "$_ctrl_out" "$_thd_base" "$_gate_out"
 }
 
 _test_audio_native_stereo() {
@@ -6299,20 +6470,27 @@ _test_unit_audio_helpers() {
   assert_muxm_fn_exit "_audio_is_commentary('Comentario...')=match (Spanish)"  0 _audio_is_commentary "" "Comentario del director"
 
   # ---- audio_is_direct_play_copyable ----
-  # Gatekeeper for the audio pipeline's biggest branch: copy vs transcode.
-  # A regression (e.g., dropping eac3) silently forces unnecessary transcoding.
-  # Since audio_is_direct_play_copyable now delegates to _sii_audio_is_container_safe (M2),
-  # tests must supply the stub and a container context (mp4 = most common direct-play target).
-  # shellcheck disable=SC2016 # $MUX_FORMAT/$c must NOT expand here; they expand at eval time inside bash -c.
-  local _sii_stub='_sii_audio_is_container_safe(){ local c=$1; [[ $MUX_FORMAT == matroska ]] && return 0; case $MUX_FORMAT in mp4|mov|m4v) case $c in aac|ac3|eac3|alac) return 0;; *) return 1;; esac;; esac; return 1; }'
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('aac')=copyable"       0 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "aac"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('alac')=copyable"      0 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "alac"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('ac3')=copyable"       0 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "ac3"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('eac3')=copyable"      0 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "eac3"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('truehd')=not copyable" 1 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "truehd"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('dts')=not copyable"   1 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "dts"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('flac')=not copyable"  1 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "flac"
-  assert_muxm_fn_exit "audio_is_direct_play_copyable('opus')=not copyable"  1 audio_is_direct_play_copyable "${_sii_stub}; MUX_FORMAT=mp4" "opus"
+  # Gatekeeper for the audio pipeline's biggest branch: copy vs transcode (Step 3 of
+  # run_audio_pipeline). A regression dropping a codec (e.g. eac3) silently forces unnecessary
+  # transcoding; wrongly adding one stream-copies a track the device can't Direct Play.
+  # F1: this is the DEVICE Direct-Play whitelist {aac,ac3,eac3,alac} and is INDEPENDENT of
+  # MUX_FORMAT — it no longer delegates to _sii_audio_is_container_safe(), so no container stub
+  # is needed. The matroska cases below are the regression guard: pre-fix the alias returned 0
+  # for EVERY codec on a matroska target, so truehd/dts were wrongly "copyable".
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('aac')=copyable"        0 audio_is_direct_play_copyable "" "aac"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('alac')=copyable"       0 audio_is_direct_play_copyable "" "alac"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('ac3')=copyable"        0 audio_is_direct_play_copyable "" "ac3"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('eac3')=copyable"       0 audio_is_direct_play_copyable "" "eac3"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('truehd')=not copyable" 1 audio_is_direct_play_copyable "" "truehd"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('dts')=not copyable"    1 audio_is_direct_play_copyable "" "dts"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('flac')=not copyable"   1 audio_is_direct_play_copyable "" "flac"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('opus')=not copyable"   1 audio_is_direct_play_copyable "" "opus"
+  # F1 regression guard: decision is MUX_FORMAT-independent. Pre-fix these all returned 0
+  # (copyable) on a matroska target; truehd/dts must now be rejected, aac/eac3 still accepted.
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('truehd',mkv)=not copyable" 1 audio_is_direct_play_copyable "MUX_FORMAT=matroska" "truehd"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('dts',mkv)=not copyable"    1 audio_is_direct_play_copyable "MUX_FORMAT=matroska" "dts"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('eac3',mkv)=copyable"       0 audio_is_direct_play_copyable "MUX_FORMAT=matroska" "eac3"
+  assert_muxm_fn_exit "audio_is_direct_play_copyable('aac',mkv)=copyable"        0 audio_is_direct_play_copyable "MUX_FORMAT=matroska" "aac"
 
   # ---- audio_is_lossless ----
   # Controls AUDIO_LOSSLESS_PASSTHROUGH path. If a codec is accidentally omitted,
@@ -6412,9 +6590,12 @@ _test_unit_audio_helpers() {
 
   # ---- audio_lossless_muxable ----
   # Tests container+codec compatibility matrix for lossless passthrough.
-  # Depends on MUX_FORMAT global. Since audio_lossless_muxable delegates to
-  # _sii_audio_is_container_safe (M2), stub must be in env_setup.
-  # Canonical mp4 set: {aac,ac3,eac3,alac}; flac is NOT muxable in mp4 (spec M2).
+  # Depends on MUX_FORMAT global. audio_lossless_muxable delegates to
+  # _sii_audio_is_container_safe (the container-fitness predicate — unlike
+  # audio_is_direct_play_copyable, which is now an independent device whitelist, F1), so the
+  # stub must be in env_setup. Canonical mp4 set: {aac,ac3,eac3,alac}; flac is NOT muxable in mp4.
+  # shellcheck disable=SC2016 # $MUX_FORMAT/$c must NOT expand here; they expand at eval time inside bash -c.
+  local _sii_stub='_sii_audio_is_container_safe(){ local c=$1; [[ $MUX_FORMAT == matroska ]] && return 0; case $MUX_FORMAT in mp4|mov|m4v) case $c in aac|ac3|eac3|alac) return 0;; *) return 1;; esac;; esac; return 1; }'
   assert_muxm_fn_exit "audio_lossless_muxable('truehd','matroska')=muxable"     0 audio_lossless_muxable "${_sii_stub}; MUX_FORMAT=matroska" "truehd"
   assert_muxm_fn_exit "audio_lossless_muxable('flac','matroska')=muxable"       0 audio_lossless_muxable "${_sii_stub}; MUX_FORMAT=matroska" "flac"
   assert_muxm_fn_exit "audio_lossless_muxable('alac','mp4')=muxable"            0 audio_lossless_muxable "${_sii_stub}; MUX_FORMAT=mp4"      "alac"
