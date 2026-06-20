@@ -17,7 +17,7 @@ muxm --profile <name> --print-effective-config
 
 | Profile | Container | Codec | Audio | Use when… |
 |---|---|---|---|---|
-| `archive` | source ext | copy | lossless copy | You want a bit-perfect archive with DV + HDR10 intact. |
+| `archive` | MKV | copy | lossless copy | You want a bit-perfect archive with DV + HDR10 intact. |
 | `hdr10-hq` | MKV | HEVC | lossless | Your gear is HDR10 but not Dolby Vision. |
 | `av1-hq` | MKV | AV1 (SVT) | lossless | High-quality AV1 archive for AV1-capable playback. |
 | `atv-directplay-hq` | source ext | HEVC | E-AC-3 | Plex → Apple TV 4K and you never want transcoding. |
@@ -47,8 +47,8 @@ target. Generate a JSON report and SHA-256 checksum for archival integrity.
 
 - Video is stream-copied, never re-encoded (unless the source is non-compliant
   and a re-encode is explicitly requested via CLI override).
-- Container follows the source: MKV sources stay MKV, MP4 sources stay MP4.
-  Unsupported source containers fall back to MKV.
+- Container is always MKV — it can hold any codec losslessly, so an MP4/MOV
+  source is re-muxed to MKV with bit-identical streams (nothing is re-encoded).
 - All audio tracks matching the language filter are copied losslessly. Commentary
   tracks are excluded by default.
 - All subtitle tracks are kept (up to `SUB_MAX_TRACKS`, default 99). Forced
@@ -291,7 +291,7 @@ size.
 - Forced subtitles are embedded as soft subs (mov_text).
 - All other dialogue subtitles (excluding SDH) exported as an external `.srt`
   file for upload to YouTube Studio.
-- Non-essential metadata stripped; chapters stripped.
+- Non-essential metadata stripped; chapters preserved.
 
 **CLI:** `muxm --profile youtube-upload movie.mkv`  
 **Script:** `apply_profile_youtube_upload()` — Section 11

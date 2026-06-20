@@ -588,11 +588,17 @@ spinner() {
   local pid=$1 msg=$2 i=0
   local -a sym=( '|' '/' '—' $'\\' )
   local -i show=1
-  [[ -t ${TERM_FD:-2} ]] || show=0
+  local _poll=0.2
+  # Non-interactive (piped / CI / test harness): there is no animation to display, so poll far
+  # more frequently. On small inputs an ffmpeg pass often finishes in <0.1s, where the 0.2s poll
+  # added ~0.2s of pure wait *per pass* — the single biggest contributor to test-suite wall time.
+  # The visible interactive spinner keeps its smooth 0.2s cadence. Contract is unchanged: this
+  # still only polls `kill -0` and never calls `wait` (callers own the wait + exit status).
+  [[ -t ${TERM_FD:-2} ]] || { show=0; _poll=0.02; }
   while kill -0 "$pid" 2>/dev/null; do
     (( show )) && _term_print '\r  %s  [ %s ]' "$msg" "${sym[i]}" || true
     i=$(( (i+1) % 4 ))
-    sleep 0.2
+    sleep "$_poll"
   done
   (( show )) && _term_print '\r  %s  [ done ]\n' "$msg" || true
 }
@@ -1098,11 +1104,19 @@ is_apple_silicon(){
 
 # ffmpeg_has_encoder — returns 0 if ffmpeg reports the named encoder.
 # Args: $1 — encoder name as listed by `ffmpeg -encoders` (e.g. hevc_videotoolbox).
-# Safe to call before tool validation: if ffmpeg is absent, grep returns 1 (not found).
+# Safe to call before tool validation: if ffmpeg is absent, the cache is empty and grep returns 1.
+# The encoder list is invariant for the life of the process, so it is fetched once and memoized —
+# previously each call (HW detection, AV1 gating) re-spawned `ffmpeg -encoders` (large output).
+_FFMPEG_ENCODERS_CACHE=""
+_FFMPEG_ENCODERS_CACHED=0
 ffmpeg_has_encoder(){
   local name="$1"
   [[ -n "$name" ]] || return 1
-  ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}' | grep -qx "$name"
+  if (( ! _FFMPEG_ENCODERS_CACHED )); then
+    _FFMPEG_ENCODERS_CACHE="$(ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}')"
+    _FFMPEG_ENCODERS_CACHED=1
+  fi
+  grep -qx "$name" <<<"$_FFMPEG_ENCODERS_CACHE"
 }
 
 # _ffmpeg_bin_is_complete — true if the given ffmpeg binary has every capability muxm's full
@@ -5713,10 +5727,10 @@ fi
 # Check AV1 encoder availability when libsvt-av1 or libaom-av1 is requested.
 # Non-fatal probe: warn if not available now; die when actually selected at runtime.
 if [[ "$VIDEO_CODEC" == "libsvt-av1" || "$VIDEO_CODEC" == "libaom-av1" ]]; then
-  if [[ "$VIDEO_CODEC" == "libsvt-av1" ]] && ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libsvtav1'; then
+  if [[ "$VIDEO_CODEC" == "libsvt-av1" ]] && ! ffmpeg_has_encoder libsvtav1; then
     die 10 "libsvtav1 encoder not available in this ffmpeg build. Install a complete ffmpeg (e.g., brew install ffmpeg-full, or run muxm --install-dependencies)."
   fi
-  if [[ "$VIDEO_CODEC" == "libaom-av1" ]] && ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libaom-av1'; then
+  if [[ "$VIDEO_CODEC" == "libaom-av1" ]] && ! ffmpeg_has_encoder libaom-av1; then
     die 10 "libaom-av1 encoder not available in this ffmpeg build. Install a complete ffmpeg (e.g., brew install ffmpeg-full, or run muxm --install-dependencies)."
   fi
 fi
@@ -11598,14 +11612,16 @@ main() {
     say "  DRY-RUN: ffprobe verify $TMP_OUT"
     say "  DRY-RUN: size of $TMP_OUT"
   else
-    # Full ffprobe dump → log only (not to terminal)
-    log "--- ffprobe output streams (full) ---"
-    ffprobe -hide_banner -show_streams "$TMP_OUT" 2>/dev/null >> "$LOGFILE" || true
+    # One ffprobe of the output, reused for both the full log dump and the compact summary below
+    # (was two separate -show_streams spawns of the same file). The JSON is written to the log —
+    # it is complete, and no assertion parses this dump (only muxm's own log lines are grepped).
+    local verify_json
+    verify_json="$(ffprobe -v error -show_streams -of json "$TMP_OUT" 2>/dev/null)" || true
+    log "--- ffprobe output streams (full, json) ---"
+    printf '%s\n' "${verify_json:-<no ffprobe output>}" >> "$LOGFILE" 2>/dev/null || true
     log "--- end ffprobe output ---"
 
     # Compact stream summary → terminal + log (via say)
-    local verify_json
-    verify_json="$(ffprobe -v error -show_streams -of json "$TMP_OUT" 2>/dev/null)" || true
     if [[ -n "${verify_json:-}" ]]; then
       # Batch: fetch all video summary fields in a single jq call
       local v_codec v_res v_fps s_count _v_summary

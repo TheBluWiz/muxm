@@ -94,7 +94,7 @@ muxm --profile hdr10-hq movie.mkv
 
 ### `atv-directplay-hq` — Apple TV Direct Play
 
-Targets true Direct Play on Apple TV 4K via Plex: MP4 container, HEVC Main10 with DV Profile 8.1 when possible, E-AC-3 surround (with Atmos JOC when present), and soft forced subtitles (mov_text). Copies compliant video without re-encoding. Skips processing if source is already ATV-compliant.
+Targets true Direct Play on Apple TV 4K via Plex: MP4 or MKV container (follows the source container — both Direct Play via Plex/Infuse), HEVC Main10 with DV Profile 8.1 when possible, E-AC-3 surround (with Atmos JOC when present), and soft forced subtitles (mov_text). Copies compliant video without re-encoding. Skips processing if source is already ATV-compliant.
 
 ```bash
 muxm --profile atv-directplay-hq movie.mkv

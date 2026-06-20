@@ -10600,6 +10600,67 @@ _test_docs_prose_drift() {
         || { fail "Stale profile heading '$heading' in docs/config_profile.md — not in VALID_PROFILES"; stale_hit=1; }
     done < <(grep -oE '^### `[a-z0-9][a-z0-9-]*`' "$cfgprofile" | sed -E 's/^### `//; s/`$//')
     (( stale_hit )) || pass "docs/config_profile.md has no stale profile headings (all map to VALID_PROFILES)"
+
+    # ---- Container column cross-check (Phase 4 / D1-D2 guard) ----
+    # The config_profile.md profile table's "Container" column must match each profile's LIVE
+    # OUTPUT_EXT: mkv→"MKV", mp4→"MP4", ""(passthrough)→"source ext". This is what catches the
+    # D2 class (archive's stale "source ext" while OUTPUT_EXT="mkv"). Any OUTPUT_EXT without a
+    # mapping below FAILS — never a silent pass. NOTE: the README profile table has no Container
+    # column, so README container prose (D1) is a hand-fix only and is intentionally NOT guarded.
+    local cont_bad=0 cf_table fn ext expected cell
+    cf_table="$(awk '/^\|[[:space:]]*Profile[[:space:]]*\|[[:space:]]*Container[[:space:]]*\|/{f=1} f{print} f&&/^[[:space:]]*$/{exit}' "$cfgprofile")"
+    if [[ -z "$cf_table" ]]; then
+      fail "docs/config_profile.md container table (\"| Profile | Container |\" header) not found — container cross-check could not run"
+    else
+      for p in $canonical; do
+        fn="apply_profile_$(printf '%s' "$p" | tr '-' '_')"
+        ext="$(awk "/^$fn\\(\\)[[:space:]]*\\{/,/^\\}/" "$MUXM" | grep -oE 'OUTPUT_EXT="[^"]*"' | head -1 | sed -E 's/OUTPUT_EXT="([^"]*)"/\1/')"
+        case "$ext" in
+          mkv) expected="MKV" ;;
+          mp4) expected="MP4" ;;
+          "")  expected="source ext" ;;
+          *)   fail "Profile '$p' has unmapped OUTPUT_EXT='$ext' — extend the container cross-check map"; cont_bad=1; continue ;;
+        esac
+        # Pull the profile's table row; column 2 (between 1st/2nd '|') is the Container cell.
+        cell="$(printf '%s\n' "$cf_table" | awk -F'|' -v name="$p" '
+          { k=$2; gsub(/[`\t ]/,"",k); if (k==name) { c=$3; gsub(/^[ \t]+|[ \t]+$/,"",c); print c; exit } }')"
+        [[ -n "$cell" ]] || continue   # missing row already reported by the name check above
+        if [[ "$cell" != "$expected" ]]; then
+          fail "config_profile.md Container for '$p' is '$cell', but OUTPUT_EXT='$ext' → expected '$expected'"
+          cont_bad=1
+        fi
+      done
+      (( cont_bad )) || pass "docs/config_profile.md Container column matches every profile's OUTPUT_EXT"
+    fi
+
+    # ---- Chapters cross-check (Phase 4 / D3 guard) ----
+    # No "Chapters" table column exists, so this scans each profile's `### section` PROSE and
+    # fires only on an UNAMBIGUOUS contradiction with the live KEEP_CHAPTERS: a keep-verb near
+    # "chapter" while KEEP_CHAPTERS=0, or a strip-verb near "chapter" while KEEP_CHAPTERS=1. The
+    # section text is whitespace-collapsed first so a line-wrapped "keep\nchapters" (archive) is
+    # seen as one phrase; a section that is silent, or that has BOTH verbs near "chapter", is
+    # skipped (no false fail). Deliberately conservative — see Review_Fixes.md Phase 4.
+    local chap_bad=0 sec keepish stripish kc
+    for p in $canonical; do
+      fn="apply_profile_$(printf '%s' "$p" | tr '-' '_')"
+      kc="$(awk "/^$fn\\(\\)[[:space:]]*\\{/,/^\\}/" "$MUXM" | grep -oE 'KEEP_CHAPTERS=[01]' | head -1 | grep -oE '[01]')"
+      [[ -n "$kc" ]] || continue
+      # Section body: from this profile's `### `name`` heading to the next `### ` (collapsed).
+      # Prefix-match (index==1), not exact: headings carry a trailing "— Title", and the closing
+      # backtick in h delimits the name so it can't match a longer profile's heading.
+      sec="$(awk -v h="### \`$p\`" 'index($0,h)==1{f=1;next} f&&/^### /{exit} f{print}' "$cfgprofile" | tr '\n' ' ')"
+      grep -qiE 'chapter' <<<"$sec" || continue   # silent on chapters → skip
+      keepish=0; stripish=0
+      grep -qiE '(keep|kept|preserv|retain)[a-z]*[^.]{0,40}chapter|chapter[^.]{0,40}(kept|preserv|retain)' <<<"$sec" && keepish=1
+      grep -qiE '(strip|remov)[a-z]*[^.]{0,40}chapter|chapter[^.]{0,40}(strip|remov)' <<<"$sec" && stripish=1
+      (( keepish == stripish )) && continue        # ambiguous (both) or no clear verb → skip
+      if (( keepish )) && (( kc == 0 )); then
+        fail "config_profile.md '$p' prose says chapters are kept, but KEEP_CHAPTERS=0"; chap_bad=1
+      elif (( stripish )) && (( kc == 1 )); then
+        fail "config_profile.md '$p' prose says chapters are stripped, but KEEP_CHAPTERS=1"; chap_bad=1
+      fi
+    done
+    (( chap_bad )) || pass "docs/config_profile.md chapters prose agrees with every profile's KEEP_CHAPTERS"
   else
     fail "docs/config_profile.md not found/readable at $cfgprofile — prose-drift guard could not run"
   fi
