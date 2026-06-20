@@ -1370,6 +1370,15 @@ test_cli() {
   _test_cli_flag_drift
   _test_cli_robustness
   _test_cli_value_flag_no_value
+
+  # F6: no advisory may emit the invalid muxm flag value `--video-codec libsvtav1`. muxm's flag
+  # value is `libsvt-av1` (hyphenated); `libsvtav1` is the ffmpeg ENCODER name, not a valid
+  # --video-codec value (it would exit 11). Source grep — a copy-pasteable advisory must be valid.
+  if grep -qE -- '--video-codec[ =]libsvtav1\b' "$MUXM"; then
+    fail "F6: an advisory emits the invalid '--video-codec libsvtav1' (should be 'libsvt-av1')"
+  else
+    pass "F6: no advisory emits an invalid '--video-codec libsvtav1' value"
+  fi
 }
 
 # M2: a value-flag used as the FINAL token (no value after it) must error cleanly —
@@ -4438,6 +4447,54 @@ EOF
   _test_audio_native_stereo
   _test_audio_f1_directplay
   _test_audio_f4_maxchannels
+  _test_audio_f7_stereo_label
+}
+
+# F7: the native-stereo-fallback track must be labeled with its REAL codec and carry the chosen
+# native track's language — not a hardcoded "aac" + the primary's language. With a surround primary
+# + a native AC-3 2ch track (same language), --stereo-fallback stream-copies the AC-3 track into an
+# MKV output; the descriptive title must read "(AC-3)", not "(AAC)". Pre-fix the title was a flat
+# "(AAC)" regardless of the copied codec (the label lied about an AC-3 stream). Skip-first guards.
+_test_audio_f7_stereo_label() {
+  section "F7: stereo-fallback codec/language labeling"
+  if ! ffmpeg_has_encoder eac3 || ! ffmpeg_has_encoder ac3; then
+    skip "F7: eac3/ac3 encoders unavailable — cannot build the surround+native-stereo fixture"; return
+  fi
+  local _dir="$TESTDIR/f7_stereo"; mkdir -p "$_dir"
+  local _src="$_dir/src.mkv"
+  # 6ch eac3 primary (eng) + 2ch ac3 native stereo (eng).
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=green:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=duration=1" -f lavfi -i "sine=frequency=660:duration=1" \
+    -map 0:v -map 1:a -map 2:a -c:v libx265 -preset ultrafast -crf 30 \
+    -c:a:0 eac3 -ac:a:0 6 -metadata:s:a:0 language=eng \
+    -c:a:1 ac3  -ac:a:1 2 -metadata:s:a:1 language=eng \
+    "$_src" 2>/dev/null || true
+  if [[ ! -s "$_src" || "$(probe_audio "$_src" channels 1)" != "2" ]]; then
+    skip "F7: could not build a surround+native-AC3-stereo fixture"; rm -rf "$_dir"; return
+  fi
+  local _out="$_dir/out.mkv"
+  run_muxm --profile atv-directplay-hq --stereo-fallback --output-ext mkv --preset ultrafast "$_src" "$_out" >/dev/null 2>&1 || true
+  local _fb_codec _fb_title _fb_lang
+  _fb_codec="$(probe_audio "$_out" codec_name 1)"
+  _fb_title="$(ffprobe -v error -select_streams a:1 -show_entries stream_tags=title -of csv=p=0 "$_out" 2>/dev/null || true)"
+  _fb_lang="$(ffprobe -v error -select_streams a:1 -show_entries stream_tags=language -of csv=p=0 "$_out" 2>/dev/null || true)"
+  if [[ "$_fb_codec" != "ac3" ]]; then
+    fail "F7: expected the native AC-3 track to be the stereo fallback (a:1), got '${_fb_codec:-none}' — fixture/selection issue"
+    rm -rf "$_dir"; return
+  fi
+  # Headline: the title names the real codec (AC-3), not the hardcoded AAC.
+  if [[ "$_fb_title" == *"AC-3"* && "$_fb_title" != *"AAC"* ]]; then
+    pass "F7: copied native AC-3 stereo fallback is labeled '(AC-3)', not '(AAC)' ('$_fb_title')"
+  else
+    fail "F7: stereo-fallback title expected '… (AC-3)', got '${_fb_title:-none}' (hardcoded AAC label?)"
+  fi
+  # The fallback carries the native track's language (eng here, sourced from the AC-3 track).
+  if [[ "$_fb_lang" == "eng" ]]; then
+    pass "F7: stereo-fallback carries the native track's language (eng)"
+  else
+    fail "F7: stereo-fallback language expected 'eng' (from the native track), got '${_fb_lang:-none}'"
+  fi
+  rm -rf "$_dir"
 }
 
 # F4: MAX_AUDIO_CHANNELS must apply on the lossless-passthrough copy path too. A lossless source
@@ -8089,6 +8146,56 @@ test_unit() {
   _test_unit_hdr10_static_metadata
   _test_unit_ocr_dispatch
   _test_unit_persist_helpers
+  _test_unit_prefer_complete_ffmpeg
+}
+
+# F5 (runtime): _prefer_complete_ffmpeg prepends the keg-only ffmpeg-full bin to PATH when the
+# active ffmpeg is incomplete (or absent), and leaves a complete ffmpeg untouched. Host-independent:
+# drives the extracted function with fake ffmpeg scripts and HOMEBREW_PREFIX pointing at a temp keg
+# (so the scan finds the fake before any real /opt/homebrew/opt/ffmpeg-full). PATH=/usr/bin:/bin in
+# the no-ffmpeg case provides grep/awk without an ffmpeg.
+_test_unit_prefer_complete_ffmpeg() {
+  local body
+  body="$(_extract_muxm_fns _prefer_complete_ffmpeg _ffmpeg_bin_is_complete)" \
+    || { fail "F5-rt: could not extract _prefer_complete_ffmpeg + _ffmpeg_bin_is_complete"; return; }
+  local d; d="$(mktemp -d)"
+  mkdir -p "$d/opt/ffmpeg-full/bin" "$d/onpath" "$d/custom"
+  local complete='#!/bin/bash
+if [[ "$1" == "-version" ]]; then echo "ffmpeg with --enable-libass"; exit 0; fi
+printf "%s\n" " V..... libsvtav1   x" " V..... libaom-av1  x"; exit 0'
+  local incomplete='#!/bin/bash
+if [[ "$1" == "-version" ]]; then echo "ffmpeg version 6.0"; exit 0; fi
+printf "%s\n" " V..... libx264  x"; exit 0'
+  printf '%s\n' "$complete"   > "$d/opt/ffmpeg-full/bin/ffmpeg"; chmod +x "$d/opt/ffmpeg-full/bin/ffmpeg"
+  printf '%s\n' "$incomplete" > "$d/onpath/ffmpeg";              chmod +x "$d/onpath/ffmpeg"
+  printf '%s\n' "$complete"   > "$d/custom/ffmpeg";              chmod +x "$d/custom/ffmpeg"
+  # $1 = PATH to run under. Echoes the resulting PATH after _prefer_complete_ffmpeg.
+  _pcf_run(){
+    HOMEBREW_PREFIX="$d" PATH="$1" bash -c 'note(){ :; }
+'"$body"'
+_prefer_complete_ffmpeg
+printf "%s\n" "$PATH"'
+  }
+  local out
+  out="$(_pcf_run "$d/onpath:/usr/bin:/bin")"
+  if [[ "$out" == "$d/opt/ffmpeg-full/bin:"* ]]; then
+    pass "F5-rt: incomplete on-PATH ffmpeg → ffmpeg-full keg prepended"
+  else
+    fail "F5-rt: expected keg prepended for incomplete ffmpeg; PATH head='${out%%:*}'"
+  fi
+  out="$(_pcf_run "$d/custom:/usr/bin:/bin")"
+  if [[ "$out" == "$d/custom:"* ]]; then
+    pass "F5-rt: complete custom ffmpeg on PATH → left untouched"
+  else
+    fail "F5-rt: complete custom ffmpeg wrongly overridden; PATH head='${out%%:*}'"
+  fi
+  out="$(_pcf_run "/usr/bin:/bin")"
+  if [[ "$out" == "$d/opt/ffmpeg-full/bin:"* ]]; then
+    pass "F5-rt: no ffmpeg on PATH → ffmpeg-full keg prepended (muxm goes from won't-run to works)"
+  else
+    fail "F5-rt: expected keg prepended when no ffmpeg on PATH; PATH head='${out%%:*}'"
+  fi
+  rm -rf "$d"
 }
 
 # === Suite: Profile End-to-End (real encodes with profiles) ===
@@ -8627,6 +8734,37 @@ test_setup() {
     pass "--install-dependencies intercepts brew via the stub (no real install/uninstall)"
   else
     fail "--install-dependencies did not route brew through the stub — real brew may have run"
+  fi
+
+  # ---- F5: missing-AV1/libass ffmpeg → install ffmpeg-full, NEVER uninstall/replace ----
+  # Shadow the real (complete) ffmpeg with an incomplete stub (no libass/AV1) so _ensure_ffmpeg_full
+  # takes the install path, with brew stubbed so nothing real happens. Pre-fix this path ran
+  # `brew tap homebrew-ffmpeg/... && brew install ... --with-* && brew uninstall <old>` (destructive,
+  # F5). Post-fix it must run `brew install ffmpeg-full` and perform NO uninstall and NO tap.
+  local f5_bin f5_prefix f5_log
+  f5_bin="$fake_home/f5_bin"
+  f5_prefix="$fake_home/f5_prefix"
+  _make_brew_stub "$f5_bin" "$f5_prefix"
+  f5_log="$f5_prefix/brew_calls.log"
+  # Incomplete ffmpeg stub: -version reports a build WITHOUT --enable-libass; -encoders lists none.
+  # (Its keg path under the stub prefix has no ffmpeg, so _ensure_ffmpeg_full proceeds to install.)
+  printf '#!/bin/bash\ncase "$1" in -version) echo "ffmpeg version 6.0";; *) :;; esac\nexit 0\n' > "$f5_bin/ffmpeg"
+  chmod +x "$f5_bin/ffmpeg"
+  HOME="$fake_home" PATH="$f5_bin:$PATH" "$MUXM" --install-dependencies >/dev/null 2>&1 || true
+  if grep -qE '(^| )install ffmpeg-full( |$)' "$f5_log"; then
+    pass "F5: --install-dependencies installs ffmpeg-full when ffmpeg lacks libass/AV1"
+  else
+    fail "F5: --install-dependencies did not run 'brew install ffmpeg-full' (log: $(tr '\n' ';' < "$f5_log"))"
+  fi
+  if grep -qE '(^| )uninstall( |$)' "$f5_log"; then
+    fail "F5: --install-dependencies ran 'brew uninstall' — must never replace the user's ffmpeg"
+  else
+    pass "F5: --install-dependencies performs NO brew uninstall (non-destructive)"
+  fi
+  if grep -qE 'homebrew-ffmpeg' "$f5_log"; then
+    fail "F5: --install-dependencies still uses the homebrew-ffmpeg tap (should be ffmpeg-full)"
+  else
+    pass "F5: --install-dependencies no longer taps homebrew-ffmpeg"
   fi
 
   # ---- --uninstall-man standalone (R24, R25) ----

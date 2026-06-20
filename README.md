@@ -104,7 +104,7 @@ muxm --profile atv-directplay-hq movie.mkv
 
 High-fidelity AV1 encode via SVT-AV1 at preset 6 with a **resolution-aware CRF**: 28 for ≤1080p SDR (the transparency point) and 24 for ≥4K or HDR sources (the calibrated default; pass `--crf 20` for measured HEVC-CRF-18 parity at the cost of larger files). Lossless audio passthrough, MKV container, and SHA-256 checksum enabled by default. Dolby Vision is automatically disabled — the AV1 encode pipeline does not support DV muxing. Intended as a modern space-efficient alternative to `hdr10-hq` for clients with AV1 decode support.
 
-> **Requires AV1 encoder support in ffmpeg.** Unlike Dolby Vision tools, a missing AV1 encoder is a fatal error — ffmpeg will exit immediately. A standard `brew install ffmpeg` does not include AV1 encoders. Use `brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-svt-av1` for SVT-AV1 (`libsvtav1`) or `--with-libaom` for libaom (`libaom-av1`), or run `muxm --install-dependencies` to check what's available.
+> **Requires AV1 encoder support in ffmpeg.** Unlike Dolby Vision tools, a missing AV1 encoder is a fatal error — ffmpeg will exit immediately. Homebrew's standard `ffmpeg` includes SVT-AV1 (`libsvtav1`, the default for the AV1 profiles) but **not** libaom (`libaom-av1`) or libass. For the complete set, `brew install ffmpeg-full` (bundles both AV1 encoders + libass + tesseract), or run `muxm --install-dependencies`, which installs it for you. `ffmpeg-full` is keg-only, but muxm detects and uses it automatically at runtime.
 
 ```bash
 muxm --profile av1-hq movie.mkv
@@ -237,7 +237,7 @@ This installs `muxm` with its required dependencies (bash 4.3+, ffmpeg, jq, bc) 
 muxm --install-dependencies       # installs everything missing in one pass
 ```
 
-After installing ffmpeg, `--install-dependencies` checks whether the installed build includes AV1 encoder support (`libsvtav1` or `libaom-av1`). If AV1 encoders are missing, it prints an advisory with the exact `brew` commands needed — nothing is automatically replaced, since swapping a working ffmpeg install is a significant step.
+`--install-dependencies` checks whether the ffmpeg in use is a *complete* build — libass (for `--sub-burn-forced`) plus both AV1 encoders (`libsvtav1` and `libaom-av1`). If anything is missing, it installs Homebrew's bottled `ffmpeg-full`, which bundles all of them. This is **non-destructive**: `ffmpeg-full` is keg-only, so it is installed *alongside* your existing ffmpeg — nothing is uninstalled or replaced. Because keg-only formulae are not put on `PATH`, muxm detects `ffmpeg-full` and uses it automatically at runtime (it prints a one-line note when it does); to make `ffmpeg` resolve to it in your own shell, add the `export PATH=…/opt/ffmpeg-full/bin:$PATH` line the installer prints.
 
 Or install individually as needed:
 
@@ -245,7 +245,7 @@ Or install individually as needed:
 brew install dovi_tool            # Dolby Vision RPU handling
 brew install gpac                 # DV container signaling (MP4Box)
 brew install tesseract            # PGS subtitle OCR engine
-brew install ffmpeg-full          # ffmpeg with libass (for --sub-burn-forced) + tesseract
+brew install ffmpeg-full          # complete ffmpeg: libass (--sub-burn-forced) + both AV1 encoders + tesseract (keg-only; muxm auto-detects it)
 ```
 
 ### Manual Install (macOS/Linux)
@@ -301,8 +301,8 @@ for your distro's packages.
 # 1. Install Homebrew on Linux — see https://brew.sh
 # 2. Add brew to your PATH — its installer prints the exact line; also add it to ~/.profile:
 eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-# 3. Install muxm's dependencies (gpac provides MP4Box; ffmpeg provides ffprobe):
-brew install ffmpeg jq bc gpac tesseract dovi_tool
+# 3. Install muxm's dependencies (gpac provides MP4Box; ffmpeg-full bundles ffprobe + libass + AV1):
+brew install ffmpeg-full jq bc gpac tesseract dovi_tool   # or: muxm --install-dependencies
 ```
 
 `pgsrip` (the optional PGS-subtitle OCR helper) is a Python tool, so install it with

@@ -1105,6 +1105,49 @@ ffmpeg_has_encoder(){
   ffmpeg -hide_banner -encoders 2>/dev/null | awk '{print $2}' | grep -qx "$name"
 }
 
+# _ffmpeg_bin_is_complete — true if the given ffmpeg binary has every capability muxm's full
+# feature set needs: libass (subtitle burn-in) + libsvtav1 + libaom-av1 (both AV1 encoders,
+# including --video-codec libaom-av1). The single definition of "complete" used by both the
+# installer (_ensure_ffmpeg_full) and the runtime preference (_prefer_complete_ffmpeg).
+# Args: $1 — ffmpeg binary (name on PATH or absolute path).
+_ffmpeg_bin_is_complete(){
+  local _b="$1" _enc
+  "$_b" -version 2>/dev/null | grep -q -- "--enable-libass" || return 1
+  _enc="$("$_b" -hide_banner -encoders 2>/dev/null | awk '{print $2}')"
+  printf '%s\n' "$_enc" | grep -qx 'libsvtav1'  || return 1
+  printf '%s\n' "$_enc" | grep -qx 'libaom-av1' || return 1
+  return 0
+}
+
+# _prefer_complete_ffmpeg — when the ffmpeg on PATH lacks libass/AV1, make muxm use a complete
+# build. `brew install ffmpeg-full` (what --install-dependencies installs) is keg-only, so Homebrew
+# does NOT symlink it onto PATH; this prepends its keg bin so every ffmpeg/ffprobe call muxm makes
+# uses it. Cost is near-zero on the common paths: it returns before any -encoders probe unless an
+# ffmpeg-full keg exists AND the active ffmpeg is neither that keg nor otherwise complete. A
+# complete custom ffmpeg already on PATH is left untouched. Emits a normal-verbosity note when it
+# switches, so `which ffmpeg` and the ffmpeg muxm actually runs never silently diverge (the F5
+# "says == does" guarantee). Called once, at the top of tool validation (Section 14).
+_prefer_complete_ffmpeg(){
+  local _kb _kegbin=""
+  # Locate an ffmpeg-full keg bin via known opt paths (avoids a slow `brew --prefix` at startup).
+  for _kb in "${HOMEBREW_PREFIX:-/opt/homebrew}/opt/ffmpeg-full/bin" \
+             /opt/homebrew/opt/ffmpeg-full/bin \
+             /usr/local/opt/ffmpeg-full/bin \
+             /home/linuxbrew/.linuxbrew/opt/ffmpeg-full/bin; do
+    if [[ -x "$_kb/ffmpeg" ]]; then _kegbin="$_kb"; break; fi
+  done
+  [[ -n "$_kegbin" ]] || return 0
+  # Fast path: the keg is already the active ffmpeg (string match — skips the -encoders probe on
+  # the common case, so this stays cheap across the whole test suite / repeated invocations).
+  [[ "$(command -v ffmpeg 2>/dev/null)" == "$_kegbin/ffmpeg" ]] && return 0
+  # A complete custom ffmpeg on PATH is authoritative — leave it (capability check, not path).
+  if command -v ffmpeg >/dev/null 2>&1 && _ffmpeg_bin_is_complete ffmpeg; then return 0; fi
+  # Prefer the keg only if it is genuinely complete (never switch to a broken keg).
+  _ffmpeg_bin_is_complete "$_kegbin/ffmpeg" || return 0
+  export PATH="$_kegbin:$PATH"
+  note "Using ffmpeg-full for libass/AV1 support: $_kegbin (keg-only — not on your default PATH)."
+}
+
 # detect_hw_accel — populate HW_ACCEL_AVAILABLE from ffmpeg's encoder list
 # and resolve HW_ACCEL="auto" to a concrete backend when possible.
 #
@@ -1317,7 +1360,7 @@ fi
 # Config chain (Section 6) is sourced before this so the installer sees the
 # user's resolved SUB_OCR_TOOL and other config-file settings.
 #
-# Required:     ffmpeg (with libass, via homebrew-ffmpeg tap), ffprobe, jq, bc
+# Required:     ffmpeg (complete build with libass + AV1, e.g. brew ffmpeg-full), ffprobe, jq, bc
 # DV pipeline:  dovi_tool, mp4box (gpac)
 # Subtitles:    tesseract, pgsrip (Python, via pipx)
 
@@ -1389,7 +1432,7 @@ _dep_check_only(){
     printf '\n'
     printf "  %-14s %-24s %-24s %s\n" "Tool" "apt (Debian/Ubuntu)" "dnf (Fedora/RHEL)" "brew (macOS)"
     printf "  %-14s %-24s %-24s %s\n" "──────────" "────────────────────" "────────────────────" "────────────────"
-    printf "  %-14s %-24s %-24s %s\n" "ffmpeg"     "apt install ffmpeg"     "dnf install ffmpeg"     "brew install ffmpeg"
+    printf "  %-14s %-24s %-24s %s\n" "ffmpeg"     "apt install ffmpeg"     "dnf install ffmpeg"     "brew install ffmpeg-full"
     printf "  %-14s %-24s %-24s %s\n" "jq"         "apt install jq"         "dnf install jq"         "brew install jq"
     printf "  %-14s %-24s %-24s %s\n" "bc"         "apt install bc"         "dnf install bc"         "brew install bc"
     printf "  %-14s %-24s %-24s %s\n" "dovi_tool"  "(GitHub release)"       "(GitHub release)"       "brew install dovi_tool"
@@ -1526,78 +1569,46 @@ _dep_install_dependencies(){
   _ensure_ffmpeg_full(){
     total=$(( total + 1 ))
     printf "  %-14s" "ffmpeg"
-    local _current_formula="" _needs_av1_reinstall=0 _install_ok=0 _is_standard_build=0
-    if command -v ffmpeg >/dev/null 2>&1; then
-      # Check compiled-in build flags — most reliable across all install methods
-      if ffmpeg -version 2>/dev/null | grep -q -- "--enable-libass"; then
-        ffmpeg -encoders 2>/dev/null | grep -q 'libsvtav1' || _needs_av1_reinstall=1
-        if (( _needs_av1_reinstall )); then
-          printf "⚠️  installed with libass but missing AV1 encoders — reinstalling with AV1 support...\n"
-        else
-          printf "✅ already installed with libass and AV1 support (%s)\n" "$(command -v ffmpeg)"
-          skipped=$(( skipped + 1 ))
-          return
-        fi
-      else
-        # Libass-only-missing: warn without touching the install (H7).
-        # A libass-less ffmpeg is fully functional except for --sub-burn-forced.
-        printf "⚠️  installed but built without libass (needed for --sub-burn-forced).\n"
-        printf "  %-14s   To enable subtitle burn-in, upgrade with:\n" ""
-        printf "  %-14s   brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass\n" ""
-        skipped=$(( skipped + 1 ))
-        return
-      fi
+    # "Complete" = libass + both AV1 encoders. The canonical complete build is Homebrew's bottled
+    # core formula `ffmpeg-full` (libass + libsvtav1 + libaom-av1 + tesseract). It is keg-only, so
+    # it coexists with any existing ffmpeg — NOTHING is uninstalled or replaced (F5; matches the
+    # README) — and muxm auto-prefers it at runtime via _prefer_complete_ffmpeg.
+    local _ff_keg_bin
+    _ff_keg_bin="$(brew --prefix ffmpeg-full 2>/dev/null)/bin"
 
-      # Identify which Homebrew formula is currently providing ffmpeg so we
-      # can remove it AFTER a successful upgrade (H7: install-before-uninstall).
-      if brew ls --versions homebrew-ffmpeg/ffmpeg/ffmpeg >/dev/null 2>&1; then
-        _current_formula="homebrew-ffmpeg/ffmpeg/ffmpeg"
-      elif brew list 2>/dev/null | grep -q '^ffmpeg-full$'; then
-        _current_formula="ffmpeg-full"
-      elif brew ls --versions ffmpeg >/dev/null 2>&1; then
-        _current_formula="ffmpeg"
-      fi
-    else
-      printf "⏳ installing via homebrew-ffmpeg tap (--with-libass)...\n"
+    # Already complete on PATH (or the keg is already active)? Nothing to do.
+    if command -v ffmpeg >/dev/null 2>&1 && _ffmpeg_bin_is_complete ffmpeg; then
+      printf "✅ already complete — libass + AV1 (%s)\n" "$(command -v ffmpeg)"
+      skipped=$(( skipped + 1 ))
+      return
+    fi
+    # ffmpeg-full already installed and complete (just keg-only / not on PATH)? Satisfied —
+    # muxm prefers it automatically; only advise the user how to surface it for direct ffmpeg use.
+    if [[ -x "$_ff_keg_bin/ffmpeg" ]] && _ffmpeg_bin_is_complete "$_ff_keg_bin/ffmpeg"; then
+      printf "✅ ffmpeg-full present (libass + AV1) — keg-only at %s\n" "$_ff_keg_bin"
+      printf "  %-14s   muxm uses it automatically; for direct shell use add:\n" ""
+      printf "  %-14s     export PATH=\"%s:\$PATH\"\n" "" "$_ff_keg_bin"
+      skipped=$(( skipped + 1 ))
+      return
     fi
 
-    # Attempt install FIRST; only remove old formula after confirming success (H7).
-    brew tap homebrew-ffmpeg/ffmpeg 2>&1 | sed 's/^/    /' || true
-    if brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass --with-svt-av1 --with-libaom 2>&1 | sed 's/^/    /'; then
-      _install_ok=1
-    else
-      # Fallback: if the tap fails, try standard ffmpeg so the tool is at least usable
-      printf "  %-14s⚠️  homebrew-ffmpeg tap failed — falling back to standard ffmpeg\n" ""
-      if brew install ffmpeg 2>&1 | sed 's/^/    /'; then
-        _install_ok=1
-        _is_standard_build=1
-      fi
-    fi
-
-    if (( _install_ok )) && command -v ffmpeg >/dev/null 2>&1; then
-      # Remove old formula only after confirming the new install is live (H7).
-      if [[ -n "$_current_formula" ]]; then
-        printf "  %-14s⏳ removing old formula %s...\n" "" "$_current_formula"
-        brew uninstall "$_current_formula" 2>&1 | sed 's/^/    /' || true
-      fi
-      if (( _is_standard_build )); then
-        printf "  %-14s✅ installed (standard build — --sub-burn-forced may not work)\n" "ffmpeg"
-      elif ffmpeg -version 2>/dev/null | grep -q -- "--enable-libass"; then
-        printf "  %-14s✅ installed with libass\n" "ffmpeg"
+    # Install the complete, bottled build. Non-destructive: existing ffmpeg is left in place.
+    printf "⏳ installing ffmpeg-full (complete build: libass + AV1, bottled)...\n"
+    if brew install ffmpeg-full 2>&1 | sed 's/^/    /'; then
+      _ff_keg_bin="$(brew --prefix ffmpeg-full 2>/dev/null)/bin"
+      if [[ -x "$_ff_keg_bin/ffmpeg" ]] && _ffmpeg_bin_is_complete "$_ff_keg_bin/ffmpeg"; then
+        printf "  %-14s✅ installed ffmpeg-full (libass + AV1) — keg-only at %s\n" "ffmpeg" "$_ff_keg_bin"
+        printf "  %-14s   muxm uses it automatically. For direct shell use, add:\n" ""
+        printf "  %-14s     export PATH=\"%s:\$PATH\"\n" "" "$_ff_keg_bin"
+        installed=$(( installed + 1 ))
       else
-        printf "  %-14s✅ installed (verify libass with: ffmpeg -version | grep enable-libass)\n" "ffmpeg"
+        printf "  %-14s⚠️  ffmpeg-full installed but libass/AV1 not detected — verify: %s/ffmpeg -version\n" "ffmpeg" "$_ff_keg_bin"
+        failed=$(( failed + 1 ))
+        return 1
       fi
-      if ! ffmpeg -encoders 2>/dev/null | grep -q 'libsvtav1'; then
-        printf "  %-14s⚠️  AV1 encoder (libsvtav1/SVT-AV1) not available in this ffmpeg build\n" ""
-      fi
-      if ! ffmpeg -encoders 2>/dev/null | grep -q 'libaom-av1'; then
-        printf "  %-14s⚠️  AV1 encoder (libaom-av1) not available in this ffmpeg build\n" ""
-      fi
-      installed=$(( installed + 1 ))
     else
-      # All install attempts failed — leave existing ffmpeg in place (H7).
-      printf "  %-14s❌ ffmpeg upgrade failed — existing install left in place\n" "ffmpeg"
-      warn "ffmpeg upgrade failed. Existing ffmpeg install was left untouched."
+      printf "  %-14s❌ brew install ffmpeg-full failed — existing ffmpeg left untouched\n" "ffmpeg"
+      warn "ffmpeg-full install failed. Existing ffmpeg install was left untouched."
       failed=$(( failed + 1 ))
       return 1
     fi
@@ -1679,21 +1690,23 @@ _dep_install_dependencies(){
   fi
   printf '\n'
 
-  # Post-install AV1 advisory: if ffmpeg is still missing AV1 encoder support after
-  # the automated install attempt above, print a note. Not a failure.
-  if command -v ffmpeg >/dev/null 2>&1; then
-    local _missing_av1=0
-    ffmpeg -encoders 2>/dev/null | grep -q 'libsvtav1' || _missing_av1=1
-    ffmpeg -encoders 2>/dev/null | grep -q 'libaom-av1' || _missing_av1=1
-    if (( _missing_av1 )); then
-      say ""
-      # One ⚠️ + an indented plain-text block (not six warns).
-      warn "ffmpeg is installed but one or more AV1 encoders are still missing — AV1 profiles (--video-codec libsvtav1 / libaom-av1) will not work until they are available."
-      say "     The automated install attempted: homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass --with-svt-av1 --with-libaom"
-      say "     If that tap or build failed, try manually:"
-      say "       brew tap homebrew-ffmpeg/ffmpeg"
-      say "       brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass --with-svt-av1 --with-libaom"
-    fi
+  # Post-install advisory: fire only if NO complete ffmpeg (libass + AV1) is available — neither
+  # on PATH nor as the keg-only ffmpeg-full that muxm prefers at runtime. Checking the keg too
+  # avoids a false "AV1 still missing" warning right after ffmpeg-full was installed keg-only
+  # (the on-PATH ffmpeg may still be the old incomplete one). Not a failure.
+  local _have_complete=0 _pi_keg_bin
+  _pi_keg_bin="$(brew --prefix ffmpeg-full 2>/dev/null)/bin"
+  if command -v ffmpeg >/dev/null 2>&1 && _ffmpeg_bin_is_complete ffmpeg; then
+    _have_complete=1
+  elif [[ -x "$_pi_keg_bin/ffmpeg" ]] && _ffmpeg_bin_is_complete "$_pi_keg_bin/ffmpeg"; then
+    _have_complete=1
+  fi
+  if (( ! _have_complete )); then
+    say ""
+    # One ⚠️ + an indented plain-text block (not multiple warns).
+    warn "No complete ffmpeg (libass + AV1) is available — AV1 profiles (--video-codec libsvt-av1 / libaom-av1) and subtitle burn-in (--sub-burn-forced) will not work until one is installed."
+    say "     Install the complete bottled build with:"
+    say "       brew install ffmpeg-full"
   fi
 
   # Summary
@@ -5667,6 +5680,9 @@ if (( PRINT_EFFCONF )); then
 fi
 
 # ===== Section 14: Tool validation ============================================================
+# F5: if a complete ffmpeg (libass + AV1) is installed as the keg-only `ffmpeg-full` but the one
+# on PATH is incomplete, prefer the keg so all features work (it emits a note when it switches).
+_prefer_complete_ffmpeg
 need ffmpeg
 need ffprobe
 need jq
@@ -5698,10 +5714,10 @@ fi
 # Non-fatal probe: warn if not available now; die when actually selected at runtime.
 if [[ "$VIDEO_CODEC" == "libsvt-av1" || "$VIDEO_CODEC" == "libaom-av1" ]]; then
   if [[ "$VIDEO_CODEC" == "libsvt-av1" ]] && ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libsvtav1'; then
-    die 10 "libsvtav1 encoder not available in this ffmpeg build. Install ffmpeg with SVT-AV1 support (e.g., brew install ffmpeg)."
+    die 10 "libsvtav1 encoder not available in this ffmpeg build. Install a complete ffmpeg (e.g., brew install ffmpeg-full, or run muxm --install-dependencies)."
   fi
   if [[ "$VIDEO_CODEC" == "libaom-av1" ]] && ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libaom-av1'; then
-    die 10 "libaom-av1 encoder not available in this ffmpeg build. Install ffmpeg with libaom support (e.g., brew tap homebrew-ffmpeg/ffmpeg && brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libaom)."
+    die 10 "libaom-av1 encoder not available in this ffmpeg build. Install a complete ffmpeg (e.g., brew install ffmpeg-full, or run muxm --install-dependencies)."
   fi
 fi
 
@@ -7880,6 +7896,10 @@ run_video_pipeline() {
 
     libx264)
       # H.264 software encode (universal / youtube-upload profile)
+      # F9: H.264 output is always 8-bit 4:2:0 (yuv420p) for universal device compatibility —
+      # the only chroma/depth H.264 decoders are guaranteed to play. TARGET_PIXFMT/FORCE_CHROMA_420
+      # are intentionally NOT honored here (4:2:2/4:4:4 or 10-bit H.264 has poor device support and
+      # no profile selects libx264 for HDR). The hevc_videotoolbox/libx265 arms do honor TARGET_PIXFMT.
       log "→ Encoding video (H.264/SDR, preset ${PRESET_VALUE}, CRF ${CRF_VALUE}) → $V_BASE"
       encode_args=(
         -c:v libx264
@@ -9166,7 +9186,11 @@ run_audio_pipeline(){
     log "  $pretty"
   done
 
-  note "[Audio] Selected track #$idx: $codec ${ch}ch [$lang]${title:+ — $title}${br:+, $((br/1000))kbps}"
+  # F9: guard the bitrate suffix with (( br > 0 )) — a 0/absent bitrate must not render ", 0kbps"
+  # (mirrors the per-stream display loop above). br is numeric here (normalized by select_best_audio).
+  local _sel_br_suffix=""
+  (( br > 0 )) && _sel_br_suffix=", $((br/1000))kbps"
+  note "[Audio] Selected track #$idx: $codec ${ch}ch [$lang]${title:+ — $title}${_sel_br_suffix}"
   report_add "audio_source" "track #$idx: $codec ${ch}ch [$lang]"
 
   A_PRIMARY="$WORKDIR/audio_primary.$(_audio_copy_ext "$codec")"
@@ -9177,7 +9201,10 @@ run_audio_pipeline(){
   A_PRIMARY_LANG="$lang"
   A_PRIMARY_TITLE="${title:-}"
   A_PRIMARY_CHANNELS="$ch"
+  # Stereo-fallback defaults (F7): a downmix is AAC in the primary's language. A native stereo
+  # track (copy or transcode) overrides these with its own codec/language in the block below.
   A_STEREO_LANG="$lang"
+  A_STEREO_CODEC="aac"
 
   # Enforce MAX_AUDIO_CHANNELS
   local effective_ch="$ch"
@@ -9346,7 +9373,7 @@ run_audio_pipeline(){
   # Add stereo fallback if needed
   if (( ADD_STEREO_IF_MULTICH )) && (( effective_ch > 2 )); then
     # Scan for a native stereo track before falling back to a synthetic downmix.
-    local _native_si="" _native_sc=""
+    local _native_si="" _native_sc="" _native_sl=""
     local _ns_total _ns_i _ns_info _ns_c _ns_ch _ns_l _ns_br _ns_t _ns_vi _ns_hi
     _ns_total="$(_audio_stream_count)"
     for (( _ns_i = 0; _ns_i < _ns_total; _ns_i++ )); do
@@ -9369,6 +9396,7 @@ run_audio_pipeline(){
       (( _ns_hi )) && continue
       _native_si="$_ns_i"
       _native_sc="$_ns_c"
+      _native_sl="$_ns_l"
       break
     done
 
@@ -9389,6 +9417,10 @@ run_audio_pipeline(){
       fi
     else
       note "[Audio] Native stereo track found (stream #${_native_si}, ${_native_sc} 2ch); using it instead of creating a stereo downmix."
+      # F7: the fallback now carries the chosen native track's language (not the primary's) so
+      # mux_final tags it honestly. The codec stays "aac" for the transcode path; the copy path
+      # below overrides it with the real native codec.
+      A_STEREO_LANG="$_native_sl"
       # Copy if codec is compatible with the output container; otherwise transcode to AAC (M2).
       local _ns_do_copy=0
       _sii_audio_is_container_safe "$_native_sc" && _ns_do_copy=1
@@ -9403,6 +9435,9 @@ run_audio_pipeline(){
           mark_done "Stereo fallback prepared (native)"
         fi
       else
+        # F7: stream-copy keeps the native codec — record it so the output track is labeled with
+        # its real codec (e.g. "(AC-3)"), not a hardcoded "aac".
+        A_STEREO_CODEC="$_native_sc"
         # Stream-copy: the intermediate must use an extension matching the
         # native codec, not the default .aac. ffmpeg picks the muxer from the
         # extension, and the .aac (ADTS) muxer only accepts AAC — copying any
@@ -9947,6 +9982,7 @@ A_PRIMARY_TITLE=""
 A_PRIMARY_CHANNELS=""
 A_PRIMARY_CODEC=""
 A_STEREO_LANG=""
+A_STEREO_CODEC=""
 
 # Process a prepared subtitle: either export as external file or embed.
 # Sets _SUB_EMBED_PATH to the subtitle path if embedded, empty if exported externally.
@@ -11023,7 +11059,7 @@ mux_final() {
     if [[ -n "$a_stereo_idx" ]]; then
       [[ -n "${A_STEREO_LANG:-}" ]] && ff_codec+=( "-metadata:s:a:${out_a_idx}" "language=$A_STEREO_LANG" )
       if (( INCLUDE_AUDIO_TITLES )); then
-        ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$(_audio_descriptive_title aac 2)" )
+        ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$(_audio_descriptive_title "${A_STEREO_CODEC:-aac}" 2)" )
       else
         ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=Stereo" )
       fi
