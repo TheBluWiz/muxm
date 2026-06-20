@@ -232,6 +232,35 @@ fail() { FAIL=$((FAIL + 1)); ERRORS+=("$*"); printf "%b  ❌ FAIL: %s%b\n" "$RED
 skip() { SKIP=$((SKIP + 1)); printf "%b  ⏭  SKIP: %s%b\n" "$YELLOW" "$*" "$NC"; }
 section() { printf "\n%b━━━ %s ━━━%b\n" "$BOLD" "$*" "$NC"; }
 
+# --- Homebrew stub for the installer paths (M1 safety) -------------------------------------
+# The installer entry points (`--setup`, `--install-dependencies`, `--install-man`,
+# `--uninstall-man`) shell out to the real `brew`: `brew install`/`uninstall`/`tap` would
+# mutate the developer's actual packages, and `brew --prefix` steers `_man_target_dir` at the
+# REAL …/share/man/man1 — so `_install_man`/`_uninstall_man` would overwrite or delete the
+# installed muxm.1. Running the suite must do neither. This drops a no-op `brew` on a temp
+# PATH dir: it answers `--prefix` with a sandbox prefix (so the man page lands under a temp
+# dir, never /opt/homebrew) and turns every other subcommand — install, uninstall, tap, list —
+# into a recorded no-op. Callers prepend "$bin" to PATH; every invocation's argv is appended to
+# "$prefix/brew_calls.log" so a test can assert brew was actually intercepted. Same stub shape
+# as the L4 sub-test in test_setup, generalized and argv-recording.
+# Usage: _make_brew_stub <stub_bin_dir> <sandbox_prefix_dir>
+_make_brew_stub() {
+  local bin="$1" prefix="$2"
+  # Pre-create the man1 dir so _install_man finds a writable target and writes directly,
+  # instead of testing -w on the (absent) parent and falling through to `sudo mkdir`/`sudo tee`
+  # — which would hang or fail non-interactively. Same reason the L4 sub-test pre-creates its
+  # man dir. _man_target_dir resolves to "$prefix/share/man/man1" via the stubbed `brew --prefix`.
+  mkdir -p "$bin" "$prefix/share/man/man1"
+  : > "$prefix/brew_calls.log"
+  # Single-quoted body keeps `$*`/`$1` LITERAL for the generated stub's own runtime; only the
+  # two real %s (log path, then prefix) are expanded here. `%%s`→literal `%s` and `\\n`→literal
+  # `\n` are for the stub's inner printf.
+  # shellcheck disable=SC2016
+  printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s"\n[[ "$1" == "--prefix" ]] && { printf "%%s\\n" "%s"; exit 0; }\nexit 0\n' \
+    "$prefix/brew_calls.log" "$prefix" > "$bin/brew"
+  chmod +x "$bin/brew"
+}
+
 # Run muxm from TESTDIR to avoid picking up .muxmrc from the user's PWD.
 # -K (--keep-temp-always) preserves workdirs for post-mortem debugging
 # (encode.err, muxm.*.log).  They live under $TESTDIR and are cleaned with it.
@@ -1393,8 +1422,20 @@ _test_cli_value_flag_no_value() {
     pass "L5: 'muxm -- --install-man <file>' does not run the man-page installer (-- honored)"
   fi
   # Sanity: without --, --install-man still triggers the installer (behavior unchanged).
+  # M1: stub `brew` so the real installer writes muxm.1 into a sandbox prefix
+  # ($_l5_home/brew_prefix/share/man/man1) instead of the developer's real …/share/man/man1.
   local _l5_home="$TESTDIR/l5_home"; rm -rf "$_l5_home"; mkdir -p "$_l5_home"
-  _out="$(HOME="$_l5_home" "$MUXM" --install-man 2>&1)" && _code=$? || _code=$?
+  local _l5_brew_bin="$_l5_home/brew_stub_bin" _l5_brew_prefix="$_l5_home/brew_prefix"
+  _make_brew_stub "$_l5_brew_bin" "$_l5_brew_prefix"
+  _out="$(HOME="$_l5_home" PATH="$_l5_brew_bin:$PATH" "$MUXM" --install-man 2>&1)" && _code=$? || _code=$?
+  # M1 regression guard: prove the install landed in the sandbox prefix, NOT the real man dir.
+  # The banner check below alone can't catch a removed stub (the banner prints either way), so
+  # this is what fails if someone later drops the brew stub from this site.
+  if [[ -s "$_l5_brew_prefix/share/man/man1/muxm.1" ]]; then
+    pass "L5: '--install-man' writes under the stubbed prefix (real man dir untouched)"
+  else
+    fail "L5: '--install-man' did not honor the brew stub — real man dir may have been written"
+  fi
   if printf '%s' "$_out" | grep -qF 'Manual Page Installer'; then
     pass "L5: '--install-man' (no --) still runs the installer"
   else
@@ -8224,9 +8265,23 @@ test_setup() {
   touch "$fake_home/.bashrc"
   touch "$fake_home/.zshrc"
 
+  # M1: stub `brew` for every installer call below. Without it, --setup / --install-dependencies
+  # would `brew install`/`uninstall` real packages (and reinstall ffmpeg per F5), and --setup /
+  # --install-man would resolve _man_target_dir to the real $(brew --prefix)/share/man/man1 and
+  # overwrite the developer's installed muxm.1. The stub answers `brew --prefix` with a sandbox
+  # prefix (steering the man page into a temp dir) and no-ops install/uninstall/tap while
+  # recording argv to "$brew_log". HOME isolation alone does NOT cover the man dir — it comes
+  # from brew --prefix, not $HOME. (See _make_brew_stub.)
+  local stub_bin stub_prefix brew_log stub_path
+  stub_bin="$fake_home/brew_stub_bin"
+  stub_prefix="$fake_home/brew_prefix"
+  _make_brew_stub "$stub_bin" "$stub_prefix"
+  brew_log="$stub_prefix/brew_calls.log"
+  stub_path="$stub_bin:$PATH"
+
   # ---- --setup shows the combined banner ----
   local out
-  out="$(HOME="$fake_home" "$MUXM" --setup 2>&1)" || true
+  out="$(HOME="$fake_home" PATH="$stub_path" "$MUXM" --setup 2>&1)" || true
   assert_contains "Full Setup" "--setup shows Full Setup banner" "$out"
 
   # ---- --setup runs all three sub-installers ----
@@ -8249,11 +8304,22 @@ test_setup() {
     fail "--setup did not install completion file"
   fi
 
+  # ---- M1: --setup writes the man page into the SANDBOX prefix, not the real man dir ----
+  # _install_man targets $(brew --prefix)/share/man/man1; with brew stubbed that resolves to
+  # "$stub_prefix/...". If muxm.1 lands there, the developer's real …/share/man/man1 was not
+  # touched. This assertion fails the instant the brew stub is removed (then the man page would
+  # go to the real prefix and nothing appears under the sandbox), so it is the regression guard.
+  if [[ -s "$stub_prefix/share/man/man1/muxm.1" ]]; then
+    pass "--setup installs man page under the stubbed prefix (real man dir untouched)"
+  else
+    fail "--setup did not write muxm.1 under the stubbed prefix — brew stub not honored"
+  fi
+
   # ---- --install-dependencies standalone (R26, R27) ----
   # In CI/test environments without Homebrew, this runs in check-only mode.
   # Either path should show the banner and list core tools.
   local dep_out
-  dep_out="$(HOME="$fake_home" "$MUXM" --install-dependencies 2>&1)" || true
+  dep_out="$(HOME="$fake_home" PATH="$stub_path" "$MUXM" --install-dependencies 2>&1)" || true
   if echo "$dep_out" | grep -qE "Dependency Installer|Dependency Check"; then
     pass "--install-dependencies shows banner"
   else
@@ -8263,11 +8329,29 @@ test_setup() {
   assert_contains "ffprobe" "--install-dependencies lists ffprobe" "$dep_out"
   assert_contains "jq" "--install-dependencies lists jq" "$dep_out"
 
+  # ---- M1: --install-dependencies routed brew through the stub — no real package mutation ----
+  # `brew --prefix` is always called during the run (tessdata resolution), so the stub log is
+  # non-empty and contains "--prefix" whenever the stub is engaged. PATH-shadowing guarantees
+  # every other brew call (install/uninstall/tap) hit the same no-op stub, so nothing real was
+  # installed or removed. Empty log ⇒ real brew ran ⇒ regression.
+  if [[ -s "$brew_log" ]] && grep -qF -- '--prefix' "$brew_log"; then
+    pass "--install-dependencies intercepts brew via the stub (no real install/uninstall)"
+  else
+    fail "--install-dependencies did not route brew through the stub — real brew may have run"
+  fi
+
   # ---- --uninstall-man standalone (R24, R25) ----
   # In test environments the man page is unlikely to be installed, so this
   # exercises the "not found — nothing to remove" safe path.
+  # M1: use a FRESH stub prefix (no muxm.1 written there) so _man_target_dir resolves into an
+  # empty sandbox — preserving the "nothing to remove" coverage. Without a brew stub this would
+  # target the real $(brew --prefix)/share/man/man1 and rm -f the developer's installed muxm.1.
+  local un_stub_bin un_stub_prefix
+  un_stub_bin="$fake_home/brew_stub_bin_uninstall"
+  un_stub_prefix="$fake_home/brew_prefix_uninstall"
+  _make_brew_stub "$un_stub_bin" "$un_stub_prefix"
   local man_out
-  man_out="$(HOME="$fake_home" "$MUXM" --uninstall-man 2>&1)" || true
+  man_out="$(HOME="$fake_home" PATH="$un_stub_bin:$PATH" "$MUXM" --uninstall-man 2>&1)" || true
   assert_contains "Manual Page Uninstaller" "--uninstall-man shows banner" "$man_out"
   # Safe when man page is not installed — should not error
   if echo "$man_out" | grep -qiE "not found|nothing to remove|removed"; then
