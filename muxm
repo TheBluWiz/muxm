@@ -6685,7 +6685,7 @@ check_skip_if_ideal() {
       _sii_s_n="$(_sub_count)"
       for (( _sii_s_i=0; _sii_s_i<_sii_s_n; _sii_s_i++ )); do
         _sii_s_info="$(_sub_stream_info "$_sii_s_i")"
-        IFS=$'\t' read -r _sii_s_codec _ _ _ <<< "$_sii_s_info"
+        IFS=$'\t' read -r _sii_s_codec _ _ _ _ <<< "$_sii_s_info"
         _sii_s_codec="${_sii_s_codec,,}"
         if [[ "$MUX_FORMAT" == "matroska" ]] || _is_text_sub_codec "$_sii_s_codec"; then
           SII_SUB_INDICES+=("$_sii_s_i")
@@ -9229,19 +9229,29 @@ run_audio_pipeline(){
     fi
   # Step 2: Lossless passthrough (if enabled and codec is lossless)
   elif (( AUDIO_LOSSLESS_PASSTHROUGH )) && audio_is_lossless "$codec"; then
-    if audio_lossless_muxable "$codec"; then
+    # F4: only stream-copy untouched when the container can hold the codec AND the channel count
+    # is uncapped. A MAX_AUDIO_CHANNELS cap (effective_ch < ch) cannot be applied to a lossless
+    # copy, so a capped source must fall through to transcode (which applies -ac) — the same
+    # `(( effective_ch == ch ))` guard Steps 1 and 3 already carry.
+    if audio_lossless_muxable "$codec" && (( effective_ch == ch )); then
       do_copy=1
       note "Lossless audio passthrough ($codec). Copying without conversion."
       report_add "audio_action" "lossless passthrough ($codec)"
     else
-      # Lossless but can't mux into target container — transcode to best compatible
+      # Lossless but either can't mux into the target container OR the channel cap applies —
+      # transcode to the best compatible codec (effective_ch is enforced via -ac downstream).
       read -r tgt_codec tgt_br <<< "$(audio_transcode_target "$effective_ch")"
       # D3: --audio-force-bitrate overrides the auto bitrate for any transcoded non-lossless
       # output, not just the --audio-force-codec path (Step 1, above). No double-apply: this is
       # a separate elif branch from Step 1.
       [[ -n "${AUDIO_FORCE_BITRATE:-}" ]] && tgt_br="$AUDIO_FORCE_BITRATE"
-      note "Lossless $codec can't mux into $MUX_FORMAT — transcoding to $tgt_codec."
-      report_add "audio_action" "transcode (lossless $codec incompatible with $MUX_FORMAT)"
+      if (( effective_ch != ch )); then
+        note "Lossless $codec capped from ${ch}ch to ${effective_ch}ch (MAX_AUDIO_CHANNELS) — transcoding to $tgt_codec."
+        report_add "audio_action" "transcode (lossless $codec capped ${ch}ch→${effective_ch}ch)"
+      else
+        note "Lossless $codec can't mux into $MUX_FORMAT — transcoding to $tgt_codec."
+        report_add "audio_action" "transcode (lossless $codec incompatible with $MUX_FORMAT)"
+      fi
     fi
   # Step 3: Direct-play-copyable codec (aac, alac, ac3, eac3) → copy
   elif audio_is_direct_play_copyable "$codec" && (( effective_ch == ch )); then
@@ -9490,27 +9500,30 @@ _is_sdh_title(){
 
 # _sub_stream_info — Fetch all scan-relevant fields for one subtitle stream
 # in a single jq call (replaces 3–4 separate jq forks per stream).
-# Returns: codec\tlanguage\ttitle\tforced  (tab-delimited)
+# Returns: codec\tlanguage\ttitle\tforced\thearing_impaired  (tab-delimited)
+# F3: hearing_impaired disposition is emitted so SDH can be classified by disposition, not just
+#     title. ALL consumers `read -r codec lang title forced hi` — a 4-field read would fold the
+#     hi field into `forced`, corrupting the `(( forced ))` checks (see the fallback below too).
 # Args: $1 — subtitle stream index (0-based, relative to subtitle streams)
 # Globals: METADATA_CACHE (read)
 _sub_stream_info(){
   local idx="$1"
   _jq_cache -r "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx] |
-    \"\(.codec_name // \"?\")\t\(.tags.language // \"\")\t\(.tags.title // \"\")\t\(.disposition.forced // 0)\"" | head -n1 || printf '?\t\t\t0\n'
+    \"\(.codec_name // \"?\")\t\(.tags.language // \"\")\t\(.tags.title // \"\")\t\(.disposition.forced // 0)\t\(.disposition.hearing_impaired // 0)\"" | head -n1 || printf '?\t\t\t0\t0\n'
 }
 
 # Format a subtitle stream as a human-readable one-line summary.
 # Output: "#0: subrip [eng] — English (forced)" (prints to stdout)
 # Args: $1 — subtitle stream index
 describe_sub_stream(){
-  local i="$1" info codec lang title forced flags=""
+  local i="$1" info codec lang title forced hi flags=""
   info="$(_sub_stream_info "$i")"
-  IFS=$'\t' read -r codec lang title forced <<< "$info"
+  IFS=$'\t' read -r codec lang title forced hi <<< "$info"
 
   _normalize_codec_lang codec lang
 
   (( forced )) && flags=" (forced)"
-  if _is_sdh_title "$title"; then
+  if (( hi )) || _is_sdh_title "$title"; then
     [[ -n "$flags" ]] && flags="$flags, "
     flags="${flags}SDH"
   fi
@@ -10145,14 +10158,16 @@ merge_subtitle_sources(){
   n="$(_sub_count)"
   local i
   for (( i=0; i<n; i++ )); do
-    local info codec lang title forced stype
+    local info codec lang title forced hi stype
     info="$(_sub_stream_info "$i")"
-    IFS=$'\t' read -r codec lang title forced <<< "$info"
+    IFS=$'\t' read -r codec lang title forced hi <<< "$info"
     _normalize_codec_lang codec lang
 
+    # F3: classify SDH by the hearing_impaired disposition OR an SDH/HI title — a track tagged
+    # hearing_impaired but titled plainly ("English") was previously mis-classified "full".
     if (( forced )) || _is_forced_title "$title"; then
       stype="forced"
-    elif _is_sdh_title "$title"; then
+    elif (( hi )) || _is_sdh_title "$title"; then
       stype="sdh"
     else
       stype="full"
@@ -11390,13 +11405,6 @@ main() {
    or disable DV handling (--no-dv) to proceed without DV metadata."
         ;;
     esac
-
-    # Warn if hdr10-hq profile will strip DV from a source without HDR10 fallback metadata.
-    # DV-only sources (especially P5 and some P7) may lack mastering display / MaxCLL data,
-    # which causes dim or washed-out playback when DV is stripped and only HDR10 remains.
-    if (( DISABLE_DV )) && [[ "${PROFILE_NAME:-}" == "hdr10-hq" ]]; then
-      _check_hdr10_static_metadata
-    fi
   elif (( _dv_rc == 2 )); then
     # Detection was skipped because DISABLE_DV=1. Check the metadata cache
     # so we can tell the user if the source actually contains DV.
@@ -11406,6 +11414,17 @@ main() {
     if _source_has_dv_metadata; then
       warn "Source contains Dolby Vision but DV handling is disabled (${_dv_skip_source}). Use --dv to override."
       report_add "dv_detected" "skipped (present in source)"
+      # F2: these profiles strip DV and emit a 10-bit HDR10 stream (DISABLE_DV=1, HDR10 target).
+      # If the source carries DV but no HDR10 static metadata (mastering display / MaxCLL), the
+      # stripped output has missing brightness data → dim/washed-out on HDR10-only displays — so
+      # warn and point at archive (preserve DV). Skipped when tone-mapping to SDR (then the output
+      # isn't HDR10 and the metadata is irrelevant). Pre-fix this lived in the dead _dv_rc==0 arm,
+      # where DISABLE_DV is always 0 (detect_dv returns 2 when DISABLE_DV=1), so it never fired.
+      if (( ! TONEMAP_HDR_TO_SDR )); then
+        case "${PROFILE_NAME:-}" in
+          hdr10-hq|streaming-hevc|streaming-av1|av1-hq) _check_hdr10_static_metadata ;;
+        esac
+      fi
     else
       note "DV detection skipped (disabled by ${_dv_skip_source})."
       report_add "dv_detected" "skipped"

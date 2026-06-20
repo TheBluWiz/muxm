@@ -4437,6 +4437,64 @@ EOF
 
   _test_audio_native_stereo
   _test_audio_f1_directplay
+  _test_audio_f4_maxchannels
+}
+
+# F4: MAX_AUDIO_CHANNELS must apply on the lossless-passthrough copy path too. A lossless source
+# with more channels than the cap can't be stream-copied (copy can't downmix), so Step 2 must fall
+# through to transcode (which applies -ac) — the same `(( effective_ch == ch ))` guard Steps 1 and 3
+# carry. Vehicle: hdr10-hq (single-track audio + AUDIO_LOSSLESS_PASSTHROUGH=1); archive is
+# AUDIO_MULTI_TRACK=1 and routes to run_audio_pipeline_multi, bypassing Step 2. MAX_AUDIO_CHANNELS
+# has no CLI flag, so it's set via a project ./.muxmrc. Pre-fix the capped 8ch source copied
+# untouched (8ch FLAC mislabeled "5.1"). Skip-first guards per the soft-skip ratchet.
+_test_audio_f4_maxchannels() {
+  section "F4: MAX_AUDIO_CHANNELS on the lossless-passthrough path"
+  if ! ffmpeg_has_encoder flac; then
+    skip "F4: flac encoder unavailable — cannot build a lossless surround fixture"; return
+  fi
+  local _dir="$TESTDIR/f4_maxch"; mkdir -p "$_dir"
+  local _src="$_dir/src_flac8.mkv"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=green:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=duration=1" -c:v libx265 -preset ultrafast -crf 30 \
+    -c:a flac -ac 8 -metadata:s:a:0 language=eng "$_src" 2>/dev/null || true
+  if [[ ! -s "$_src" || "$(probe_audio "$_src" channels 0)" != "8" ]]; then
+    skip "F4: could not build an 8ch FLAC fixture"; rm -rf "$_dir"; return
+  fi
+
+  # Capped: ./.muxmrc sets MAX_AUDIO_CHANNELS=6 → the 8ch lossless source must TRANSCODE (not copy)
+  # to 6ch eac3 with a "5.1" descriptive title. Run from the config dir so ./.muxmrc is sourced.
+  local _capdir="$_dir/capped"; mkdir -p "$_capdir"
+  printf 'MAX_AUDIO_CHANNELS=6\n' > "$_capdir/.muxmrc"
+  local _capout="$_capdir/out.mkv"
+  (cd "$_capdir" && "$MUXM" -K --profile hdr10-hq --preset ultrafast "$_src" "$_capout" >/dev/null 2>&1) || true
+  local _cc _cch _ct
+  _cc="$(probe_audio "$_capout" codec_name 0)"; _cch="$(probe_audio "$_capout" channels 0)"
+  _ct="$(ffprobe -v error -select_streams a:0 -show_entries stream_tags=title -of csv=p=0 "$_capout" 2>/dev/null || true)"
+  if [[ "$_cc" == "eac3" && "$_cch" == "6" ]]; then
+    pass "F4: lossless 8ch + MAX_AUDIO_CHANNELS=6 → transcoded to 6ch eac3 (cap honored, not copied)"
+  else
+    fail "F4: capped lossless → expected eac3/6ch, got '${_cc:-none}'/${_cch:-?}ch (lossless copy ignored the cap?)"
+  fi
+  # The label must honestly reflect the transcoded output: "5.1" channels AND the E-AC-3 codec.
+  # Pre-fix the 8ch copy was mislabeled "5.1 Surround (FLAC)" — right channel label, wrong codec
+  # and wrong actual channel count — so requiring the E-AC-3 codec in the title flips on the bug.
+  if [[ "$_ct" == *"5.1"* && "$_ct" == *"E-AC-3"* ]]; then
+    pass "F4: capped descriptive title honestly reads '5.1 … (E-AC-3)' ('$_ct')"
+  else
+    fail "F4: capped title expected '5.1 … (E-AC-3)', got '${_ct:-none}' (mislabeled copy?)"
+  fi
+
+  # Regression: WITHOUT a cap (default MAX=8), the 8ch lossless source still copies untouched.
+  local _uncout="$_dir/uncapped.mkv"
+  run_muxm --profile hdr10-hq --preset ultrafast "$_src" "$_uncout" >/dev/null 2>&1 || true
+  local _uc _uch
+  _uc="$(probe_audio "$_uncout" codec_name 0)"; _uch="$(probe_audio "$_uncout" channels 0)"
+  if [[ "$_uc" == "flac" && "$_uch" == "8" ]]; then
+    pass "F4: uncapped lossless 8ch → stream-copied untouched (flac/8ch, no regression)"
+  else
+    fail "F4: uncapped lossless → expected copied flac/8ch, got '${_uc:-none}'/${_uch:-?}ch"
+  fi
+  rm -rf "$_dir"
 }
 
 # F1: device Direct-Play correctness on MKV targets. audio_is_direct_play_copyable() used to
@@ -5177,6 +5235,56 @@ SRT
     fi
   fi
   rm -rf "$_burn_dir"
+
+  _test_subs_f3_sdh_disposition
+}
+
+# F3: SDH must be classified by the hearing_impaired DISPOSITION, not just an SDH/HI title. A track
+# tagged hearing_impaired=1 but titled plainly ("English") was previously classified "full" — so it
+# survived --no-sub-sdh and its hearing_impaired disposition was stripped to 0 on output. Uses
+# archive (multi-track subtitle mode) so the keep-list honors SUB_INCLUDE_SDH cleanly; single-track
+# mode has a direct-map fallback that re-adds a lone text sub regardless of type. Both assertions
+# below flip on the pre-fix (title-only) classifier. Skip-first guard per the soft-skip ratchet.
+_test_subs_f3_sdh_disposition() {
+  section "F3: SDH classified by hearing_impaired disposition"
+  local _dir="$TESTDIR/f3_sdh"; mkdir -p "$_dir"
+  printf '1\n00:00:00,000 --> 00:00:01,000\nHello\n' > "$_dir/s.srt"
+  local _src="$_dir/src.mkv"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=blue:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=d=1" -i "$_dir/s.srt" -map 0:v -map 1:a -map 2:s \
+    -c:v libx265 -preset ultrafast -crf 30 -c:a aac -c:s srt \
+    -disposition:s:0 hearing_impaired -metadata:s:s:0 title=English -metadata:s:s:0 language=eng \
+    "$_src" 2>/dev/null || true
+  # The fixture must carry hearing_impaired=1 with a PLAIN title, else the test proves nothing.
+  local _src_hi
+  _src_hi="$(ffprobe -v error -select_streams s:0 -show_entries stream_disposition=hearing_impaired -of csv=p=0 "$_src" 2>/dev/null || true)"
+  if [[ ! -s "$_src" || "$_src_hi" != "1" ]]; then
+    skip "F3: could not build a hearing_impaired subtitle fixture (ffmpeg disposition support)"
+    rm -rf "$_dir"; return
+  fi
+
+  # (a) Include path: the plain-titled hearing_impaired track is classified SDH, kept, and keeps
+  #     its hearing_impaired disposition on output. Pre-fix it was "full" → disposition reset to 0.
+  local _inc="$_dir/inc.mkv"
+  run_muxm --profile archive --preset ultrafast "$_src" "$_inc" >/dev/null 2>&1 || true
+  local _inc_hi
+  _inc_hi="$(ffprobe -v error -select_streams s:0 -show_entries stream_disposition=hearing_impaired -of csv=p=0 "$_inc" 2>/dev/null || true)"
+  if [[ -s "$_inc" && "$_inc_hi" == "1" ]]; then
+    pass "F3: hearing_impaired+plain-title sub → classified SDH, output keeps hearing_impaired disposition"
+  else
+    fail "F3: expected output sub disposition hearing_impaired=1, got '${_inc_hi:-none}' (classified 'full'?)"
+  fi
+
+  # (b) --no-sub-sdh drops it — only possible because it is now classified SDH (was kept pre-fix).
+  local _nos="$_dir/nos.mkv"
+  run_muxm --profile archive --no-sub-sdh --preset ultrafast "$_src" "$_nos" >/dev/null 2>&1 || true
+  local _nos_cnt; _nos_cnt="$(count_streams "$_nos" s)"
+  if [[ -s "$_nos" && "$_nos_cnt" == "0" ]]; then
+    pass "F3: --no-sub-sdh drops the disposition-only SDH track (0 subtitle streams)"
+  else
+    fail "F3: --no-sub-sdh → expected output with 0 subtitle streams, got ${_nos_cnt:-?} (output exists: $([[ -s "$_nos" ]] && echo yes || echo no))"
+  fi
+  rm -rf "$_dir"
 }
 
 # === Suite: Output Features ===
@@ -10086,6 +10194,47 @@ test_dv_vt() {
     fi
   else
     skip "C6 (e2e): set MUXM_DV_FIXTURE=/path/to/real_dv_source to exercise the post-probe path (unit suite covers the predicate)"
+  fi
+
+  # ---- F2: "DV stripped → HDR10 has no static metadata" warning REACHABILITY + scoping ----
+  # The bundled DV fixture has a DOVI configuration record but NO mastering-display/MaxCLL side
+  # data — exactly the at-risk source. Pre-fix the _check_hdr10_static_metadata call lived in
+  # main()'s dead `_dv_rc==0` arm (DISABLE_DV is always 0 there, since detect_dv returns 2 when
+  # DISABLE_DV=1), so it never fired for any DV-stripping profile. The function's own present/
+  # missing/partial logic is unit-tested in _test_unit_hdr10_static_metadata; here we assert it is
+  # now REACHED for the right profiles and NOT for the wrong ones. Dry-run (no encode needed).
+  # Skip-first guard (not an else-skip) per the soft-skip ratchet.
+  if [[ -z "${MUXM_DV_FIXTURE:-}" || ! -f "${MUXM_DV_FIXTURE:-}" || ! -r "${MUXM_DV_FIXTURE:-}" ]]; then
+    skip "F2 (e2e): no DV fixture available (set MUXM_DV_FIXTURE to exercise the HDR10-metadata warning)"
+  else
+    local _f2_warn='NO HDR10 static metadata' _f2
+    # DV-stripping HDR10 profiles must warn (hdr10-hq, plus the broadened streaming-hevc).
+    _f2="$(run_muxm --profile hdr10-hq --dry-run "$MUXM_DV_FIXTURE" 2>&1)"
+    if printf '%s' "$_f2" | grep -qF "$_f2_warn"; then
+      pass "F2: hdr10-hq strips DV from a no-HDR10-metadata source → warns (call now reached)"
+    else
+      fail "F2: hdr10-hq + DV-no-metadata source → expected the missing-HDR10-metadata warning"
+    fi
+    _f2="$(run_muxm --profile streaming-hevc --dry-run "$MUXM_DV_FIXTURE" 2>&1)"
+    if printf '%s' "$_f2" | grep -qF "$_f2_warn"; then
+      pass "F2: streaming-hevc (broadened DV-stripping profile) + DV-no-metadata → warns"
+    else
+      fail "F2: streaming-hevc + DV-no-metadata → expected the missing-HDR10-metadata warning"
+    fi
+    # Scoping: atv-directplay-hq PRESERVES DV (DISABLE_DV=0) → it isn't stripped → must NOT warn.
+    _f2="$(run_muxm --profile atv-directplay-hq --dry-run "$MUXM_DV_FIXTURE" 2>&1)"
+    if printf '%s' "$_f2" | grep -qF "$_f2_warn"; then
+      fail "F2: atv-directplay-hq preserves DV but wrongly warned about missing HDR10 metadata"
+    else
+      pass "F2: atv-directplay-hq (DV preserved) → no missing-HDR10-metadata warning"
+    fi
+    # Scoping: --tonemap yields SDR output (not HDR10), so the HDR10 metadata is irrelevant → no warn.
+    _f2="$(run_muxm --profile hdr10-hq --tonemap --dry-run "$MUXM_DV_FIXTURE" 2>&1)"
+    if printf '%s' "$_f2" | grep -qF "$_f2_warn"; then
+      fail "F2: hdr10-hq --tonemap (SDR output) wrongly warned about missing HDR10 metadata"
+    else
+      pass "F2: hdr10-hq --tonemap (SDR output) → no missing-HDR10-metadata warning"
+    fi
   fi
 
   # --- Gate 1: platform ---
