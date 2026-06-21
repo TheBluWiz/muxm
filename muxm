@@ -7226,6 +7226,21 @@ _source_has_dv_metadata() {
     select(.side_data_type == "DOVI configuration record")' >/dev/null 2>&1
 }
 
+# _source_dv_profile — Echo the source's Dolby Vision profile number (e.g. "7",
+# "8") read directly from the DOVI configuration record in the metadata cache, or
+# nothing if the source carries no DV side data. Read-only: writes no globals and
+# emits no notes/report, so it is safe to call from the skip-if-ideal copy gate,
+# where IS_DV/DV_SRC_PROFILE are not yet populated (C1). Mirrors the JSON arm of
+# detect_dv_info().
+# Globals: METADATA_CACHE (read)
+_source_dv_profile() {
+  [[ -n "${METADATA_CACHE:-}" ]] || return 0
+  _jq_cache -r '
+    [.streams[] | select(.codec_type=="video")] | .[0].side_data_list[]? |
+    select(.side_data_type == "DOVI configuration record") | .dv_profile // empty' \
+    2>/dev/null | head -n1 || true
+}
+
 # Populate DV source metadata from ffprobe side data and container records.
 # Sets: DV_SRC_PROFILE, DV_SRC_COMPAT_ID, DV_SRC_BL_PRESENT, DV_SRC_EL_PRESENT
 # Must be called after detect_dv returns true and METADATA_CACHE is populated.
@@ -7561,6 +7576,46 @@ declare -a ALL_SUB_TITLES=()      # title tag per entry (empty for external file
 # Globals: VIDEO_CODEC, TARGET_PIXFMT, TONEMAP_HDR_TO_SDR, PROFILE_DESC,
 #          IS_DV, DISABLE_DV, PROFILE_NAME, DV_SRC_PROFILE,
 #          MAX_COPY_BITRATE (read)
+# _output_pixfmt_is_10bit — Would the encoded output be 10-bit for the active
+# profile, given the source's color metadata? Self-sufficient: probes the source
+# directly (color_primaries/transfer/space + pix_fmt) and reads only config that is
+# already set at skip time, so it is correct on BOTH the normal pipeline path AND
+# the skip-if-ideal path — where TARGET_PIXFMT is not yet computed and still holds
+# its "yuv420p" default (the C1 bug). This mirrors the 4:2:0 bit-depth arm of
+# decide_color_and_pixfmt() (its source of truth — keep the two in sync if that
+# logic changes). It does NOT replicate decide's SDR 4:4:4/4:2:2 chroma-preservation
+# branch, which downgrades a forced-10-bit target back to 8-bit for an 8-bit source;
+# that path is unreachable here (the only VIDEO_COPY_IF_COMPLIANT profile setting
+# SDR_FORCE_10BIT also sets FORCE_CHROMA_420), and even if reached it would only cost
+# an unnecessary re-encode at the same 8-bit depth — never a wrong-depth output.
+# Reads: HDR_TARGET_PIXFMT, TONEMAP_HDR_TO_SDR, SDR_FORCE_10BIT, SDR_USE_10BIT_IF_SRC_10BIT
+# Returns: 0 (true) if the output would be 10-bit, 1 (false) otherwise.
+_output_pixfmt_is_10bit() {
+  local prim trc cspace pix src_is_hdr=0 src_is_10bit=0
+  prim="$(_lower "$(_probe_field color_primaries)")"
+  trc="$(_lower "$(_probe_field color_transfer)")"
+  cspace="$(_lower "$(_probe_field color_space)")"
+  pix="$(_lower "$(_probe_field pix_fmt)")"
+
+  # Classify the source exactly as decide_color_and_pixfmt does (same predicates).
+  [[ "$prim" == "bt2020" || "$cspace" == "bt2020nc" || "$trc" == "smpte2084" \
+     || "$trc" == "arib-std-b67" || "$trc" == "hlg" ]] && src_is_hdr=1
+  [[ "$pix" =~ (p010le|p10|p12) ]] && src_is_10bit=1
+
+  if (( src_is_hdr )); then
+    # HDR source: tone-mapped to SDR → 8-bit yuv420p; otherwise the output bit depth
+    # follows HDR_TARGET_PIXFMT (HLG and HDR10 both take this branch in decide).
+    (( TONEMAP_HDR_TO_SDR )) && return 1
+    [[ "$HDR_TARGET_PIXFMT" =~ (p010le|p10|p12) ]] && return 0
+    return 1
+  fi
+
+  # SDR source: 10-bit iff forced, or preserved from a 10-bit source.
+  (( SDR_FORCE_10BIT )) && return 0
+  (( SDR_USE_10BIT_IF_SRC_10BIT )) && (( src_is_10bit )) && return 0
+  return 1
+}
+
 _video_is_copy_compliant() {
   _COPY_REJECT_REASON=""
   local src_codec src_pix
@@ -7593,9 +7648,14 @@ _video_is_copy_compliant() {
     fi
   fi
 
-  # Check pixel format (10-bit for HDR)
-  if [[ "$TARGET_PIXFMT" == "yuv420p10le" && "$src_pix" != *"p10"* ]]; then
-    _COPY_REJECT_REASON="pixel format is $src_pix (need 10-bit for $TARGET_PIXFMT)"
+  # Pixel-format (bit-depth) gate. Self-sufficient so it is correct on BOTH the
+  # normal pipeline path AND the skip-if-ideal path, where TARGET_PIXFMT is not yet
+  # computed and still holds its "yuv420p" default (C1). Decide the INTENDED output
+  # bit depth from the profile/SDR config + freshly-probed source color metadata
+  # (_output_pixfmt_is_10bit) instead of reading the stale TARGET_PIXFMT, and detect
+  # the source's depth with decide_color_and_pixfmt's own 10-bit predicate.
+  if _output_pixfmt_is_10bit && [[ ! "$src_pix" =~ (p010le|p10|p12) ]]; then
+    _COPY_REJECT_REASON="pixel format is $src_pix (need 10-bit output for this profile)"
     return 1
   fi
 
@@ -7611,13 +7671,27 @@ _video_is_copy_compliant() {
     fi
   fi
 
-  # Check DV profile compatibility when DV handling is active.
-  # For atv-directplay-hq, only Profile 8 is acceptable for copy; other
-  # profiles (e.g., P7) require RPU conversion and cannot be stream-copied.
-  if (( IS_DV && ! DISABLE_DV )) && [[ "${PROFILE_NAME:-}" == "atv-directplay-hq" ]] \
-     && [[ "${DV_SRC_PROFILE:-}" != "8" ]]; then
-    _COPY_REJECT_REASON="DV profile ${DV_SRC_PROFILE:-?} requires conversion (need P8 for copy)"
-    return 1
+  # DV-profile gate. For atv-directplay-hq, only Profile 8 may be stream-copied;
+  # P7/P5 etc. need RPU conversion to P8.1 and cannot be copied verbatim.
+  #
+  # Must be correct on BOTH call paths. On the normal pipeline path detect_dv/
+  # detect_dv_info have run, so IS_DV/DV_SRC_PROFILE are authoritative (and stay so
+  # for frame-probe-only or text-fallback DV, where the cache JSON has no DOVI
+  # record). On the skip-if-ideal path they are still their defaults (IS_DV=0,
+  # DV_SRC_PROFILE="") — the C1 bug — so fall back to a read-only probe of the
+  # source's DV profile from the metadata cache.
+  if (( ! DISABLE_DV )) && [[ "${PROFILE_NAME:-}" == "atv-directplay-hq" ]]; then
+    local _cc_is_dv="$IS_DV" _cc_dv_profile="${DV_SRC_PROFILE:-}"
+    if (( ! _cc_is_dv )) && [[ -z "$_cc_dv_profile" ]]; then
+      if _source_has_dv_metadata; then
+        _cc_is_dv=1
+        _cc_dv_profile="$(_source_dv_profile)"
+      fi
+    fi
+    if (( _cc_is_dv )) && [[ "$_cc_dv_profile" != "8" ]]; then
+      _COPY_REJECT_REASON="DV profile ${_cc_dv_profile:-?} requires conversion (need P8 for copy)"
+      return 1
+    fi
   fi
 
   # Bitrate ceiling: reject copy if source exceeds MAX_COPY_BITRATE.

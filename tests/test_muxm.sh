@@ -7929,19 +7929,26 @@ _test_unit_video_copy_compliant() {
   # covered e2e by the output suite (sii_mt: commentary forces remux; sii_subs: 5 subs preserved
   # through the ideal path). Not duplicated here — this item adds the missing reject-reason cover.
   local body
-  body="$(_extract_muxm_fns _video_is_copy_compliant _lower)" \
-    || { fail "3.5: could not extract _video_is_copy_compliant + _lower"; return; }
+  body="$(_extract_muxm_fns _video_is_copy_compliant _lower _output_pixfmt_is_10bit)" \
+    || { fail "3.5: could not extract _video_is_copy_compliant + _lower + _output_pixfmt_is_10bit"; return; }
   # $1=src_codec $2=src_pix $3=src_prim $4=src_trc $5=src_bitrate(bps) $6=extra global overrides.
   # Emits "<rc>|<reject reason>". Bitrate is always a real number so the size/duration stat
   # fallback in the ceiling check is never reached (keeps the ceiling scenario deterministic).
+  # C1: the 10-bit gate now derives intent from HDR_TARGET_PIXFMT/SDR_* + probed color (not the
+  # stale TARGET_PIXFMT), and the DV gate falls back to a direct probe (stubbed here via
+  # P_DV_PROFILE) when IS_DV/DV_SRC_PROFILE are unset — so the harness seeds those config globals
+  # and a controllable DV-probe stub. _probe_field also answers color_space for the HDR classifier.
   _vcc(){
     local extra="${6:-}"
     bash -c '_CLI_CRF_EXPLICIT=0; _CLI_PRESET_EXPLICIT=0
 VIDEO_CODEC=libx265; TARGET_PIXFMT=yuv420p; TONEMAP_HDR_TO_SDR=0
-IS_DV=0; DISABLE_DV=1; PROFILE_NAME=""; DV_SRC_PROFILE=""; MAX_COPY_BITRATE=""
-P_CODEC="$1"; P_PIX="$2"; P_PRIM="$3"; P_TRC="$4"; P_BR="$5"
+HDR_TARGET_PIXFMT=yuv420p10le; SDR_FORCE_10BIT=0; SDR_USE_10BIT_IF_SRC_10BIT=0
+IS_DV=0; DISABLE_DV=1; PROFILE_NAME=""; DV_SRC_PROFILE=""; MAX_COPY_BITRATE=""; P_DV_PROFILE=""
+P_CODEC="$1"; P_PIX="$2"; P_PRIM="$3"; P_TRC="$4"; P_BR="$5"; P_CSPACE=""
 '"$extra"'
-_probe_field(){ case "$1" in codec_name) printf "%s" "$P_CODEC";; pix_fmt) printf "%s" "$P_PIX";; color_primaries) printf "%s" "$P_PRIM";; color_transfer) printf "%s" "$P_TRC";; bit_rate) printf "%s" "$P_BR";; esac; }
+_probe_field(){ case "$1" in codec_name) printf "%s" "$P_CODEC";; pix_fmt) printf "%s" "$P_PIX";; color_primaries) printf "%s" "$P_PRIM";; color_transfer) printf "%s" "$P_TRC";; color_space) printf "%s" "$P_CSPACE";; bit_rate) printf "%s" "$P_BR";; esac; }
+_source_has_dv_metadata(){ [[ -n "$P_DV_PROFILE" ]]; }
+_source_dv_profile(){ printf "%s" "$P_DV_PROFILE"; }
 warn(){ :; }
 '"$body"'
 if _video_is_copy_compliant; then printf "0|%s" "$_COPY_REJECT_REASON"; else printf "1|%s" "$_COPY_REJECT_REASON"; fi' -- "$1" "$2" "$3" "$4" "$5"
@@ -7961,10 +7968,34 @@ if _video_is_copy_compliant; then printf "0|%s" "$_COPY_REJECT_REASON"; else pri
   _vcc_assert "3.5 copy-compliant: HEVC matches target → copyable"  0 ""               "$(_vcc hevc yuv420p '' '' 5000000)"
   # Codec mismatch: libx265 target wants hevc; an h264 source must re-encode.
   _vcc_assert "3.5 copy-compliant: codec mismatch (h264) → re-encode" 1 "video codec"  "$(_vcc h264 yuv420p '' '' 5000000)"
-  # 10-bit-pixfmt ceiling: 10-bit target, 8-bit source → re-encode. (M-VCC-1 neuters this reject.)
-  _vcc_assert "3.5 copy-compliant: 10-bit pixfmt ceiling → re-encode" 1 "pixel format" "$(_vcc hevc yuv420p '' '' 5000000 'TARGET_PIXFMT=yuv420p10le')"
-  # Tonemap-required: HDR source (bt2020/pq) with tone-map on → cannot copy.
+  # 10-bit-pixfmt ceiling (C1): the gate now derives intended-10-bit from config + probed source,
+  # NOT the stale TARGET_PIXFMT. SDR source + --sdr-force-10bit wants 10-bit out, 8-bit source → re-encode.
+  _vcc_assert "3.5 copy-compliant: 10-bit out (sdr-force) vs 8-bit src → re-encode" 1 "need 10-bit" "$(_vcc hevc yuv420p '' '' 5000000 'SDR_FORCE_10BIT=1')"
+  # 10-bit ceiling via an HDR source (HDR_TARGET_PIXFMT is 10-bit) with an 8-bit pixfmt → re-encode.
+  _vcc_assert "3.5 copy-compliant: 10-bit out (HDR target) vs 8-bit src → re-encode" 1 "need 10-bit" "$(_vcc hevc yuv420p bt2020 smpte2084 5000000)"
+  # Regression: a 10-bit source under a 10-bit target is NOT bit-depth-rejected (only the depth gap rejects).
+  _vcc_assert "3.5 copy-compliant: 10-bit src under 10-bit target → copyable" 0 "" "$(_vcc hevc yuv420p10le '' '' 5000000 'SDR_FORCE_10BIT=1')"
+  # Tonemap-required: HDR source (bt2020/pq) with tone-map on → cannot copy. (10-bit gate must NOT
+  # pre-empt this: tone-mapped output is 8-bit, so _output_pixfmt_is_10bit is false here.)
   _vcc_assert "3.5 copy-compliant: tonemap-required (HDR) → re-encode" 1 "tone-mapping" "$(_vcc hevc yuv420p10le bt2020 smpte2084 5000000 'TONEMAP_HDR_TO_SDR=1')"
+
+  # ---- C1 DV-profile gate. atv-directplay-hq may stream-copy ONLY Profile 8; P7/P5 must re-encode.
+  #      The decisive new case is the skip-if-ideal path (IS_DV/DV_SRC_PROFILE unset) where the gate
+  #      now falls back to a direct probe (stubbed via P_DV_PROFILE). 10-bit src so the bit-depth gate
+  #      doesn't pre-empt. ----
+  local _dv_atv='PROFILE_NAME=atv-directplay-hq; DISABLE_DV=0'
+  # Normal path (globals populated): P7 → re-encode, P8 → copyable.
+  _vcc_assert "3.5 DV gate: normal-path P7 → re-encode" 1 "DV profile 7 requires conversion" "$(_vcc hevc yuv420p10le '' '' 5000000 "$_dv_atv; IS_DV=1; DV_SRC_PROFILE=7")"
+  _vcc_assert "3.5 DV gate: normal-path P8 → copyable"   0 ""                                "$(_vcc hevc yuv420p10le '' '' 5000000 "$_dv_atv; IS_DV=1; DV_SRC_PROFILE=8")"
+  # Skip-if-ideal path (C1): IS_DV/DV_SRC_PROFILE unset → direct probe decides. P7 → re-encode, P8 → copyable.
+  _vcc_assert "3.5 DV gate: skip-path P7 (direct probe) → re-encode" 1 "DV profile 7 requires conversion" "$(_vcc hevc yuv420p10le '' '' 5000000 "$_dv_atv; P_DV_PROFILE=7")"
+  _vcc_assert "3.5 DV gate: skip-path P8 (direct probe) → copyable"  0 ""                                 "$(_vcc hevc yuv420p10le '' '' 5000000 "$_dv_atv; P_DV_PROFILE=8")"
+  # Skip-path, source is NOT DV → no DV reject (probe finds nothing).
+  _vcc_assert "3.5 DV gate: skip-path non-DV → copyable" 0 "" "$(_vcc hevc yuv420p10le '' '' 5000000 "$_dv_atv")"
+  # DISABLE_DV bypasses the gate even for a P7 source.
+  _vcc_assert "3.5 DV gate: DISABLE_DV bypasses → copyable" 0 "" "$(_vcc hevc yuv420p10le '' '' 5000000 'PROFILE_NAME=atv-directplay-hq; DISABLE_DV=1; IS_DV=1; DV_SRC_PROFILE=7')"
+  # The gate is scoped to atv-directplay-hq; a P7 under any other profile is not DV-rejected here.
+  _vcc_assert "3.5 DV gate: other profile not DV-gated → copyable" 0 "" "$(_vcc hevc yuv420p10le '' '' 5000000 'PROFILE_NAME=hdr10-hq; DISABLE_DV=0; IS_DV=1; DV_SRC_PROFILE=7')"
   # MAX_COPY_BITRATE ceiling: 20 Mbps source over a 10000k cap → re-encode. (M-VCC-2 neuters this.)
   _vcc_assert "3.5 copy-compliant: bitrate ceiling exceeded → re-encode" 1 "MAX_COPY_BITRATE" "$(_vcc hevc yuv420p '' '' 20000000 'MAX_COPY_BITRATE=10000k')"
   # Under the ceiling: 5 Mbps source below the 10000k cap → still copyable (the ceiling only
@@ -7978,6 +8009,58 @@ if _video_is_copy_compliant; then printf "0|%s" "$_COPY_REJECT_REASON"; else pri
   _vcc_assert "3.6 copy-compliant: non-k ceiling '80000' exceeded → re-encode" 1 "MAX_COPY_BITRATE" "$(_vcc hevc yuv420p '' '' 100000000 'MAX_COPY_BITRATE=80000')"
   _vcc_assert "3.6 copy-compliant: non-k ceiling '80000' not exceeded → copyable" 0 ""              "$(_vcc hevc yuv420p '' ''  20000000 'MAX_COPY_BITRATE=80000')"
   _vcc_assert "3.6 copy-compliant: invalid rate '80M' → warn + ceiling skipped (copyable)" 0 ""      "$(_vcc hevc yuv420p '' '' 100000000 'MAX_COPY_BITRATE=80M')"
+}
+
+_test_unit_c1_gate_helpers() {
+  # 3.5b (C1): direct unit tests for the two self-sufficient helpers the skip-if-ideal copy gate
+  # now relies on (they replace the stale TARGET_PIXFMT / IS_DV reads):
+  #   _output_pixfmt_is_10bit — would the OUTPUT be 10-bit? (mirrors decide_color_and_pixfmt's
+  #     bit-depth arm) — mock the _probe_field I/O boundary, assert the boolean across the matrix.
+  #   _source_dv_profile     — read the source DV profile from the DOVI record in METADATA_CACHE
+  #     (real jq parse of a synthetic cache), assert the echoed profile number.
+
+  # ---- _output_pixfmt_is_10bit ----
+  local body10
+  body10="$(_extract_muxm_fns _output_pixfmt_is_10bit _lower)" \
+    || { fail "3.5b: could not extract _output_pixfmt_is_10bit + _lower"; return; }
+  # $1=pix $2=prim $3=trc $4=cspace $5=extra flags. Emits "10" if 10-bit output else "8".
+  _o10(){
+    bash -c 'HDR_TARGET_PIXFMT=yuv420p10le; TONEMAP_HDR_TO_SDR=0; SDR_FORCE_10BIT=0; SDR_USE_10BIT_IF_SRC_10BIT=0
+P_PIX="$1"; P_PRIM="$2"; P_TRC="$3"; P_CSPACE="$4"
+'"${5:-}"'
+_probe_field(){ case "$1" in pix_fmt) printf "%s" "$P_PIX";; color_primaries) printf "%s" "$P_PRIM";; color_transfer) printf "%s" "$P_TRC";; color_space) printf "%s" "$P_CSPACE";; esac; }
+'"$body10"'
+if _output_pixfmt_is_10bit; then printf 10; else printf 8; fi' -- "$1" "$2" "$3" "$4"
+  }
+  _o10_assert(){ local label="$1" want="$2" got="$3"; if [[ "$got" == "$want" ]]; then pass "$label (=$got-bit)"; else fail "$label — got ${got}-bit, expected ${want}-bit"; fi; }
+
+  _o10_assert "3.5b 10bit: SDR 8-bit, no flags → 8-bit out"            8  "$(_o10 yuv420p '' '' '')"
+  _o10_assert "3.5b 10bit: SDR --sdr-force-10bit → 10-bit out"         10 "$(_o10 yuv420p '' '' '' 'SDR_FORCE_10BIT=1')"
+  _o10_assert "3.5b 10bit: SDR 10-bit src + use-if-src-10bit → 10-bit" 10 "$(_o10 yuv420p10le '' '' '' 'SDR_USE_10BIT_IF_SRC_10BIT=1')"
+  _o10_assert "3.5b 10bit: SDR 8-bit src + use-if-src-10bit → 8-bit"   8  "$(_o10 yuv420p '' '' '' 'SDR_USE_10BIT_IF_SRC_10BIT=1')"
+  _o10_assert "3.5b 10bit: HDR10 (bt2020/pq) → 10-bit out"             10 "$(_o10 yuv420p bt2020 smpte2084 bt2020nc)"
+  _o10_assert "3.5b 10bit: HDR via colorspace only (bt2020nc) → 10-bit" 10 "$(_o10 yuv420p '' '' bt2020nc)"
+  _o10_assert "3.5b 10bit: HLG (arib-std-b67) → 10-bit out"            10 "$(_o10 yuv420p10le bt2020 arib-std-b67 bt2020nc)"
+  _o10_assert "3.5b 10bit: HDR but tone-mapped to SDR → 8-bit out"     8  "$(_o10 yuv420p10le bt2020 smpte2084 bt2020nc 'TONEMAP_HDR_TO_SDR=1')"
+  _o10_assert "3.5b 10bit: HDR + 8-bit HDR_TARGET_PIXFMT → 8-bit out"  8  "$(_o10 yuv420p bt2020 smpte2084 bt2020nc 'HDR_TARGET_PIXFMT=yuv420p')"
+
+  # ---- _source_dv_profile (real jq over a synthetic cache) ----
+  local bodydv
+  bodydv="$(_extract_muxm_fns _source_dv_profile _jq_cache)" \
+    || { fail "3.5b: could not extract _source_dv_profile + _jq_cache"; return; }
+  _sdp(){ bash -c 'METADATA_CACHE="$1"; DEBUG=0
+'"$bodydv"'
+_source_dv_profile' -- "$1"; }
+  _sdp_assert(){ local label="$1" want="$2" got="$3"; if [[ "$got" == "$want" ]]; then pass "$label (='${got}')"; else fail "$label — got '${got}', expected '${want}'"; fi; }
+
+  local _cache_p7='{"streams":[{"codec_type":"video","side_data_list":[{"side_data_type":"DOVI configuration record","dv_profile":7}]}]}'
+  local _cache_p8='{"streams":[{"codec_type":"video","side_data_list":[{"side_data_type":"DOVI configuration record","dv_profile":8}]}]}'
+  local _cache_nodv='{"streams":[{"codec_type":"video","side_data_list":[{"side_data_type":"Display Matrix"}]}]}'
+  local _cache_plain='{"streams":[{"codec_type":"video"}]}'
+  _sdp_assert "3.5b dv-profile: DOVI record profile 7 → '7'"   "7" "$(_sdp "$_cache_p7")"
+  _sdp_assert "3.5b dv-profile: DOVI record profile 8 → '8'"   "8" "$(_sdp "$_cache_p8")"
+  _sdp_assert "3.5b dv-profile: side-data but no DOVI → empty" ""  "$(_sdp "$_cache_nodv")"
+  _sdp_assert "3.5b dv-profile: no side_data_list → empty"     ""  "$(_sdp "$_cache_plain")"
 }
 
 _test_unit_hdr10_static_metadata() {
@@ -8179,6 +8262,7 @@ test_unit() {
   _test_unit_report_add_escaping
   _test_unit_duration_tier3
   _test_unit_video_copy_compliant
+  _test_unit_c1_gate_helpers
   _test_unit_hdr10_static_metadata
   _test_unit_ocr_dispatch
   _test_unit_persist_helpers
@@ -10598,6 +10682,95 @@ test_dv_sw() {
     fail "dv_sw: frame-count mismatch — source=$src_frames, output=$out_frames"
   fi
   rm -f "$out"
+
+  # ---- C1 regression: skip-if-ideal must evaluate the DV and bit-depth copy gates against the
+  #      REAL source, not the still-default globals. IS_DV/DV_SRC_PROFILE/TARGET_PIXFMT are unset
+  #      when check_skip_if_ideal runs (they are only populated later, on the non-skip path), so a
+  #      DV-Profile-7 or an 8-bit source was stream-copied verbatim under atv-directplay-hq's
+  #      "HEVC Main10 + DV P8.1" contract with NO warning. --dry-run suffices: the skip vs.
+  #      "does not match ideal" decision and its reason are emitted before any encode runs.
+  section "C1: skip-if-ideal evaluates the DV & bit-depth gates against the real source"
+
+  local _c1_mp4box=""
+  if command -v MP4Box >/dev/null 2>&1; then _c1_mp4box=MP4Box
+  elif command -v mp4box >/dev/null 2>&1; then _c1_mp4box=mp4box; fi
+  local _c1_bundled
+  _c1_bundled="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures/HDR1080p.MOV"
+
+  if [[ ! -r "$_c1_bundled" || -z "$_c1_mp4box" ]]; then
+    skip "dv_sw C1: bundled HDR1080p.MOV or MP4Box unavailable — cannot build the P7/P8 fixtures"
+  else
+    # Known-Profile-8, 10-bit, HLG source (the bundled DV fixture copied to .mp4).
+    local _c1_p8="$TESTDIR/c1_p8.mp4"
+    cp "$_c1_bundled" "$_c1_p8"
+    local _c1_srcprofile _c1_fps
+    _c1_srcprofile="$(ffprobe -v error -show_streams -select_streams v:0 "$_c1_p8" 2>/dev/null | grep -m1 '^dv_profile=' | cut -d= -f2)"
+    _c1_fps="$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=nk=1:nw=1 "$_c1_p8" 2>/dev/null | head -1)"
+    [[ "$_c1_fps" =~ ^[0-9]+/[0-9]+$ || "$_c1_fps" =~ ^[0-9.]+$ ]] || _c1_fps="24"
+
+    # Fabricate a DV-Profile-7-LABELED source: extract the HEVC ES and re-mux declaring dvp=7 via
+    # MP4Box's profile hint, so the container DOVI configuration record reports dv_profile=7 — which
+    # is exactly what the copy gate reads (the RPU payload is irrelevant to the profile-number gate).
+    local _c1_es="$TESTDIR/c1_src.hevc" _c1_p7="$TESTDIR/c1_p7.mp4"
+    ffmpeg -v error -y -i "$_c1_p8" -map 0:v:0 -c copy -bsf:v hevc_mp4toannexb -f hevc "$_c1_es" 2>/dev/null
+    "$_c1_mp4box" -fps "$_c1_fps" -add "${_c1_es}:dvp=7.6" -new "$_c1_p7" >/dev/null 2>&1
+
+    # Build an 8-bit HEVC source tagged HDR (bt2020nc) so decide_color_and_pixfmt targets 10-bit
+    # while the source stays 8-bit — the bit-depth companion to the P7 case.
+    local _c1_8bit="$TESTDIR/c1_8bit.mp4"
+    ffmpeg -v error -y -f lavfi -i "testsrc2=size=640x360:rate=24:duration=2" \
+      -c:v libx265 -pix_fmt yuv420p -x265-params log-level=none \
+      -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
+      -tag:v hvc1 -movflags +faststart "$_c1_8bit" 2>/dev/null
+    local _c1_8cs
+    _c1_8cs="$(ffprobe -v error -select_streams v:0 -show_entries stream=color_space -of default=nk=1:nw=1 "$_c1_8bit" 2>/dev/null | head -1)"
+
+    # --dry-run atv-directplay-hq; capture the combined skip/no-skip decision + reason.
+    _c1_run(){ (cd "$TESTDIR" && "$MUXM" --profile atv-directplay-hq --dry-run "$1" "$TESTDIR/c1_out.mp4" 2>&1) || true; }
+    local _c1_out
+
+    # (a) Regression guard: a genuinely-compliant Profile-8 10-bit source must STILL skip (don't
+    #     over-correct into never skipping). Skip-first guard (not an else-skip) per the ratchet.
+    if [[ "$_c1_srcprofile" != "8" ]]; then
+      skip "dv_sw C1: bundled fixture is not Profile 8 (got '${_c1_srcprofile:-none}') — skipping the P8 skip-guard"
+    else
+      _c1_out="$(_c1_run "$_c1_p8")"
+      if printf '%s\n' "$_c1_out" | grep -qiE 'already matches.*skipping'; then
+        pass "dv_sw C1: compliant Profile-8 10-bit source still skips under atv-directplay-hq (no over-correction)"
+      else
+        fail "dv_sw C1: Profile-8 source no longer skips — the gate over-corrected. Saw: $(printf '%s\n' "$_c1_out" | grep -iE 'match|skip' | head -1)"
+      fi
+    fi
+
+    # (b) DV-Profile-7 source must NOT skip-copy; the reason must cite the DV conversion gate.
+    #     Skip-first guard (not an else-skip) per the ratchet.
+    if [[ ! -s "$_c1_p7" ]] || \
+       [[ "$(ffprobe -v error -show_streams -select_streams v:0 "$_c1_p7" 2>/dev/null | grep -m1 '^dv_profile=' | cut -d= -f2)" != "7" ]]; then
+      skip "dv_sw C1: could not fabricate a Profile-7-labeled fixture (MP4Box dvp hint) — skipping the P7 assertion"
+    else
+      _c1_out="$(_c1_run "$_c1_p7")"
+      if printf '%s\n' "$_c1_out" | grep -qiE 'does not match ideal:.*DV profile 7.*requires conversion'; then
+        pass "dv_sw C1: DV Profile-7 source rejected from skip-copy under atv-directplay-hq (no silent P7 passthrough)"
+      else
+        fail "dv_sw C1: DV Profile-7 source still skip-copied under atv-directplay-hq (C1). Saw: $(printf '%s\n' "$_c1_out" | grep -iE 'match|skip' | head -1)"
+      fi
+    fi
+
+    # (c) 8-bit source must NOT skip-copy under a 10-bit profile; the reason must cite the bit-depth.
+    #     Skip-first guard (not an else-skip) per the ratchet.
+    if [[ ! -s "$_c1_8bit" || "$_c1_8cs" != "bt2020nc" ]]; then
+      skip "dv_sw C1: 8-bit HDR fixture unavailable or lost its bt2020nc tag (got '${_c1_8cs:-none}') — skipping the bit-depth assertion"
+    else
+      _c1_out="$(_c1_run "$_c1_8bit")"
+      if printf '%s\n' "$_c1_out" | grep -qiE 'does not match ideal:.*need 10-bit'; then
+        pass "dv_sw C1: 8-bit source rejected from skip-copy under atv-directplay-hq (no silent 8-bit passthrough)"
+      else
+        fail "dv_sw C1: 8-bit source still skip-copied under atv-directplay-hq (C1). Saw: $(printf '%s\n' "$_c1_out" | grep -iE 'match|skip' | head -1)"
+      fi
+    fi
+
+    rm -f "$_c1_p8" "$_c1_p7" "$_c1_es" "$_c1_8bit" "$TESTDIR/c1_out.mp4" 2>/dev/null || true
+  fi
 }
 
 # Phase 2.1: prose-doc profile drift guard. Mirrors the cli-suite VALID_PROFILES
