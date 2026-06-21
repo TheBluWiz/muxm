@@ -10,7 +10,7 @@
 #  per-profile calibration table identifying the quality setting that
 #  achieves VMAF parity with the software encoder (Δ ≤ 0.5).
 #
-#  Requires: ffmpeg (with target hardware encoder), ffprobe, jq, bc
+#  Requires: ffmpeg (with target hardware encoder), ffprobe, jq
 #  Optional: ffmpeg with libvmaf (for VMAF scoring)
 #
 # =============================================================================
@@ -383,7 +383,7 @@ printf '%s\n' $VALID_PROFILES | grep -qxF "$PROFILE" \
 need ffmpeg
 need ffprobe
 need jq
-need bc
+# (all float math uses awk; bc is intentionally not required)
 
 say ""
 say "${C_BOLD}${C_CYAN}╔══════════════════════════════════════════════════════╗${C_RESET}"

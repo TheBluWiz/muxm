@@ -75,8 +75,16 @@ enforce() {
     bad "$id [$suite]: mutation applied but the named test did NOT go red (sig: '$sig') — that test cannot detect this break"
     return
   fi
-  # (2) green when reverted (run the clean muxm)
+  # (2) green when reverted (run the clean muxm). AFFIRMATIVELY confirm the clean run completed
+  # before concluding "green": a crashed / OOM-killed / empty clean-harness run emits no FAIL line
+  # either, so inferring success from a missing FAIL alone would report a false GREEN — the one
+  # outcome an acceptance gate must never produce. test_muxm.sh always prints a "Test Summary"
+  # block when it runs to completion; its absence means the harness did not finish.
   out="$(bash "$TEST" --muxm "$MUXM" --suite "$suite" 2>&1)"
+  if ! grep -q 'Test Summary' <<<"$out"; then
+    bad "$id [$suite]: CLEAN muxm run did not complete (no 'Test Summary') — cannot confirm green; harness/setup error?"
+    return
+  fi
   if _named_test_failed "$out" "$sig"; then
     bad "$id [$suite]: named test also fails on CLEAN muxm (sig: '$sig') — guard is not specific to the mutation"
     return

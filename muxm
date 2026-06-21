@@ -6393,7 +6393,12 @@ disk_free_warn() {
 
   if (( vbr > 0 )); then
     if (( VIDEO_COPY_IF_COMPLIANT )); then
-      # Copy mode: output ≈ source size (no CRF reduction)
+      # Copy mode: output ≈ source size (no CRF reduction).
+      # NOTE (known marginal edge): this assumes the source is actually compliant and gets
+      # stream-copied. If it is NOT compliant, muxm re-encodes instead, and a very low-CRF
+      # (≤~14, near-lossless) re-encode of an already-large source can exceed this copy-sized
+      # reservation — so the guard may under-warn in that narrow case. Acceptable: such profiles
+      # target near-lossless preservation, where the operator is expected to provision headroom.
       est_video_bytes=$(( (vbr / 8) * dur ))
     else
       local -i ratio preset_mult
@@ -8135,6 +8140,19 @@ run_video_pipeline() {
     if (( DV_CONVERT_TO_P81_IF_FAIL )); then
       note "Source DV is Profile ${DV_SRC_PROFILE} — will convert to Profile 8 after injection…"
       dv_needs_convert=1
+
+      # F8: Profile 5 carries an IPT-PQ-c2 ("ICtCp") base layer, not a standard BT.2020 image.
+      # muxm decodes and re-encodes that base layer as-is, and `dovi_tool convert -d` rewrites
+      # ONLY the RPU — the base-layer pixels are never color-converted out of IPT. So a P5→P8.1
+      # conversion is best-effort: on non-DV players (which ignore the RPU) the base layer may
+      # render with incorrect colors. P7 is unaffected — its base layer is already BT.2020.
+      if [[ "${DV_SRC_PROFILE:-}" == "5" ]]; then
+        warn "Source DV is Profile 5 (IPT base layer). muxm re-encodes the base layer as-is and"
+        warn "  converts only the RPU to P8.1 — the IPT base layer is NOT color-converted, so this"
+        warn "  is best-effort: colors may be incorrect on non-DV players. Verify the output, or"
+        warn "  keep the original if exact P5 color fidelity matters."
+        report_add "dv_p5_base_best_effort" "true (P5 IPT base layer not color-converted)"
+      fi
 
       # Warn about enhancement layer data loss for P7
       if [[ "${DV_SRC_EL_PRESENT:-}" == "1" ]]; then

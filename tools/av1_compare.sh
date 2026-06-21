@@ -9,7 +9,7 @@
 #  then produces a side-by-side comparison table with file size, bitrate,
 #  encode time, and (optionally) VMAF scores.
 #
-#  Requires: ffmpeg (with libsvtav1 + libx265), ffprobe, jq, bc
+#  Requires: ffmpeg (with libsvtav1 + libx265), ffprobe, jq
 #  Optional: ffmpeg with libvmaf (for VMAF scoring)
 #
 # =============================================================================
@@ -112,14 +112,18 @@ need() {
 spinner() {
   local pid=$1 msg=$2 i=0
   local -a sym=( '|' '/' '—' $'\\' )
-  [[ -t 2 ]] || { wait "$pid" 2>/dev/null; return; }
+  # `|| true` on every `wait`: under `set -e` a failed background encode would otherwise make
+  # `wait` (the function's last command) return non-zero, aborting the whole run BEFORE the
+  # caller's graceful "Encode FAILED — skipping" handler. Detect failure via the output-file
+  # check instead, mirroring hw_compare.sh's spinner.
+  [[ -t 2 ]] || { wait "$pid" 2>/dev/null || true; return; }
   while kill -0 "$pid" 2>/dev/null; do
     printf '\r  %s  [%s]' "$msg" "${sym[i]}" >&2
     i=$(( (i+1) % 4 ))
     sleep 0.15
   done
   printf '\r  %s  [done]\n' "$msg" >&2
-  wait "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null || true
 }
 
 # ---- Formatting helpers ----
@@ -312,11 +316,10 @@ if [[ -n "$AV1_CRF_LIST" || -n "$AV1_PRESET_LIST" ]]; then
   done
 fi
 
-# Dependency check
+# Dependency check (all float math uses awk; bc is intentionally not required)
 need ffmpeg
 need ffprobe
 need jq
-need bc
 
 # ===== Section 9: Pre-flight ffmpeg capability checks =====================================
 say ""
@@ -533,7 +536,9 @@ for (( idx=0; idx < TOTAL_ENCODES; idx++ )); do
   T_END=$(date +%s)
   ENCODE_SECS=$(( T_END - T_START ))
 
-  if [[ ! -f "$OUT_FILE" ]]; then
+  # -s (not just -f): a failed ffmpeg with -y can leave a 0-byte file behind. Treating an empty
+  # output as success would later feed a 0 denominator into the "vs HEVC" size ratio (awk div-by-0).
+  if [[ ! -s "$OUT_FILE" ]]; then
     warn "Encode FAILED for ${label} — skipping."
     RESULT_LABELS+=( "$label" )
     RESULT_SIZES+=( "FAILED" )
