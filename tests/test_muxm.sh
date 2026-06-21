@@ -8358,26 +8358,32 @@ test_profile_e2e() {
   fi
 
   # ---- Encoder unavailability: libsvtav1 missing → exit code 10 ----
-  # When libsvt-av1 is requested but the encoder is absent, muxm must die with
-  # exit code 10 ("encoder not available").  Simulate by prepending a mock ffmpeg
-  # that reports no encoders to PATH so the availability probe fails.
-  local mock_ffmpeg_dir="$TESTDIR/mock_no_svtav1"
+  # When libsvt-av1 is requested but the encoder is absent everywhere, muxm must die with exit
+  # code 10 ("encoder not available"). Simulate with a mock ffmpeg that reports no encoders. Two
+  # interactions must be handled:
+  #   (1) The mock forwards every non-`-encoders` call to the REAL ffmpeg by ABSOLUTE path. A bare
+  #       `exec ffmpeg "$@"` would re-find this mock (its dir is first on PATH) and exec-loop
+  #       forever — which is exactly the hang this test previously caused once muxm began probing
+  #       `ffmpeg -version` at startup (_prefer_complete_ffmpeg).
+  #   (2) _prefer_complete_ffmpeg would otherwise see this incomplete ffmpeg and substitute the
+  #       real keg-only `ffmpeg-full` (which DOES have libsvtav1), making muxm succeed instead of
+  #       dying. So the mock is placed AT a fake HOMEBREW_PREFIX keg path and HOMEBREW_PREFIX points
+  #       at it: _prefer_complete_ffmpeg then sees the active ffmpeg already IS the (incomplete)
+  #       keg and leaves it, exercising the genuine "no AV1 encoder anywhere → die 10" path.
+  local mock_keg_root="$TESTDIR/mock_no_svtav1_prefix"
+  local mock_ffmpeg_dir="$mock_keg_root/opt/ffmpeg-full/bin"
   mkdir -p "$mock_ffmpeg_dir"
-  cat > "$mock_ffmpeg_dir/ffmpeg" <<'MOCK_EOF'
+  local _real_ffmpeg; _real_ffmpeg="$(command -v ffmpeg)"
+  cat > "$mock_ffmpeg_dir/ffmpeg" <<MOCK_EOF
 #!/bin/bash
-# Mock ffmpeg: lists no encoders so libsvtav1 probe fails.
-# All other invocations are forwarded to the real ffmpeg.
-for arg in "$@"; do
-  if [[ "$arg" == "-encoders" ]]; then
-    echo "Encoders:"
-    exit 0
-  fi
-done
-exec ffmpeg "$@"
+# Mock ffmpeg: reports no encoders so the libsvtav1 probe fails. Every other call forwards to the
+# REAL ffmpeg by absolute path (NOT bare \`ffmpeg\`, which would re-exec this mock infinitely).
+for arg in "\$@"; do [[ "\$arg" == "-encoders" ]] && { echo "Encoders:"; exit 0; }; done
+exec "$_real_ffmpeg" "\$@"
 MOCK_EOF
   chmod +x "$mock_ffmpeg_dir/ffmpeg"
   local mock_code
-  (cd "$TESTDIR" && PATH="$mock_ffmpeg_dir:$PATH" "$MUXM" -K \
+  (cd "$TESTDIR" && HOMEBREW_PREFIX="$mock_keg_root" PATH="$mock_ffmpeg_dir:$PATH" "$MUXM" -K \
     --video-codec libsvt-av1 "$TESTDIR/basic_sdr_subs.mkv" 2>&1) \
     && mock_code=$? || mock_code=$?
   if [[ "$mock_code" -eq 10 ]]; then
