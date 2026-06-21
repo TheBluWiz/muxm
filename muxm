@@ -78,6 +78,14 @@ shopt -s inherit_errexit 2>/dev/null || true
 #   - LC_NUMERIC=C guards all printf %.Nf calls that receive bc decimal output (M3)
 #   Validated by: LANG=C LC_ALL=C tests/test_muxm.sh --suite all
 
+# Naming convention (L9): a leading underscore marks an internal/"private" helper not meant to be
+# called from outside its subsystem; unprefixed names are the public-ish entry points (main, the
+# pipeline stages, profile appliers). The convention is applied loosely — a few long-standing
+# internal helpers predate it and are intentionally left unprefixed to avoid churn/test-rename risk
+# (filesize_pretty, write_checksum, list_sub_indices); and the subtitle-probe twins carry an
+# _sp_sub_* prefix (subtitle-pipeline) rather than _sub_* purely for historical reasons. Treat the
+# underscore as a hint, not a guarantee.
+
 # ---- Bash version guard ----
 # Namerefs (local -n), declare -i arrays, and other features require bash 4.3+.
 # macOS ships bash 3.2; users must install a modern bash (e.g., via Homebrew).
@@ -918,7 +926,12 @@ _detect_mp4box(){
   return 0
 }
 
-# Improved realpath that handles non-existent files on all platforms
+# Improved realpath that handles non-existent files on all platforms.
+# L9 note (left as-is, functionally inert): the BSD/no-realpath fallback below resolves the
+# *directory* to canonical via `cd … && pwd` but does NOT canonicalize symlinks or `..` in the
+# basename the way GNU `realpath -m` does for the whole path. Both call sites (SRC_ABS, OUT_ABS)
+# operate on an existing file whose directory is cd-resolved, so the difference never surfaces;
+# noted only so a future caller passing a symlinked/`..`-bearing basename knows the limitation.
 realpath_fallback(){
   local p="$1"
   
@@ -7012,35 +7025,27 @@ decide_color_and_pixfmt() {
 build_x265_params() {
   X265_PARAMS="$X265_PARAMS_BASE"
 
-  if [[ "$PROFILE_DESC" != "HDR10" ]]; then
-    # Strip all baked HDR10/PQ keys from X265_PARAMS_BASE for non-HDR10 sources (H9).
-    # Some profiles bake hdr10=1, transfer=smpte2084, etc. into X265_PARAMS_BASE;
-    # these must be removed when the source is HLG or SDR to avoid signaling PQ
-    # metadata on non-PQ content.
-    X265_PARAMS="$(printf '%s' "$X265_PARAMS" | sed \
-      's/:hdr10=[^:]*//g; s/^hdr10=[^:]*://
-       s/:hdr10-opt=[^:]*//g; s/^hdr10-opt=[^:]*://
-       s/:hdr-opt=[^:]*//g; s/^hdr-opt=[^:]*://
-       s/:colorprim=[^:]*//g; s/^colorprim=[^:]*://
-       s/:transfer=[^:]*//g; s/^transfer=[^:]*://
-       s/:colormatrix=[^:]*//g; s/^colormatrix=[^:]*://
-       s/:range=[^:]*//g; s/^range=[^:]*://')"
-    # For HLG sources, inject the correct HLG color signaling (H9).
-    if [[ "$PROFILE_DESC" == "HLG" ]]; then
-      X265_PARAMS="${X265_PARAMS}:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc"
-    fi
-  else
-    # HDR10: strip any baked-in instances first (avoid duplicates), then append.
-    X265_PARAMS="$(printf '%s' "$X265_PARAMS" | sed \
-      's/:hdr10=[^:]*//g; s/^hdr10=[^:]*://
-       s/:hdr10-opt=[^:]*//g; s/^hdr10-opt=[^:]*://
-       s/:hdr-opt=[^:]*//g; s/^hdr-opt=[^:]*://
-       s/:colorprim=[^:]*//g; s/^colorprim=[^:]*://
-       s/:transfer=[^:]*//g; s/^transfer=[^:]*://
-       s/:colormatrix=[^:]*//g; s/^colormatrix=[^:]*://
-       s/:range=[^:]*//g; s/^range=[^:]*://')"
+  # Strip all baked HDR10/PQ color keys from X265_PARAMS_BASE up front (H9, L7): some profiles bake
+  # hdr10=1/transfer=smpte2084/colorprim=bt2020/etc. in, which must NOT signal PQ on non-PQ (HLG/SDR)
+  # content and must be de-duplicated before the HDR10 path re-appends them. Both color paths start
+  # from this clean slate, so the strip — previously duplicated verbatim in both branches — is hoisted
+  # here and each branch only appends what it needs.
+  X265_PARAMS="$(printf '%s' "$X265_PARAMS" | sed \
+    's/:hdr10=[^:]*//g; s/^hdr10=[^:]*://
+     s/:hdr10-opt=[^:]*//g; s/^hdr10-opt=[^:]*://
+     s/:hdr-opt=[^:]*//g; s/^hdr-opt=[^:]*://
+     s/:colorprim=[^:]*//g; s/^colorprim=[^:]*://
+     s/:transfer=[^:]*//g; s/^transfer=[^:]*://
+     s/:colormatrix=[^:]*//g; s/^colormatrix=[^:]*://
+     s/:range=[^:]*//g; s/^range=[^:]*://')"
+
+  if [[ "$PROFILE_DESC" == "HDR10" ]]; then
     X265_PARAMS="${X265_PARAMS}:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited"
+  elif [[ "$PROFILE_DESC" == "HLG" ]]; then
+    # HLG: inject the correct HLG color signaling (H9).
+    X265_PARAMS="${X265_PARAMS}:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc"
   fi
+  # (SDR / SDR-TONEMAP and anything else: stripped, nothing appended.)
 
   # --threads N → genuinely cap core usage by sizing x265's worker thread pool.
   # ffmpeg's -threads does NOT size that pool (it defaults to all logical cores),
@@ -8658,12 +8663,11 @@ run_video_pipeline() {
 }
 
 # ===== Section 27: Audio selection & pipeline =================================================
-# Note on variable scope: Several variables in run_audio_pipeline are declared
-# 'local' for documentation purposes (they're "owned" by that function) but are
-# read by downstream functions and mux_final. In Bash, local variables are visible
-# to all functions called from the declaring function. Key variables consumed
-# downstream: A_PRIMARY_LANG, A_PRIMARY_TITLE, A_PRIMARY_CHANNELS, A_STEREO_LANG,
-# A_PRIMARY, AAC_STEREO, HAS_AUDIO.
+# Note on variable scope: the audio-result variables below are intentionally GLOBAL — they are
+# assigned without `local` in run_audio_pipeline / run_audio_pipeline_multi precisely because
+# mux_final and other downstream functions consume them after the pipeline returns (a `local`
+# would not survive the return). Key variables consumed downstream: A_PRIMARY_LANG, A_PRIMARY_TITLE,
+# A_PRIMARY_CHANNELS, A_STEREO_LANG, A_PRIMARY, AAC_STEREO, HAS_AUDIO.
 # Count audio streams in source file
 # Returns: Integer count (0 if none)
 # Globals: METADATA_CACHE
@@ -8671,24 +8675,21 @@ _audio_stream_count(){
   _jq_cache '[.streams[] | select(.codec_type=="audio")] | length' || echo 0
 }
 
-# Get audio field from cached metadata (single jq call)
-# Args: $1 — audio stream index (0-based, relative to audio streams)
-#        $2 — field name (jq path, e.g., codec_name, channels)
+# _probe_stream_field TYPE IDX FIELD — echo FIELD of the IDX-th stream of codec_type TYPE from the
+# metadata cache (single jq call). FIELD is a jq path under the stream object, so a container tag
+# is reached by passing "tags.<name>". The _audio_*/_sp_sub_* field+tag accessors are one-line
+# wrappers over this (L7 — they were four byte-identical bodies differing only in the type string).
 # Globals: METADATA_CACHE (read)
-_audio_field(){
-  local idx="$1" field="$2"
+_probe_stream_field(){
+  local type="$1" idx="$2" field="$3"
   _jq_cache -r \
-    "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].$field // empty" | head -n1 || true
+    "[.streams[] | select(.codec_type==\"$type\")] | .[$idx].$field // empty" | head -n1 || true
 }
 
-# Get audio tag from cached metadata (single jq call)
-# Args: $1 — audio stream index, $2 — tag name (e.g., language, title)
-# Globals: METADATA_CACHE (read)
-_audio_tag(){
-  local idx="$1" tag="$2"
-  _jq_cache -r \
-    "[.streams[] | select(.codec_type==\"audio\")] | .[$idx].tags.$tag // empty" | head -n1 || true
-}
+# Get audio field from cached metadata.  Args: $1 — audio stream index, $2 — field (e.g. codec_name).
+_audio_field(){ _probe_stream_field audio "$1" "$2"; }
+# Get audio tag from cached metadata.    Args: $1 — audio stream index, $2 — tag (e.g. language, title).
+_audio_tag(){ _probe_stream_field audio "$1" "tags.$2"; }
 
 # Return language tag for audio stream (lowercased), defaulting to TAG_LANGUAGE_DEFAULT.
 # Args: $1 — audio stream index
@@ -9742,24 +9743,10 @@ list_sub_indices(){
   for (( i=0; i<n; i++ )); do echo "$i"; done
 }
 
-# Get subtitle field from cached metadata (single jq call)
-# Args: $1 — subtitle stream index (0-based, relative to subtitle streams)
-#        $2 — field name (jq path, e.g., codec_name)
-# Globals: METADATA_CACHE (read)
-_sp_sub_field() {
-  local idx="$1" field="$2"
-  _jq_cache -r \
-    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].$field // empty" | head -n1 || true
-}
-
-# Get subtitle tag from cached metadata (single jq call)
-# Args: $1 — subtitle stream index, $2 — tag name (e.g., language, title)
-# Globals: METADATA_CACHE (read)
-_sp_sub_tag() {
-  local idx="$1" tag="$2"
-  _jq_cache -r \
-    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].tags.$tag // empty" | head -n1 || true
-}
+# Get subtitle field from cached metadata.  Args: $1 — subtitle stream index, $2 — field (e.g. codec_name).
+_sp_sub_field() { _probe_stream_field subtitle "$1" "$2"; }
+# Get subtitle tag from cached metadata.    Args: $1 — subtitle stream index, $2 — tag (e.g. language, title).
+_sp_sub_tag() { _probe_stream_field subtitle "$1" "tags.$2"; }
 
 # Check if subtitle stream has forced disposition (single jq call)
 # Args: $1 — subtitle stream index
