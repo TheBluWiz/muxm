@@ -6791,7 +6791,7 @@ assert_muxm_fn_stdout() {
 # _extract_muxm_fns NAME... — echo the concatenated awk single-function extractions for each
 # NAME (a target decision function plus the pure helpers it calls), so the function can be
 # exercised in a subshell with its REAL formula and only its I/O boundary mocked. This is the
-# Phase 2 unit mechanism (see Test_Suite_Fixes.md §0.4 and the "rejected `source muxm`" note):
+# Phase 2 unit mechanism (chosen over sourcing the whole muxm script in-test, which was rejected):
 # it needs no change to muxm. Same extraction as assert_muxm_fn_stdout, but it returns the
 # body so the caller drives the function directly. A name that isn't found emits nothing for
 # that name and makes the whole call return 1 — so a renamed dependency can't silently yield a
@@ -6867,7 +6867,7 @@ _test_unit_audio_helpers() {
   #  components in the test (codec_step=10, max_br_bonus=8, …) and asserted arithmetic
   #  tautologies (10>8, FLAC>AC3) that NEVER called _score_audio_stream, so a real scoring
   #  break was invisible. Replaced by _test_unit_score_audio_stream, which exercises the real
-  #  function via _extract_muxm_fns. See Test_Suite_Fixes.md §2.1.)
+  #  function via _extract_muxm_fns.)
 
   # ---- _audio_is_commentary ----
   assert_muxm_fn_exit "_audio_is_commentary('Director\\'s Commentary')=match"  0 _audio_is_commentary "" "Director's Commentary"
@@ -11332,7 +11332,7 @@ _test_meta_soft_skip() {
       log "  ↳ soft-skips dropped to $found — lower SOFT_SKIP_BASELINE to $found in _test_meta_soft_skip to lock it in"
     fi
   else
-    fail "soft-skip ratchet: $found else-only-skip blocks > baseline $baseline — a new 'else → skip' crept in. Convert it to 'fail' where the setup guarantees the property (see Test_Suite_Fixes.md §1.1), or it's a genuine host/version skip that belongs in an 'if [[ ! cond ]]; then skip' guard, not an else."
+    fail "soft-skip ratchet: $found else-only-skip blocks > baseline $baseline — a new 'else → skip' crept in. Convert it to 'fail' where the setup guarantees the property, or it's a genuine host/version skip that belongs in an 'if [[ ! cond ]]; then skip' guard, not an else."
   fi
 
   # M4 recurrence guard: the soft-skip ratchet above only catches the `else → skip` *shape*.

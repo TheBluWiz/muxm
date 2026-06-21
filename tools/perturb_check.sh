@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  perturb_check.sh — perturbation catalog / acceptance gate (Test_Suite_Fixes.md §0.1)
+#  perturb_check.sh — perturbation catalog / acceptance gate for the hardened test suite
 #
 #  The "spine" of the test-remediation plan: it proves each hardened test can actually
 #  FAIL when the feature it covers is broken. For every ENFORCED mutation it
@@ -21,7 +21,7 @@
 #  Exit:  0 = every enforced mutation behaved; 1 = a gate failed; 2 = usage/setup error.
 #
 #  Run it locally after the suite passes — it's the acceptance gate that signs off each
-#  remediation item (see Test_Suite_Fixes.md §0.1).
+#  remediation item.
 # =============================================================================
 set -uo pipefail
 

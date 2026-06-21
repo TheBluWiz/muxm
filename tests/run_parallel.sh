@@ -5,9 +5,9 @@
 #  Runs the muxm test suites concurrently to cut wall-clock, WITHOUT modifying
 #  test_muxm.sh. Each suite runs as its own `test_muxm.sh --suite NAME` process
 #  with a private $TMPDIR, so the per-run mktemp $TESTDIR / isolated $HOME and
-#  the suite's auto_cleanup never collide (external fan-out; see Test_Review.md §4.5).
+#  the suite's auto_cleanup never collide (external fan-out — no shared in-process state).
 #
-#  WHY SEGREGATED (Test_Review.md §4.1–4.2): running the fast config-printing
+#  WHY SEGREGATED: running the fast config-printing
 #  suites concurrently with the CPU-saturating real-encode suites starves the
 #  config probes and produces intermittent false "output missing" failures. The
 #  config suites parallelize cleanly among themselves; the encode suites do too.
