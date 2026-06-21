@@ -24,37 +24,40 @@
 # =============================================================================
 #  Table of Contents
 # =============================================================================
-#  §  1  Strict mode & bash version guard ...............................  line    60
-#  §  2  Branding / CLI constants ......................................  line    87
-#  §  3  Globals ........................................................  line   104
-#  §  4  Opinionated defaults ..........................................  line   156
-#  §  5  Basic helpers ..................................................  line   308
-#  §  6  Config chain: Defaults → /etc → ~ → project ...................  line   859
-#  §  7  Dependency installer ..........................................  line   925
-#  §  8  Man page installer ............................................  line  1278
-#  §  9  Completion installer ..........................................  line  2263
-#  §  9b Full setup (--setup) ..........................................  line  2536
-#  § 10  Config generator ..............................................  line  2604
-#  § 11  Profiles & application ........................................  line  3364
-#  § 12  CLI parsing ...................................................  line  4016
-#  § 13  Profile + flag conflict warnings ..............................  line  4209
-#  § 14  Tool validation ...............................................  line  4616
-#  § 15  Input validation & security checks ............................  line  4667
-#  § 16  Build ffmpeg/ffprobe flags ....................................  line  4835
-#  § 17  Workdir & logging .............................................  line  4853
-#  § 18  Traps .........................................................  line  4884
-#  § 19  Disk space preflight ..........................................  line  4986
-#  § 20  Metadata caching & ffprobe helpers ............................  line  5183
-#  § 21  Report helpers & skip-if-ideal ................................  line  5203
-#  § 22  Color space & pixel format decision ...........................  line  5419
-#  § 23  x265 params & Level/VBV guardrails ............................  line  5503
-#  § 24  Dolby Vision detection ........................................  line  5561
-#  § 25  Temp paths ....................................................  line  5842
-#  § 26  Video pipeline ................................................  line  5921
-#  § 27  Audio selection & pipeline ....................................  line  6619
-#  § 28  Subtitle helpers (planner + OCR) ..............................  line  7502
-#  § 29  Final mux .....................................................  line  8645
-#  § 30  Main ..........................................................  line  9100
+#  Section names only — no line numbers. Per this project's "cite names, not line
+#  numbers" rule (CLAUDE.md), absolute offsets drift on nearly every edit and
+#  silently rot; grep for the "===== Section N:" banner to jump to a section.
+#  §  1  Strict mode & bash version guard
+#  §  2  Branding / CLI constants
+#  §  3  Globals
+#  §  4  Opinionated defaults
+#  §  5  Basic helpers
+#  §  6  Config chain: Defaults → /etc → ~ → project
+#  §  7  Dependency installer
+#  §  8  Man page installer
+#  §  9  Completion installer
+#  §  9b Full setup (--setup)
+#  § 10  Config generator
+#  § 11  Profiles & application
+#  § 12  CLI parsing
+#  § 13  Profile + flag conflict warnings
+#  § 14  Tool validation
+#  § 15  Input validation & security checks
+#  § 16  Build ffmpeg/ffprobe flags
+#  § 17  Workdir & logging
+#  § 18  Traps
+#  § 19  Disk space preflight
+#  § 20  Metadata caching & ffprobe helpers
+#  § 21  Report helpers & skip-if-ideal
+#  § 22  Color space & pixel format decision
+#  § 23  x265 params & Level/VBV guardrails
+#  § 24  Dolby Vision detection
+#  § 25  Temp paths
+#  § 26  Video pipeline
+#  § 27  Audio selection & pipeline
+#  § 28  Subtitle helpers (planner + OCR)
+#  § 29  Final mux
+#  § 30  Main
 # =============================================================================
 
 # ===== Section 1: Strict mode & bash version guard =============================================

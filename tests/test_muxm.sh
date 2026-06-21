@@ -13,6 +13,17 @@
 #  Run with -h or --help for the full suite list.
 #  Default: no arguments shows help.
 # =============================================================================
+
+# ---- bash 4.3+ guard ----
+# This harness uses `mapfile`/`readarray` (bash 4.0+) and namerefs elsewhere, and it drives
+# muxm, which itself enforces bash 4.3+. macOS ships /bin/bash 3.2, so check before anything
+# depends on it and fail with a clear message (mirrors the guard in run_parallel.sh).
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+  echo "test_muxm.sh requires bash 4.3+ (uses mapfile/namerefs); running under bash ${BASH_VERSION:-?}." >&2
+  echo "On macOS, install a newer bash (e.g. 'brew install bash') and invoke the script with it." >&2
+  exit 2
+fi
+
 set -euo pipefail
 
 # ---- Configuration ----
@@ -543,7 +554,7 @@ SRT
     -metadata:s:a:0 language=eng \
     -metadata:s:s:0 language=eng -metadata:s:s:0 title="English" \
     "$TESTDIR/basic_sdr_subs.mkv"
-  pass "basic_sdr_subs.mkv created"
+  [[ -s "$TESTDIR/basic_sdr_subs.mkv" ]] && pass "basic_sdr_subs.mkv created" || fail "basic_sdr_subs.mkv NOT created (missing or empty)"
 
   log "Core test media ready in $TESTDIR"
 }
@@ -557,7 +568,7 @@ generate_extended_media() {
     -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
     -c:a ac3 -b:a 384k -ac 6 \
     -metadata:s:a:0 language=eng
-  pass "hevc_sdr_51.mkv created"
+  [[ -s "$TESTDIR/hevc_sdr_51.mkv" ]] && pass "hevc_sdr_51.mkv created" || fail "hevc_sdr_51.mkv NOT created (missing or empty)"
 
   # 2b) HEVC 10-bit SDR with 7.1 (8ch) audio — regression test for eac3 encoder
   #     channel cap bug: ffmpeg's native eac3 encoder only supports up to 6ch,
@@ -569,7 +580,7 @@ generate_extended_media() {
     -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
     -c:a flac -ac 8 \
     -metadata:s:a:0 language=eng
-  pass "hevc_sdr_71.mkv created"
+  [[ -s "$TESTDIR/hevc_sdr_71.mkv" ]] && pass "hevc_sdr_71.mkv created" || fail "hevc_sdr_71.mkv NOT created (missing or empty)"
 
   # 3) HEVC 10-bit with HDR10-like metadata tags (not real HDR, but tagged)
   log "Creating hevc_hdr10_tagged.mkv (HEVC 10-bit with HDR-like tags)"
@@ -578,7 +589,7 @@ generate_extended_media() {
     -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc" \
     -c:a eac3 -b:a 448k -ac 6 \
     -metadata:s:a:0 language=eng
-  pass "hevc_hdr10_tagged.mkv created"
+  [[ -s "$TESTDIR/hevc_hdr10_tagged.mkv" ]] && pass "hevc_hdr10_tagged.mkv created" || fail "hevc_hdr10_tagged.mkv NOT created (missing or empty)"
 
   # 4) Multi-audio file (stereo AAC + 5.1 EAC3 + stereo commentary)
   #    3 audio inputs require explicit maps — raw ffmpeg.
@@ -597,7 +608,7 @@ generate_extended_media() {
     -metadata:s:a:1 language=eng -metadata:s:a:1 title="5.1 Surround" \
     -metadata:s:a:2 language=eng -metadata:s:a:2 title="Commentary" \
     "$TESTDIR/multi_audio.mkv"
-  pass "multi_audio.mkv created"
+  [[ -s "$TESTDIR/multi_audio.mkv" ]] && pass "multi_audio.mkv created" || fail "multi_audio.mkv NOT created (missing or empty)"
 
   # 5) Multi-subtitle file (forced + full + SDH)
   #    3 SRT file inputs require explicit maps — raw ffmpeg.
@@ -633,7 +644,7 @@ SRT
     -metadata:s:s:2 language=eng -metadata:s:s:2 title="English SDH" \
     -disposition:s:0 forced \
     "$TESTDIR/multi_subs.mkv"
-  pass "multi_subs.mkv created"
+  [[ -s "$TESTDIR/multi_subs.mkv" ]] && pass "multi_subs.mkv created" || fail "multi_subs.mkv NOT created (missing or empty)"
 
   # 5b) Multi-language subtitle file (eng + spa + fra subtitles)
   log "Creating multi_subs_multilang.mkv (eng + spa + fra subtitles)"
@@ -667,7 +678,7 @@ SRT
     -metadata:s:s:1 language=spa -metadata:s:s:1 title="Spanish" \
     -metadata:s:s:2 language=fra -metadata:s:s:2 title="French" \
     "$TESTDIR/multi_subs_multilang.mkv"
-  pass "multi_subs_multilang.mkv created"
+  [[ -s "$TESTDIR/multi_subs_multilang.mkv" ]] && pass "multi_subs_multilang.mkv created" || fail "multi_subs_multilang.mkv NOT created (missing or empty)"
 
   # 5c) ASS/SSA subtitle file (for SUB_PRESERVE_TEXT_FORMAT tests)
   #     ASS subtitles carry positioning, styling, fonts, and typesetting data
@@ -699,7 +710,7 @@ ASS
     -metadata:s:a:0 language=eng \
     -metadata:s:s:0 language=eng -metadata:s:s:0 title="English Styled" \
     "$TESTDIR/ass_subs.mkv"
-  pass "ass_subs.mkv created"
+  [[ -s "$TESTDIR/ass_subs.mkv" ]] && pass "ass_subs.mkv created" || fail "ass_subs.mkv NOT created (missing or empty)"
 
   # 5d) Stream titles containing literal pipe characters (v1.0.2 regression fixture).
   #     Pipe characters in subtitle/audio titles previously corrupted the pipe-delimited
@@ -722,7 +733,7 @@ SRT
     -metadata:s:a:0 language=eng -metadata:s:a:0 title="Original | English" \
     -metadata:s:s:0 language=eng -metadata:s:s:0 title="Original | English | (SDH)" \
     "$TESTDIR/pipe_titles.mkv"
-  pass "pipe_titles.mkv created"
+  [[ -s "$TESTDIR/pipe_titles.mkv" ]] && pass "pipe_titles.mkv created" || fail "pipe_titles.mkv NOT created (missing or empty)"
 
   # 6) File with chapters — chapter metadata input requires raw ffmpeg.
   log "Creating with_chapters.mkv (chapters)"
@@ -749,7 +760,7 @@ CHAP
     -c:a aac -b:a 128k -ac 2 \
     -metadata:s:a:0 language=eng \
     "$TESTDIR/with_chapters.mkv"
-  pass "with_chapters.mkv created"
+  [[ -s "$TESTDIR/with_chapters.mkv" ]] && pass "with_chapters.mkv created" || fail "with_chapters.mkv NOT created (missing or empty)"
 
   # 7) Already-compliant MP4 (for skip-if-ideal tests)
   log "Creating compliant.mp4 (HEVC 10-bit + EAC3 in MP4)"
@@ -757,7 +768,7 @@ CHAP
     -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le -tag:v hvc1 \
     -c:a eac3 -b:a 448k -ac 6 \
     -metadata:s:a:0 language=eng
-  pass "compliant.mp4 created"
+  [[ -s "$TESTDIR/compliant.mp4" ]] && pass "compliant.mp4 created" || fail "compliant.mp4 NOT created (missing or empty)"
 
   # 7b/7c) Skip-if-ideal fixtures carrying GLOBAL metadata + chapters, for the D2 regression
   #   (--strip-metadata / --no-keep-chapters must reach the output even on the skip-the-encode
@@ -791,7 +802,7 @@ FFMETA
     -c:a eac3 -b:a 448k -ac 6 \
     -metadata:s:a:0 language=eng \
     "$TESTDIR/compliant_meta.mp4"
-  pass "compliant_meta.mp4 created"
+  [[ -s "$TESTDIR/compliant_meta.mp4" ]] && pass "compliant_meta.mp4 created" || fail "compliant_meta.mp4 NOT created (missing or empty)"
 
   log "Creating compliant_archive.mkv (compliant for archive: HEVC + FLAC + metadata + chapters)"
   ffmpeg -hide_banner -loglevel error -y \
@@ -803,7 +814,7 @@ FFMETA
     -c:a flac -ac 2 \
     -metadata:s:a:0 language=eng \
     "$TESTDIR/compliant_archive.mkv"
-  pass "compliant_archive.mkv created"
+  [[ -s "$TESTDIR/compliant_archive.mkv" ]] && pass "compliant_archive.mkv created" || fail "compliant_archive.mkv NOT created (missing or empty)"
 
   # 8) Multi-language audio file (English + Spanish)
   #    2 audio inputs require explicit maps — raw ffmpeg.
@@ -819,7 +830,7 @@ FFMETA
     -metadata:s:a:0 language=eng -metadata:s:a:0 title="English" \
     -metadata:s:a:1 language=spa -metadata:s:a:1 title="Spanish" \
     "$TESTDIR/multi_lang_audio.mkv"
-  pass "multi_lang_audio.mkv created"
+  [[ -s "$TESTDIR/multi_lang_audio.mkv" ]] && pass "multi_lang_audio.mkv created" || fail "multi_lang_audio.mkv NOT created (missing or empty)"
 
   # 8b) Commentary detection fixture: two 5.1 EAC3 English tracks, one is "Director's Commentary"
   #     2 audio inputs require explicit maps — raw ffmpeg.
@@ -835,7 +846,7 @@ FFMETA
     -metadata:s:a:0 language=eng -metadata:s:a:0 title="Director's Commentary" \
     -metadata:s:a:1 language=eng -metadata:s:a:1 title="Main Feature" \
     "$TESTDIR/multi_audio_commentary.mkv"
-  pass "multi_audio_commentary.mkv created"
+  [[ -s "$TESTDIR/multi_audio_commentary.mkv" ]] && pass "multi_audio_commentary.mkv created" || fail "multi_audio_commentary.mkv NOT created (missing or empty)"
 
   # 8c) HEVC multi-audio fixture for archive multi-track testing.
   #     HEVC video (copy-if-compliant) + 3 audio: eng main, eng commentary, spa.
@@ -855,7 +866,7 @@ FFMETA
     -metadata:s:a:1 language=eng -metadata:s:a:1 title="Director's Commentary" \
     -metadata:s:a:2 language=spa -metadata:s:a:2 title="Spanish" \
     "$TESTDIR/hevc_multi_audio.mkv"
-  pass "hevc_multi_audio.mkv created"
+  [[ -s "$TESTDIR/hevc_multi_audio.mkv" ]] && pass "hevc_multi_audio.mkv created" || fail "hevc_multi_audio.mkv NOT created (missing or empty)"
 
   # 8c-ii) Lossless vs lossy audio fixture — codec preference regression test.
   #     Simulates the Arcane Blu-ray scenario: FLAC 5.1 (lossless, VBR, bit_rate=0
@@ -875,7 +886,7 @@ FFMETA
     -metadata:s:a:0 language=eng -metadata:s:a:0 title="Surround 5.1" \
     -metadata:s:a:1 language=eng -metadata:s:a:1 title="Surround 5.1" \
     "$TESTDIR/lossless_vs_lossy.mkv"
-  pass "lossless_vs_lossy.mkv created"
+  [[ -s "$TESTDIR/lossless_vs_lossy.mkv" ]] && pass "lossless_vs_lossy.mkv created" || fail "lossless_vs_lossy.mkv NOT created (missing or empty)"
 
   # 8d) HEVC multi-subtitle fixture for archive multi-track subtitle testing.
   #     HEVC video (copy-if-compliant) + 1 audio + 5 subs: eng forced, eng full, eng SDH, spa full, fra full.
@@ -926,7 +937,7 @@ SRT
     -metadata:s:s:4 language=fra -metadata:s:s:4 title="French" \
     -disposition:s:0 forced \
     "$TESTDIR/hevc_multi_subs.mkv"
-  pass "hevc_multi_subs.mkv created"
+  [[ -s "$TESTDIR/hevc_multi_subs.mkv" ]] && pass "hevc_multi_subs.mkv created" || fail "hevc_multi_subs.mkv NOT created (missing or empty)"
 
   # 9) File with rich metadata (encoder, title, etc.) for strip-metadata tests
   log "Creating rich_metadata.mkv (with extra metadata tags)"
@@ -937,7 +948,7 @@ SRT
     -metadata comment="This is a test comment" \
     -metadata encoder="TestEncoder v1.0" \
     -metadata:s:a:0 language=eng
-  pass "rich_metadata.mkv created"
+  [[ -s "$TESTDIR/rich_metadata.mkv" ]] && pass "rich_metadata.mkv created" || fail "rich_metadata.mkv NOT created (missing or empty)"
 
   # 10) External subtitle source fixtures (no embedded subtitle streams)
   #     Dedicated source file for ext_subs suite — keeps sidecars isolated so
@@ -947,7 +958,7 @@ SRT
     -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
     -c:a aac -b:a 128k -ac 2 \
     -metadata:s:a:0 language=eng
-  pass "ext_sub_source.mkv created"
+  [[ -s "$TESTDIR/ext_sub_source.mkv" ]] && pass "ext_sub_source.mkv created" || fail "ext_sub_source.mkv NOT created (missing or empty)"
 
   # SRT content used for all sidecar files
   cat > "$TESTDIR/_ext_srt.srt" <<'SRT'
@@ -970,7 +981,18 @@ SRT
   do
     cp "$TESTDIR/_ext_srt.srt" "$TESTDIR/ext_sub_source${_stem_sfx}.srt"
   done
-  pass "ext_sub_source sidecar .srt files created"
+  # Assert the loop actually produced the sidecars (9 suffixes above) and none are empty —
+  # an unconditional "created" pass would mask a failed cp / empty source SRT.
+  _ext_n=0; _ext_bad=0
+  for _f in "$TESTDIR"/ext_sub_source*.srt; do
+    [[ -e "$_f" ]] || continue
+    _ext_n=$((_ext_n + 1)); [[ -s "$_f" ]] || _ext_bad=1
+  done
+  if (( _ext_n >= 9 && _ext_bad == 0 )); then
+    pass "ext_sub_source sidecar .srt files created ($_ext_n non-empty)"
+  else
+    fail "ext_sub_source sidecars: $_ext_n found (expected ≥9), empty-present=$_ext_bad"
+  fi
 
   # Dedicated single-sidecar source for clean integration tests
   log "Creating ext_only_source.mkv (no embedded subs — single sidecar test)"
@@ -979,7 +1001,11 @@ SRT
     -c:a aac -b:a 128k -ac 2 \
     -metadata:s:a:0 language=eng
   cp "$TESTDIR/_ext_srt.srt" "$TESTDIR/ext_only_source.en.srt"
-  pass "ext_only_source.mkv + sidecar created"
+  if [[ -s "$TESTDIR/ext_only_source.mkv" && -s "$TESTDIR/ext_only_source.en.srt" ]]; then
+    pass "ext_only_source.mkv + sidecar created"
+  else
+    fail "ext_only_source.mkv + sidecar NOT created (missing or empty)"
+  fi
 
   # 10) HLG-tagged HEVC fixture for H9 regression test (P5.3)
   log "Creating hevc_hlg_tagged.mkv (HEVC 10-bit with HLG color tags)"
@@ -988,7 +1014,7 @@ SRT
     -x265-params "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc" \
     -c:a aac -b:a 128k -ac 2 \
     -metadata:s:a:0 language=eng
-  pass "hevc_hlg_tagged.mkv created"
+  [[ -s "$TESTDIR/hevc_hlg_tagged.mkv" ]] && pass "hevc_hlg_tagged.mkv created" || fail "hevc_hlg_tagged.mkv NOT created (missing or empty)"
 
   # 11) 4:2:2 SDR fixture for H8 regression test (P5.3)
   log "Creating h264_422p_sdr.mkv (H.264 4:2:2 SDR for FORCE_CHROMA_420 test)"
@@ -999,7 +1025,7 @@ SRT
     -c:a aac -b:a 128k -ac 2 \
     -metadata:s:a:0 language=eng \
     "$TESTDIR/h264_422p_sdr.mkv"
-  pass "h264_422p_sdr.mkv created"
+  [[ -s "$TESTDIR/h264_422p_sdr.mkv" ]] && pass "h264_422p_sdr.mkv created" || fail "h264_422p_sdr.mkv NOT created (missing or empty)"
 
   # 12) DV-tagged fixture for H10 regression test (P5.3)
   # Uses dvh1 codec tag so detect_dv() matches via ffprobe codec_tag_string.
@@ -1014,7 +1040,7 @@ SRT
     -c:a aac -b:a 128k -ac 2 \
     -metadata:s:a:0 language=eng \
     "$TESTDIR/hevc_dv_p5_tagged.mp4"
-  pass "hevc_dv_p5_tagged.mp4 created"
+  [[ -s "$TESTDIR/hevc_dv_p5_tagged.mp4" ]] && pass "hevc_dv_p5_tagged.mp4 created" || fail "hevc_dv_p5_tagged.mp4 NOT created (missing or empty)"
 
   log "All extended test media ready in $TESTDIR"
 }
@@ -1147,9 +1173,15 @@ _test_cli_profile_crossref() {
 
   # Extract VALID_PROFILES from the script itself (single source of truth)
   local canonical
-  canonical="$(grep '^readonly VALID_PROFILES=' "$MUXM" | sed 's/^readonly VALID_PROFILES="//;s/"$//')"
+  # `|| true`: a no-match grep exits 1, which (under set -e + pipefail) would abort the suite at
+  # this assignment BEFORE the drift guard below can fire a clean diagnostic. Swallow it so the
+  # empty result reaches the `[[ -z "$canonical" ]]` fail instead of a cryptic mid-suite abort.
+  canonical="$(grep '^readonly VALID_PROFILES=' "$MUXM" | sed 's/^readonly VALID_PROFILES="//;s/"$//' || true)"
   if [[ -z "$canonical" ]]; then
-    skip "VALID_PROFILES constant not found in script — cross-reference tests skipped"
+    # M4: VALID_PROFILES is a committed constant — its absence here means the anchor was
+    # renamed/reformatted, which is drift, never host-optionality. Fail, never skip (a skip
+    # would silently void the entire cross-reference below).
+    fail "VALID_PROFILES constant not found in script — cross-reference guard could not run (drift?)"
     return
   fi
 
@@ -6495,7 +6527,9 @@ muxm_fn() {
   local body
   body="$(awk "/^${fn}\\(\\)[[:space:]]*\\{/,/^\\}/" "$MUXM")"
   if [[ -z "$body" ]]; then
-    skip "Function $fn not found in muxm"
+    # M4: a committed function that the awk anchor can't find was renamed/reformatted —
+    # drift, never host-optionality. Fail (not skip), so the rename surfaces red.
+    fail "Function $fn not found in muxm — extraction anchor failed (renamed/reformatted?)"
     return
   fi
   # Some functions reference other helpers — extract dependencies too
@@ -6522,7 +6556,7 @@ assert_muxm_fn_exit() {
   shift 4
   local body actual=0
   body="$(awk "/^${fn}\\(\\)[[:space:]]*\\{/,/^\\}/" "$MUXM")"
-  if [[ -z "$body" ]]; then skip "Function $fn not found in muxm"; return; fi
+  if [[ -z "$body" ]]; then fail "Function $fn not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
   # Capture the REAL exit code (|| actual=$? leaves $? intact from the failing cmd).
   bash -c "${env_setup}"$'\n'"$body"$'\n'"$fn \"\$@\"" -- "$@" || actual=$?
   # 0 = predicate true; 1–125 = clean predicate false; >=126 = crash/not-found/signal.
@@ -6544,7 +6578,7 @@ assert_muxm_fn_stdout() {
   shift 4
   local body actual
   body="$(awk "/^${fn}\\(\\)[[:space:]]*\\{/,/^\\}/" "$MUXM")"
-  if [[ -z "$body" ]]; then skip "Function $fn not found in muxm"; return; fi
+  if [[ -z "$body" ]]; then fail "Function $fn not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
   actual="$(bash -c "${env_setup}"$'\n'"$body"$'\n'"$fn \"\$@\"" -- "$@")"
   if [[ "$actual" == "$expected" ]]; then pass "$label"; else fail "$label — expected '$expected', got '$actual'"; fi
 }
@@ -6737,7 +6771,9 @@ _test_unit_audio_helpers() {
       fail "_codec_max_channels($att8_codec)=$att8_codec_max — expected < 8 to prevent ffmpeg failure on 7.1 sources"
     fi
   else
-    skip "_codec_max_channels not found in muxm (not yet implemented)"
+    # M4: _codec_max_channels is committed — absence is drift (renamed/reformatted), not
+    # host-optionality. Fail, never skip.
+    fail "_codec_max_channels not found in muxm — extraction anchor failed (renamed/reformatted?)"
   fi
 
   # ---- _audio_lang_matches ----
@@ -7025,7 +7061,7 @@ _test_unit_disk_preflight() {
 _test_unit_disk_fallback() {
   local body
   body="$(awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
-  if [[ -z "$body" ]]; then skip "disk_free_warn not found in muxm"; return; fi
+  if [[ -z "$body" ]]; then fail "disk_free_warn not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
 
   local srcfile; srcfile="$(mktemp "$TESTDIR/disk_fallback.XXXXXX")"
   head -c 10485760 /dev/zero > "$srcfile"   # exactly 10 MiB = 10485760 bytes
@@ -7096,7 +7132,7 @@ _test_unit_disk_output_volume() {
   # M-DISK-1 inverts the cross-volume guard (!= → ==) → the output check is skipped → no die → red.
   local body
   body="$(awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
-  if [[ -z "$body" ]]; then skip "disk_free_warn not found in muxm"; return; fi
+  if [[ -z "$body" ]]; then fail "disk_free_warn not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
   local srcfile; srcfile="$(mktemp "$TESTDIR/disk_ov.XXXXXX")"
   head -c 10485760 /dev/zero > "$srcfile"   # 10 MiB, so the stat-based estimate is non-degenerate
 
@@ -7157,7 +7193,7 @@ _test_unit_av1_resolution_crf() {
   # CRF_VALUE for each (profile × resolution/HDR × --crf) case. Deterministic, no encode.
   local body
   body="$(awk '/^_apply_av1_resolution_crf\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
-  if [[ -z "$body" ]]; then skip "_apply_av1_resolution_crf not found in muxm"; return; fi
+  if [[ -z "$body" ]]; then fail "_apply_av1_resolution_crf not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
 
   # $1 profile  $2 width  $3 height  $4 PROFILE_DESC  $5 _CLI_CRF_EXPLICIT  $6 base CRF
   _av1crf() {
@@ -7196,7 +7232,7 @@ _test_unit_ignored_knobs() {
   # — exercises the VideoToolbox cases (C1–C4) that can't resolve on non-macOS CI hosts.
   local body
   body="$(awk '/^_warn_ignored_knobs\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
-  if [[ -z "$body" ]]; then skip "_warn_ignored_knobs not found in muxm"; return; fi
+  if [[ -z "$body" ]]; then fail "_warn_ignored_knobs not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
 
   # $1 = extra global assignments (override the safe defaults below).
   _wik() {
@@ -7271,7 +7307,7 @@ _test_unit_h264_drops_dv() {
   # gated `dv_vt` suite covers the full post-probe path against a real DV fixture.
   local body
   body="$(awk '/^_warn_h264_drops_dv\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
-  if [[ -z "$body" ]]; then skip "_warn_h264_drops_dv not found in muxm"; return; fi
+  if [[ -z "$body" ]]; then fail "_warn_h264_drops_dv not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
 
   _wddv() {  # $1 = global assignments
     bash -c 'warn(){ printf "%s\n" "$*"; }
@@ -7545,7 +7581,7 @@ _test_unit_av1_helpers() {
   local bap_body result
   bap_body="$(awk '/^build_av1_params\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
   if [[ -z "$bap_body" ]]; then
-    skip "build_av1_params not found in muxm"
+    fail "build_av1_params not found in muxm — extraction anchor failed (renamed/reformatted?)"
   else
     # Default base value
     result="$(bash -c 'SVT_AV1_PARAMS_BASE="film-grain=0:enable-overlays=1:scd=1"; SVT_AV1_PARAMS=""'"
@@ -10577,9 +10613,14 @@ _test_docs_prose_drift() {
 
   # Single source of truth (same extraction as _test_cli_profile_crossref).
   local canonical
-  canonical="$(grep '^readonly VALID_PROFILES=' "$MUXM" | sed 's/^readonly VALID_PROFILES="//;s/"$//')"
+  # `|| true`: a no-match grep exits 1, which (under set -e + pipefail) would abort the suite at
+  # this assignment BEFORE the drift guard below can fire a clean diagnostic. Swallow it so the
+  # empty result reaches the `[[ -z "$canonical" ]]` fail instead of a cryptic mid-suite abort.
+  canonical="$(grep '^readonly VALID_PROFILES=' "$MUXM" | sed 's/^readonly VALID_PROFILES="//;s/"$//' || true)"
   if [[ -z "$canonical" ]]; then
-    skip "VALID_PROFILES constant not found in script — prose-doc drift guard skipped"
+    # M4: VALID_PROFILES is committed — its absence is drift (anchor renamed), not host
+    # optionality. Fail, never skip (a skip would void the whole prose-doc cross-check below).
+    fail "VALID_PROFILES constant not found in script — prose-doc drift guard could not run (drift?)"
     return
   fi
 
@@ -10710,9 +10751,13 @@ _test_docs_prose_drift() {
   if [[ -r "$av1doc" ]]; then
     local body pairs
     body="$(awk '/^_crf_ratio\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
-    pairs="$(grep -oE '[0-9]+\) echo [0-9]+' "$av1doc" | sed 's/) echo / /')"
+    # `|| true`: like the VALID_PROFILES grep above, a no-match here exits 1 and would abort the
+    # suite under set -e + pipefail before the `[[ -z "$pairs" ]]` drift fail can fire.
+    pairs="$(grep -oE '[0-9]+\) echo [0-9]+' "$av1doc" | sed 's/) echo / /' || true)"
     if [[ -z "$body" ]]; then
-      skip "_crf_ratio not found in muxm — AV1 ratio cross-check skipped (script-side, not doc drift)"
+      # M4: _crf_ratio is a committed function — if the awk anchor can't find it, it was
+      # renamed/reformatted. That is drift, not host-optionality, so fail (never skip).
+      fail "_crf_ratio not found in muxm — AV1 ratio cross-check anchor failed (renamed/reformatted?)"
     elif [[ -z "$pairs" ]]; then
       fail "docs/AV1_CALIBRATION.md is present but its _crf_ratio ratio table is gone — doc drift"
     else
@@ -10751,7 +10796,7 @@ _test_docs_prose_drift() {
 #    catches creep in the config/CLI suites.
 _test_meta_soft_skip() {
   local self="${BASH_SOURCE[0]}"
-  local -i baseline=61   # 2026-06-17: 80→65 (Phase 1 converted 15 soft-skips to fail); 65→62 (Phase 4 replaced the R28/R29 tonemap dry-run skips with a real encode and converted the avi-fixture else-skip to a positive guard); 62→61 (Phase 5 replaced the host-gated NVENC-stub else-skip with a host-independent unit test). LOWER as more convert; never raise.
+  local -i baseline=60   # 2026-06-17: 80→65 (Phase 1 converted 15 soft-skips to fail); 65→62 (Phase 4 replaced the R28/R29 tonemap dry-run skips with a real encode and converted the avi-fixture else-skip to a positive guard); 62→61 (Phase 5 replaced the host-gated NVENC-stub else-skip with a host-independent unit test); 61→60 (Phase 5/M4 converted the _codec_max_channels else-skip to fail — a committed function's absence is drift, not host-optionality). LOWER as more convert; never raise.
   local -i found
   found="$(awk '
     function trim(s){ gsub(/^[ \t]+|[ \t]+$/,"",s); return s }
@@ -10769,6 +10814,26 @@ _test_meta_soft_skip() {
     fi
   else
     fail "soft-skip ratchet: $found else-only-skip blocks > baseline $baseline — a new 'else → skip' crept in. Convert it to 'fail' where the setup guarantees the property (see Test_Suite_Fixes.md §1.1), or it's a genuine host/version skip that belongs in an 'if [[ ! cond ]]; then skip' guard, not an else."
+  fi
+
+  # M4 recurrence guard: the soft-skip ratchet above only catches the `else → skip` *shape*.
+  # A second, message-keyed class is just as drift-prone regardless of shape — a skip() whose
+  # message reports a COMMITTED muxm/script symbol as absent. That can only happen when an
+  # extraction anchor (awk/grep) stops matching because the symbol was renamed or reformatted,
+  # which is always drift, never host-optionality, so it must fail — never skip (a skip would
+  # silently void the test). Phase 5/M4 converted every such site to fail; this keeps new ones
+  # from creeping back. Anchored on the `skip "<text>` invocation form (double-quoted arg), so
+  # the legitimate runtime guards ("<fixture>.mkv fixture not found", "… output not found") and
+  # this guard's own grep line (single-quoted pattern) are not matched.
+  local drift_skips
+  drift_skips="$(grep -nE 'skip "[^"]*not found in (muxm|script)' "$self" || true)"
+  if [[ -z "$drift_skips" ]]; then
+    pass "no 'committed symbol not found in muxm/script' soft-skips (absence of a committed symbol must fail, not skip)"
+  else
+    local _ds
+    while IFS= read -r _ds; do
+      [[ -n "$_ds" ]] && fail "drift soft-skip must be 'fail', not 'skip' (committed-symbol absence is drift): $_ds"
+    done <<< "$drift_skips"
   fi
   return 0
 }

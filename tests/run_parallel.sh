@@ -98,25 +98,50 @@ CONFIG_SUITES=(unit cli toggles completions setup config profiles conflicts hw_a
 # Phase 2 — real-encode suites.
 ENCODE_SUITES=(collision dryrun video hdr audio subs ext_subs output containers metadata edge e2e multi_profile regression_p5 dv_sw)
 
-# ---- Drift guard ----
-# The union of the two batches MUST equal the canonical set of suites that
-# `test_muxm.sh --suite all` runs (its run_suite_tracked calls). If someone adds a suite to
-# test_muxm.sh and forgets to add it here, fail loudly — never silently skip it and still
-# report "ALL PASSED" (that would be coverage loss disguised as success). Runs before the
-# work directory is created, so a drift abort leaves nothing behind.
+# ---- Partition guard ----
+# The two batches must PARTITION the canonical suite set that `test_muxm.sh --suite all` runs
+# (its run_suite_tracked calls): together they cover every canonical suite EXACTLY ONCE. That
+# is stronger than the old set-equality check, which deduped a suite misfiled into BOTH batches
+# and silently ran it twice (wasted CPU / coverage loss disguised as success). We assert three
+# things: the batches are disjoint (no suite in both phases), their deduped union equals the
+# canonical set (none missing, none extra — reported by name), and their non-deduped slot count
+# equals the canonical count (no suite listed twice within ONE batch). Runs before the work
+# directory is created, so a drift abort leaves nothing behind.
 _canonical="$(grep -oE 'run_suite_tracked[[:space:]]+[A-Za-z0-9_]+' "$SCRIPT" | awk '{print $2}' | sort -u)"
-_mine="$(printf '%s\n' "${CONFIG_SUITES[@]}" "${ENCODE_SUITES[@]}" | sort -u)"
 if [[ -z "$_canonical" ]]; then
   printf '%bERROR: could not read the canonical suite list from %s (run_suite_tracked calls).%b\n' "$RED" "$SCRIPT" "$NC" >&2
   echo "  Refusing to run a partial suite. Check test_muxm.sh's run_suites()." >&2
   exit 2
 fi
+_canon_n="$(printf '%s\n' "$_canonical" | grep -c .)"
+
+# (a) Disjoint: no suite may appear in BOTH phases — the misfiled-into-both case the old
+#     deduped set-equality silently tolerated (running that suite twice).
+_in_both="$(comm -12 <(printf '%s\n' "${CONFIG_SUITES[@]}" | sort -u) <(printf '%s\n' "${ENCODE_SUITES[@]}" | sort -u) | tr '\n' ' ')"
+if [[ -n "${_in_both// }" ]]; then
+  printf '%bERROR: suite(s) listed in BOTH phases of run_parallel.sh — they would run twice: %s%b\n' "$RED" "$_in_both" "$NC" >&2
+  echo "  Each suite must live in exactly one of CONFIG_SUITES / ENCODE_SUITES." >&2
+  exit 2
+fi
+
+# (b) Coverage: the deduped union must equal the canonical set (catches missing/extra, by name).
+_mine="$(printf '%s\n' "${CONFIG_SUITES[@]}" "${ENCODE_SUITES[@]}" | sort -u)"
 if [[ "$_canonical" != "$_mine" ]]; then
   printf '%bERROR: suite-list drift between run_parallel.sh and test_muxm.sh — refusing to run a partial suite.%b\n' "$RED" "$NC" >&2
   _missing="$(comm -23 <(printf '%s\n' "$_canonical") <(printf '%s\n' "$_mine") | tr '\n' ' ')"
   _extra="$(comm -13 <(printf '%s\n' "$_canonical") <(printf '%s\n' "$_mine") | tr '\n' ' ')"
   [[ -n "${_missing// }" ]] && echo "  in test_muxm.sh but NOT run here (add to a batch above): $_missing" >&2
   [[ -n "${_extra// }"   ]] && echo "  listed here but not a real suite (remove):               $_extra"   >&2
+  exit 2
+fi
+
+# (c) Partition count: the non-deduped batch sizes must sum to the canonical count. With (a)+(b)
+#     already proven, this additionally rejects a suite duplicated WITHIN a single batch — which
+#     (a)'s cross-batch test and (b)'s deduped equality both miss.
+_total=$(( ${#CONFIG_SUITES[@]} + ${#ENCODE_SUITES[@]} ))
+if (( _total != _canon_n )); then
+  printf '%bERROR: run_parallel.sh batches list %s suite slots but test_muxm.sh has %s canonical suites.%b\n' "$RED" "$_total" "$_canon_n" "$NC" >&2
+  echo "  A suite is probably listed twice within one batch — each must appear exactly once across the two batches." >&2
   exit 2
 fi
 
