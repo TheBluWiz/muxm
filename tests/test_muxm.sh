@@ -8147,6 +8147,35 @@ test_unit() {
   _test_unit_ocr_dispatch
   _test_unit_persist_helpers
   _test_unit_prefer_complete_ffmpeg
+  _test_unit_parse_audio_record
+}
+
+# Regression: _parse_audio_record must preserve an EMPTY title field. A plain `IFS=$'\t' read`
+# collapses an empty middle field (tab is IFS-whitespace), shifting an untitled track's bitrate
+# into `title` and blanking the bitrate. This test drives the extracted helper with an untitled
+# record and asserts title stays empty + the bitrate lands in br. It goes red on the pre-fix
+# `IFS=$'\t' read` parse (which yields title=<bitrate>, br=empty) and green on the fixed split.
+_test_unit_parse_audio_record() {
+  local body
+  body="$(_extract_muxm_fns _parse_audio_record)" \
+    || { fail "parse_audio_record: could not extract _parse_audio_record"; return; }
+  # Driver: parse $1, echo "title|br" so empty fields are visible.
+  _par(){ bash -c "$body"$'\n''_parse_audio_record "$1"; printf "%s|%s\n" "$_AREC_TITLE" "$_AREC_BR"' -- "$1"; }
+  local out
+  # Untitled track (empty title field between two tabs) — the regression case.
+  out="$(_par "$(printf '0\teac3\t6\teng\t\t383578')")"
+  if [[ "$out" == "|383578" ]]; then
+    pass "_parse_audio_record: untitled track keeps title empty, bitrate in br (no field-shift)"
+  else
+    fail "_parse_audio_record: untitled track expected '|383578', got '$out' (bitrate shifted into title?)"
+  fi
+  # Titled track — the normal case must still parse correctly.
+  out="$(_par "$(printf '2\tac3\t2\tspa\tCommentary\t128000')")"
+  if [[ "$out" == "Commentary|128000" ]]; then
+    pass "_parse_audio_record: titled track parses title + br correctly"
+  else
+    fail "_parse_audio_record: titled track expected 'Commentary|128000', got '$out'"
+  fi
 }
 
 # F5 (runtime): _prefer_complete_ffmpeg prepends the keg-only ffmpeg-full bin to PATH when the

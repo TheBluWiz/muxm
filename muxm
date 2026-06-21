@@ -8835,6 +8835,23 @@ select_best_audio(){
   printf '%s\n' "${best_line#*$'\t'}"
 }
 
+# _parse_audio_record — split a select_best_audio record (idx\tcodec\tch\tlang\ttitle\traw_br) into
+# six globals, PRESERVING empty fields. A plain `IFS=$'\t' read` collapses an empty MIDDLE field
+# because tab is IFS-whitespace — so an untitled track (empty title field) shifted its bitrate into
+# `title` and left the bitrate empty. Manual %%/#-parameter-expansion splits on the literal tabs
+# and never collapses, so an empty title stays empty and raw_br lands in _AREC_BR. Fields never
+# contain a tab (select_best_audio strips \t\n\r from titles), so the split is unambiguous.
+# Sets: _AREC_IDX _AREC_CODEC _AREC_CH _AREC_LANG _AREC_TITLE _AREC_BR
+_parse_audio_record(){
+  local _rec="$1"
+  _AREC_IDX="${_rec%%$'\t'*}";   _rec="${_rec#*$'\t'}"
+  _AREC_CODEC="${_rec%%$'\t'*}"; _rec="${_rec#*$'\t'}"
+  _AREC_CH="${_rec%%$'\t'*}";    _rec="${_rec#*$'\t'}"
+  _AREC_LANG="${_rec%%$'\t'*}";  _rec="${_rec#*$'\t'}"
+  _AREC_TITLE="${_rec%%$'\t'*}"; _rec="${_rec#*$'\t'}"
+  _AREC_BR="$_rec"
+}
+
 # Check whether a TARGET DEVICE can Direct Play this audio codec — independent of MUX_FORMAT.
 # This answers the device-capability question ("will Apple TV / Plex Direct Play stream-copy this
 # track untouched?"), NOT the container question ("can this container physically hold the codec?").
@@ -9181,7 +9198,10 @@ run_audio_pipeline(){
   local _best_record
   _best_record="$(select_best_audio)"
   [[ -n "$_best_record" ]] || { HAS_AUDIO=0; return 0; }
-  IFS=$'\t' read -r idx codec ch lang title br <<< "$_best_record"
+  # Tab-safe split that preserves an empty title field (a plain `IFS=$'\t' read` collapses it —
+  # tab is IFS-whitespace — shifting an untitled track's bitrate into title and blanking br).
+  _parse_audio_record "$_best_record"
+  idx="$_AREC_IDX"; codec="$_AREC_CODEC"; ch="$_AREC_CH"; lang="$_AREC_LANG"; title="$_AREC_TITLE"; br="$_AREC_BR"
 
   # SYNC: mirror of display loop in run_audio_pipeline_multi — keep both in sync
   log "• Detected audio streams:"
