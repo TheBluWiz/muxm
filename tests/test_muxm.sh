@@ -554,7 +554,7 @@ SRT
     -metadata:s:a:0 language=eng \
     -metadata:s:s:0 language=eng -metadata:s:s:0 title="English" \
     "$TESTDIR/basic_sdr_subs.mkv"
-  [[ -s "$TESTDIR/basic_sdr_subs.mkv" ]] && pass "basic_sdr_subs.mkv created" || fail "basic_sdr_subs.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/basic_sdr_subs.mkv" ]]; then pass "basic_sdr_subs.mkv created"; else fail "basic_sdr_subs.mkv NOT created (missing or empty)"; fi
 
   log "Core test media ready in $TESTDIR"
 }
@@ -568,7 +568,7 @@ generate_extended_media() {
     -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
     -c:a ac3 -b:a 384k -ac 6 \
     -metadata:s:a:0 language=eng
-  [[ -s "$TESTDIR/hevc_sdr_51.mkv" ]] && pass "hevc_sdr_51.mkv created" || fail "hevc_sdr_51.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/hevc_sdr_51.mkv" ]]; then pass "hevc_sdr_51.mkv created"; else fail "hevc_sdr_51.mkv NOT created (missing or empty)"; fi
 
   # 2b) HEVC 10-bit SDR with 7.1 (8ch) audio — regression test for eac3 encoder
   #     channel cap bug: ffmpeg's native eac3 encoder only supports up to 6ch,
@@ -580,7 +580,7 @@ generate_extended_media() {
     -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
     -c:a flac -ac 8 \
     -metadata:s:a:0 language=eng
-  [[ -s "$TESTDIR/hevc_sdr_71.mkv" ]] && pass "hevc_sdr_71.mkv created" || fail "hevc_sdr_71.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/hevc_sdr_71.mkv" ]]; then pass "hevc_sdr_71.mkv created"; else fail "hevc_sdr_71.mkv NOT created (missing or empty)"; fi
 
   # 3) HEVC 10-bit with HDR10-like metadata tags (not real HDR, but tagged)
   log "Creating hevc_hdr10_tagged.mkv (HEVC 10-bit with HDR-like tags)"
@@ -589,7 +589,7 @@ generate_extended_media() {
     -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc" \
     -c:a eac3 -b:a 448k -ac 6 \
     -metadata:s:a:0 language=eng
-  [[ -s "$TESTDIR/hevc_hdr10_tagged.mkv" ]] && pass "hevc_hdr10_tagged.mkv created" || fail "hevc_hdr10_tagged.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/hevc_hdr10_tagged.mkv" ]]; then pass "hevc_hdr10_tagged.mkv created"; else fail "hevc_hdr10_tagged.mkv NOT created (missing or empty)"; fi
 
   # 4) Multi-audio file (stereo AAC + 5.1 EAC3 + stereo commentary)
   #    3 audio inputs require explicit maps — raw ffmpeg.
@@ -608,7 +608,7 @@ generate_extended_media() {
     -metadata:s:a:1 language=eng -metadata:s:a:1 title="5.1 Surround" \
     -metadata:s:a:2 language=eng -metadata:s:a:2 title="Commentary" \
     "$TESTDIR/multi_audio.mkv"
-  [[ -s "$TESTDIR/multi_audio.mkv" ]] && pass "multi_audio.mkv created" || fail "multi_audio.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/multi_audio.mkv" ]]; then pass "multi_audio.mkv created"; else fail "multi_audio.mkv NOT created (missing or empty)"; fi
 
   # 5) Multi-subtitle file (forced + full + SDH)
   #    3 SRT file inputs require explicit maps — raw ffmpeg.
@@ -644,7 +644,7 @@ SRT
     -metadata:s:s:2 language=eng -metadata:s:s:2 title="English SDH" \
     -disposition:s:0 forced \
     "$TESTDIR/multi_subs.mkv"
-  [[ -s "$TESTDIR/multi_subs.mkv" ]] && pass "multi_subs.mkv created" || fail "multi_subs.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/multi_subs.mkv" ]]; then pass "multi_subs.mkv created"; else fail "multi_subs.mkv NOT created (missing or empty)"; fi
 
   # 5b) Multi-language subtitle file (eng + spa + fra subtitles)
   log "Creating multi_subs_multilang.mkv (eng + spa + fra subtitles)"
@@ -678,7 +678,7 @@ SRT
     -metadata:s:s:1 language=spa -metadata:s:s:1 title="Spanish" \
     -metadata:s:s:2 language=fra -metadata:s:s:2 title="French" \
     "$TESTDIR/multi_subs_multilang.mkv"
-  [[ -s "$TESTDIR/multi_subs_multilang.mkv" ]] && pass "multi_subs_multilang.mkv created" || fail "multi_subs_multilang.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/multi_subs_multilang.mkv" ]]; then pass "multi_subs_multilang.mkv created"; else fail "multi_subs_multilang.mkv NOT created (missing or empty)"; fi
 
   # 5c) ASS/SSA subtitle file (for SUB_PRESERVE_TEXT_FORMAT tests)
   #     ASS subtitles carry positioning, styling, fonts, and typesetting data
@@ -710,7 +710,7 @@ ASS
     -metadata:s:a:0 language=eng \
     -metadata:s:s:0 language=eng -metadata:s:s:0 title="English Styled" \
     "$TESTDIR/ass_subs.mkv"
-  [[ -s "$TESTDIR/ass_subs.mkv" ]] && pass "ass_subs.mkv created" || fail "ass_subs.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/ass_subs.mkv" ]]; then pass "ass_subs.mkv created"; else fail "ass_subs.mkv NOT created (missing or empty)"; fi
 
   # 5d) Stream titles containing literal pipe characters (v1.0.2 regression fixture).
   #     Pipe characters in subtitle/audio titles previously corrupted the pipe-delimited
@@ -733,7 +733,7 @@ SRT
     -metadata:s:a:0 language=eng -metadata:s:a:0 title="Original | English" \
     -metadata:s:s:0 language=eng -metadata:s:s:0 title="Original | English | (SDH)" \
     "$TESTDIR/pipe_titles.mkv"
-  [[ -s "$TESTDIR/pipe_titles.mkv" ]] && pass "pipe_titles.mkv created" || fail "pipe_titles.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/pipe_titles.mkv" ]]; then pass "pipe_titles.mkv created"; else fail "pipe_titles.mkv NOT created (missing or empty)"; fi
 
   # 6) File with chapters — chapter metadata input requires raw ffmpeg.
   log "Creating with_chapters.mkv (chapters)"
@@ -760,7 +760,7 @@ CHAP
     -c:a aac -b:a 128k -ac 2 \
     -metadata:s:a:0 language=eng \
     "$TESTDIR/with_chapters.mkv"
-  [[ -s "$TESTDIR/with_chapters.mkv" ]] && pass "with_chapters.mkv created" || fail "with_chapters.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/with_chapters.mkv" ]]; then pass "with_chapters.mkv created"; else fail "with_chapters.mkv NOT created (missing or empty)"; fi
 
   # 7) Already-compliant MP4 (for skip-if-ideal tests)
   log "Creating compliant.mp4 (HEVC 10-bit + EAC3 in MP4)"
@@ -768,7 +768,7 @@ CHAP
     -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le -tag:v hvc1 \
     -c:a eac3 -b:a 448k -ac 6 \
     -metadata:s:a:0 language=eng
-  [[ -s "$TESTDIR/compliant.mp4" ]] && pass "compliant.mp4 created" || fail "compliant.mp4 NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/compliant.mp4" ]]; then pass "compliant.mp4 created"; else fail "compliant.mp4 NOT created (missing or empty)"; fi
 
   # 7b/7c) Skip-if-ideal fixtures carrying GLOBAL metadata + chapters, for the D2 regression
   #   (--strip-metadata / --no-keep-chapters must reach the output even on the skip-the-encode
@@ -802,7 +802,7 @@ FFMETA
     -c:a eac3 -b:a 448k -ac 6 \
     -metadata:s:a:0 language=eng \
     "$TESTDIR/compliant_meta.mp4"
-  [[ -s "$TESTDIR/compliant_meta.mp4" ]] && pass "compliant_meta.mp4 created" || fail "compliant_meta.mp4 NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/compliant_meta.mp4" ]]; then pass "compliant_meta.mp4 created"; else fail "compliant_meta.mp4 NOT created (missing or empty)"; fi
 
   log "Creating compliant_archive.mkv (compliant for archive: HEVC + FLAC + metadata + chapters)"
   ffmpeg -hide_banner -loglevel error -y \
@@ -814,7 +814,7 @@ FFMETA
     -c:a flac -ac 2 \
     -metadata:s:a:0 language=eng \
     "$TESTDIR/compliant_archive.mkv"
-  [[ -s "$TESTDIR/compliant_archive.mkv" ]] && pass "compliant_archive.mkv created" || fail "compliant_archive.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/compliant_archive.mkv" ]]; then pass "compliant_archive.mkv created"; else fail "compliant_archive.mkv NOT created (missing or empty)"; fi
 
   # 8) Multi-language audio file (English + Spanish)
   #    2 audio inputs require explicit maps — raw ffmpeg.
@@ -830,7 +830,7 @@ FFMETA
     -metadata:s:a:0 language=eng -metadata:s:a:0 title="English" \
     -metadata:s:a:1 language=spa -metadata:s:a:1 title="Spanish" \
     "$TESTDIR/multi_lang_audio.mkv"
-  [[ -s "$TESTDIR/multi_lang_audio.mkv" ]] && pass "multi_lang_audio.mkv created" || fail "multi_lang_audio.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/multi_lang_audio.mkv" ]]; then pass "multi_lang_audio.mkv created"; else fail "multi_lang_audio.mkv NOT created (missing or empty)"; fi
 
   # 8b) Commentary detection fixture: two 5.1 EAC3 English tracks, one is "Director's Commentary"
   #     2 audio inputs require explicit maps — raw ffmpeg.
@@ -846,7 +846,7 @@ FFMETA
     -metadata:s:a:0 language=eng -metadata:s:a:0 title="Director's Commentary" \
     -metadata:s:a:1 language=eng -metadata:s:a:1 title="Main Feature" \
     "$TESTDIR/multi_audio_commentary.mkv"
-  [[ -s "$TESTDIR/multi_audio_commentary.mkv" ]] && pass "multi_audio_commentary.mkv created" || fail "multi_audio_commentary.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/multi_audio_commentary.mkv" ]]; then pass "multi_audio_commentary.mkv created"; else fail "multi_audio_commentary.mkv NOT created (missing or empty)"; fi
 
   # 8c) HEVC multi-audio fixture for archive multi-track testing.
   #     HEVC video (copy-if-compliant) + 3 audio: eng main, eng commentary, spa.
@@ -866,7 +866,7 @@ FFMETA
     -metadata:s:a:1 language=eng -metadata:s:a:1 title="Director's Commentary" \
     -metadata:s:a:2 language=spa -metadata:s:a:2 title="Spanish" \
     "$TESTDIR/hevc_multi_audio.mkv"
-  [[ -s "$TESTDIR/hevc_multi_audio.mkv" ]] && pass "hevc_multi_audio.mkv created" || fail "hevc_multi_audio.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/hevc_multi_audio.mkv" ]]; then pass "hevc_multi_audio.mkv created"; else fail "hevc_multi_audio.mkv NOT created (missing or empty)"; fi
 
   # 8c-ii) Lossless vs lossy audio fixture — codec preference regression test.
   #     Simulates the Arcane Blu-ray scenario: FLAC 5.1 (lossless, VBR, bit_rate=0
@@ -886,7 +886,7 @@ FFMETA
     -metadata:s:a:0 language=eng -metadata:s:a:0 title="Surround 5.1" \
     -metadata:s:a:1 language=eng -metadata:s:a:1 title="Surround 5.1" \
     "$TESTDIR/lossless_vs_lossy.mkv"
-  [[ -s "$TESTDIR/lossless_vs_lossy.mkv" ]] && pass "lossless_vs_lossy.mkv created" || fail "lossless_vs_lossy.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/lossless_vs_lossy.mkv" ]]; then pass "lossless_vs_lossy.mkv created"; else fail "lossless_vs_lossy.mkv NOT created (missing or empty)"; fi
 
   # 8d) HEVC multi-subtitle fixture for archive multi-track subtitle testing.
   #     HEVC video (copy-if-compliant) + 1 audio + 5 subs: eng forced, eng full, eng SDH, spa full, fra full.
@@ -937,7 +937,7 @@ SRT
     -metadata:s:s:4 language=fra -metadata:s:s:4 title="French" \
     -disposition:s:0 forced \
     "$TESTDIR/hevc_multi_subs.mkv"
-  [[ -s "$TESTDIR/hevc_multi_subs.mkv" ]] && pass "hevc_multi_subs.mkv created" || fail "hevc_multi_subs.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/hevc_multi_subs.mkv" ]]; then pass "hevc_multi_subs.mkv created"; else fail "hevc_multi_subs.mkv NOT created (missing or empty)"; fi
 
   # 9) File with rich metadata (encoder, title, etc.) for strip-metadata tests
   log "Creating rich_metadata.mkv (with extra metadata tags)"
@@ -948,7 +948,7 @@ SRT
     -metadata comment="This is a test comment" \
     -metadata encoder="TestEncoder v1.0" \
     -metadata:s:a:0 language=eng
-  [[ -s "$TESTDIR/rich_metadata.mkv" ]] && pass "rich_metadata.mkv created" || fail "rich_metadata.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/rich_metadata.mkv" ]]; then pass "rich_metadata.mkv created"; else fail "rich_metadata.mkv NOT created (missing or empty)"; fi
 
   # 10) External subtitle source fixtures (no embedded subtitle streams)
   #     Dedicated source file for ext_subs suite — keeps sidecars isolated so
@@ -958,7 +958,7 @@ SRT
     -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
     -c:a aac -b:a 128k -ac 2 \
     -metadata:s:a:0 language=eng
-  [[ -s "$TESTDIR/ext_sub_source.mkv" ]] && pass "ext_sub_source.mkv created" || fail "ext_sub_source.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/ext_sub_source.mkv" ]]; then pass "ext_sub_source.mkv created"; else fail "ext_sub_source.mkv NOT created (missing or empty)"; fi
 
   # SRT content used for all sidecar files
   cat > "$TESTDIR/_ext_srt.srt" <<'SRT'
@@ -1014,7 +1014,7 @@ SRT
     -x265-params "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc" \
     -c:a aac -b:a 128k -ac 2 \
     -metadata:s:a:0 language=eng
-  [[ -s "$TESTDIR/hevc_hlg_tagged.mkv" ]] && pass "hevc_hlg_tagged.mkv created" || fail "hevc_hlg_tagged.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/hevc_hlg_tagged.mkv" ]]; then pass "hevc_hlg_tagged.mkv created"; else fail "hevc_hlg_tagged.mkv NOT created (missing or empty)"; fi
 
   # 11) 4:2:2 SDR fixture for H8 regression test (P5.3)
   log "Creating h264_422p_sdr.mkv (H.264 4:2:2 SDR for FORCE_CHROMA_420 test)"
@@ -1025,7 +1025,7 @@ SRT
     -c:a aac -b:a 128k -ac 2 \
     -metadata:s:a:0 language=eng \
     "$TESTDIR/h264_422p_sdr.mkv"
-  [[ -s "$TESTDIR/h264_422p_sdr.mkv" ]] && pass "h264_422p_sdr.mkv created" || fail "h264_422p_sdr.mkv NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/h264_422p_sdr.mkv" ]]; then pass "h264_422p_sdr.mkv created"; else fail "h264_422p_sdr.mkv NOT created (missing or empty)"; fi
 
   # 12) DV-tagged fixture for H10 regression test (P5.3)
   # Uses dvh1 codec tag so detect_dv() matches via ffprobe codec_tag_string.
@@ -1040,7 +1040,7 @@ SRT
     -c:a aac -b:a 128k -ac 2 \
     -metadata:s:a:0 language=eng \
     "$TESTDIR/hevc_dv_p5_tagged.mp4"
-  [[ -s "$TESTDIR/hevc_dv_p5_tagged.mp4" ]] && pass "hevc_dv_p5_tagged.mp4 created" || fail "hevc_dv_p5_tagged.mp4 NOT created (missing or empty)"
+  if [[ -s "$TESTDIR/hevc_dv_p5_tagged.mp4" ]]; then pass "hevc_dv_p5_tagged.mp4 created"; else fail "hevc_dv_p5_tagged.mp4 NOT created (missing or empty)"; fi
 
   log "All extended test media ready in $TESTDIR"
 }
@@ -8225,9 +8225,11 @@ _test_unit_prefer_complete_ffmpeg() {
     || { fail "F5-rt: could not extract _prefer_complete_ffmpeg + _ffmpeg_bin_is_complete"; return; }
   local d; d="$(mktemp -d)"
   mkdir -p "$d/opt/ffmpeg-full/bin" "$d/onpath" "$d/custom"
+  # shellcheck disable=SC2016  # mock ffmpeg body: $1 must stay literal — it expands when the stub runs, not at definition
   local complete='#!/bin/bash
 if [[ "$1" == "-version" ]]; then echo "ffmpeg with --enable-libass"; exit 0; fi
 printf "%s\n" " V..... libsvtav1   x" " V..... libaom-av1  x"; exit 0'
+  # shellcheck disable=SC2016  # mock ffmpeg body: $1 must stay literal — it expands when the stub runs, not at definition
   local incomplete='#!/bin/bash
 if [[ "$1" == "-version" ]]; then echo "ffmpeg version 6.0"; exit 0; fi
 printf "%s\n" " V..... libx264  x"; exit 0'
@@ -8819,6 +8821,7 @@ test_setup() {
   f5_log="$f5_prefix/brew_calls.log"
   # Incomplete ffmpeg stub: -version reports a build WITHOUT --enable-libass; -encoders lists none.
   # (Its keg path under the stub prefix has no ffmpeg, so _ensure_ffmpeg_full proceeds to install.)
+  # shellcheck disable=SC2016  # mock ffmpeg stub: $1 must stay literal — it expands when the stub runs, not here
   printf '#!/bin/bash\ncase "$1" in -version) echo "ffmpeg version 6.0";; *) :;; esac\nexit 0\n' > "$f5_bin/ffmpeg"
   chmod +x "$f5_bin/ffmpeg"
   HOME="$fake_home" PATH="$f5_bin:$PATH" "$MUXM" --install-dependencies >/dev/null 2>&1 || true
