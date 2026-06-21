@@ -8669,7 +8669,7 @@ _audio_descriptive_title() {
     ac3)       codec_display="AC-3" ;;
     aac)       codec_display="AAC" ;;
     truehd)    codec_display="TrueHD" ;;
-    dts)       codec_display="DTS" ;;
+    dts|dca)   codec_display="DTS" ;;
     flac)      codec_display="FLAC" ;;
     alac)      codec_display="ALAC" ;;
     opus)      codec_display="Opus" ;;
@@ -8708,16 +8708,39 @@ _audio_codec_rank(){
 }
 
 # Check if a language tag matches any entry in AUDIO_LANG_PREF.
-# Returns 0 (true) if the tag matches, 1 otherwise.
-# Args: $1 — language tag (lowercased, e.g., "eng", "spa", "und")
+# Both the stream tag and each pref entry are run through _norm_lang_code, so 2-letter
+# and 3-letter codes (and 639-2/B vs /T variants) match symmetrically: `en`↔`eng`,
+# `ja`↔`jpn`, `fre`↔`fra` (H2). Returns 0 (true) if the tag matches, 1 otherwise.
+# Args: $1 — language tag (e.g., "en", "eng", "spa", "und")
 # Globals: AUDIO_LANG_PREF (read)
 _audio_lang_matches(){
-  local lang="$1" pref
+  local lang pref
+  lang="$(_norm_lang_code "$1")"
   IFS=',' read -r -a prefs <<< "$AUDIO_LANG_PREF"
   for pref in "${prefs[@]}"; do
-    pref="${pref// /}"; pref="${pref,,}"
+    pref="${pref// /}"
     [[ -z "$pref" ]] && continue
-    [[ "$lang" == "$pref" ]] && return 0
+    [[ "$lang" == "$(_norm_lang_code "$pref")" ]] && return 0
+  done
+  return 1
+}
+
+# Subtitle analogue of _audio_lang_matches: does a subtitle language tag match any
+# entry in SUB_LANG_PREF, normalizing BOTH sides via _norm_lang_code (H2)? This closes
+# the embedded-vs-external asymmetry — an embedded `en` sub now survives an `eng` filter,
+# matching how external `movie.en.srt` (parsed to `eng`) is already treated.
+# An empty/whitespace-only SUB_LANG_PREF matches nothing here; callers gate on
+# `-n SUB_LANG_PREF` first (empty = keep-all), preserving the existing semantics.
+# Args: $1 — language tag. Globals: SUB_LANG_PREF (read).
+_sub_lang_matches(){
+  local lang pref
+  lang="$(_norm_lang_code "$1")"
+  local -a prefs
+  IFS=',' read -r -a prefs <<< "$SUB_LANG_PREF"
+  for pref in "${prefs[@]}"; do
+    pref="${pref// /}"
+    [[ -z "$pref" ]] && continue
+    [[ "$lang" == "$(_norm_lang_code "$pref")" ]] && return 0
   done
   return 1
 }
@@ -9152,9 +9175,22 @@ run_audio_pipeline_multi(){
   keep_list="$(_build_audio_keep_list)"
 
   if [[ -z "$keep_list" ]]; then
-    note "[Audio] Multi-track filter: no audio tracks survived filtering."
-    HAS_AUDIO=0
-    return 0
+    local _n_audio; _n_audio="$(_audio_stream_count)"
+    if (( _n_audio > 0 )); then
+      # H3: the language/commentary filter dropped EVERY audio track, but the source HAS
+      # audio. Never silently ship a video-only file — fall back to the best-scored track and
+      # warn loudly (mirrors select_best_audio's single-track "default to track 0" guard).
+      local _fallback_idx
+      _fallback_idx="$(select_best_audio | cut -f1)"
+      [[ "$_fallback_idx" =~ ^[0-9]+$ ]] || _fallback_idx=0
+      warn "[Audio] No audio track matched the language/commentary filter (AUDIO_LANG_PREF='${AUDIO_LANG_PREF:-}'); keeping the best-scored track #${_fallback_idx} so the output is not left without audio."
+      report_add "audio_keep_fallback" "no filter match; kept best track #${_fallback_idx}"
+      keep_list="$_fallback_idx"
+    else
+      note "[Audio] Multi-track filter: no audio tracks survived filtering."
+      HAS_AUDIO=0
+      return 0
+    fi
   fi
 
   # Reset single-track vars (not used in multi-track mode)
@@ -9645,21 +9681,25 @@ _sp_sub_lang(){
 }
 
 # Heuristic: check if a subtitle title string indicates forced/signs content.
-# Matches: "forced", "signs", "foreign" (case-insensitive).
+# Matches "forced", "signs", "foreign" as whole words (word-anchored, M2) so titles like
+# "Designs"/"Foreigner"/"Cosigns" don't false-match — important because a "forced" track is
+# burned into the video under SUB_BURN_FORCED.
 # Args: $1 — title string to test
 # Returns: 0 if match, 1 otherwise
 _is_forced_title(){
   local t="${1,,}"
-  [[ "$t" =~ forced|signs|foreign ]]
+  [[ "$t" =~ (^|[^a-z])(forced|signs|foreign)([^a-z]|$) ]]
 }
 
 # Heuristic: check if a subtitle title string indicates SDH/HI content.
-# Matches: "sdh", "hi", "hearing", "impaired", "cc", "caption" as whole words.
+# Matches "sdh", "hi", "cc", "caption", "hearing", "impaired" as whole words (every
+# alternative word-anchored, M2) so "Soccer"/"vaccine"/"Account" (containing "cc") and
+# "history" (containing "hi") don't false-match.
 # Args: $1 — title string to test
 # Returns: 0 if match, 1 otherwise
 _is_sdh_title(){
   local t="${1,,}"
-  [[ "$t" =~ (^|[^a-z])(sdh|hi)([^a-z]|$)|hearing|impaired|cc|caption ]]
+  [[ "$t" =~ (^|[^a-z])(sdh|hi|cc|caption|hearing|impaired)([^a-z]|$) ]]
 }
 
 # _sub_stream_info — Fetch all scan-relevant fields for one subtitle stream
@@ -9717,7 +9757,7 @@ _pick_direct_text_sub_relidx(){
   # shellcheck disable=SC2046  # Intentional word-splitting of integer list
   for i in $(list_sub_indices); do
     lang="$(_sp_sub_lang "$i")"
-    [[ ",$SUB_LANG_PREF," == *",$lang,"* ]] || continue
+    _sub_lang_matches "$lang" || continue
     codec="$(_sp_sub_field "$i" codec_name)"; codec="${codec,,}"
     if _is_text_sub_codec "$codec"; then
       echo "$i"
@@ -10168,6 +10208,10 @@ _norm_lang_code(){
     no) echo "nor" ;; tr) echo "tur" ;; cs) echo "ces" ;; hu) echo "hun" ;;
     ro) echo "ron" ;; el) echo "ell" ;; he) echo "heb" ;; vi) echo "vie" ;;
     th) echo "tha" ;; id) echo "ind" ;; uk) echo "ukr" ;; sk) echo "slk" ;;
+    # ISO 639-2/B (bibliographic) → 639-2/T (terminological), so a `fre`-tagged stream
+    # matches an `fra` preference. Only the /B variants of languages already mapped above.
+    fre) echo "fra" ;; ger) echo "deu" ;; dut) echo "nld" ;; gre) echo "ell" ;;
+    chi) echo "zho" ;; cze) echo "ces" ;; slo) echo "slk" ;; rum) echo "ron" ;;
     *) echo "${1,,}" ;;
   esac
 }
@@ -10345,20 +10389,41 @@ merge_subtitle_sources(){
     ALL_SUB_TITLES+=("${title:-}")
   done
 
-  # Append external subtitle files
-  local j
+  # Append external subtitle files, de-duplicating against embedded streams (M3): skip a
+  # sidecar when an embedded track already provides the same normalized language + type, so a
+  # `movie.en.srt` next to an embedded `eng` track does not yield two identical subtitle tracks.
+  # `n` is the embedded count; the externals are appended after those first `n` entries.
+  local j _ext_kept=0 _ext_deduped=0
   for (( j=0; j<${#EXT_SUB_PATHS[@]}; j++ )); do
+    local _xlang="${EXT_SUB_LANGS[$j]}" _xtype="${EXT_SUB_TYPES[$j]}"
+    local _xlang_n; _xlang_n="$(_norm_lang_code "$_xlang")"
+    local _dup=0 k
+    for (( k=0; k<n; k++ )); do
+      if [[ "$(_norm_lang_code "${ALL_SUB_LANGS[$k]}")" == "$_xlang_n" \
+            && "${ALL_SUB_TYPES[$k]}" == "$_xtype" ]]; then
+        _dup=1; break
+      fi
+    done
+    if (( _dup )); then
+      note "[Subs] Skipping external $(basename -- "${EXT_SUB_PATHS[$j]}") — an embedded ${_xlang_n} ${_xtype} subtitle is already present."
+      _ext_deduped=$(( _ext_deduped + 1 ))
+      continue
+    fi
     ALL_SUB_SOURCES+=("ext:${EXT_SUB_PATHS[$j]}")
-    ALL_SUB_LANGS+=("${EXT_SUB_LANGS[$j]}")
-    ALL_SUB_TYPES+=("${EXT_SUB_TYPES[$j]}")
+    ALL_SUB_LANGS+=("$_xlang")
+    ALL_SUB_TYPES+=("$_xtype")
     ALL_SUB_CODECS+=("${EXT_SUB_CODECS[$j]}")
     ALL_SUB_TITLES+=("")
+    _ext_kept=$(( _ext_kept + 1 ))
   done
 
   local total="${#ALL_SUB_SOURCES[@]}"
-  local ext_count="${#EXT_SUB_PATHS[@]}"
-  if (( ext_count > 0 )); then
-    note "[Subs] Unified subtitle list: $n embedded + $ext_count external = $total source(s)"
+  if (( ${#EXT_SUB_PATHS[@]} > 0 )); then
+    if (( _ext_deduped > 0 )); then
+      note "[Subs] Unified subtitle list: $n embedded + ${_ext_kept} external (${_ext_deduped} duplicate sidecar(s) skipped) = $total source(s)"
+    else
+      note "[Subs] Unified subtitle list: $n embedded + ${_ext_kept} external = $total source(s)"
+    fi
   fi
 }
 
@@ -10397,9 +10462,9 @@ _build_subtitle_keep_list(){
     local src_label
     src_label="$(_source_label "$src")"
 
-    # Filter 1: language
+    # Filter 1: language (normalized both sides — H2)
     if [[ -n "${SUB_LANG_PREF:-}" ]]; then
-      if [[ ",$SUB_LANG_PREF," != *",$lang,"* ]]; then
+      if ! _sub_lang_matches "$lang"; then
         dropped_reasons+=("$src_label: ${codec} [$lang] — language not in SUB_LANG_PREF")
         continue
       fi
@@ -10671,9 +10736,9 @@ build_subtitle_plan(){
     local lang="${ALL_SUB_LANGS[$i]}"
     local stype="${ALL_SUB_TYPES[$i]}"
 
-    # Language filter
+    # Language filter (normalized both sides — H2)
     if [[ -n "${SUB_LANG_PREF:-}" ]]; then
-      [[ ",$SUB_LANG_PREF," == *",$lang,"* ]] || continue
+      _sub_lang_matches "$lang" || continue
     fi
 
     case "$stype" in
@@ -11328,7 +11393,7 @@ _check_multitrack_container_safety() {
       _scodec="${ALL_SUB_CODECS[$_si],,}"
       _slang="${ALL_SUB_LANGS[$_si]}"
       _stype="${ALL_SUB_TYPES[$_si]}"
-      [[ -n "${SUB_LANG_PREF:-}" && ",$SUB_LANG_PREF," != *",$_slang,"* ]] && continue
+      [[ -n "${SUB_LANG_PREF:-}" ]] && ! _sub_lang_matches "$_slang" && continue
       case "$_stype" in
         forced) (( SUB_INCLUDE_FORCED )) || continue ;;
         sdh)    (( SUB_INCLUDE_SDH ))    || continue ;;

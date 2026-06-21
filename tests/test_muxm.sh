@@ -4480,6 +4480,46 @@ EOF
   _test_audio_f1_directplay
   _test_audio_f4_maxchannels
   _test_audio_f7_stereo_label
+  _test_audio_h3_no_audio_guard
+}
+
+# H3: a multi-track audio source whose language filter empties the keep-list must NOT silently
+# ship a video-only file — fall back to the best-scored track and warn loudly. Mirrors the
+# single-track "default to track 0" guard. Fixture: 2 audio tracks (jpn, spa) — a genuinely
+# different language from the `eng` pref, so H2 normalization can't accidentally satisfy the
+# filter and mask the guard. Skip-first guards (not else-skips) per the soft-skip ratchet.
+_test_audio_h3_no_audio_guard() {
+  if ! ffmpeg_has_encoder libx265; then
+    skip "H3: ffmpeg lacks libx265 — cannot build the multi-audio fixture"; return
+  fi
+  local _h3_src="$TESTDIR/h3_no_eng_audio.mkv" _h3_out="$TESTDIR/h3_out.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=teal:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=550:duration=2" \
+    -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p10le \
+    -map 0:v -map 1:a -map 2:a \
+    -c:a:0 aac -b:a:0 128k -ac:a:0 2 -c:a:1 aac -b:a:1 128k -ac:a:1 2 \
+    -metadata:s:a:0 language=jpn -metadata:s:a:1 language=spa \
+    "$_h3_src" 2>/dev/null
+  if [[ ! -s "$_h3_src" ]]; then
+    skip "H3: could not build the multi-audio fixture"; return
+  fi
+  # archive enables multi-track audio; --audio-lang-pref eng filters out the (jpn,spa) tracks.
+  local _h3_log _h3_acount
+  _h3_log="$(run_muxm --profile archive --audio-lang-pref eng --output-ext mkv "$_h3_src" "$_h3_out")"
+  _h3_acount="$(count_streams "$_h3_out" a)"
+  if [[ -s "$_h3_out" ]] && (( _h3_acount >= 1 )); then
+    pass "H3: no-language-match multi-track audio still ships ≥1 audio track (got $_h3_acount), not video-only"
+  else
+    fail "H3: output has no audio track (count=${_h3_acount:-?}) — silently shipped video-only (H3 regression)"
+  fi
+  if printf '%s\n' "$_h3_log" | grep -qiE 'not be left without audio|best-scored track|no audio track matched'; then
+    pass "H3: a loud warning was emitted about the audio language fallback"
+  else
+    fail "H3: no warning emitted when the audio language filter matched nothing"
+  fi
+  rm -f "$_h3_src" "$_h3_out" 2>/dev/null || true
 }
 
 # F7: the native-stereo-fallback track must be labeled with its REAL codec and carry the chosen
@@ -5324,6 +5364,37 @@ SRT
     fi
   fi
   rm -rf "$_burn_dir"
+
+  # ---- H2 (subtitles): an embedded sub tagged with a 2-letter code (`en`) must survive a
+  #      3-letter language filter (`eng`) — closing the embedded-vs-external asymmetry where an
+  #      external `movie.en.srt` was kept (parsed to `eng`) but an embedded `en` was dropped.
+  #      Skip-first guard (not an else-skip) per the soft-skip ratchet. ----
+  if ! ffmpeg_has_encoder libx265; then
+    skip "H2-sub: ffmpeg lacks libx265 — cannot build the embedded-subtitle fixture"
+  else
+    local _h2_src="$TESTDIR/h2_embedded_en_sub.mkv" _h2_out="$TESTDIR/h2_sub_out.mkv"
+    printf '1\n00:00:00,000 --> 00:00:02,000\nEmbedded two-letter English\n' > "$TESTDIR/h2_en.srt"
+    ffmpeg -hide_banner -loglevel error -y \
+      -f lavfi -i "color=c=navy:s=320x240:r=24:d=2" \
+      -f lavfi -i "sine=frequency=440:duration=2" \
+      -i "$TESTDIR/h2_en.srt" \
+      -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p10le \
+      -map 0:v -map 1:a -map 2:s -c:a aac -c:s srt \
+      -metadata:s:s:0 language=en \
+      "$_h2_src" 2>/dev/null
+    if [[ ! -s "$_h2_src" ]]; then
+      skip "H2-sub: could not build the embedded-subtitle fixture"
+    else
+      run_muxm --profile archive --sub-lang-pref eng --output-ext mkv "$_h2_src" "$_h2_out" >/dev/null
+      local _h2_scount; _h2_scount="$(count_streams "$_h2_out" s)"
+      if [[ -s "$_h2_out" ]] && (( _h2_scount >= 1 )); then
+        pass "H2-sub: embedded 'en' subtitle survives the 'eng' language filter (got $_h2_scount sub track)"
+      else
+        fail "H2-sub: embedded 'en' subtitle dropped by the 'eng' filter (count=${_h2_scount:-?}) — embedded/external asymmetry (regression)"
+      fi
+    fi
+    rm -f "$_h2_src" "$_h2_out" "$TESTDIR/h2_en.srt" 2>/dev/null || true
+  fi
 
   _test_subs_f3_sdh_disposition
 }
@@ -6632,6 +6703,9 @@ _test_unit_audio_helpers() {
   result="$(muxm_fn _audio_descriptive_title aac 2)";   if [[ "$result" == "Stereo (AAC)" ]]; then pass "_audio_descriptive_title(aac,2)"; else fail "_audio_descriptive_title(aac,2) expected 'Stereo (AAC)', got '$result'"; fi
   result="$(muxm_fn _audio_descriptive_title truehd 8)"; if [[ "$result" == "7.1 Surround (TrueHD)" ]]; then pass "_audio_descriptive_title(truehd,8)"; else fail "_audio_descriptive_title(truehd,8) expected '7.1 Surround (TrueHD)', got '$result'"; fi
   result="$(muxm_fn _audio_descriptive_title pcm_s16le 2)"; if [[ "$result" == "Stereo (PCM)" ]]; then pass "_audio_descriptive_title(pcm_s16le,2)"; else fail "expected 'Stereo (PCM)', got '$result'"; fi
+  # L6: ffprobe reports DTS as 'dca' — must render "DTS", not "(dca)".
+  result="$(muxm_fn _audio_descriptive_title dts 6)"; if [[ "$result" == "5.1 Surround (DTS)" ]]; then pass "_audio_descriptive_title(dts,6)"; else fail "_audio_descriptive_title(dts,6) expected '5.1 Surround (DTS)', got '$result'"; fi
+  result="$(muxm_fn _audio_descriptive_title dca 6)"; if [[ "$result" == "5.1 Surround (DTS)" ]]; then pass "_audio_descriptive_title(dca,6) → DTS (L6)"; else fail "_audio_descriptive_title(dca,6) expected '5.1 Surround (DTS)', got '$result'"; fi
 
   # ---- _audio_codec_rank ----
   # Requires AUDIO_CODEC_PREFERENCE to be set (use muxm default)
@@ -6778,16 +6852,25 @@ _test_unit_audio_helpers() {
 
   # ---- _audio_lang_matches ----
   # Drives audio track selection — the strongest scoring signal (150 points).
-  # A bug here silently selects the wrong audio track.
-  assert_muxm_fn_exit "_audio_lang_matches('eng', pref='eng,spa')=match"        0 _audio_lang_matches 'AUDIO_LANG_PREF="eng,spa"' "eng"
-  assert_muxm_fn_exit "_audio_lang_matches('spa', pref='eng,spa')=match"        0 _audio_lang_matches 'AUDIO_LANG_PREF="eng,spa"' "spa"
-  assert_muxm_fn_exit "_audio_lang_matches('fra', pref='eng,spa')=no match"     1 _audio_lang_matches 'AUDIO_LANG_PREF="eng,spa"' "fra"
-  assert_muxm_fn_exit "_audio_lang_matches('und', pref='eng')=no match"         1 _audio_lang_matches 'AUDIO_LANG_PREF="eng"'     "und"
-  assert_muxm_fn_exit "_audio_lang_matches('', pref='eng')=no match (empty)"    1 _audio_lang_matches 'AUDIO_LANG_PREF="eng"'     ""
-  assert_muxm_fn_exit "_audio_lang_matches('eng', pref='eng')=match (single pref)" 0 _audio_lang_matches 'AUDIO_LANG_PREF="eng"' "eng"
-  assert_muxm_fn_exit "_audio_lang_matches: empty pref → no match" 1 _audio_lang_matches 'AUDIO_LANG_PREF=""' "eng"
-  assert_muxm_fn_exit "_audio_lang_matches: whitespace-padded pref matches" 0 _audio_lang_matches 'AUDIO_LANG_PREF=" eng , jpn "' "eng"
-  assert_muxm_fn_exit "_audio_lang_matches: uppercase pref 'ENG' matches 'eng'" 0 _audio_lang_matches 'AUDIO_LANG_PREF="ENG,JPN"' "eng"
+  # A bug here silently selects the wrong audio track. H2: the matcher now normalizes BOTH the
+  # tag and each pref entry via _norm_lang_code, so inject the real normalizer into env_setup
+  # (assert_muxm_fn_exit extracts only the named function — it would otherwise be "command not found").
+  local _nlc; _nlc="$(awk '/^_norm_lang_code\(\)/,/^}/' "$MUXM")"
+  assert_muxm_fn_exit "_audio_lang_matches('eng', pref='eng,spa')=match"        0 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="eng,spa"' "eng"
+  assert_muxm_fn_exit "_audio_lang_matches('spa', pref='eng,spa')=match"        0 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="eng,spa"' "spa"
+  assert_muxm_fn_exit "_audio_lang_matches('fra', pref='eng,spa')=no match"     1 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="eng,spa"' "fra"
+  assert_muxm_fn_exit "_audio_lang_matches('und', pref='eng')=no match"         1 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="eng"'     "und"
+  assert_muxm_fn_exit "_audio_lang_matches('', pref='eng')=no match (empty)"    1 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="eng"'     ""
+  assert_muxm_fn_exit "_audio_lang_matches('eng', pref='eng')=match (single pref)" 0 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="eng"' "eng"
+  assert_muxm_fn_exit "_audio_lang_matches: empty pref → no match" 1 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF=""' "eng"
+  assert_muxm_fn_exit "_audio_lang_matches: whitespace-padded pref matches" 0 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF=" eng , jpn "' "eng"
+  assert_muxm_fn_exit "_audio_lang_matches: uppercase pref 'ENG' matches 'eng'" 0 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="ENG,JPN"' "eng"
+  # H2: 2-letter tag ↔ 3-letter pref (both directions) and 639-2/B ↔ /T must match symmetrically.
+  assert_muxm_fn_exit "_audio_lang_matches('en', pref='eng')=match (2→3, H2)"    0 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="eng"' "en"
+  assert_muxm_fn_exit "_audio_lang_matches('ja', pref='jpn')=match (2→3, H2)"    0 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="jpn"' "ja"
+  assert_muxm_fn_exit "_audio_lang_matches('jpn', pref='ja')=match (3→2, H2)"    0 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="ja"' "jpn"
+  assert_muxm_fn_exit "_audio_lang_matches('fre', pref='fra')=match (639-2/B↔/T, H2)" 0 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="fra"' "fre"
+  assert_muxm_fn_exit "_audio_lang_matches('jpn', pref='eng')=no match (diff lang)"   1 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="eng"' "jpn"
 
   # ---- audio_lossless_muxable ----
   # Tests container+codec compatibility matrix for lossless passthrough.
@@ -6826,21 +6909,41 @@ _test_unit_audio_helpers() {
 }
 
 _test_unit_sub_helpers() {
-  # ---- _is_forced_title ----
+  # ---- _is_forced_title (M2: every alternative word-anchored) ----
   assert_muxm_fn_exit "_is_forced_title('Forced')=match"            0 _is_forced_title "" "Forced"
   assert_muxm_fn_exit "_is_forced_title('Signs & Songs')=match"     0 _is_forced_title "" "Signs & Songs"
   assert_muxm_fn_exit "_is_forced_title('Foreign Parts Only')=match" 0 _is_forced_title "" "Foreign Parts Only"
   assert_muxm_fn_exit "_is_forced_title('English')=no match"        1 _is_forced_title "" "English"
   assert_muxm_fn_exit "_is_forced_title('')=no match (empty)"       1 _is_forced_title "" ""
+  # M2 false-positive guards: substrings of longer words must NOT match (would burn-in under SUB_BURN_FORCED).
+  assert_muxm_fn_exit "_is_forced_title('Designs')=no match (M2: 'signs' substring)"   1 _is_forced_title "" "Designs"
+  assert_muxm_fn_exit "_is_forced_title('Foreigner')=no match (M2: 'foreign' substring)" 1 _is_forced_title "" "Foreigner"
+  assert_muxm_fn_exit "_is_forced_title('Cosigns')=no match (M2: 'signs' substring)"   1 _is_forced_title "" "Cosigns"
 
-  # ---- _is_sdh_title ----
+  # ---- _is_sdh_title (M2: every alternative word-anchored, comment corrected) ----
   assert_muxm_fn_exit "_is_sdh_title('English SDH')=match"          0 _is_sdh_title "" "English SDH"
   assert_muxm_fn_exit "_is_sdh_title('English (CC)')=match"         0 _is_sdh_title "" "English (CC)"
   assert_muxm_fn_exit "_is_sdh_title('Hearing Impaired')=match"     0 _is_sdh_title "" "Hearing Impaired"
+  assert_muxm_fn_exit "_is_sdh_title('Closed Caption')=match"       0 _is_sdh_title "" "Closed Caption"
   assert_muxm_fn_exit "_is_sdh_title('English')=no match"           1 _is_sdh_title "" "English"
   assert_muxm_fn_exit "_is_sdh_title('history')=no match (false positive guard: 'hi' in 'history')" 1 _is_sdh_title "" "history"
   assert_muxm_fn_exit "_is_sdh_title('HI')=match (standalone HI)"   0 _is_sdh_title "" "HI"
   assert_muxm_fn_exit "_is_sdh_title('')=no match (empty)"          1 _is_sdh_title "" ""
+  # M2 false-positive guards: words merely CONTAINING cc/caption/hearing must NOT match.
+  assert_muxm_fn_exit "_is_sdh_title('Soccer')=no match (M2: 'cc' substring)"     1 _is_sdh_title "" "Soccer"
+  assert_muxm_fn_exit "_is_sdh_title('vaccine')=no match (M2: 'cc' substring)"    1 _is_sdh_title "" "vaccine"
+  assert_muxm_fn_exit "_is_sdh_title('Account')=no match (M2: 'cc' substring)"    1 _is_sdh_title "" "Account"
+  assert_muxm_fn_exit "_is_sdh_title('Succession')=no match (M2: 'cc' substring)" 1 _is_sdh_title "" "Succession"
+
+  # ---- _sub_lang_matches (H2: subtitle analogue of _audio_lang_matches; normalize both sides) ----
+  local _nlc_s; _nlc_s="$(awk '/^_norm_lang_code\(\)/,/^}/' "$MUXM")"
+  assert_muxm_fn_exit "_sub_lang_matches('eng', pref='eng')=match"             0 _sub_lang_matches "$_nlc_s"$'\n''SUB_LANG_PREF="eng"' "eng"
+  assert_muxm_fn_exit "_sub_lang_matches('en', pref='eng')=match (2→3, H2)"    0 _sub_lang_matches "$_nlc_s"$'\n''SUB_LANG_PREF="eng"' "en"
+  assert_muxm_fn_exit "_sub_lang_matches('eng', pref='en')=match (pref 2-letter, H2)" 0 _sub_lang_matches "$_nlc_s"$'\n''SUB_LANG_PREF="en"' "eng"
+  assert_muxm_fn_exit "_sub_lang_matches('fre', pref='fra')=match (639-2/B↔/T, H2)" 0 _sub_lang_matches "$_nlc_s"$'\n''SUB_LANG_PREF="fra"' "fre"
+  assert_muxm_fn_exit "_sub_lang_matches('jpn', pref='eng')=no match (diff lang)" 1 _sub_lang_matches "$_nlc_s"$'\n''SUB_LANG_PREF="eng,spa"' "jpn"
+  assert_muxm_fn_exit "_sub_lang_matches('eng', pref='')=no match (empty pref)" 1 _sub_lang_matches "$_nlc_s"$'\n''SUB_LANG_PREF=""' "eng"
+  assert_muxm_fn_exit "_sub_lang_matches: whitespace-padded pref matches"       0 _sub_lang_matches "$_nlc_s"$'\n''SUB_LANG_PREF=" eng , jpn "' "en"
 
   # ---- _is_text_sub_codec ----
   assert_muxm_fn_exit "_is_text_sub_codec('subrip')=text"              0 _is_text_sub_codec "" "subrip"
@@ -7673,7 +7776,7 @@ _test_unit_score_audio_stream() {
   # skip the indented profile-arm reassignments) and use canonical hardcoded constants as oracle.
   local body
   body="$(_extract_muxm_fns _score_audio_stream _normalize_codec_lang _audio_codec_rank \
-                            _audio_lang_matches audio_is_lossless _audio_is_commentary)" || {
+                            _audio_lang_matches _norm_lang_code audio_is_lossless _audio_is_commentary)" || {
     fail "2.1: could not extract _score_audio_stream + helpers from muxm"; return; }
   local defaults
   defaults="$(grep -E '^(declare -i )?(AUDIO_SCORE_[A-Z_]+|AUDIO_CODEC_PREFERENCE|AUDIO_LANG_PREF|TAG_LANGUAGE_DEFAULT|_AUDIO_CODEC_RANK_PREF)=' "$MUXM")"
@@ -7773,7 +7876,7 @@ _test_unit_select_best_audio() {
   # the review found untested (esp. invalid-override fallback and the all-fail guard).
   local body defaults
   body="$(_extract_muxm_fns select_best_audio _score_audio_stream _normalize_codec_lang \
-                            _audio_codec_rank _audio_lang_matches audio_is_lossless _audio_is_commentary)" \
+                            _audio_codec_rank _audio_lang_matches _norm_lang_code audio_is_lossless _audio_is_commentary)" \
     || { fail "2.2: could not extract select_best_audio + helpers"; return; }
   defaults="$(grep -E '^(declare -i )?(AUDIO_SCORE_[A-Z_]+|AUDIO_CODEC_PREFERENCE|AUDIO_LANG_PREF|TAG_LANGUAGE_DEFAULT|_AUDIO_CODEC_RANK_PREF)=' "$MUXM")"
   _tr(){ printf '%s\t%s\t%s\t%s\t%s' "$1" "$2" "$3" "$4" "$5"; }   # one mocked stream record
@@ -7799,6 +7902,11 @@ select_best_audio | cut -f1" -- "$tracks" "$override"
   _sba_assert "2.2 select: all-tracks-fail → default-to-track-0 guard"         0 "$(_sba_idx "$two" '' '_score_audio_stream(){ echo nonnumeric; }')"
   local comm; comm="$(_tr eac3 6 eng 448000 'Director Commentary')"$'\n'"$(_tr eac3 6 eng 448000 'Main')"
   _sba_assert "2.2 select: commentary deprioritized vs identical main feature" 1 "$(_sba_idx "$comm")"
+  # H2: a 2-letter `en` tag must earn the +150 language bonus under the default pref `eng`,
+  # beating a higher-channel foreign track — the scoring-flip the review flagged. idx0=jpn 6ch,
+  # idx1=en 2ch → English (idx1) must win. (Pre-H2: en≠eng, no bonus, the 6ch jpn track wins.)
+  local h2lang; h2lang="$(_tr eac3 6 jpn 448000 '')"$'\n'"$(_tr aac 2 en 128000 '')"
+  _sba_assert "2.2 select: en-tagged English wins lang bonus over a 6ch foreign track (H2)" 1 "$(_sba_idx "$h2lang")"
 }
 
 _test_unit_build_subtitle_lists() {
@@ -7810,9 +7918,9 @@ _test_unit_build_subtitle_lists() {
   # Mock the probe I/O boundary (list_sub_indices / _sp_sub_lang / _sp_sub_field for the picker;
   # the ALL_SUB_* arrays for the keep list) and assert the returned indices.
   local body_pdt body_bskl
-  body_pdt="$(_extract_muxm_fns _pick_direct_text_sub_relidx _is_text_sub_codec)" \
+  body_pdt="$(_extract_muxm_fns _pick_direct_text_sub_relidx _is_text_sub_codec _sub_lang_matches _norm_lang_code)" \
     || { fail "2.4: could not extract _pick_direct_text_sub_relidx + _is_text_sub_codec"; return; }
-  body_bskl="$(_extract_muxm_fns _build_subtitle_keep_list _is_text_sub_codec)" \
+  body_bskl="$(_extract_muxm_fns _build_subtitle_keep_list _is_text_sub_codec _sub_lang_matches _norm_lang_code)" \
     || { fail "2.4: could not extract _build_subtitle_keep_list + _is_text_sub_codec"; return; }
 
   # $1=space-sep langs  $2=space-sep codecs (parallel)  [$3=SUB_LANG_PREF, default eng].
@@ -9285,6 +9393,39 @@ EOF
     else
       fail "--no-sub-sole-ext-fallback: expected 0 subtitle tracks, got $no_fallback_scount"
     fi
+  fi
+
+  # ---- M3: an embedded subtitle and a sidecar of the SAME normalized language+type must not
+  #      both survive — `merge_subtitle_sources` de-duplicates the sidecar. Embedded `eng` +
+  #      `<stem>.en.srt` (parsed to `eng`) → exactly ONE English subtitle track, not two.
+  #      Skip-first guard (not an else-skip) per the soft-skip ratchet. ----
+  if ! ffmpeg_has_encoder libx265; then
+    skip "M3: ffmpeg lacks libx265 — cannot build the embedded+sidecar fixture"
+  else
+    local _m3_src="$TESTDIR/m3_dedup_source.mkv" _m3_out="$TESTDIR/m3_dedup_out.mkv"
+    printf '1\n00:00:00,000 --> 00:00:02,000\nEmbedded English\n' > "$TESTDIR/m3_embed.srt"
+    ffmpeg -hide_banner -loglevel error -y \
+      -f lavfi -i "color=c=maroon:s=320x240:r=24:d=2" \
+      -f lavfi -i "sine=frequency=440:duration=2" \
+      -i "$TESTDIR/m3_embed.srt" \
+      -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p10le \
+      -map 0:v -map 1:a -map 2:s -c:a aac -c:s srt \
+      -metadata:s:s:0 language=eng \
+      "$_m3_src" 2>/dev/null
+    # Sidecar with the SAME language (2-letter form) and type (full) as the embedded track.
+    printf '1\n00:00:00,000 --> 00:00:02,000\nSidecar English\n' > "$TESTDIR/m3_dedup_source.en.srt"
+    if [[ ! -s "$_m3_src" ]]; then
+      skip "M3: could not build the embedded+sidecar fixture"
+    else
+      run_muxm --profile archive --output-ext mkv "$_m3_src" "$_m3_out" >/dev/null
+      local _m3_scount; _m3_scount="$(count_streams "$_m3_out" s)"
+      if [[ -s "$_m3_out" ]] && (( _m3_scount == 1 )); then
+        pass "M3: embedded 'eng' + sidecar '.en.srt' de-duplicated to exactly 1 subtitle track"
+      else
+        fail "M3: expected exactly 1 subtitle track after dedup, got ${_m3_scount:-?} (embedded+external not deduped)"
+      fi
+    fi
+    rm -f "$_m3_src" "$_m3_out" "$TESTDIR/m3_embed.srt" "$TESTDIR/m3_dedup_source.en.srt" 2>/dev/null || true
   fi
 }
 
