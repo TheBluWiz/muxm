@@ -132,6 +132,7 @@ WORKDIR_BASE=""        # --workdir DIR: parent dir for the .muxm.tmp.* workdir.
 LOGFILE=""
 LOG_PERSIST_PATH=""   # Durable copy target for the run log under --keep-log; set once in Section 15
 DEBUG_BUNDLE_DIR=""   # Durable diagnostics-bundle dir kept on failure; set once in Section 15
+declare -i _OUT_LOCK_HELD=0   # M4: 1 once this run owns ${OUT}.lock; on_exit releases it only then
 _LOG_BUFFER=""        # In-memory capture of pre-§17 narrative (config/profile/conflict/validation),
                       # flushed into $LOGFILE the moment it is created in Section 17. Lets the log
                       # tell the WHOLE story, and stops log() leaking internal lines to the terminal.
@@ -1120,6 +1121,19 @@ ffmpeg_has_encoder(){
     _FFMPEG_ENCODERS_CACHED=1
   fi
   grep -qx "$name" <<<"$_FFMPEG_ENCODERS_CACHE"
+}
+
+# _preflight_sw_video_encoder — when the run will use the software x26x encoder (VIDEO_CODEC is
+# libx265/libx264 and no hardware backend resolved), verify ffmpeg actually has it and die 10 with
+# an install hint — the same fail-fast treatment the AV1 and hardware encoders already get above.
+# Without this, a stripped ffmpeg build lacking libx265 proceeds all the way to the encode and
+# fails mid-stream at die 40 instead of cleanly at preflight (M5). No-op for AV1/hardware paths.
+# Reads: VIDEO_CODEC, HW_ACCEL_RESOLVED.
+_preflight_sw_video_encoder() {
+  [[ "$VIDEO_CODEC" == "libx265" || "$VIDEO_CODEC" == "libx264" ]] || return 0
+  [[ "${HW_ACCEL_RESOLVED:-none}" == "none" ]] || return 0   # HW path uses hevc_videotoolbox/etc.
+  ffmpeg_has_encoder "$VIDEO_CODEC" && return 0
+  die 10 "${VIDEO_CODEC} encoder not available in this ffmpeg build. Install a complete ffmpeg (e.g., brew install ffmpeg-full, or run muxm --install-dependencies)."
 }
 
 # _ffmpeg_bin_is_complete — true if the given ffmpeg binary has every capability muxm's full
@@ -2702,6 +2716,12 @@ Video pipeline structural error (missing or corrupt encoded video stream).
 .TP
 .B 43
 Audio transcode or copy failure.
+.TP
+.B 44
+Dolby Vision RPU profile conversion or RPU/frame desync failure (with fallback disabled).
+.TP
+.B 45
+Frame-rate integrity check failed (output fps differs from source, which would desync audio).
 .TP
 .B 130
 Interrupted by user (SIGINT / Ctrl\-C).
@@ -4898,6 +4918,15 @@ _require_val(){
   return 0
 }
 
+# Parse-time validators for the numeric/rate value flags (L3). These reject obvious garbage at
+# parse time — the same robustness the CLI already gives CRF — instead of letting it slip through
+# to a mid-encode ffmpeg failure (die 40). Framing is validation-consistency, not security: the
+# user owns their own command line. A sourced .muxmrc bypasses these (it assigns the globals
+# directly), so the matching globals are re-validated after config load in Section 15.
+# Args: $1 = flag name (for the message), $2 = the value.
+_validate_level_arg(){ [[ "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die 11 "Invalid $1 '$2': expected a numeric H.265/H.264 level like 5.1 or 4.0."; }
+_validate_rate_arg(){ [[ "$2" =~ ^[0-9]+(\.[0-9]+)?[kKmMgG]?$ ]] || die 11 "Invalid $1 '$2': expected a bitrate like 20000k, 5M, or a plain integer (bits/s)."; }
+
 POSITIONALS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -4950,9 +4979,9 @@ while [[ $# -gt 0 ]]; do
     --x265-params) _require_val "$1" "$#" "${2:-}"; X265_PARAMS_BASE="$2"; _CLI_X265_PARAMS_EXPLICIT=1; shift 2 ;;
     --x264-params) _require_val "$1" "$#" "${2:-}"; X264_PARAMS_BASE="$2"; _CLI_X264_PARAMS_EXPLICIT=1; shift 2 ;;
     --av1-params)  _require_val "$1" "$#" "${2:-}"; SVT_AV1_PARAMS_BASE="$2"; _CLI_AV1_PARAMS_EXPLICIT=1; shift 2 ;;
-    --av1-maxrate) _require_val "$1" "$#" "${2:-}"; AV1_MAXRATE="$2"; shift 2 ;;
-    --av1-bufsize) _require_val "$1" "$#" "${2:-}"; AV1_BUFSIZE="$2"; shift 2 ;;
-    -l|--level)    _require_val "$1" "$#" "${2:-}"; LEVEL_VALUE="$2"; _CLI_LEVEL_EXPLICIT=1; shift 2 ;;
+    --av1-maxrate) _require_val "$1" "$#" "${2:-}"; _validate_rate_arg "$1" "$2"; AV1_MAXRATE="$2"; shift 2 ;;
+    --av1-bufsize) _require_val "$1" "$#" "${2:-}"; _validate_rate_arg "$1" "$2"; AV1_BUFSIZE="$2"; shift 2 ;;
+    -l|--level)    _require_val "$1" "$#" "${2:-}"; _validate_level_arg "$1" "$2"; LEVEL_VALUE="$2"; _CLI_LEVEL_EXPLICIT=1; shift 2 ;;
     --conservative-vbv) CONSERVATIVE_VBV=1; shift ;;
     --no-conservative-vbv) CONSERVATIVE_VBV=0; shift ;;
     --dv) DISABLE_DV=0; shift ;;
@@ -4994,7 +5023,7 @@ while [[ $# -gt 0 ]]; do
 
     --audio-track)        _require_val "$1" "$#" "${2:-}"; AUDIO_TRACK_OVERRIDE="$2"; shift 2 ;;
     --audio-lang-pref)    _require_val "$1" "$#" "${2:-}"; AUDIO_LANG_PREF="$2"; shift 2 ;;
-    --stereo-bitrate)     _require_val "$1" "$#" "${2:-}"; STEREO_BITRATE="$2"; shift 2 ;;
+    --stereo-bitrate)     _require_val "$1" "$#" "${2:-}"; _validate_rate_arg "$1" "$2"; STEREO_BITRATE="$2"; shift 2 ;;
     --prefer-stereo) AUDIO_PREFER_STEREO=1; _CLI_AUDIO_PREFER_STEREO_EXPLICIT=1; shift ;;
     --no-prefer-stereo) AUDIO_PREFER_STEREO=0; _CLI_AUDIO_PREFER_STEREO_EXPLICIT=1; shift ;;
     --stereo-fallback) ADD_STEREO_IF_MULTICH=1; _CLI_ADD_STEREO_IF_MULTICH_EXPLICIT=1; shift ;;
@@ -5738,6 +5767,10 @@ if [[ "$VIDEO_CODEC" == "libsvt-av1" || "$VIDEO_CODEC" == "libaom-av1" ]]; then
   fi
 fi
 
+# Same fail-fast preflight for the software x26x encoders (M5) — runs after detect_hw_accel so
+# HW_ACCEL_RESOLVED is known (the HW path uses hevc_videotoolbox/hevc_nvenc, not libx265/libx264).
+_preflight_sw_video_encoder
+
 # Strict check for explicit hardware acceleration requests. detect_hw_accel
 # ran earlier (Section 13b) as a non-fatal probe so --print-effective-config
 # could still run; here we enforce that an explicit --hw-accel or HW_ACCEL
@@ -5784,6 +5817,15 @@ esac
 if [[ ! "$CRF_VALUE" =~ ^[0-9]+$ ]] || (( CRF_VALUE > 51 )); then
   die 11 "Invalid CRF_VALUE from config: integer 0–51 expected (got: ${CRF_VALUE})"
 fi
+
+# Re-validate the level/rate value flags after config load, mirroring the CRF re-check (L3): a
+# sourced .muxmrc assigns these directly, bypassing the parse-time guards above. LEVEL_VALUE,
+# AV1_MAXRATE, and AV1_BUFSIZE are optional (blank = let the encoder decide), so gate on -n;
+# STEREO_BITRATE always has a value (default 192k).
+[[ -n "$LEVEL_VALUE"  && ! "$LEVEL_VALUE"  =~ ^[0-9]+(\.[0-9]+)?$ ]]       && die 11 "Invalid LEVEL_VALUE from config: expected a numeric level like 5.1 (got: ${LEVEL_VALUE})"
+[[ -n "$AV1_MAXRATE"  && ! "$AV1_MAXRATE"  =~ ^[0-9]+(\.[0-9]+)?[kKmMgG]?$ ]] && die 11 "Invalid AV1_MAXRATE from config: expected a bitrate like 20000k (got: ${AV1_MAXRATE})"
+[[ -n "$AV1_BUFSIZE"  && ! "$AV1_BUFSIZE"  =~ ^[0-9]+(\.[0-9]+)?[kKmMgG]?$ ]] && die 11 "Invalid AV1_BUFSIZE from config: expected a bitrate like 40000k (got: ${AV1_BUFSIZE})"
+[[ ! "$STEREO_BITRATE" =~ ^[0-9]+(\.[0-9]+)?[kKmMgG]?$ ]]                     && die 11 "Invalid STEREO_BITRATE from config: expected a bitrate like 192k (got: ${STEREO_BITRATE})"
 
 # Resolve and validate source file
 SRC_ABS="$(realpath_fallback "$SRC")"
@@ -5876,11 +5918,16 @@ if (( ! FFMPEG_OVERWRITE )) && [[ -f "$OUT_ABS" ]]; then
   die 11 "Output file already exists (--no-overwrite): $OUT_ABS — remove --no-overwrite to overwrite, or choose a different output path."
 fi
 
-# Security: Use unpredictable temp file name.
-# NOTE: mktemp creates the file, then we delete it and re-add the extension.
-# There is a theoretical TOCTOU window between rm and ffmpeg's eventual open.
-# This is acceptable because: (a) the window is microseconds, (b) exploitation
-# requires local write access to OUT_DIR, (c) mktemp --suffix is not portable.
+# Temp output file name (L1): mktemp creates a 0600 file, then we delete it and re-add the
+# extension so the muxer writes to a name with the right suffix. NOTE on the TOCTOU window — the
+# mktemp name is NOT a secret: an attacker with write access to OUT_DIR can read it from a
+# directory listing and, in the gap between the rm below and ffmpeg's open, plant a symlink at
+# that path that ffmpeg's -y then writes through. So the real precondition is a shared/world-
+# writable OUT_DIR (an attacker with write access there already controls the output location);
+# the random name only thwarts blind pre-creation, not an attacker who observes the listing.
+# Honest severity is Low (it needs a hostile OUT_DIR). mktemp --suffix would avoid the rm→reuse
+# but is not portable to BSD/macOS. The same observe-then-symlink applies to write_checksum's
+# deterministic ${file}.${algo} target.
 TMP_OUT="$(mktemp "$OUT_DIR/.muxm.output.XXXXXXXX")" || die 11 "Cannot create temp output file"
 rm -f "$TMP_OUT"  # Remove the file, we just wanted the name
 TMP_OUT="${TMP_OUT}.${OUTPUT_EXT}"
@@ -6177,6 +6224,13 @@ on_exit() {
   # Clean up subtitle burn-in temp file (lives inside WORKDIR; explicit removal before workdir cleanup)
   [[ -n "${_BURN_SRT_FILTER:-}" && -f "$_BURN_SRT_FILTER" ]] && rm -f "$_BURN_SRT_FILTER"
 
+  # M4: release our output lock if (and only if) we acquired it. Gated on _OUT_LOCK_HELD so the
+  # multi-profile parent (exits before acquiring) and a refused concurrent run never remove the
+  # lock that another live run owns. Runs on every exit path, including SIGINT/SIGTERM.
+  if (( ${_OUT_LOCK_HELD:-0} )) && [[ -n "${OUT:-}" ]]; then
+    rm -rf "${OUT}.lock" 2>/dev/null || true
+  fi
+
   local have_result=0 _persist_ok=1
 
   if (( DRY_RUN )); then
@@ -6262,7 +6316,33 @@ on_exit() {
     exit "${EXIT_CODE:-1}"
   fi
 }
+
+# _acquire_out_lock — refuse to start when another LIVE muxm run already targets this $OUT, and
+# reclaim a lock orphaned by a dead one (on_exit cannot run on SIGKILL). The lock is a directory
+# (${OUT}.lock) created atomically by mkdir — portable across macOS and Linux, where flock(1)
+# (util-linux) is unavailable. A pid file inside names the owner for the liveness check (mirrors
+# run_parallel.sh's stale-dir sweep). Released in on_exit, gated on _OUT_LOCK_HELD. (M4)
+_acquire_out_lock() {
+  local lock="${OUT}.lock" owner tries=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    owner=""; [[ -r "$lock/pid" ]] && read -r owner < "$lock/pid" 2>/dev/null
+    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+      die 11 "Another muxm run (PID $owner) is already writing to this output: $OUT — wait for it to finish, choose a different output path, or remove the stale lock with: rm -rf '$lock'"
+    fi
+    # Owner dead or unidentifiable → stale lock. Reclaim and retry, bounded so a genuinely-stuck
+    # path (e.g. a permission error) can't spin forever.
+    (( ++tries > 3 )) && die 11 "Could not acquire the output lock '$lock' — remove it manually: rm -rf '$lock'"
+    rm -rf "$lock" 2>/dev/null || true
+  done
+  printf '%s\n' "$$" > "$lock/pid" 2>/dev/null || true
+  _OUT_LOCK_HELD=1
+}
 trap 'on_exit' EXIT
+
+# M4: with the EXIT trap now armed (so the lock is guaranteed to be released) and the
+# print-config / multi-profile early exits already behind us, take an advisory lock on $OUT so two
+# concurrent runs can't clobber each other's output, report, or log. Dry runs write nothing — skip.
+(( DRY_RUN )) || _acquire_out_lock
 
 # ===== Section 19: Disk space preflight =======================================================
 # Estimates required disk space before starting an encode and aborts early if
@@ -6555,15 +6635,33 @@ cache_stream_metadata() {
 
 # ===== Section 21: Report helpers & skip-if-ideal =============================================
 
-# Add an entry to the JSON report accumulator.
-# Escapes backslash, double-quote, and ASCII control characters to produce valid JSON.
+# _json_escape — Echo a string with every JSON-string-illegal byte escaped, so the result is
+# safe to embed between double quotes in RFC-8259 JSON. Order matters: backslash first, then the
+# double quote, then the common control characters as their short forms (\n \r \t), then EVERY
+# remaining ASCII control byte (< 0x20) as \uXXXX. That last pass is what makes a crafted path or
+# track title (a `"` in a filename, a BEL/0x07 in a tag) unable to break the report's key/line
+# structure or emit a control byte that violates the JSON grammar (M1). NUL (0x00) can't occur —
+# a bash string cannot hold it.
+_json_escape() {
+  local s="${1//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+  if [[ "$s" == *[[:cntrl:]]* ]]; then
+    local i ch esc
+    for (( i=1; i<32; i++ )); do
+      (( i == 9 || i == 10 || i == 13 )) && continue   # already emitted as \t \n \r above
+      printf -v ch '\\%03o' "$i"; printf -v ch '%b' "$ch"   # the literal control byte for value i
+      printf -v esc '\\u%04x' "$i"
+      s="${s//"$ch"/$esc}"
+    done
+  fi
+  printf '%s' "$s"
+}
+
+# Add an entry to the JSON report accumulator. Both key and value are escaped via _json_escape
+# so any byte is JSON-safe.
 report_add() {
-  # Escape in order: backslash first (must be first), then the other JSON special chars.
-  # Control characters (newline, tab, carriage-return) would break the JSON line structure
-  # if left bare, so they are replaced with their two-character escape sequences.
-  local key="${1//\\/\\\\}"; key="${key//\"/\\\"}"; key="${key//$'\n'/\\n}"; key="${key//$'\r'/\\r}"; key="${key//$'\t'/\\t}"
-  local val="${2//\\/\\\\}"; val="${val//\"/\\\"}"; val="${val//$'\n'/\\n}"; val="${val//$'\r'/\\r}"; val="${val//$'\t'/\\t}"
-  REPORT_ENTRIES+=("\"${key}\": \"${val}\"")
+  REPORT_ENTRIES+=("\"$(_json_escape "$1")\": \"$(_json_escape "$2")\"")
 }
 
 # Write JSON report alongside output
@@ -6572,10 +6670,10 @@ write_json_report() {
   local report_path="${OUT%."${OUTPUT_EXT}"}.report.json"
   {
     printf '{\n'
-    printf '  "tool": "%s",\n' "$APP_NAME v$VERSION"
-    printf '  "profile": "%s",\n' "${PROFILE_NAME:-<none>}"
-    printf '  "source": "%s",\n' "$SRC_ABS"
-    printf '  "output": "%s",\n' "$OUT"
+    printf '  "tool": "%s",\n' "$(_json_escape "$APP_NAME v$VERSION")"
+    printf '  "profile": "%s",\n' "$(_json_escape "${PROFILE_NAME:-<none>}")"
+    printf '  "source": "%s",\n' "$(_json_escape "$SRC_ABS")"
+    printf '  "output": "%s",\n' "$(_json_escape "$OUT")"
     if (( ${#REPORT_ENTRIES[@]} > 0 )); then
       printf '  "timestamp": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       local i last=$(( ${#REPORT_ENTRIES[@]} - 1 ))
@@ -9501,6 +9599,7 @@ run_audio_pipeline(){
     local _acopy_rc; wait "$acopy_pid" 2>/dev/null || _acopy_rc=$?
     _ACTIVE_FFMPEG_PID=""
     if (( ${_acopy_rc:-0} != 0 )); then
+      _check_disk_full "$WORKDIR/audio_primary.err"   # L5: surface ENOSPC, like the die 40/41 paths
       die 43 "Audio copy failed. See: $WORKDIR/audio_primary.err"
     fi
   else
@@ -9524,6 +9623,7 @@ run_audio_pipeline(){
     local total_secs
     total_secs="$(_get_source_duration_secs)"
     if ! _ffmpeg_run_with_ui transcode_args "Transcoding audio" "$WORKDIR/audio_primary.err" "$total_secs"; then
+      _check_disk_full "$WORKDIR/audio_primary.err"   # L5: surface ENOSPC, like the die 40/41 paths
       die 43 "Audio transcode to $tgt_codec failed. See: $WORKDIR/audio_primary.err"
     fi
   fi
@@ -10315,6 +10415,14 @@ discover_external_subtitles(){
   for ext in "${sub_exts[@]}"; do
     while IFS= read -r -d '' fpath; do
       [[ -z "$fpath" || ! -f "$fpath" ]] && continue
+
+      # Reject sidecar paths containing control characters, mirroring the SRC_ABS/OUT guards (L2):
+      # a newline/tab/etc. in the name could corrupt a log or report line downstream. Warn (with the
+      # control bytes rendered as '?' so the warning itself stays clean) and skip — never mux it.
+      if [[ "$fpath" =~ [[:cntrl:]] ]]; then
+        warn "[Subs] Skipping external subtitle with control characters in its path: ${fpath//[[:cntrl:]]/?}"
+        continue
+      fi
 
       # .idx requires a partner .sub file to form a valid VobSub pair
       if [[ "$ext" == "idx" ]]; then

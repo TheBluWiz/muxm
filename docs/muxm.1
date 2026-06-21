@@ -944,6 +944,12 @@ Video pipeline structural error (missing or corrupt encoded video stream).
 .B 43
 Audio transcode or copy failure.
 .TP
+.B 44
+Dolby Vision RPU profile conversion or RPU/frame desync failure (with fallback disabled).
+.TP
+.B 45
+Frame-rate integrity check failed (output fps differs from source, which would desync audio).
+.TP
 .B 130
 Interrupted by user (SIGINT / Ctrl\-C).
 .TP

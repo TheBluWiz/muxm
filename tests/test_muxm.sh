@@ -1402,6 +1402,7 @@ test_cli() {
   _test_cli_flag_drift
   _test_cli_robustness
   _test_cli_value_flag_no_value
+  _test_cli_l3_value_validation
 
   # F6: no advisory may emit the invalid muxm flag value `--video-codec libsvtav1`. muxm's flag
   # value is `libsvt-av1` (hyphenated); `libsvtav1` is the ffmpeg ENCODER name, not a valid
@@ -1411,6 +1412,54 @@ test_cli() {
   else
     pass "F6: no advisory emits an invalid '--video-codec libsvtav1' value"
   fi
+}
+
+# L3: --level and the rate flags (--av1-maxrate/--av1-bufsize/--stereo-bitrate) are validated at
+# parse time (die 11), and the matching globals are re-validated after config load so a sourced
+# .muxmrc can't bypass the parse guard (mirrors the CRF re-check). Parse-time validation fires
+# before source validation, so a dummy source path is fine.
+_test_cli_l3_value_validation() {
+  # NOTE: a missing source ALSO exits 11, so exit-code alone is vacuous here — assert the SPECIFIC
+  # validation message instead, which only the parse/config guard produces. The parse-time guard
+  # fires before source resolution, so a non-existent source path is fine (and keeps this cli test
+  # media-free): pre-fix the run dies later with "source not found", never the "Invalid …" message.
+  local out
+  _l3_msg(){ (cd "$TESTDIR" && "$MUXM" "$@" --dry-run /no/such/l3src.mkv y.mkv 2>&1) || true; }
+  _l3_assert_rejected(){   # $1=label  $2=expected-message-substr  $3..=muxm flags
+    local label="$1" sub="$2"; shift 2
+    out="$(_l3_msg "$@")"
+    if printf '%s\n' "$out" | grep -qiF "$sub"; then pass "$label"
+    else fail "$label — no '$sub' message (got: $(printf '%s\n' "$out" | grep -iE 'Invalid|not found' | head -1))"; fi
+  }
+  _l3_assert_rejected "L3: --level garbage rejected at parse"        "Invalid --level"        --level garbage
+  _l3_assert_rejected "L3: --level 5.1:x=1 rejected at parse"        "Invalid --level"        --level "5.1:x=1"
+  _l3_assert_rejected "L3: --av1-maxrate notarate rejected at parse" "Invalid --av1-maxrate"  --av1-maxrate notarate
+  _l3_assert_rejected "L3: --stereo-bitrate 1x2 rejected at parse"   "Invalid --stereo-bitrate" --stereo-bitrate 1x2
+
+  # Valid values must NOT trip the parse guard (no "Invalid …" message; the run fails later only
+  # for the missing source).
+  out="$(_l3_msg --level 5.1 --av1-maxrate 5000k --av1-bufsize 40000k --stereo-bitrate 256k)"
+  if printf '%s\n' "$out" | grep -qiE 'Invalid (--level|--av1-maxrate|--av1-bufsize|--stereo-bitrate)'; then
+    fail "L3: valid level/rate values wrongly rejected at parse — $(printf '%s\n' "$out" | grep -iE 'Invalid' | head -1)"
+  else
+    pass "L3: valid level/rate values accepted at parse (5.1, 5000k, 40000k, 256k)"
+  fi
+
+  # Config-bypass: a sourced .muxmrc assigns the global directly. The post-config re-check must
+  # still reject it. Use AV1_MAXRATE (no profile overrides it; the re-check fires before source
+  # validation, so the dummy source is fine). Isolated HOME so no stray ~/.muxmrc interferes.
+  # The post-config re-check fires before source resolution, so the dummy source is fine — and
+  # assert the SPECIFIC message (not just exit 11, which an empty/missing source also yields).
+  local _l3dir; _l3dir="$(mktemp -d "$TESTDIR/l3.XXXXXX")"
+  printf 'AV1_MAXRATE=notarate\n' > "$_l3dir/.muxmrc"
+  : > "$_l3dir/src.mkv"
+  local _l3out; _l3out="$(cd "$_l3dir" && HOME="$_l3dir" "$MUXM" --dry-run src.mkv out.mkv 2>&1)" || true
+  if printf '%s\n' "$_l3out" | grep -qiF "Invalid AV1_MAXRATE from config"; then
+    pass "L3: config AV1_MAXRATE=garbage rejected after load (bypass closed)"
+  else
+    fail "L3: config AV1_MAXRATE=garbage not rejected after load (got: $(printf '%s\n' "$_l3out" | grep -iE 'Invalid|not found|empty' | head -1))"
+  fi
+  rm -rf "$_l3dir"
 }
 
 # M2: a value-flag used as the FINAL token (no value after it) must error cleanly —
@@ -4481,6 +4530,25 @@ EOF
   _test_audio_f4_maxchannels
   _test_audio_f7_stereo_label
   _test_audio_h3_no_audio_guard
+  _test_audio_l5_disk_hint
+}
+
+# L5: the audio copy/transcode failure paths (die 43) must surface the disk-full hint like the
+# video (die 40) and mux (die 41) paths do — i.e. _check_disk_full runs on the .err log before the
+# die. ENOSPC is impractical to provoke deterministically, so assert the call's presence/ordering
+# at the two .err-bearing die-43 sites (review parity, per the plan). A source-anchored check.
+_test_audio_l5_disk_hint() {
+  # Each block that ends in `die 43 "... audio_primary.err"` must contain a matching
+  # `_check_disk_full "$WORKDIR/audio_primary.err"` ahead of it. Count both within run_audio_pipeline.
+  local body checks dies
+  body="$(awk '/^run_audio_pipeline\(\)/,/^\}/' "$MUXM")"
+  checks="$(printf '%s\n' "$body" | grep -cE '_check_disk_full "\$WORKDIR/audio_primary\.err"')"
+  dies="$(printf '%s\n' "$body" | grep -cE 'die 43 "[^"]*audio_primary\.err')"
+  if (( dies > 0 && checks >= dies )); then
+    pass "L5: each die-43 audio failure with an .err log is preceded by _check_disk_full (checks=$checks, dies=$dies)"
+  else
+    fail "L5: die-43 audio .err sites lack the _check_disk_full disk-full hint (checks=$checks, dies=$dies)"
+  fi
 }
 
 # H3: a multi-track audio source whose language filter empties the keep-list must NOT silently
@@ -5833,6 +5901,32 @@ test_output() {
   local kt_cfg
   kt_cfg="$(run_muxm --keep-temp --print-effective-config)"
   assert_contains "KEEP_TEMP" "--keep-temp: flag registered in effective config" "$kt_cfg"
+
+  # ---- M1: the --report-json output must stay jq-valid under hostile inputs. A double-quote in
+  #      the source path (emitted through bare printf pre-fix) breaks the "source" field's JSON.
+  #      Skip-first guard (not an else-skip) per the soft-skip ratchet. ----
+  if ! ffmpeg_has_encoder libx265; then
+    skip "M1: ffmpeg lacks libx265 — cannot build the hostile-path report fixture"
+  else
+    local _m1_dir; _m1_dir="$(mktemp -d "$TESTDIR/m1.XXXXXX")"
+    local _m1_src="$_m1_dir/te\"st.mkv" _m1_out="$_m1_dir/m1out.mkv"
+    ffmpeg -hide_banner -loglevel error -y \
+      -f lavfi -i "testsrc2=size=320x180:rate=24:duration=1" \
+      -f lavfi -i "sine=frequency=440:duration=1" \
+      -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p -c:a aac "$_m1_src" 2>/dev/null
+    if [[ ! -s "$_m1_src" ]]; then
+      skip "M1: could not build a source with a double-quote in its name"
+    else
+      run_muxm --report-json --output-ext mkv "$_m1_src" "$_m1_out" >/dev/null
+      local _m1_report="${_m1_out%.mkv}.report.json"
+      if [[ -f "$_m1_report" ]] && jq -e . "$_m1_report" >/dev/null 2>&1; then
+        pass "M1: --report-json with a double-quote in the source path is jq-valid"
+      else
+        fail "M1: --report-json not jq-parseable under a quoted source path (report: $_m1_report, exists: $([[ -f "$_m1_report" ]] && echo yes || echo no))"
+      fi
+    fi
+    rm -rf "$_m1_dir"
+  fi
 }
 
 # === Suite: Container Formats ===
@@ -6364,6 +6458,46 @@ test_collision() {
     fail "Explicit output path should not trigger collision handling"
   else
     pass "Explicit output path: no collision triggered"
+  fi
+
+  # ---- M4: two runs targeting the same $OUT must not clobber each other. A lock held by a LIVE
+  #      owner refuses the second run (exit 11); a stale lock (dead owner PID) is reclaimed and the
+  #      run proceeds. Skip-first guard (not an else-skip) per the soft-skip ratchet. ----
+  if ! ffmpeg_has_encoder libx265; then
+    skip "M4: ffmpeg lacks libx265 — cannot build the concurrency-lock fixture"
+  else
+    local _m4_dir; _m4_dir="$(mktemp -d "$TESTDIR/m4.XXXXXX")"
+    local _m4_src="$_m4_dir/src.mkv" _m4_out="$_m4_dir/out.mkv"
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=320x180:rate=24:duration=1" \
+      -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p "$_m4_src" 2>/dev/null
+    if [[ ! -s "$_m4_src" ]]; then
+      skip "M4: could not build the concurrency-lock fixture"
+    else
+      # (a) Live owner → refuse with exit 11.
+      sleep 30 & local _m4_live=$!
+      mkdir "${_m4_out}.lock"; printf '%s\n' "$_m4_live" > "${_m4_out}.lock/pid"
+      local _m4_code
+      (cd "$_m4_dir" && "$MUXM" --output-ext mkv "$_m4_src" "$_m4_out" >/dev/null 2>&1) && _m4_code=$? || _m4_code=$?
+      if [[ "$_m4_code" == 11 ]]; then
+        pass "M4: a live concurrent-run lock refuses the second run (exit 11)"
+      else
+        fail "M4: expected exit 11 against a live lock, got $_m4_code (output clobbered?)"
+      fi
+      kill "$_m4_live" 2>/dev/null || true; wait "$_m4_live" 2>/dev/null || true; rm -rf "${_m4_out}.lock"
+
+      # (b) Stale owner (a reaped/dead PID) → reclaim and proceed.
+      local _m4_dead; sleep 0.1 & _m4_dead=$!; wait "$_m4_dead" 2>/dev/null || true
+      mkdir "${_m4_out}.lock"; printf '%s\n' "$_m4_dead" > "${_m4_out}.lock/pid"
+      (cd "$_m4_dir" && "$MUXM" --output-ext mkv "$_m4_src" "$_m4_out" >/dev/null 2>&1) && _m4_code=$? || _m4_code=$?
+      # The successful run must also RELEASE its own lock (on_exit), or every output litters a
+      # leaked ${OUT}.lock that the staleness escape would silently reclaim — masking a release bug.
+      if [[ "$_m4_code" == 0 && -s "$_m4_out" && ! -d "${_m4_out}.lock" ]]; then
+        pass "M4: a stale lock is reclaimed, the run proceeds, and its own lock is released on success"
+      else
+        fail "M4: stale-lock reclaim/release failed (exit $_m4_code, output: $([[ -s "$_m4_out" ]] && echo yes || echo no), lock left: $([[ -d "${_m4_out}.lock" ]] && echo yes || echo no))"
+      fi
+    fi
+    rm -rf "$_m4_dir"
   fi
 }
 
@@ -7972,11 +8106,14 @@ _test_unit_report_add_escaping() {
   # with a value containing quote/backslash/newline/tab/CR, emit the resulting object, and assert
   # jq PARSES it and ROUND-TRIPS the value. A dropped escape step → invalid JSON → jq fails.
   local body
-  body="$(_extract_muxm_fns report_add)" || { fail "2.5: could not extract report_add"; return; }
-  local key="track.title" val
+  body="$(_extract_muxm_fns report_add _json_escape)" || { fail "2.5: could not extract report_add + _json_escape"; return; }
+  # $1=key $2=val → emits the round-tripped value jq reads back (empty if jq rejected the object).
+  _ra_roundtrip(){
+    bash -c "$body"$'\n''REPORT_ENTRIES=(); report_add "$1" "$2"; IFS=,; printf "{%s}\n" "${REPORT_ENTRIES[*]}"' -- "$1" "$2" 2>/dev/null | jq -r --arg k "$1" '.[$k]' 2>/dev/null || true
+  }
+  local key="track.title" val got
   printf -v val 'a"b\\c\nd\te\rf'   # quote, backslash, newline, tab, carriage-return
-  local got
-  got="$(bash -c "$body"$'\n''REPORT_ENTRIES=(); report_add "$1" "$2"; IFS=,; printf "{%s}\n" "${REPORT_ENTRIES[*]}"' -- "$key" "$val" 2>/dev/null | jq -r --arg k "$key" '.[$k]' 2>/dev/null)" || true
+  got="$(_ra_roundtrip "$key" "$val")"
   # Shared label prefix across pass/fail so the perturb signature (which keys on FAIL lines)
   # matches when the escaping is broken — see MUT-REP-1 in tools/perturb_check.sh.
   local label="2.5 report_add escaping: quote/backslash/newline/tab/CR round-trips through jq"
@@ -7984,6 +8121,16 @@ _test_unit_report_add_escaping() {
     pass "$label"
   else
     fail "$label — jq returned $(printf '%q' "$got"), expected $(printf '%q' "$val")"
+  fi
+  # M1: a raw control byte < 0x20 (BEL 0x07, 0x01) is invalid in a JSON string per RFC-8259 — it
+  # must be \uXXXX-escaped or jq rejects the whole object. Assert the value round-trips intact.
+  local cval; cval=$'x\x07y\x01z'
+  local cgot; cgot="$(_ra_roundtrip "$key" "$cval")"
+  local clabel="2.5 report_add escaping: control bytes (0x07/0x01) \u-escaped → valid JSON round-trips (M1)"
+  if [[ "$cgot" == "$cval" ]]; then
+    pass "$clabel"
+  else
+    fail "$clabel — jq returned $(printf '%q' "$cgot"), expected $(printf '%q' "$cval")"
   fi
 }
 
@@ -8169,6 +8316,31 @@ _source_dv_profile' -- "$1"; }
   _sdp_assert "3.5b dv-profile: DOVI record profile 8 → '8'"   "8" "$(_sdp "$_cache_p8")"
   _sdp_assert "3.5b dv-profile: side-data but no DOVI → empty" ""  "$(_sdp "$_cache_nodv")"
   _sdp_assert "3.5b dv-profile: no side_data_list → empty"     ""  "$(_sdp "$_cache_plain")"
+}
+
+_test_unit_m5_sw_encoder_preflight() {
+  # M5: the software x26x encoder must be preflighted (die 10 with an install hint) when ffmpeg
+  # lacks it, instead of slipping through to a mid-encode die 40. Extract the helper, stub the I/O
+  # boundary (ffmpeg_has_encoder) and die, and assert the exit code across codec × availability ×
+  # HW-backend. die is stubbed to `exit $1` so the exact code (10) is observable.
+  local body
+  body="$(_extract_muxm_fns _preflight_sw_video_encoder)" \
+    || { fail "M5: could not extract _preflight_sw_video_encoder"; return; }
+  # $1=VIDEO_CODEC $2=HW_ACCEL_RESOLVED $3=ffmpeg_has_encoder return (0=present, 1=missing). Emits exit code.
+  _m5(){
+    bash -c "die(){ exit \"\$1\"; }
+ffmpeg_has_encoder(){ return ${3}; }
+VIDEO_CODEC=${1}; HW_ACCEL_RESOLVED=${2}
+${body}
+_preflight_sw_video_encoder"
+    printf '%s' "$?"
+  }
+  _m5_assert(){ local label="$1" want="$2" got="$3"; if [[ "$got" == "$want" ]]; then pass "$label (exit $got)"; else fail "$label — exit $got, expected $want"; fi; }
+  _m5_assert "M5: libx265 missing on the software path → die 10" 10 "$(_m5 libx265 none 1)"
+  _m5_assert "M5: libx264 missing on the software path → die 10" 10 "$(_m5 libx264 none 1)"
+  _m5_assert "M5: libx265 present → no die (exit 0)"             0  "$(_m5 libx265 none 0)"
+  _m5_assert "M5: HW backend resolved → check skipped (exit 0)"  0  "$(_m5 libx265 videotoolbox 1)"
+  _m5_assert "M5: AV1 codec is not x26x → skipped (exit 0)"      0  "$(_m5 libsvt-av1 none 1)"
 }
 
 _test_unit_hdr10_static_metadata() {
@@ -8371,6 +8543,7 @@ test_unit() {
   _test_unit_duration_tier3
   _test_unit_video_copy_compliant
   _test_unit_c1_gate_helpers
+  _test_unit_m5_sw_encoder_preflight
   _test_unit_hdr10_static_metadata
   _test_unit_ocr_dispatch
   _test_unit_persist_helpers
@@ -9426,6 +9599,35 @@ EOF
       fi
     fi
     rm -f "$_m3_src" "$_m3_out" "$TESTDIR/m3_embed.srt" "$TESTDIR/m3_dedup_source.en.srt" 2>/dev/null || true
+  fi
+
+  # ---- L2: an external subtitle whose path contains control characters must be skipped (with a
+  #      warning), not muxed — mirroring the SRC_ABS/OUT control-char guards. Skip-first guard. ----
+  if ! ffmpeg_has_encoder libx265; then
+    skip "L2: ffmpeg lacks libx265 — cannot build the control-char sidecar fixture"
+  else
+    local _l2_dir; _l2_dir="$(mktemp -d "$TESTDIR/l2.XXXXXX")"
+    local _l2_src="$_l2_dir/movie.mkv" _l2_out="$_l2_dir/l2out.mkv"
+    ffmpeg -hide_banner -loglevel error -y \
+      -f lavfi -i "testsrc2=size=320x180:rate=24:duration=1" \
+      -f lavfi -i "sine=frequency=440:duration=1" \
+      -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p -c:a aac "$_l2_src" 2>/dev/null
+    # Sidecar with a BEL (0x07) control char in the qualifier: movie.<BEL>en.srt (matches movie.*.srt).
+    local _l2_bad; _l2_bad="$(printf '%s/movie.\007en.srt' "$_l2_dir")"
+    printf '1\n00:00:00,000 --> 00:00:01,000\nbad sidecar\n' > "$_l2_bad" 2>/dev/null
+    if [[ ! -s "$_l2_src" || ! -e "$_l2_bad" ]]; then
+      skip "L2: could not build the control-char sidecar fixture"
+    else
+      local _l2_log _l2_subs
+      _l2_log="$(cd "$_l2_dir" && "$MUXM" -K --output-ext mkv "$_l2_src" "$_l2_out" 2>&1)" || true
+      _l2_subs="$(count_streams "$_l2_out" s)"
+      if printf '%s\n' "$_l2_log" | grep -qiE 'control character' && [[ "${_l2_subs:-0}" == "0" ]]; then
+        pass "L2: control-char sidecar skipped with a warning (0 subtitle tracks muxed)"
+      else
+        fail "L2: control-char sidecar not skipped (warned=$(printf '%s\n' "$_l2_log" | grep -ciE 'control character'), sub tracks=${_l2_subs:-?})"
+      fi
+    fi
+    rm -rf "$_l2_dir"
   fi
 }
 
