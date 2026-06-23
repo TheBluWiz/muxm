@@ -5595,6 +5595,7 @@ SRT
   fi
 
   _test_subs_f3_sdh_disposition
+  _test_subs_c2_untagged_forced
 }
 
 # F3: SDH must be classified by the hearing_impaired DISPOSITION, not just an SDH/HI title. A track
@@ -5641,6 +5642,49 @@ _test_subs_f3_sdh_disposition() {
     pass "F3: --no-sub-sdh drops the disposition-only SDH track (0 subtitle streams)"
   else
     fail "F3: --no-sub-sdh → expected output with 0 subtitle streams, got ${_nos_cnt:-?} (output exists: $([[ -s "$_nos" ]] && echo yes || echo no))"
+  fi
+  rm -rf "$_dir"
+}
+
+# C2 (subtitle classification): merge_subtitle_sources parses each embedded subtitle record
+# (codec⇥lang⇥title⇥forced⇥hi) to classify it forced/sdh/full and to record its language/title.
+# `lang` and `title` are empty-able MIDDLE fields, so the old collapsing `IFS=$'\t' read` shifted
+# an UNTAGGED-language subtitle's later fields left: the title became the language, the forced
+# disposition became the title, and `(( forced ))`/`(( hi ))` read the wrong (shifted) values — so
+# an untagged forced subtitle was mis-stored as language="<title>" and mis-classified "full". The
+# fix routes the parse through the non-collapsing _split_tab. Here an untagged-language forced
+# subtitle must scan as `[und] — <title> (forced)`, not the collapsed `[<title>] — <forced> (full)`.
+# The scan line is the direct read-back of merge_subtitle_sources' ALL_SUB_LANGS/TITLES/TYPES.
+# Perturb MUT-C2-SUBCLASS reverts merge_subtitle_sources to the collapsing read → red.
+_test_subs_c2_untagged_forced() {
+  local _dir="$TESTDIR/c2_subforced"; mkdir -p "$_dir"
+  printf '1\n00:00:00,000 --> 00:00:02,000\nForced sign\n' > "$_dir/f.srt"
+  local _src="$_dir/src.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=olive:s=320x240:r=24:d=2" -f lavfi -i "sine=frequency=440:duration=2" -i "$_dir/f.srt" \
+    -map 0:v -map 1:a -map 2:s \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le -c:a aac -ac 2 -c:s srt \
+    -metadata:s:a:0 language=eng \
+    -disposition:s:0 forced -metadata:s:s:0 title="Forced" \
+    "$_src" 2>/dev/null || true
+  # Fixture must carry forced=1 with NO language tag, else the test proves nothing.
+  local _fd _fl
+  _fd="$(ffprobe -v error -select_streams s:0 -show_entries stream_disposition=forced -of csv=p=0 "$_src" 2>/dev/null || true)"
+  _fl="$(ffprobe -v error -select_streams s:0 -show_entries stream_tags=language -of default=nw=1:nk=1 "$_src" 2>/dev/null || true)"
+  if [[ ! -s "$_src" || "$_fd" != "1" || -n "$_fl" ]]; then
+    skip "C2 sub-classify: could not build an untagged-language forced subtitle fixture (forced=$_fd lang='$_fl')"
+    rm -rf "$_dir"; return
+  fi
+  local _home="$_dir/home"; mkdir -p "$_home"
+  local out sline
+  log "Testing untagged-language forced subtitle classification (C2)..."
+  out="$(MUXM_HOME="$_home" run_muxm --dry-run --profile universal "$_src")"
+  sline="$(printf '%s\n' "$out" | grep -E '#0: ' | head -1)"
+  # Fixed: "#0: subrip [und] — Forced (forced)".  Collapsed bug: "#0: subrip [forced] — 1 (full)".
+  if [[ "$sline" == *"[und] — Forced (forced)"* ]]; then
+    pass "C2 sub-classify: untagged forced subtitle scans as [und] — Forced (forced) (no field shift)"
+  else
+    fail "C2 sub-classify: untagged forced subtitle misclassified (collapse shifted lang/title/forced): '$sline'"
   fi
   rm -rf "$_dir"
 }

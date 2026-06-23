@@ -183,6 +183,19 @@ enforce MUT-C2-VERIFY audio \
   'C2 verify-display: verify Audio line lost the title' \
   'M-C2-VERIFY: mux_final verify-summary non-collapsing split → empty-bitrate title-shift probe'
 
+# MUT-C2-SUBCLASS (C2 follow-up): revert the subtitle-record split in merge_subtitle_sources to the
+# collapsing `IFS=$'\t' read`. An UNTAGGED-language subtitle's empty middle (lang) field then
+# collapses, shifting title→lang and forced→title, so `(( forced ))` reads the wrong field and an
+# untagged forced subtitle is mis-stored (language="<title>") and mis-classified "full". Anchored on
+# that site's full inline-commented line (merge_subtitle_sources is now the sole consumer of this
+# parse — the prefix-identical describe_sub_stream helper was dead code and has been removed). The
+# untagged-forced scan probe goes red.
+# shellcheck disable=SC2016  # $info / $'\t' are literal sed text — they must NOT expand here.
+enforce MUT-C2-SUBCLASS subs \
+  's|_split_tab "$info" codec lang title forced hi  # C2: non-collapsing — empty lang/title must not shift forced/hi (sub classification)|IFS=$'"'"'\t'"'"' read -r codec lang title forced hi <<< "$info"|' \
+  'C2 sub-classify: untagged forced subtitle misclassified' \
+  'M-C2-SUBCLASS: merge_subtitle_sources non-collapsing split → untagged-forced classification probe'
+
 # M-AUD-1 (Phase 2.1 — was pending): the same '(10 - rank)' inversion, now caught by the new
 # direct _score_audio_stream unit test. The ch<6 scenario keeps this signature distinct from
 # M-AUD-3 (surround only applies at ≥6ch).

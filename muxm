@@ -6847,7 +6847,7 @@ check_skip_if_ideal() {
       _sii_s_n="$(_sub_count)"
       for (( _sii_s_i=0; _sii_s_i<_sii_s_n; _sii_s_i++ )); do
         _sii_s_info="$(_sub_stream_info "$_sii_s_i")"
-        IFS=$'\t' read -r _sii_s_codec _ _ _ _ <<< "$_sii_s_info"
+        _sii_s_codec="${_sii_s_info%%$'\t'*}"  # C2: codec is the first field — non-collapsing by construction
         _sii_s_codec="${_sii_s_codec,,}"
         if [[ "$MUX_FORMAT" == "matroska" ]] || _is_text_sub_codec "$_sii_s_codec"; then
           SII_SUB_INDICES+=("$_sii_s_i")
@@ -9835,25 +9835,6 @@ _sub_stream_info(){
     \"\(.codec_name // \"?\")\t\(.tags.language // \"\")\t\(.tags.title // \"\")\t\(.disposition.forced // 0)\t\(.disposition.hearing_impaired // 0)\"" | head -n1 || printf '?\t\t\t0\t0\n'
 }
 
-# Format a subtitle stream as a human-readable one-line summary.
-# Output: "#0: subrip [eng] — English (forced)" (prints to stdout)
-# Args: $1 — subtitle stream index
-describe_sub_stream(){
-  local i="$1" info codec lang title forced hi flags=""
-  info="$(_sub_stream_info "$i")"
-  IFS=$'\t' read -r codec lang title forced hi <<< "$info"
-
-  _normalize_codec_lang codec lang
-
-  (( forced )) && flags=" (forced)"
-  if (( hi )) || _is_sdh_title "$title"; then
-    [[ -n "$flags" ]] && flags="$flags, "
-    flags="${flags}SDH"
-  fi
-  
-  printf "#%s: %s [%s]%s%s\n" "$i" "${codec:-?}" "$lang" "${title:+ — $title}" "$flags"
-}
-
 # Check if codec is text-based (can be stream-copied to MP4 as mov_text or MKV as srt).
 # Text: subrip, srt, ass, ssa, webvtt, vtt, mov_text
 # Bitmap (not text): hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle
@@ -10450,7 +10431,7 @@ discover_external_subtitles(){
 
       fname="$(basename -- "$fpath")"
       parsed="$(_parse_ext_sub_filename "$src_stem" "$fname")"
-      IFS=$'\t' read -r lang stype <<< "$parsed"
+      _split_tab "$parsed" lang stype  # C2: non-collapsing (producer always emits both fields, but keep the pattern uniform)
       codec="$(_ext_sub_codec_from_ext "$ext")"
 
       EXT_SUB_PATHS+=("$fpath")
@@ -10496,7 +10477,7 @@ merge_subtitle_sources(){
   for (( i=0; i<n; i++ )); do
     local info codec lang title forced hi stype
     info="$(_sub_stream_info "$i")"
-    IFS=$'\t' read -r codec lang title forced hi <<< "$info"
+    _split_tab "$info" codec lang title forced hi  # C2: non-collapsing — empty lang/title must not shift forced/hi (sub classification)
     _normalize_codec_lang codec lang
 
     # F3: classify SDH by the hearing_impaired disposition OR an SDH/HI title — a track tagged
@@ -11938,7 +11919,7 @@ main() {
           + "\t" + "\(.width)x\(.height)"
           + "\t" + (.r_frame_rate // "?"))
         + "\t" + ([.streams[] | select(.codec_type=="subtitle")] | length | tostring)' 2>/dev/null)"
-      IFS=$'\t' read -r v_codec v_res v_fps s_count <<< "$_v_summary"
+      _split_tab "$_v_summary" v_codec v_res v_fps s_count  # C2: non-collapsing (keep the pattern uniform; fields here are never empty)
       v_codec="${v_codec% }"
       # Convert fractional fps like 24000/1001 to decimal
       if [[ "$v_fps" == */* ]]; then
