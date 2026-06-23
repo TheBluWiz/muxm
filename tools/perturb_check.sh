@@ -136,6 +136,32 @@ enforce MUT-SII-1 output \
   'skip-if-ideal non-compliant: re-encoded H.264 → HEVC' \
   'M-SII-1: check_skip_if_ideal always-ideal → non-compliant must-re-encode probe'
 
+# MUT-SII-MOV (C1, Phase 1): invert the mov) arm's source-container guard (!= → ==) in
+# check_skip_if_ideal, so a copy-compliant non-.mov source requested as .mov is again judged
+# ideal and false-skipped (the C1 defect). Anchored on the unique `!= "mov"` (the mp4/m4v/mkv
+# arms test their own extensions), so exactly the mov) guard changes. The new skip-if-ideal+.mov
+# probe asserts the source is NOT skipped and the output is a real MOV → under the mutation it is
+# skipped (and raw-hardlinked to Matroska-in-.mov) → red.
+# shellcheck disable=SC2016  # $src_ext is literal sed text — it must NOT expand in this shell.
+enforce MUT-SII-MOV output \
+  's/!= "mov"/== "mov"/' \
+  'skip-if-ideal mov: compliant .mkv was wrongly skipped' \
+  'M-SII-MOV: check_skip_if_ideal mov) container arm → false-skip mislabel probe'
+
+# MUT-C2-MTLANG (C2, Phase 1): revert the multi-track audio populate site in
+# run_audio_pipeline_multi from the non-collapsing _split_tab back to the collapsing
+# `IFS=$'\t' read`. For an untagged-language track the empty middle field then collapses and the
+# bitrate shifts into `lang`, so AUDIO_MT_LANGS carries the bitrate and mux_final stamps a bogus
+# `language=<digits>` on the output. Anchored on that site's UNIQUE inline comment ("…untagged
+# lang/title into MT output metadata"), so exactly the output-corrupting site reverts (the scorer
+# and keep-list `_split_tab "$info" …` lines, identical but for their comment, are untouched). The
+# untagged-track probe asserts a:1 is NOT a numeric language → under the mutation it is → red.
+# shellcheck disable=SC2016  # $info / $'\t' are literal sed text — they must NOT expand in this shell.
+enforce MUT-C2-MTLANG audio \
+  's|_split_tab "$info" codec ch lang br title  # C2: non-collapsing — untagged lang/title into MT output metadata|IFS=$'"'"'\t'"'"' read -r codec ch lang br title <<< "$info"|' \
+  'C2 multi-track: untagged track a:1 has garbage numeric language' \
+  'M-C2-MTLANG: run_audio_pipeline_multi non-collapsing split → untagged-language output-metadata probe'
+
 # M-AUD-1 (Phase 2.1 — was pending): the same '(10 - rank)' inversion, now caught by the new
 # direct _score_audio_stream unit test. The ch<6 scenario keeps this signature distinct from
 # M-AUD-3 (surround only applies at ≥6ch).
@@ -216,8 +242,9 @@ enforce MUT-VTPARAMS-1 hw_accel \
 # told WHY hardware accel was disabled); under the mutation it no longer does → that assertion goes
 # red (the companion "stays software libx265" assertion is unaffected). QSV/VAAPI rejection rides
 # the existing is_valid_hw_accel validation (same path as --hw-accel bogus) — no dedicated mutation.
+# Anchored on the unique nvenc-case reason string ("NVENC is not supported in this build; …").
 enforce MUT-NVENC-1 hw_accel \
-  's/NVENC encoder dispatch not yet implemented/HW-accel dispatch not yet implemented/' \
+  's/NVENC is not supported in this build/Hardware acceleration is not supported in this build/' \
   '5.2 NVENC: software-fallback reason' \
   'M-NVENC-1: NVENC software-fallback contract caught by the resolve_video_encoder unit test'
 
@@ -251,12 +278,14 @@ enforce MUT-SUB-MAXTRACKS unit \
   '2.4 keep: SUB_MAX_TRACKS caps 4→2' \
   '2.4b: SUB_MAX_TRACKS cap caught by _build_subtitle_keep_list test'
 
-# M-REP-1 (Phase 2.5): use the raw $2 instead of the escaped $val in report_add's JSON push, so a
-# value containing a quote/backslash/newline produces invalid JSON. The new report_add escaping
-# test feeds exactly such a value and asserts jq parses + round-trips, so it goes red.
-# shellcheck disable=SC2016  # ${val}/${2} are literal sed text — they must NOT expand in this shell.
+# M-REP-1 (Phase 2.5): drop the _json_escape wrapper around the report_add VALUE ($2) so the raw
+# argument is pushed into the JSON entry — a value containing a quote/backslash/newline then
+# produces invalid JSON. The report_add escaping test feeds exactly such a value and asserts jq
+# parses + round-trips, so it goes red. Anchored on the unique `_json_escape "$2"` (the key uses
+# "$1"), so exactly the value-escape call changes.
+# shellcheck disable=SC2016  # $(_json_escape "$2")/$2 are literal sed text — they must NOT expand here.
 enforce MUT-REP-1 unit \
-  's/${val}/${2}/' \
+  's/$(_json_escape "$2")/$2/' \
   '2.5 report_add escaping' \
   'M-REP-1: report_add JSON-escaping caught by the jq round-trip test'
 
@@ -272,14 +301,16 @@ enforce MUT-DUR-1 unit \
   'M-DUR-1: tier-3 HH:MM:SS parse caught by the _get_source_duration_secs unit test'
 
 # M-VCC-1 (Phase 3.5): neuter the 10-bit-pixfmt copy-reject in _video_is_copy_compliant by
-# inverting its source-pixfmt test (`!= *p10*` → `== *p10*`), so an 8-bit source is wrongly judged
-# copyable for a 10-bit target. The copy-compliant unit test asserts that exact case returns
-# re-encode (rc 1, "pixel format" reason); under the mutation it returns copyable (rc 0) → red.
-# The compliant / codec / tonemap / bitrate scenarios use an 8-bit (or matching) target, so the
-# first half of the `&&` is false there — only the 10-bit-ceiling scenario flips.
+# inverting its source-pixfmt test — drop the negation in `[[ ! "$src_pix" =~ (p010le|p10|p12) ]]`
+# so an 8-bit source is wrongly judged copyable for a 10-bit target. The copy-compliant unit test
+# asserts that exact case (sdr-force 10-bit out vs 8-bit src) returns re-encode (rc 1, "need 10-bit"
+# reason); under the mutation it returns copyable (rc 0) → red. The compliant / codec / tonemap /
+# bitrate scenarios use an 8-bit (or matching) target, so `_output_pixfmt_is_10bit` is false there —
+# only the 10-bit-ceiling scenarios flip. Anchored on the unique `! "$src_pix" =~`.
+# shellcheck disable=SC2016  # $src_pix is literal sed text — it must NOT expand in this shell.
 enforce MUT-VCC-1 unit \
-  's/!= \*"p10"\*/== *"p10"*/' \
-  '3.5 copy-compliant: 10-bit pixfmt ceiling' \
+  's/\[\[ ! "$src_pix" =~/[[ "$src_pix" =~/' \
+  '3.5 copy-compliant: 10-bit out (sdr-force) vs 8-bit src' \
   'M-VCC-1: 10-bit-pixfmt copy-reject caught by the _video_is_copy_compliant unit test'
 
 # M-HDR-2 (Phase 3.1) — RE-POINTED off the catalog's original "drop master-display/max-cll x265

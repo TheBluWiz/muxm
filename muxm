@@ -6524,7 +6524,7 @@ disk_free_warn() {
     for (( i=0; i<max_tracks; i++ )); do
       local a_info a_codec a_channels _a_lang a_bitrate _a_title
       a_info="$(_audio_stream_info "$i")"
-      IFS=$'\t' read -r a_codec a_channels _a_lang a_bitrate _a_title <<< "$a_info"
+      _split_tab "$a_info" a_codec a_channels _a_lang a_bitrate _a_title  # C2: non-collapsing
 
       local -i ch=0
       [[ "$a_channels" =~ ^[0-9]+$ ]] && ch="$a_channels"
@@ -6739,6 +6739,19 @@ check_skip_if_ideal() {
         if [[ "$src_ext" != "mkv" ]]; then
           ideal=0; reason="container is .$src_ext (need .mkv)"
         fi
+        ;;
+      mov)
+        # C1: without this arm a non-.mov source requested as .mov fell through with
+        # ideal=1 and was hardlinked into a .mov name — a Matroska/MP4 byte stream in a
+        # mislabeled container. Require an actual .mov source to skip into a .mov output.
+        if [[ "$src_ext" != "mov" ]]; then
+          ideal=0; reason="container is .$src_ext (need .mov)"
+        fi
+        ;;
+      *)
+        # C1: defensive default — any future/unknown OUTPUT_EXT must never silently
+        # false-skip into a mislabeled container. Force a remux instead.
+        ideal=0; reason="container .$OUTPUT_EXT has no skip-if-ideal rule"
         ;;
     esac
   fi
@@ -8893,7 +8906,7 @@ _score_audio_stream(){
   # Single jq call fetches all fields at once
   local info codec lang ch br title rank score
   info="$(_audio_stream_info "$idx")"
-  IFS=$'\t' read -r codec ch lang br title <<< "$info"
+  _split_tab "$info" codec ch lang br title  # C2: non-collapsing — preserve empty lang/title
 
   _normalize_codec_lang codec lang
   [[ -z "$ch" || ! "$ch" =~ ^[0-9]+$ ]] && ch=0
@@ -8963,7 +8976,7 @@ select_best_audio(){
       # Fetch full record for the overridden track so caller can destructure (L2b).
       local _ov_info _ov_codec _ov_ch _ov_lang _ov_br _ov_title
       _ov_info="$(_audio_stream_info "$AUDIO_TRACK_OVERRIDE")"
-      IFS=$'\t' read -r _ov_codec _ov_ch _ov_lang _ov_br _ov_title <<< "$_ov_info"
+      _split_tab "$_ov_info" _ov_codec _ov_ch _ov_lang _ov_br _ov_title  # C2: non-collapsing
       _normalize_codec_lang _ov_codec _ov_lang
       [[ -z "$_ov_ch"  || ! "$_ov_ch"  =~ ^[0-9]+$ ]] && _ov_ch=0
       [[ -z "$_ov_br"  || ! "$_ov_br"  =~ ^[0-9]+$ ]] && _ov_br=0
@@ -9027,8 +9040,8 @@ select_best_audio(){
     best_idx="${best_line#*$'\t'}"; best_idx="${best_idx%%$'\t'*}"
     for (( i=0; i<n; i++ )); do
       local marker=""
-      # shellcheck disable=SC2034  # s_title, s_raw_br complete the IFS destructure
-      IFS=$'\t' read -r s_score s_idx s_codec s_ch s_lang s_title s_raw_br <<< "${score_lines[$i]}"
+      # shellcheck disable=SC2034  # s_title, s_raw_br complete the split destructure
+      _split_tab "${score_lines[$i]}" s_score s_idx s_codec s_ch s_lang s_title s_raw_br  # C2: non-collapsing
       [[ "$s_idx" == "$best_idx" ]] && marker=" ★"
       score_summary+="#${s_idx}: ${s_codec} ${s_ch}ch [${s_lang}] = ${s_score}${marker}  "
     done
@@ -9040,7 +9053,7 @@ select_best_audio(){
     warn "Audio scoring failed for all tracks; defaulting to track 0."
     local _g_info _g_codec _g_ch _g_lang _g_br _g_title
     _g_info="$(_audio_stream_info "0")"
-    IFS=$'\t' read -r _g_codec _g_ch _g_lang _g_br _g_title <<< "$_g_info"
+    _split_tab "$_g_info" _g_codec _g_ch _g_lang _g_br _g_title  # C2: non-collapsing
     _normalize_codec_lang _g_codec _g_lang
     [[ -z "$_g_ch" || ! "$_g_ch" =~ ^[0-9]+$ ]] && _g_ch=0
     [[ -z "$_g_br" || ! "$_g_br" =~ ^[0-9]+$ ]] && _g_br=0
@@ -9052,21 +9065,40 @@ select_best_audio(){
   printf '%s\n' "${best_line#*$'\t'}"
 }
 
+# _split_tab RECORD VAR1 [VAR2 …] — split RECORD on LITERAL tabs into the named variables,
+# PRESERVING empty middle fields (C2). A plain `IFS=$'\t' read` collapses empty/leading fields
+# because tab is IFS-whitespace, so an untagged-language or untitled audio track (empty MIDDLE
+# field in codec⇥ch⇥lang⇥br⇥title) shifted its bitrate into the next variable and silently wrote
+# garbage like `language=640000` into the output metadata. Manual %%/#-parameter-expansion splits
+# on each literal tab and never collapses. Semantics match `read` for the field/variable mismatch
+# cases: the LAST variable absorbs the entire remainder (any internal tabs included); with more
+# variables than fields the trailing ones are set empty. Free-text fields have \t\n\r stripped by
+# their producers, so the split is unambiguous. Assignment is by name via `printf -v` (bash dynamic
+# scope reaches the caller's locals); the locals are `_st_`-prefixed so they cannot collide with a
+# caller's field-variable names.
+_split_tab(){
+  local _st_rec="$1"; shift
+  while (( $# > 1 )); do
+    if [[ "$_st_rec" == *$'\t'* ]]; then
+      printf -v "$1" '%s' "${_st_rec%%$'\t'*}"
+      _st_rec="${_st_rec#*$'\t'}"
+    else
+      printf -v "$1" '%s' "$_st_rec"
+      _st_rec=""
+    fi
+    shift
+  done
+  printf -v "$1" '%s' "$_st_rec"
+}
+
 # _parse_audio_record — split a select_best_audio record (idx\tcodec\tch\tlang\ttitle\traw_br) into
-# six globals, PRESERVING empty fields. A plain `IFS=$'\t' read` collapses an empty MIDDLE field
-# because tab is IFS-whitespace — so an untitled track (empty title field) shifted its bitrate into
-# `title` and left the bitrate empty. Manual %%/#-parameter-expansion splits on the literal tabs
-# and never collapses, so an empty title stays empty and raw_br lands in _AREC_BR. Fields never
-# contain a tab (select_best_audio strips \t\n\r from titles), so the split is unambiguous.
+# six globals, PRESERVING empty fields. Thin wrapper over _split_tab (C2): a plain `IFS=$'\t' read`
+# collapses an empty MIDDLE field (tab is IFS-whitespace), so an untitled track shifted its bitrate
+# into `title` and left the bitrate empty. _split_tab never collapses, so an empty title stays
+# empty and raw_br lands in _AREC_BR.
 # Sets: _AREC_IDX _AREC_CODEC _AREC_CH _AREC_LANG _AREC_TITLE _AREC_BR
 _parse_audio_record(){
-  local _rec="$1"
-  _AREC_IDX="${_rec%%$'\t'*}";   _rec="${_rec#*$'\t'}"
-  _AREC_CODEC="${_rec%%$'\t'*}"; _rec="${_rec#*$'\t'}"
-  _AREC_CH="${_rec%%$'\t'*}";    _rec="${_rec#*$'\t'}"
-  _AREC_LANG="${_rec%%$'\t'*}";  _rec="${_rec#*$'\t'}"
-  _AREC_TITLE="${_rec%%$'\t'*}"; _rec="${_rec#*$'\t'}"
-  _AREC_BR="$_rec"
+  _split_tab "$1" _AREC_IDX _AREC_CODEC _AREC_CH _AREC_LANG _AREC_TITLE _AREC_BR
 }
 
 # Check whether a TARGET DEVICE can Direct Play this audio codec — independent of MUX_FORMAT.
@@ -9234,7 +9266,7 @@ _build_audio_keep_list(){
   for (( i=0; i<n; i++ )); do
     local info codec lang ch br title
     info="$(_audio_stream_info "$i")"
-    IFS=$'\t' read -r codec ch lang br title <<< "$info"
+    _split_tab "$info" codec ch lang br title  # C2: non-collapsing — preserve empty lang/title
     _normalize_codec_lang codec lang
 
     # Filter 1: language
@@ -9307,7 +9339,7 @@ run_audio_pipeline_multi(){
   for idx in $keep_list; do
     local info codec ch lang br title
     info="$(_audio_stream_info "$idx")"
-    IFS=$'\t' read -r codec ch lang br title <<< "$info"
+    _split_tab "$info" codec ch lang br title  # C2: non-collapsing — untagged lang/title into MT output metadata
     _normalize_codec_lang codec lang
 
     AUDIO_MT_INDICES+=("$idx")
@@ -9332,7 +9364,7 @@ run_audio_pipeline_multi(){
   for (( i=0; i<n_total; i++ )); do
     local _ainfo _c _ch_i _l _br_i _t pretty marker=""
     _ainfo="$(_audio_stream_info "$i")"
-    IFS=$'\t' read -r _c _ch_i _l _br_i _t <<< "$_ainfo"
+    _split_tab "$_ainfo" _c _ch_i _l _br_i _t  # C2: non-collapsing
     _normalize_codec_lang _c _l
     [[ -z "$_br_i" || ! "$_br_i" =~ ^[0-9]+$ ]] && _br_i=0
 
@@ -9439,7 +9471,7 @@ run_audio_pipeline(){
   for (( i=0; i<n; i++ )); do
     local _ainfo _c _ch_i _l _br_i _t pretty
     _ainfo="$(_audio_stream_info "$i")"
-    IFS=$'\t' read -r _c _ch_i _l _br_i _t <<< "$_ainfo"
+    _split_tab "$_ainfo" _c _ch_i _l _br_i _t  # C2: non-collapsing
     _normalize_codec_lang _c _l
     [[ -z "$_br_i" || ! "$_br_i" =~ ^[0-9]+$ ]] && _br_i=0
 
@@ -9645,7 +9677,7 @@ run_audio_pipeline(){
     for (( _ns_i = 0; _ns_i < _ns_total; _ns_i++ )); do
       (( _ns_i == idx )) && continue
       _ns_info="$(_audio_stream_info "$_ns_i")"
-      IFS=$'\t' read -r _ns_c _ns_ch _ns_l _ns_br _ns_t <<< "$_ns_info"
+      _split_tab "$_ns_info" _ns_c _ns_ch _ns_l _ns_br _ns_t  # C2: non-collapsing
       _ns_c="${_ns_c,,}"; _ns_l="${_ns_l,,}"
       [[ -z "$_ns_l" ]] && _ns_l="$TAG_LANGUAGE_DEFAULT"
       [[ -z "$_ns_ch" || ! "$_ns_ch" =~ ^[0-9]+$ ]] && _ns_ch=0

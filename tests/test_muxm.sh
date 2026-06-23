@@ -4531,6 +4531,7 @@ EOF
   _test_audio_f7_stereo_label
   _test_audio_h3_no_audio_guard
   _test_audio_l5_disk_hint
+  _test_audio_c2_untagged_lang
 }
 
 # L5: the audio copy/transcode failure paths (die 43) must surface the disk-full hint like the
@@ -4548,6 +4549,62 @@ _test_audio_l5_disk_hint() {
     pass "L5: each die-43 audio failure with an .err log is preceded by _check_disk_full (checks=$checks, dies=$dies)"
   else
     fail "L5: die-43 audio .err sites lack the _check_disk_full disk-full hint (checks=$checks, dies=$dies)"
+  fi
+}
+
+# C2: a multi-track audio source with an UNTAGGED-language track must not write garbage metadata.
+# _audio_stream_info emits codec⇥ch⇥lang⇥br⇥title; an untagged track has an EMPTY middle
+# (language) field. The old collapsing `IFS=$'\t' read` dropped that empty field and shifted the
+# bitrate into `lang`, so run_audio_pipeline_multi filled AUDIO_MT_LANGS with the bitrate and
+# mux_final stamped a bogus `language=<digits>` on the output (and blanked the title). The fix
+# routes every audio-record parse through the non-collapsing _split_tab. The kept untagged track
+# here is EAC3 on purpose: EAC3 reports its bitrate, so the collapsed garbage survives the
+# matroska muxer (an untagged AAC track reports no bitrate → garbage "0" → the muxer silently drops
+# it, masking the bug). A kept untagged track must come out UNTAGGED, never language=<digits>; the
+# tagged eng track must stay eng; and the titled commentary track must still be detected and
+# dropped (its title must not have shifted). Perturb MUT-C2-MTLANG reverts the multi-track populate
+# site to the collapsing read → a:1 gains a numeric language → red.
+_test_audio_c2_untagged_lang() {
+  local src="$TESTDIR/c2_untagged_multi.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=teal:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=550:duration=2" \
+    -f lavfi -i "sine=frequency=660:duration=2" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -map 0:v -map 1:a -map 2:a -map 3:a \
+    -c:a:0 eac3 -b:a:0 448k -ac:a:0 6 \
+    -c:a:1 eac3 -b:a:1 384k -ac:a:1 6 \
+    -c:a:2 ac3  -b:a:2 192k -ac:a:2 2 \
+    -metadata:s:a:0 language=eng -metadata:s:a:0 title="Main Feature" \
+    -metadata:s:a:1 title="Bonus Feature" \
+    -metadata:s:a:2 title="Director's Commentary" \
+    "$src" 2>/dev/null
+  if [[ ! -s "$src" ]]; then
+    fail "C2 multi-track: could not create untagged-language fixture"; return
+  fi
+  local home="$TESTDIR/c2_home"; mkdir -p "$home"
+  local out="$TESTDIR/out_c2_untagged.mkv"
+  log "Testing multi-track audio with an untagged-language track (C2: no garbage language metadata)..."
+  MUXM_HOME="$home" run_muxm --profile archive "$src" "$out" >/dev/null
+  if [[ ! -f "$out" || ! -s "$out" ]]; then
+    fail "C2 multi-track: no output produced"; return
+  fi
+  # Commentary (titled, untagged-lang) must still be detected and dropped → 2 kept tracks.
+  assert_stream_count "C2 multi-track: commentary dropped (title field parsed correctly)" "$out" a 2 2
+  # Tagged track keeps its language.
+  local a0_lang; a0_lang="$(probe_stream_tag "$out" a:0 language)"
+  if [[ "$a0_lang" == "eng" ]]; then
+    pass "C2 multi-track: tagged track a:0 keeps language=eng"
+  else
+    fail "C2 multi-track: tagged track a:0 language expected 'eng', got '$a0_lang'"
+  fi
+  # Untagged track must stay untagged — never language=<bitrate digits>.
+  local a1_lang; a1_lang="$(probe_stream_tag "$out" a:1 language)"
+  if [[ "$a1_lang" =~ ^[0-9]+$ ]]; then
+    fail "C2 multi-track: untagged track a:1 has garbage numeric language=$a1_lang (must stay untagged, never digits)"
+  else
+    pass "C2 multi-track: untagged track a:1 stays untagged (language='$a1_lang', not a digit string)"
   fi
 }
 
@@ -5669,6 +5726,43 @@ test_output() {
     assert_probe "skip-if-ideal non-compliant: re-encoded H.264 → HEVC" "$sii_no_out" codec_name hevc
   else
     fail "skip-if-ideal non-compliant: no output produced"
+  fi
+
+  # ---- C1: skip-if-ideal must NOT false-skip a non-.mov source requested as .mov ----
+  # Before C1's fix, check_skip_if_ideal had no mov) arm: with OUTPUT_EXT=mov the container
+  # case fell through with ideal=1, so a copy-compliant .mkv requested as .mov was reported
+  # "already matches … skipping" and (on the no-remux branch) raw-hardlinked verbatim — shipping
+  # Matroska bytes inside a .mov name. The fix adds a mov) arm (plus a defensive default *)).
+  # --no-profile-comment --no-audio-titles force the raw-hardlink branch (single audio track, no
+  # subs → no filtering) so the mislabel is observable in format_name; the copy-remux branch would
+  # otherwise mask it by re-containerizing via -f mov. The two assertions below — "did NOT skip"
+  # and "output is a real MOV, not a renamed Matroska" — each go red without the mov) arm.
+  # Perturb MUT-SII-MOV inverts the mov) guard (!= → ==) to reintroduce exactly this defect.
+  local c1_src="$TESTDIR/compliant_hevc.mkv"
+  gen_media "$c1_src" white \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le -tag:v hvc1 \
+    -c:a eac3 -b:a 256k -ac 2 -metadata:s:a:0 language=eng
+  local c1_home="$TESTDIR/c1_home"; mkdir -p "$c1_home"
+  local c1_out="$TESTDIR/out_c1_mov.mov" c1_log
+  log "skip-if-ideal + --output-ext mov: compliant .mkv must NOT false-skip into a mislabeled container (C1)..."
+  c1_log="$(MUXM_HOME="$c1_home" run_muxm --profile atv-directplay-hq \
+    --no-profile-comment --no-audio-titles --output-ext mov --skip-if-ideal \
+    "$c1_src" "$c1_out")"
+  if echo "$c1_log" | grep -qiE "already matches.*skip|skipping processing"; then
+    fail "skip-if-ideal mov: compliant .mkv was wrongly skipped for a .mov target (C1 — mislabeled container)"
+  else
+    pass "skip-if-ideal mov: compliant .mkv not skipped for a .mov target (C1)"
+  fi
+  if [[ -f "$c1_out" && -s "$c1_out" ]]; then
+    local c1_fmt; c1_fmt="$(probe_format "$c1_out" format_name)"
+    if [[ "$c1_fmt" == *mov* && "$c1_fmt" != matroska* ]]; then
+      pass "skip-if-ideal mov: output is a real MOV (format_name=$c1_fmt), not a renamed Matroska"
+    else
+      fail "skip-if-ideal mov: output container is '$c1_fmt' — expected a real MOV (C1 mislabel)"
+    fi
+    assert_probe "skip-if-ideal mov: video stream-copied (stays HEVC)" "$c1_out" codec_name hevc
+  else
+    fail "skip-if-ideal mov: no output produced"
   fi
 
   # ---- skip-if-ideal + multi-track: commentary triggers remux (not ideal) ----
@@ -7909,7 +8003,7 @@ _test_unit_score_audio_stream() {
   # the test would pass under mutation. So we SOURCE muxm's actual default lines (^-anchored, to
   # skip the indented profile-arm reassignments) and use canonical hardcoded constants as oracle.
   local body
-  body="$(_extract_muxm_fns _score_audio_stream _normalize_codec_lang _audio_codec_rank \
+  body="$(_extract_muxm_fns _score_audio_stream _split_tab _normalize_codec_lang _audio_codec_rank \
                             _audio_lang_matches _norm_lang_code audio_is_lossless _audio_is_commentary)" || {
     fail "2.1: could not extract _score_audio_stream + helpers from muxm"; return; }
   local defaults
@@ -8009,7 +8103,7 @@ _test_unit_select_best_audio() {
   # AUDIO_SCORE_* defaults, run the REAL scorer, and assert the CHOSEN INDEX across the scenarios
   # the review found untested (esp. invalid-override fallback and the all-fail guard).
   local body defaults
-  body="$(_extract_muxm_fns select_best_audio _score_audio_stream _normalize_codec_lang \
+  body="$(_extract_muxm_fns select_best_audio _score_audio_stream _split_tab _normalize_codec_lang \
                             _audio_codec_rank _audio_lang_matches _norm_lang_code audio_is_lossless _audio_is_commentary)" \
     || { fail "2.2: could not extract select_best_audio + helpers"; return; }
   defaults="$(grep -E '^(declare -i )?(AUDIO_SCORE_[A-Z_]+|AUDIO_CODEC_PREFERENCE|AUDIO_LANG_PREF|TAG_LANGUAGE_DEFAULT|_AUDIO_CODEC_RANK_PREF)=' "$MUXM")"
@@ -8556,9 +8650,10 @@ test_unit() {
 # into `title` and blanking the bitrate. This test drives the extracted helper with an untitled
 # record and asserts title stays empty + the bitrate lands in br. It goes red on the pre-fix
 # `IFS=$'\t' read` parse (which yields title=<bitrate>, br=empty) and green on the fixed split.
+# _parse_audio_record now delegates to _split_tab (C2), so extract that too.
 _test_unit_parse_audio_record() {
   local body
-  body="$(_extract_muxm_fns _parse_audio_record)" \
+  body="$(_extract_muxm_fns _parse_audio_record _split_tab)" \
     || { fail "parse_audio_record: could not extract _parse_audio_record"; return; }
   # Driver: parse $1, echo "title|br" so empty fields are visible.
   _par(){ bash -c "$body"$'\n''_parse_audio_record "$1"; printf "%s|%s\n" "$_AREC_TITLE" "$_AREC_BR"' -- "$1"; }
