@@ -1104,6 +1104,10 @@ is_valid_loglevel(){
     *) return 1;;
   esac
 }
+# M-DRY-c: human-readable valid-loglevel list for "Valid values: …" die messages, hand-kept in
+# sync with is_valid_loglevel's case above (a unit drift-guard asserts every entry here passes
+# is_valid_loglevel and that the counts match). Single source for the four error messages.
+readonly _VALID_LOGLEVEL_STR="quiet, panic, fatal, error, warning, info, verbose, debug, trace"
 
 # Validate HW_ACCEL values (used by .muxmrc validation + CLI parsing).
 # Accepted: none | auto | videotoolbox | nvenc
@@ -1379,17 +1383,23 @@ _muxm_try_source "$HOME/.muxmrc"
 _muxm_try_source "./.muxmrc"   # Sources from $PWD — intentional project-level override (see section header)
 
 # Deprecation bridge: AUDIO_SCORE_LANG_BONUS_ENG → AUDIO_SCORE_LANG_BONUS (v1.1)
+# M7: apply the legacy alias ONLY when the new var was not explicitly set in config — i.e. it still
+# equals its pre-config default (_MUXM_PRE_CONFIG snapshot, taken before the .muxmrc chain). If a
+# .muxmrc sets BOTH, the new var wins; the legacy value must never silently overwrite it. The
+# rename warning always fires while the legacy alias is present.
 if [[ -n "${AUDIO_SCORE_LANG_BONUS_ENG:-}" ]]; then
-  AUDIO_SCORE_LANG_BONUS="$AUDIO_SCORE_LANG_BONUS_ENG"
+  if [[ "$AUDIO_SCORE_LANG_BONUS" == "${_MUXM_PRE_CONFIG[AUDIO_SCORE_LANG_BONUS]}" ]]; then
+    AUDIO_SCORE_LANG_BONUS="$AUDIO_SCORE_LANG_BONUS_ENG"
+  fi
   # shellcheck disable=SC2016
   printf '⚠️  Deprecated: AUDIO_SCORE_LANG_BONUS_ENG → rename to AUDIO_SCORE_LANG_BONUS in your .muxmrc\n' >&2
 fi
 
 # Validate loglevel values from config files (catch typos early, before ffmpeg sees them)
 [[ -n "$FFMPEG_LOGLEVEL" ]] && ! is_valid_loglevel "$FFMPEG_LOGLEVEL" && \
-  die 11 "Invalid FFMPEG_LOGLEVEL=\"$FFMPEG_LOGLEVEL\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
+  die 11 "Invalid FFMPEG_LOGLEVEL=\"$FFMPEG_LOGLEVEL\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: ${_VALID_LOGLEVEL_STR}"
 [[ -n "$FFPROBE_LOGLEVEL" ]] && ! is_valid_loglevel "$FFPROBE_LOGLEVEL" && \
-  die 11 "Invalid FFPROBE_LOGLEVEL=\"$FFPROBE_LOGLEVEL\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
+  die 11 "Invalid FFPROBE_LOGLEVEL=\"$FFPROBE_LOGLEVEL\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: ${_VALID_LOGLEVEL_STR}"
 # Validate HW_ACCEL set via .muxmrc (CLI validation happens in the parser).
 [[ -n "${HW_ACCEL:-}" ]] && ! is_valid_hw_accel "$HW_ACCEL" && \
   die 11 "Invalid HW_ACCEL=\"$HW_ACCEL\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: none, auto, videotoolbox, nvenc"
@@ -1493,6 +1503,19 @@ _dep_check_only(){
   exit 0
 }
 
+# _pipx_resolve_bin_dir — echo pipx's bin directory (PIPX_BIN_DIR), or "" if undeterminable.
+# M8: `pipx environment --value PIPX_BIN_DIR` exists only on pipx ≥1.0; on older pipx (e.g. some
+# Ubuntu LTS) it fails silently, leaving only the hardcoded $HOME/.local/bin guess — so a
+# non-standard pipx install made pgsrip look missing right after installing it. Fall back to
+# parsing the full `pipx environment` dump. Top-level (not nested in _dep_install_dependencies) so
+# the unit suite can extract and exercise it against a pipx shim.
+_pipx_resolve_bin_dir(){
+  local _d
+  _d="$(pipx environment --value PIPX_BIN_DIR 2>/dev/null)" || true
+  [[ -z "$_d" ]] && _d="$(pipx environment 2>/dev/null | grep '^PIPX_BIN_DIR=' | cut -d= -f2)"
+  printf '%s' "$_d"
+}
+
 _dep_install_dependencies(){
   say "=== ${APP_NAME} v${VERSION} — Dependency Installer ==="
   printf '\n'
@@ -1550,7 +1573,7 @@ _dep_install_dependencies(){
           pipx ensurepath 2>/dev/null || true
           # Add pipx bin dir to current PATH (without eval of arbitrary output)
           local _pipx_bin
-          _pipx_bin="$(pipx environment --value PIPX_BIN_DIR 2>/dev/null)" || true
+          _pipx_bin="$(_pipx_resolve_bin_dir)"  # M8: pipx <1.0-safe (falls back to parsing `pipx environment`)
           if [[ -n "$_pipx_bin" && -d "$_pipx_bin" ]]; then
             export PATH="$_pipx_bin:$PATH"
           fi
@@ -2950,6 +2973,21 @@ MANPAGE_EOF
 }
 # <<< end embedded man page >>>
 
+# _refresh_mandb DIR — refresh the man database so the just-installed/removed page appears in /
+# drops out of `man -k`/whatis. M-DRY: byte-identical block in _install_man / _uninstall_man.
+# No-op when mandb is absent; uses sudo only when DIR is not writable by the current user.
+_refresh_mandb(){
+  local _mandir="$1"
+  if command -v mandb >/dev/null 2>&1; then
+    printf '  🔄 Updating man database ...\n'
+    if [[ -w "$_mandir" ]]; then
+      mandb -q 2>/dev/null || true
+    else
+      sudo mandb -q 2>/dev/null || true
+    fi
+  fi
+}
+
 _install_man(){
   local mandir
   mandir="$(_man_target_dir)"
@@ -2981,14 +3019,7 @@ _install_man(){
   printf '\n'
 
   # Update man database if mandb/makewhatis available
-  if command -v mandb >/dev/null 2>&1; then
-    printf '  🔄 Updating man database ...\n'
-    if [[ -w "$mandir" ]]; then
-      mandb -q 2>/dev/null || true
-    else
-      sudo mandb -q 2>/dev/null || true
-    fi
-  fi
+  _refresh_mandb "$mandir"  # M-DRY-b
 
   printf '\n  View with: man %s\n' "$CLI_NAME"
   exit 0
@@ -3020,14 +3051,7 @@ _uninstall_man(){
   printf '  ✅ Removed %s\n' "$target"
 
   # Refresh the man database so the removed page drops out of `man -k`/whatis (mirrors install).
-  if command -v mandb >/dev/null 2>&1; then
-    printf '  🔄 Updating man database ...\n'
-    if [[ -w "$mandir" ]]; then
-      mandb -q 2>/dev/null || true
-    else
-      sudo mandb -q 2>/dev/null || true
-    fi
-  fi
+  _refresh_mandb "$mandir"  # M-DRY-b
   exit 0
 }
 
@@ -4980,13 +5004,13 @@ while [[ $# -gt 0 ]]; do
 
     --ffmpeg-loglevel)
       _require_val "$1" "$#" "${2:-}"; FFMPEG_LOGLEVEL="$2"
-      is_valid_loglevel "$FFMPEG_LOGLEVEL" || die 11 "Invalid --ffmpeg-loglevel: \"$FFMPEG_LOGLEVEL\". Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
+      is_valid_loglevel "$FFMPEG_LOGLEVEL" || die 11 "Invalid --ffmpeg-loglevel: \"$FFMPEG_LOGLEVEL\". Valid values: ${_VALID_LOGLEVEL_STR}"
       shift 2 ;;
     --no-hide-banner) FFMPEG_HIDE_BANNER=0; shift ;;
     --no-overwrite) FFMPEG_OVERWRITE=0; shift ;;
     --ffprobe-loglevel)
       _require_val "$1" "$#" "${2:-}"; FFPROBE_LOGLEVEL="$2"
-      is_valid_loglevel "$FFPROBE_LOGLEVEL" || die 11 "Invalid --ffprobe-loglevel: \"$FFPROBE_LOGLEVEL\". Valid values: quiet, panic, fatal, error, warning, info, verbose, debug, trace"
+      is_valid_loglevel "$FFPROBE_LOGLEVEL" || die 11 "Invalid --ffprobe-loglevel: \"$FFPROBE_LOGLEVEL\". Valid values: ${_VALID_LOGLEVEL_STR}"
       shift 2 ;;
     --threads)
       _require_val "$1" "$#" "${2:-}"
@@ -7472,6 +7496,19 @@ _count_video_frames() {
   [[ "$count" =~ ^[0-9]+$ ]] && echo "$count" || echo "0"
 }
 
+# _dv_probe_has_config_record FILE — true (rc 0) iff FILE's video stream carries a container-level
+# DOVI configuration record (dvcC/dvvC box). M-DRY: the ffprobe-side-data + grep idiom was
+# copy-pasted across the DV fallback / pre-wrap paths. ffprobe failure is treated as "no record"
+# (those callers act only on a positive detection). verify_dv_container_record deliberately does
+# NOT use this helper — it distinguishes an ffprobe failure ("unknown") from a genuine absence.
+# Globals: FFPROBE_FLAGS, DV_CONTAINER_PATTERN (read).
+_dv_probe_has_config_record() {
+  local _probe
+  _probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
+            stream_side_data -select_streams v:0 "$1" 2>&1)" || true
+  printf '%s\n' "$_probe" | grep -qiE "$DV_CONTAINER_PATTERN"
+}
+
 # Verify DOVI configuration record (dvcC/dvvC box) is present in muxed output.
 # For MP4/MOV containers, the dvcC box is required for players to activate DV rendering.
 # If missing, attempts a fallback remux. If still missing, warns clearly.
@@ -7534,11 +7571,7 @@ verify_dv_container_record() {
       spinner "$mp4box_fb_pid" "DV fallback: muxing with mp4box"
       local _mp4box_fb_rc=0; wait "$mp4box_fb_pid" 2>/dev/null || _mp4box_fb_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
       if (( _mp4box_fb_rc == 0 )) && [[ -s "$dv_video_mp4" ]]; then
-        local mux_probe
-        mux_probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
-                     stream_side_data -select_streams v:0 "$dv_video_mp4" 2>&1)" || true
-
-        if printf '%s\n' "$mux_probe" | grep -qiE "$DV_CONTAINER_PATTERN"; then
+        if _dv_probe_has_config_record "$dv_video_mp4"; then  # M-DRY-a
           fallback_ok=1
         else
           warn "mp4box fallback muxed OK but dvcC not detected. See: $WORKDIR/dovi_mux_mp4box.log"
@@ -7575,11 +7608,7 @@ verify_dv_container_record() {
       local _remux_fb_rc; wait "$remux_fb_pid" 2>/dev/null && _remux_fb_rc=0 || _remux_fb_rc=$?
       _ACTIVE_FFMPEG_PID=""
       if (( _remux_fb_rc == 0 )) && [[ -s "$dv_final" ]]; then
-        local final_probe
-        final_probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
-                       stream_side_data -select_streams v:0 "$dv_final" 2>&1)" || true
-
-        if printf '%s\n' "$final_probe" | grep -qiE "$DV_CONTAINER_PATTERN"; then
+        if _dv_probe_has_config_record "$dv_final"; then  # M-DRY-a
           mv -f "$dv_final" "$TMP_OUT"
           note "✅ DV container fallback succeeded (mp4box) — DOVI configuration record added."
           report_add "dv_container_record" "added via mp4box fallback"
@@ -8610,11 +8639,7 @@ run_video_pipeline() {
       spinner "$pw_mp4box_pid" "Pre-wrapping DV video (mp4box)"
       local _pw_mp4box_rc=0; wait "$pw_mp4box_pid" 2>/dev/null || _pw_mp4box_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
       if (( _pw_mp4box_rc == 0 )) && [[ -s "$dv_prewrap" ]]; then
-        local pw_probe
-        pw_probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
-                     stream_side_data -select_streams v:0 "$dv_prewrap" 2>&1)" || true
-
-        if printf '%s\n' "$pw_probe" | grep -qiE "$DV_CONTAINER_PATTERN"; then
+        if _dv_probe_has_config_record "$dv_prewrap"; then  # M-DRY-a
           V_DV_MP4="$dv_prewrap"
           prewrap_ok=1
           note "✅ DV pre-wrap succeeded (mp4box) — dvcC box present."
@@ -8651,11 +8676,7 @@ run_video_pipeline() {
       spinner "$pw_ff_pid" "Pre-wrapping DV video (ffmpeg fallback)"
       local _pw_ff_rc=0; wait "$pw_ff_pid" 2>/dev/null || _pw_ff_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
       if (( _pw_ff_rc == 0 )) && [[ -s "$dv_prewrap" ]]; then
-        local pw_probe2
-        pw_probe2="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
-                      stream_side_data -select_streams v:0 "$dv_prewrap" 2>&1)" || true
-
-        if printf '%s\n' "$pw_probe2" | grep -qiE "$DV_CONTAINER_PATTERN"; then
+        if _dv_probe_has_config_record "$dv_prewrap"; then  # M-DRY-a
           V_DV_MP4="$dv_prewrap"
           prewrap_ok=1
           note "✅ DV pre-wrap succeeded (ffmpeg direct) — dvcC box present."

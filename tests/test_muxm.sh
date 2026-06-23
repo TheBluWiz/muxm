@@ -2475,6 +2475,40 @@ test_config() {
   _test_config_layering
   _test_config_validation
   _test_config_create_overrides
+  _test_config_m7_deprecation_bridge
+}
+
+# M7: the AUDIO_SCORE_LANG_BONUS_ENG → AUDIO_SCORE_LANG_BONUS deprecation bridge must apply the
+# legacy alias ONLY when the new var was not explicitly set in config. If a .muxmrc sets BOTH, the
+# new var wins (the legacy value must not silently overwrite it); the rename warning fires whenever
+# the legacy alias is present. Bidirectional: both-set → new wins (+ warning); legacy-only → legacy
+# applies. Perturb MUT-M7-BRIDGE reverts to the unconditional overwrite → both-set → legacy wins → red.
+_test_config_m7_deprecation_bridge() {
+  local _dir="$TESTDIR/m7"; mkdir -p "$_dir/h"
+  # (a) both set → new (200) wins, NOT legacy (100); warning still emitted (stderr).
+  printf 'AUDIO_SCORE_LANG_BONUS=200\nAUDIO_SCORE_LANG_BONUS_ENG=100\n' > "$_dir/.muxmrc"
+  local _out _err
+  _err="$_dir/err.txt"
+  _out="$(cd "$_dir" && HOME="$_dir/h" "$MUXM" --print-effective-config 2>"$_err")"
+  if printf '%s\n' "$_out" | grep -qE "AUDIO_SCORE_LANG_BONUS[[:space:]]*=[[:space:]]*200"; then
+    pass "M7: both legacy+new set → new value wins (200, not the legacy 100)"
+  else
+    fail "M7: both set → expected AUDIO_SCORE_LANG_BONUS=200, got: $(printf '%s\n' "$_out" | grep 'AUDIO_SCORE_LANG_BONUS ')"
+  fi
+  if grep -qi "Deprecated: AUDIO_SCORE_LANG_BONUS_ENG" "$_err"; then
+    pass "M7: rename warning still emitted when the legacy alias is present"
+  else
+    fail "M7: deprecation/rename warning not emitted for the legacy alias"
+  fi
+  # (b) legacy only → legacy value (100) applies (new var left at its default).
+  printf 'AUDIO_SCORE_LANG_BONUS_ENG=100\n' > "$_dir/.muxmrc"
+  _out="$(cd "$_dir" && HOME="$_dir/h" "$MUXM" --print-effective-config 2>/dev/null)"
+  if printf '%s\n' "$_out" | grep -qE "AUDIO_SCORE_LANG_BONUS[[:space:]]*=[[:space:]]*100"; then
+    pass "M7: legacy-only → legacy value applies (100) via the deprecation bridge"
+  else
+    fail "M7: legacy-only → expected AUDIO_SCORE_LANG_BONUS=100, got: $(printf '%s\n' "$_out" | grep 'AUDIO_SCORE_LANG_BONUS ')"
+  fi
+  rm -rf "$_dir"
 }
 
 # === Suite: Profile Variable Assignment ===
@@ -8931,6 +8965,104 @@ test_unit() {
   _test_unit_prefer_complete_ffmpeg
   _test_unit_parse_audio_record
   _test_unit_m3_ffmpeg_pid_lifecycle
+  _test_unit_m8_pipx_bin_dir
+  _test_unit_mdry_dv_probe
+  _test_unit_mdry_refresh_mandb
+  _test_unit_mdry_loglevel_str
+}
+
+# M8: _pipx_resolve_bin_dir must find PIPX_BIN_DIR even on pipx <1.0, which lacks
+# `environment --value` — by falling back to parsing the full `pipx environment` dump. Drives the
+# extracted helper against a shim mimicking old pipx. Perturb MUT-M8-FALLBACK removes the fallback
+# line → the helper returns empty under the old-pipx shim → red.
+_test_unit_m8_pipx_bin_dir() {
+  local body
+  body="$(_extract_muxm_fns _pipx_resolve_bin_dir)" \
+    || { fail "M8: could not extract _pipx_resolve_bin_dir"; return; }
+  local _d="$TESTDIR/m8_unit"; mkdir -p "$_d/bin"
+  # pipx <1.0 shim: `environment --value` fails; plain `environment` prints PIPX_BIN_DIR=...
+  cat > "$_d/bin/pipx" <<EOF
+#!/bin/sh
+if [ "\$1" = "environment" ] && [ "\$2" = "--value" ]; then echo "error: no such option --value" >&2; exit 2; fi
+if [ "\$1" = "environment" ]; then echo "PIPX_HOME=/x"; echo "PIPX_BIN_DIR=$_d/pbin"; exit 0; fi
+exit 0
+EOF
+  chmod +x "$_d/bin/pipx"
+  local got
+  got="$(PATH="$_d/bin:$PATH" bash -c "$body"$'\n''_pipx_resolve_bin_dir')"
+  if [[ "$got" == "$_d/pbin" ]]; then
+    pass "M8: _pipx_resolve_bin_dir finds PIPX_BIN_DIR on pipx <1.0 (parses 'pipx environment')"
+  else
+    fail "M8: _pipx_resolve_bin_dir returned '$got' under old-pipx shim (expected '$_d/pbin')"
+  fi
+  rm -rf "$_d"
+}
+
+# M-DRY-a: _dv_probe_has_config_record is true iff the probe output carries a DOVI configuration
+# record. Drives the extracted helper with a shimmed ffprobe (DV text vs plain) — independent of a
+# real DV file, so it pins the helper's probe+grep logic directly. Perturb MUT-MDRYA-PROBE breaks
+# the helper's grep → the positive case goes false → red.
+_test_unit_mdry_dv_probe() {
+  local body
+  body="$(_extract_muxm_fns _dv_probe_has_config_record)" \
+    || { fail "M-DRY-a: could not extract _dv_probe_has_config_record"; return; }
+  # shellcheck disable=SC2016  # the shim/globals are literal text for the sub-shell, not this one.
+  local drv='ffprobe(){ case "$*" in *DVPOS*) echo "DOVI configuration record present";; *) echo "codec_name=hevc";; esac; }
+FFPROBE_FLAGS=(-v error); DV_CONTAINER_PATTERN="DOVI configuration record|dv_profile|dv_version"'
+  if bash -c "$drv"$'\n'"$body"$'\n''_dv_probe_has_config_record DVPOS' 2>/dev/null; then
+    pass "M-DRY-a: _dv_probe_has_config_record detects a present DOVI configuration record"
+  else
+    fail "M-DRY-a: helper failed to detect a present DOVI configuration record"
+  fi
+  if bash -c "$drv"$'\n'"$body"$'\n''_dv_probe_has_config_record nope' 2>/dev/null; then
+    fail "M-DRY-a: helper falsely reported a DOVI record on non-DV output"
+  else
+    pass "M-DRY-a: _dv_probe_has_config_record returns false on non-DV output"
+  fi
+}
+
+# M-DRY-b: structural — both _install_man and _uninstall_man must delegate the man-database refresh
+# to the extracted _refresh_mandb helper (no inline duplicate block). A behavioral mandb test is
+# not meaningful (command -v-guarded, output uninspectable, mandb often absent), so this guards the
+# extraction itself. Covered behaviorally by the existing setup man-tests staying green.
+_test_unit_mdry_refresh_mandb() {
+  local _inst _uninst
+  _inst="$(awk '/^_install_man\(\)/,/^\}/' "$MUXM")"
+  _uninst="$(awk '/^_uninstall_man\(\)/,/^\}/' "$MUXM")"
+  if grep -q '_refresh_mandb ' <<<"$_inst" && grep -q '_refresh_mandb ' <<<"$_uninst"; then
+    pass "M-DRY-b: _install_man and _uninstall_man both delegate to _refresh_mandb"
+  else
+    fail "M-DRY-b: a man function still inlines the mandb-refresh block instead of calling _refresh_mandb"
+  fi
+}
+
+# M-DRY-c: drift guard — _VALID_LOGLEVEL_STR (the human-readable "Valid values:" list) must stay in
+# sync with is_valid_loglevel's case set. Assert every entry passes is_valid_loglevel and the count
+# matches the case arms. Perturb MUT-MDRYC-DRIFT adds a bogus value to the constant → drift → red.
+_test_unit_mdry_loglevel_str() {
+  local body
+  body="$(_extract_muxm_fns is_valid_loglevel)" \
+    || { fail "M-DRY-c: could not extract is_valid_loglevel"; return; }
+  local _str
+  _str="$(grep -E '^readonly _VALID_LOGLEVEL_STR=' "$MUXM" | sed -E 's/^[^"]*"//; s/"[^"]*$//')"
+  if [[ -z "$_str" ]]; then fail "M-DRY-c: could not read _VALID_LOGLEVEL_STR"; return; fi
+  # Count of case arms in is_valid_loglevel (split the single 'a|b|c) ...' arm on '|').
+  local _arms
+  _arms="$(awk -F'|' '/return 0;;/{gsub(/[^a-z|]/,"",$0); n=split($0,a,"|"); print n; exit}' <<<"$body")"
+  # Validate each constant entry + count.
+  local _bad="" _n=0 _v
+  local _IFS_save="$IFS"; IFS=','
+  for _v in $_str; do
+    _v="${_v// /}"; [[ -z "$_v" ]] && continue
+    _n=$(( _n + 1 ))
+    bash -c "$body"$'\n'"is_valid_loglevel '$_v'" || _bad="$_bad $_v"
+  done
+  IFS="$_IFS_save"
+  if [[ -z "$_bad" ]] && [[ "$_n" == "$_arms" ]]; then
+    pass "M-DRY-c: _VALID_LOGLEVEL_STR ($_n values) is in sync with is_valid_loglevel ($_arms arms)"
+  else
+    fail "M-DRY-c: _VALID_LOGLEVEL_STR drifted from is_valid_loglevel (invalid:${_bad:-none}; count $_n vs $_arms)"
+  fi
 }
 
 # M3: _ACTIVE_FFMPEG_PID lifecycle — on_exit SIGKILLs $_ACTIVE_FFMPEG_PID on interrupt, so every

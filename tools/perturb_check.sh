@@ -279,6 +279,39 @@ enforce MUT-M6-EOF cli \
   'M6: REPLACE_SOURCE + EOF stdin → expected die 11' \
   'M-M6-EOF: read EOF treated as decline → clean-die-11-not-crash probe'
 
+# MUT-M7-BRIDGE (Phase 4, M7): make the deprecation bridge's guard always-true (compare the new var
+# to itself), reverting to the unconditional overwrite. With BOTH set in config the legacy value
+# then wins over the explicitly-set new value → the M7 both-set probe goes red.
+# shellcheck disable=SC2016  # the variable refs are literal sed text.
+enforce MUT-M7-BRIDGE config \
+  's#== "${_MUXM_PRE_CONFIG\[AUDIO_SCORE_LANG_BONUS\]}"#== "$AUDIO_SCORE_LANG_BONUS"#' \
+  'M7: both set → expected AUDIO_SCORE_LANG_BONUS=200' \
+  'M-M7-BRIDGE: deprecation bridge applies legacy only when new is unset → new-wins probe'
+
+# MUT-M8-FALLBACK (Phase 4, M8): drop the pipx <1.0 fallback line in _pipx_resolve_bin_dir. Under
+# the old-pipx shim (no `environment --value`) the helper then returns empty → the M8 unit probe red.
+# shellcheck disable=SC2016  # $_d / pipx text is literal sed text.
+enforce MUT-M8-FALLBACK unit \
+  's@  \[\[ -z "$_d" \]\] && _d="$(pipx environment.*@  :@' \
+  'M8: _pipx_resolve_bin_dir returned' \
+  'M-M8-FALLBACK: pipx <1.0 environment-dump fallback → bin-dir-resolution probe'
+
+# MUT-MDRYA-PROBE (Phase 4, M-DRY-a): break _dv_probe_has_config_record's grep (always false).
+# Anchored on the helper's "$_probe" so only the helper changes (verify_dv_container_record's
+# "$out_probe" grep is untouched). The DV-probe unit positive case goes red.
+# shellcheck disable=SC2016  # $_probe / $DV_CONTAINER_PATTERN are literal sed text.
+enforce MUT-MDRYA-PROBE unit \
+  's/printf .*"$_probe" | grep -qiE "$DV_CONTAINER_PATTERN"/false/' \
+  'M-DRY-a: helper failed to detect a present DOVI configuration record' \
+  'M-MDRYA-PROBE: _dv_probe_has_config_record probe+grep → DV-record-detection probe'
+
+# MUT-MDRYC-DRIFT (Phase 4, M-DRY-c): inject a bogus value into _VALID_LOGLEVEL_STR so it diverges
+# from is_valid_loglevel's case set (invalid entry + count mismatch). The loglevel drift guard red.
+enforce MUT-MDRYC-DRIFT unit \
+  's/, trace"/, bogus, trace"/' \
+  'M-DRY-c: _VALID_LOGLEVEL_STR drifted from is_valid_loglevel' \
+  'M-MDRYC-DRIFT: _VALID_LOGLEVEL_STR ↔ is_valid_loglevel sync → loglevel drift-guard probe'
+
 # M-AUD-1 (Phase 2.1 — was pending): the same '(10 - rank)' inversion, now caught by the new
 # direct _score_audio_stream unit test. The ch<6 scenario keeps this signature distinct from
 # M-AUD-3 (surround only applies at ≥6ch).
