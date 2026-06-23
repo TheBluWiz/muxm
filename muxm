@@ -1659,7 +1659,12 @@ _dep_install_dependencies(){
   }
 
   say "Core tools (required):"
-  _ensure_ffmpeg_full
+  # M4: guard the call so a return-1 (install failed / incomplete build) does not abort the whole
+  # installer under `set -e` before its summary. _ensure_ffmpeg_full already does its own failed++
+  # on every failure path, so `|| true` (NOT `|| (( failed++ ))`, which would double-count) just
+  # neutralizes the abort; the failure is still recorded and the summary prints. Mirrors the
+  # guarded pipx/pgsrip installs above.
+  _ensure_ffmpeg_full || true
   # ffprobe ships with ffmpeg — verify it's on PATH
   total=$(( total + 1 ))
   printf "  %-14s" "ffprobe"
@@ -3971,6 +3976,17 @@ HEADER
   fi
 }
 
+# M5: fetch the value following a value-taking --create-config override flag, dying cleanly (11)
+# instead of crashing under `set -u` when it is missing (e.g. a trailing `--crf` with no value).
+# Mirrors the main parser's _require_val. Sets _cc_val as a SIDE EFFECT (not via stdout: a `die`
+# inside `$(...)` would only exit the subshell, not abort) and must be called bare from
+# _create_config, whose _cc_oi / _cc_flag / _cc_override_argv locals it reads via dynamic scope.
+_cc_need_val() {
+  (( _cc_oi + 1 < ${#_cc_override_argv[@]} )) \
+    || die 11 "Config override '$_cc_flag' requires a value."
+  _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"
+}
+
 _create_config() {
   local scope="$1"
   local profile="${2:-atv-directplay-hq}"
@@ -3984,14 +4000,14 @@ _create_config() {
   while (( _cc_oi < ${#_cc_override_argv[@]} )); do
     _cc_flag="${_cc_override_argv[$_cc_oi]}"
     case "$_cc_flag" in
-      --crf)                        _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[CRF_VALUE]="$_cc_val";                (( _cc_oi += 2 )) ;;
-      --preset)                     _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[PRESET_VALUE]="$_cc_val";             (( _cc_oi += 2 )) ;;
-      --output-ext)                 _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[OUTPUT_EXT]="$_cc_val";               (( _cc_oi += 2 )) ;;
-      --level)                      _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[LEVEL_VALUE]="$_cc_val";              (( _cc_oi += 2 )) ;;
-      --video-codec)                _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[VIDEO_CODEC]="$_cc_val";              (( _cc_oi += 2 )) ;;
-      --stereo-bitrate)             _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[STEREO_BITRATE]="$_cc_val";           (( _cc_oi += 2 )) ;;
-      --sub-lang-pref)              _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[SUB_LANG_PREF]="$_cc_val";            (( _cc_oi += 2 )) ;;
-      --audio-lang-pref)            _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[AUDIO_LANG_PREF]="$_cc_val";          (( _cc_oi += 2 )) ;;
+      --crf)                        _cc_need_val;_CC_OVERRIDES[CRF_VALUE]="$_cc_val";                (( _cc_oi += 2 )) ;;
+      --preset)                     _cc_need_val;_CC_OVERRIDES[PRESET_VALUE]="$_cc_val";             (( _cc_oi += 2 )) ;;
+      --output-ext)                 _cc_need_val;_CC_OVERRIDES[OUTPUT_EXT]="$_cc_val";               (( _cc_oi += 2 )) ;;
+      --level)                      _cc_need_val;_CC_OVERRIDES[LEVEL_VALUE]="$_cc_val";              (( _cc_oi += 2 )) ;;
+      --video-codec)                _cc_need_val;_CC_OVERRIDES[VIDEO_CODEC]="$_cc_val";              (( _cc_oi += 2 )) ;;
+      --stereo-bitrate)             _cc_need_val;_CC_OVERRIDES[STEREO_BITRATE]="$_cc_val";           (( _cc_oi += 2 )) ;;
+      --sub-lang-pref)              _cc_need_val;_CC_OVERRIDES[SUB_LANG_PREF]="$_cc_val";            (( _cc_oi += 2 )) ;;
+      --audio-lang-pref)            _cc_need_val;_CC_OVERRIDES[AUDIO_LANG_PREF]="$_cc_val";          (( _cc_oi += 2 )) ;;
       --ext-subs)                   _CC_OVERRIDES[EXT_SUB_ENABLED]=1;                                                                  (( ++_cc_oi )) ;;
       --no-ext-subs)                _CC_OVERRIDES[EXT_SUB_ENABLED]=0;                                                                  (( ++_cc_oi )) ;;
       --sub-burn-forced)            _CC_OVERRIDES[SUB_BURN_FORCED]=1;                                                                  (( ++_cc_oi )) ;;
@@ -4004,19 +4020,19 @@ _create_config() {
       --no-disk-check)              _CC_OVERRIDES[DISK_CHECK]=0;                                                                       (( ++_cc_oi )) ;;
       --checksum)                   _CC_OVERRIDES[CHECKSUM]=1;                                                                         (( ++_cc_oi )) ;;
       --no-checksum)                _CC_OVERRIDES[CHECKSUM]=0;                                                                         (( ++_cc_oi )) ;;
-      --checksum-algo)              _CC_OVERRIDES[CHECKSUM_ALGO]="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[CHECKSUM]=1;      (( _cc_oi += 2 )) ;;
+      --checksum-algo)              _cc_need_val; _CC_OVERRIDES[CHECKSUM_ALGO]="$_cc_val"; _CC_OVERRIDES[CHECKSUM]=1;                 (( _cc_oi += 2 )) ;;
       # Encoding params
-      --x265-params)                _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[X265_PARAMS_BASE]="$_cc_val";          (( _cc_oi += 2 )) ;;
-      --x264-params)                _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[X264_PARAMS_BASE]="$_cc_val";          (( _cc_oi += 2 )) ;;
-      --av1-params)                 _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[SVT_AV1_PARAMS_BASE]="$_cc_val";       (( _cc_oi += 2 )) ;;
-      --av1-maxrate)                _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[AV1_MAXRATE]="$_cc_val";               (( _cc_oi += 2 )) ;;
-      --av1-bufsize)                _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[AV1_BUFSIZE]="$_cc_val";               (( _cc_oi += 2 )) ;;
-      --max-copy-bitrate)           _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[MAX_COPY_BITRATE]="$_cc_val";          (( _cc_oi += 2 )) ;;
+      --x265-params)                _cc_need_val;_CC_OVERRIDES[X265_PARAMS_BASE]="$_cc_val";          (( _cc_oi += 2 )) ;;
+      --x264-params)                _cc_need_val;_CC_OVERRIDES[X264_PARAMS_BASE]="$_cc_val";          (( _cc_oi += 2 )) ;;
+      --av1-params)                 _cc_need_val;_CC_OVERRIDES[SVT_AV1_PARAMS_BASE]="$_cc_val";       (( _cc_oi += 2 )) ;;
+      --av1-maxrate)                _cc_need_val;_CC_OVERRIDES[AV1_MAXRATE]="$_cc_val";               (( _cc_oi += 2 )) ;;
+      --av1-bufsize)                _cc_need_val;_CC_OVERRIDES[AV1_BUFSIZE]="$_cc_val";               (( _cc_oi += 2 )) ;;
+      --max-copy-bitrate)           _cc_need_val;_CC_OVERRIDES[MAX_COPY_BITRATE]="$_cc_val";          (( _cc_oi += 2 )) ;;
       --video-copy-if-compliant)    _CC_OVERRIDES[VIDEO_COPY_IF_COMPLIANT]=1;                                                           (( ++_cc_oi )) ;;
       --no-video-copy-if-compliant) _CC_OVERRIDES[VIDEO_COPY_IF_COMPLIANT]=0;                                                           (( ++_cc_oi )) ;;
       --conservative-vbv)           _CC_OVERRIDES[CONSERVATIVE_VBV]=1;                                                                  (( ++_cc_oi )) ;;
       --no-conservative-vbv)        _CC_OVERRIDES[CONSERVATIVE_VBV]=0;                                                                  (( ++_cc_oi )) ;;
-      --threads)                    _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[THREADS]="$_cc_val";                   (( _cc_oi += 2 )) ;;
+      --threads)                    _cc_need_val;_CC_OVERRIDES[THREADS]="$_cc_val";                   (( _cc_oi += 2 )) ;;
       # HDR/DV
       --tonemap)                    _CC_OVERRIDES[TONEMAP_HDR_TO_SDR]=1;                                                                (( ++_cc_oi )) ;;
       --no-tonemap)                 _CC_OVERRIDES[TONEMAP_HDR_TO_SDR]=0;                                                                (( ++_cc_oi )) ;;
@@ -4033,8 +4049,8 @@ _create_config() {
       --no-prefer-stereo)           _CC_OVERRIDES[AUDIO_PREFER_STEREO]=0;                                                               (( ++_cc_oi )) ;;
       --stereo-fallback)            _CC_OVERRIDES[ADD_STEREO_IF_MULTICH]=1;                                                             (( ++_cc_oi )) ;;
       --no-stereo-fallback)         _CC_OVERRIDES[ADD_STEREO_IF_MULTICH]=0;                                                             (( ++_cc_oi )) ;;
-      --audio-force-codec)          _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[AUDIO_FORCE_CODEC]="$_cc_val";         (( _cc_oi += 2 )) ;;
-      --audio-force-bitrate)        _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[AUDIO_FORCE_BITRATE]="$_cc_val";       (( _cc_oi += 2 )) ;;
+      --audio-force-codec)          _cc_need_val;_CC_OVERRIDES[AUDIO_FORCE_CODEC]="$_cc_val";         (( _cc_oi += 2 )) ;;
+      --audio-force-bitrate)        _cc_need_val;_CC_OVERRIDES[AUDIO_FORCE_BITRATE]="$_cc_val";       (( _cc_oi += 2 )) ;;
       --audio-titles)               _CC_OVERRIDES[INCLUDE_AUDIO_TITLES]=1;                                                              (( ++_cc_oi )) ;;
       --no-audio-titles)            _CC_OVERRIDES[INCLUDE_AUDIO_TITLES]=0;                                                              (( ++_cc_oi )) ;;
       # Subtitles
@@ -4047,8 +4063,8 @@ _create_config() {
       --sub-sole-ext-fallback)      _CC_OVERRIDES[SUB_SOLE_EXT_FALLBACK]=1;                                                             (( ++_cc_oi )) ;;
       --no-sub-sole-ext-fallback)   _CC_OVERRIDES[SUB_SOLE_EXT_FALLBACK]=0;                                                             (( ++_cc_oi )) ;;
       --no-sub-sdh)                 _CC_OVERRIDES[SUB_INCLUDE_SDH]=0;                                                                   (( ++_cc_oi )) ;;
-      --ocr-lang)                   _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[SUB_OCR_LANG]="$_cc_val";              (( _cc_oi += 2 )) ;;
-      --ocr-tool)                   _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[SUB_OCR_TOOL]="$_cc_val";              (( _cc_oi += 2 )) ;;
+      --ocr-lang)                   _cc_need_val;_CC_OVERRIDES[SUB_OCR_LANG]="$_cc_val";              (( _cc_oi += 2 )) ;;
+      --ocr-tool)                   _cc_need_val;_CC_OVERRIDES[SUB_OCR_TOOL]="$_cc_val";              (( _cc_oi += 2 )) ;;
       --no-ocr)                     _CC_OVERRIDES[SUB_ENABLE_OCR]=0;                                                                    (( ++_cc_oi )) ;;
       # Metadata/pipeline
       --keep-chapters)              _CC_OVERRIDES[KEEP_CHAPTERS]=1;                                                                     (( ++_cc_oi )) ;;
@@ -4060,8 +4076,8 @@ _create_config() {
       --profile-comment)            _CC_OVERRIDES[PROFILE_COMMENT]=1;                                                                   (( ++_cc_oi )) ;;
       --no-profile-comment)         _CC_OVERRIDES[PROFILE_COMMENT]=0;                                                                   (( ++_cc_oi )) ;;
       # Logging
-      --ffmpeg-loglevel)            _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[FFMPEG_LOGLEVEL]="$_cc_val";           (( _cc_oi += 2 )) ;;
-      --ffprobe-loglevel)           _cc_val="${_cc_override_argv[$((_cc_oi+1))]}"; _CC_OVERRIDES[FFPROBE_LOGLEVEL]="$_cc_val";          (( _cc_oi += 2 )) ;;
+      --ffmpeg-loglevel)            _cc_need_val;_CC_OVERRIDES[FFMPEG_LOGLEVEL]="$_cc_val";           (( _cc_oi += 2 )) ;;
+      --ffprobe-loglevel)           _cc_need_val;_CC_OVERRIDES[FFPROBE_LOGLEVEL]="$_cc_val";          (( _cc_oi += 2 )) ;;
       *)
         die 11 "Unknown config override: $_cc_flag
    Use --create-config without extra flags to generate a default template."
@@ -5097,7 +5113,7 @@ while [[ $# -gt 0 ]]; do
     # --profile was consumed by pre-scan; handle straggler gracefully
     --profile) shift 2 ;;
 
-    --) shift; break ;;
+    --) shift; POSITIONALS+=("$@"); break ;;  # M1: fold remaining args back in (the `--` end-of-options idiom, e.g. `muxm -- -dashname.mkv`); the arity check below still guards
     -*) die 11 "Unknown option: $1. $USAGE_SHORT" ;;
     *) POSITIONALS+=("$1"); shift ;;
   esac
@@ -5903,7 +5919,7 @@ if [[ "$SRC_ABS" -ef "$OUT_ABS" ]]; then
     note "Source will be replaced (--force-replace-source): $SRC_ABS"
   elif (( REPLACE_SOURCE )); then
     printf '⚠️  Are you sure you want the original file replaced? (y/n) '
-    read -r _confirm
+    read -r _confirm || _confirm=""  # M6: REPLACE_SOURCE via .muxmrc bypasses the --replace-source TTY guard; treat a non-interactive EOF as a decline (clean die 11 below) instead of an ERR-trap crash
     if [[ "$_confirm" == [Yy]* ]]; then
       _REPLACING_SOURCE=1
       note "Source will be replaced (confirmed): $SRC_ABS"
@@ -6232,7 +6248,14 @@ _persist_failure_bundle() {
 }
 
 on_exit() {
-  trap '' INT TERM EXIT  # prevent re-entrancy: cleanup must run atomically (M10)
+  # M2: disarm ERR alongside INT/TERM/EXIT. This does NOT by itself keep cleanup running — `trap ''
+  # ERR` only suppresses the on_error handler; `set -e` still exits on a failing command regardless.
+  # What actually prevents the leak is GUARDING the failure-prone final steps below (the `if ! mv`
+  # and `write_checksum || warn`) so a failed mv/checksum never trips set -e and aborts on_exit
+  # mid-way (which would skip the drain/log-persist/workdir cleanup and leak the multi-GB workdir).
+  # Disarming ERR here is the complementary half: it stops on_error from printing a spurious
+  # "Command failed at line…" diagnostic during cleanup. Both together = clean, complete teardown.
+  trap '' INT TERM ERR EXIT  # prevent re-entrancy + suppress the spurious ERR diagnostic during cleanup
   set +x 2>/dev/null || true   # stop DEBUG xtrace before the FD teardown closes BASH_XTRACEFD (FD 3)
   # Clean up subtitle burn-in temp file (lives inside WORKDIR; explicit removal before workdir cleanup)
   [[ -n "${_BURN_SRT_FILTER:-}" && -f "$_BURN_SRT_FILTER" ]] && rm -f "$_BURN_SRT_FILTER"
@@ -6262,16 +6285,24 @@ on_exit() {
       [[ -f "$TMP_OUT" ]] && rm -f "$TMP_OUT"
       note "DRY-RUN complete — no real files were created."
     else
-      [[ -f "$TMP_OUT" ]] && mv -f "$TMP_OUT" "$OUT"
-      # macOS/APFS sets the UF_HIDDEN (user hidden) flag on dot-prefixed files
-      # at the filesystem level. Our temp file (.muxm.output.XXXXXXXX) inherits
-      # this flag, and `mv` preserves it even after renaming to a non-dot name.
-      # This causes Finder to treat the final output as hidden. Clear it here.
-      # No-op on Linux (chflags doesn't exist) and harmless if already clear.
-      chflags nohidden "$OUT" 2>/dev/null || true
-      (( _REPLACING_SOURCE )) && note "Original source file has been replaced."
-      (( CHECKSUM )) && write_checksum "$OUT"
-      note "Build SUCCEEDED."
+      # M2: surface a failed final mv/checksum cleanly (the ERR trap is disarmed above, so these no
+      # longer abort cleanup) — warn and skip the success banner rather than claiming success.
+      local _mv_ok=1
+      if [[ -f "$TMP_OUT" ]] && ! mv -f "$TMP_OUT" "$OUT"; then
+        _mv_ok=0
+        warn "Could not move the finished output into place: $OUT (output volume full or unwritable?)."
+      fi
+      if (( _mv_ok )); then
+        # macOS/APFS sets the UF_HIDDEN (user hidden) flag on dot-prefixed files
+        # at the filesystem level. Our temp file (.muxm.output.XXXXXXXX) inherits
+        # this flag, and `mv` preserves it even after renaming to a non-dot name.
+        # This causes Finder to treat the final output as hidden. Clear it here.
+        # No-op on Linux (chflags doesn't exist) and harmless if already clear.
+        chflags nohidden "$OUT" 2>/dev/null || true
+        (( _REPLACING_SOURCE )) && note "Original source file has been replaced."
+        (( CHECKSUM )) && { write_checksum "$OUT" || warn "Could not write the checksum file for $OUT."; }
+        note "Build SUCCEEDED."
+      fi
     fi
 
     _print_completed_steps
@@ -7499,8 +7530,10 @@ verify_dv_container_record() {
       "$MP4BOX_CMD" "${fps_arg[@]}" -add "${V_MIXED}${dvp_hint}" \
            -new "$dv_video_mp4" >"$WORKDIR/dovi_mux_mp4box.log" 2>&1 &
       local mp4box_fb_pid=$!
+      _ACTIVE_FFMPEG_PID=$mp4box_fb_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
       spinner "$mp4box_fb_pid" "DV fallback: muxing with mp4box"
-      if wait "$mp4box_fb_pid" 2>/dev/null && [[ -s "$dv_video_mp4" ]]; then
+      local _mp4box_fb_rc=0; wait "$mp4box_fb_pid" 2>/dev/null || _mp4box_fb_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+      if (( _mp4box_fb_rc == 0 )) && [[ -s "$dv_video_mp4" ]]; then
         local mux_probe
         mux_probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
                      stream_side_data -select_streams v:0 "$dv_video_mp4" 2>&1)" || true
@@ -7953,8 +7986,8 @@ run_video_pipeline() {
           local rpu_val_pid=$!
           _ACTIVE_FFMPEG_PID=$rpu_val_pid
           spinner "$rpu_val_pid" "Validating DV RPU integrity"
-          _ACTIVE_FFMPEG_PID=""
-          if wait "$rpu_val_pid" 2>/dev/null && [[ -s "$rpu_check" ]]; then
+          local _rpu_val_rc=0; wait "$rpu_val_pid" 2>/dev/null || _rpu_val_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+          if (( _rpu_val_rc == 0 )) && [[ -s "$rpu_check" ]]; then
             if _validate_dv_rpu "$rpu_check"; then
               note "DV RPU integrity verified for copy path."
               report_add "dv_copy_rpu_check" "passed"
@@ -8245,8 +8278,8 @@ run_video_pipeline() {
     local rpu_pipe_pid=$!
     _ACTIVE_FFMPEG_PID=$rpu_pipe_pid
     spinner "$rpu_pipe_pid" "Extracting DV RPU (piped)"
-    _ACTIVE_FFMPEG_PID=""
-    if wait "$rpu_pipe_pid" 2>/dev/null; then
+    local _rpu_pipe_rc=0; wait "$rpu_pipe_pid" 2>/dev/null || _rpu_pipe_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+    if (( _rpu_pipe_rc == 0 )); then
       if [[ -s "$RPU_P7" ]]; then
         rpu_extracted=1
         log "DV RPU extracted successfully (piped method)."
@@ -8266,8 +8299,10 @@ run_video_pipeline() {
       log "→ Extracting DV RPU from demuxed ES file (fallback)…"
       dovi_tool extract-rpu -i "$V_SRC_ES" -o "$RPU_P7" >"$WORKDIR/rpu_file.log" 2>&1 &
       local rpu_file_pid=$!
+      _ACTIVE_FFMPEG_PID=$rpu_file_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
       spinner "$rpu_file_pid" "Extracting DV RPU (file fallback)"
-      if wait "$rpu_file_pid" 2>/dev/null; then
+      local _rpu_file_rc=0; wait "$rpu_file_pid" 2>/dev/null || _rpu_file_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+      if (( _rpu_file_rc == 0 )); then
         if [[ -s "$RPU_P7" ]]; then
           rpu_extracted=1
           log "DV RPU extracted successfully (file-based fallback)."
@@ -8400,8 +8435,10 @@ run_video_pipeline() {
 
   dovi_tool inject-rpu -i "$V_BASE" --rpu-in "$RPU_FINAL" -o "$inject_target" >"$WORKDIR/rpu_inject.log" 2>&1 &
   local inject_pid=$!
+  _ACTIVE_FFMPEG_PID=$inject_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
   spinner "$inject_pid" "Injecting DV RPU into video"
-  if ! wait "$inject_pid" 2>/dev/null; then
+  local _inject_rc=0; wait "$inject_pid" 2>/dev/null || _inject_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+  if (( _inject_rc != 0 )); then
     warn "DV RPU injection failed. See: $WORKDIR/rpu_inject.log"
     if (( ALLOW_DV_FALLBACK )); then
       warn "Falling back to base video without DV."
@@ -8433,8 +8470,10 @@ run_video_pipeline() {
   if (( dv_needs_convert )); then
     dovi_tool convert -i "$V_INJECTED" -o "$V_MIXED" -d >"$WORKDIR/rpu_convert.log" 2>&1 &
     local conv_pid=$!
+    _ACTIVE_FFMPEG_PID=$conv_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
     spinner "$conv_pid" "Converting DV RPU (P${DV_SRC_PROFILE} → P8.1)"
-    if wait "$conv_pid" 2>/dev/null && [[ -s "$V_MIXED" ]]; then
+    local _conv_rc=0; wait "$conv_pid" 2>/dev/null || _conv_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+    if (( _conv_rc == 0 )) && [[ -s "$V_MIXED" ]]; then
       note "DV profile converted (P${DV_SRC_PROFILE} → P8.1)"
       report_add "dv_rpu_action" "converted P${DV_SRC_PROFILE} → P8.1"
       # video_injected is now superseded by the converted V_MIXED — reclaim it.
@@ -8567,8 +8606,10 @@ run_video_pipeline() {
       "$MP4BOX_CMD" "${fps_arg[@]}" -add "${V_MIXED}${dvp_hint}" \
            -new "$dv_prewrap" >"$WORKDIR/dv_prewrap_mp4box.log" 2>&1 &
       local pw_mp4box_pid=$!
+      _ACTIVE_FFMPEG_PID=$pw_mp4box_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
       spinner "$pw_mp4box_pid" "Pre-wrapping DV video (mp4box)"
-      if wait "$pw_mp4box_pid" 2>/dev/null && [[ -s "$dv_prewrap" ]]; then
+      local _pw_mp4box_rc=0; wait "$pw_mp4box_pid" 2>/dev/null || _pw_mp4box_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+      if (( _pw_mp4box_rc == 0 )) && [[ -s "$dv_prewrap" ]]; then
         local pw_probe
         pw_probe="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
                      stream_side_data -select_streams v:0 "$dv_prewrap" 2>&1)" || true
@@ -8606,8 +8647,10 @@ run_video_pipeline() {
            -movflags +faststart \
            -f mp4 "$dv_prewrap" >"$WORKDIR/dv_prewrap.log" 2>&1 &
       local pw_ff_pid=$!
+      _ACTIVE_FFMPEG_PID=$pw_ff_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
       spinner "$pw_ff_pid" "Pre-wrapping DV video (ffmpeg fallback)"
-      if wait "$pw_ff_pid" 2>/dev/null && [[ -s "$dv_prewrap" ]]; then
+      local _pw_ff_rc=0; wait "$pw_ff_pid" 2>/dev/null || _pw_ff_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+      if (( _pw_ff_rc == 0 )) && [[ -s "$dv_prewrap" ]]; then
         local pw_probe2
         pw_probe2="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -show_entries \
                       stream_side_data -select_streams v:0 "$dv_prewrap" 2>&1)" || true
@@ -8648,8 +8691,10 @@ run_video_pipeline() {
              -movflags +faststart \
              -f mp4 "$dv_prewrap" >"$WORKDIR/dv_prewrap.log" 2>&1 &
         local pw_ts_pid=$!
+        _ACTIVE_FFMPEG_PID=$pw_ts_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
         spinner "$pw_ts_pid" "Wrapping DV video for MKV mux (timestamps)"
-        if wait "$pw_ts_pid" 2>/dev/null && [[ -s "$dv_prewrap" ]]; then
+        local _pw_ts_rc=0; wait "$pw_ts_pid" 2>/dev/null || _pw_ts_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+        if (( _pw_ts_rc == 0 )) && [[ -s "$dv_prewrap" ]]; then
           V_DV_MP4="$dv_prewrap"
           note "✅ DV video wrapped into timestamped MP4 for MKV mux (RPU preserved in-band)."
           report_add "dv_prewrap" "timestamped wrap (mkv)"
@@ -9747,8 +9792,9 @@ run_audio_pipeline(){
         local _ns_pid=$!
         _ACTIVE_FFMPEG_PID=$_ns_pid
         spinner "$_ns_pid" "Copying native stereo track"
-        _ACTIVE_FFMPEG_PID=""
-        if ! wait "$_ns_pid" 2>/dev/null; then
+        # M3: capture wait result, THEN clear (clearing before wait would orphan the child on SIGINT).
+        local _ns_rc=0; wait "$_ns_pid" 2>/dev/null || _ns_rc=$?; _ACTIVE_FFMPEG_PID=""
+        if (( _ns_rc != 0 )); then
           warn "Native stereo copy failed - continuing without it. See: $WORKDIR/audio_stereo.err"
           AAC_STEREO=""
         else
@@ -10041,8 +10087,7 @@ _prepare_subtitle(){
       local ocr_sup_pid=$!
       _ACTIVE_FFMPEG_PID=$ocr_sup_pid
       spinner "$ocr_sup_pid" "Running OCR on subtitle #${idx} (SUP)"
-      _ACTIVE_FFMPEG_PID=""
-      wait "$ocr_sup_pid" 2>/dev/null || true
+      wait "$ocr_sup_pid" 2>/dev/null || true; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait (a SIGINT before wait would otherwise orphan the OCR child and could hang the tee drain)
       # Check common output locations for the SRT
       if [[ -s "${sup%.sup}.srt" ]]; then
         mv -f "${sup%.sup}.srt" "$srt" || true
@@ -10147,8 +10192,7 @@ _prepare_ext_subtitle(){
       local ocr_pid=$!
       _ACTIVE_FFMPEG_PID=$ocr_pid
       spinner "$ocr_pid" "OCR external PGS: $basename_label"
-      _ACTIVE_FFMPEG_PID=""
-      wait "$ocr_pid" 2>/dev/null || true
+      wait "$ocr_pid" 2>/dev/null || true; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait (avoid orphaning the OCR child on SIGINT)
 
       # Some OCR tools write .srt next to source file; relocate to workdir
       local sup_srt="${ext_path%.sup}.srt"
@@ -10194,8 +10238,7 @@ _prepare_ext_subtitle(){
       local ocr_pid=$!
       _ACTIVE_FFMPEG_PID=$ocr_pid
       spinner "$ocr_pid" "OCR external VobSub: $basename_label"
-      _ACTIVE_FFMPEG_PID=""
-      wait "$ocr_pid" 2>/dev/null || true
+      wait "$ocr_pid" 2>/dev/null || true; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait (avoid orphaning the OCR child on SIGINT)
 
       if [[ -s "$srt_out" ]] && grep -q ' --> ' "$srt_out"; then
         echo "$srt_out"
@@ -11723,9 +11766,8 @@ main() {
             local _sii_cp_pid=$!
             _ACTIVE_FFMPEG_PID=$_sii_cp_pid
             spinner "$_sii_cp_pid" "Copying source to output"
-            _ACTIVE_FFMPEG_PID=""
-            wait "$_sii_cp_pid" 2>/dev/null \
-              || die 41 "Failed to copy source to output (skip-if-ideal)"
+            local _sii_cp_rc=0; wait "$_sii_cp_pid" 2>/dev/null || _sii_cp_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+            (( _sii_cp_rc == 0 )) || die 41 "Failed to copy source to output (skip-if-ideal)"
           fi
           _validate_media_file "$TMP_OUT" "Skip-if-ideal copy"
           note "Linked/copied source to output (already ideal)."

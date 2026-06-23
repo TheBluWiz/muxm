@@ -1403,6 +1403,9 @@ test_cli() {
   _test_cli_robustness
   _test_cli_value_flag_no_value
   _test_cli_l3_value_validation
+  _test_cli_m1_dashdash
+  _test_cli_m5_config_missing_val
+  _test_cli_m6_replace_source_eof
 
   # F6: no advisory may emit the invalid muxm flag value `--video-codec libsvtav1`. muxm's flag
   # value is `libsvt-av1` (hyphenated); `libsvtav1` is the ffmpeg ENCODER name, not a valid
@@ -1412,6 +1415,71 @@ test_cli() {
   else
     pass "F6: no advisory emits an invalid '--video-codec libsvtav1' value"
   fi
+}
+
+# M1: `--` (end-of-options) must fold the remaining args back into POSITIONALS. The old
+# `--) shift; break` dropped them, so `muxm -- <src>` lost its source (and `muxm -- -dash.mkv`,
+# the one idiom `--` exists for, could not work at all). Fixed → the source resolves and a plan is
+# produced; bug → the parser falls through to no-source usage/help. Perturb MUT-M1-DASHDASH reverts
+# the fold. Uses --dry-run (no encode); discriminates on "Plan:" present vs the "Usage:" banner.
+_test_cli_m1_dashdash() {
+  local _src="$TESTDIR/basic_sdr_subs.mkv" out
+  out="$(run_muxm --dry-run -- "$_src")"
+  if grep -qiE "DRY-RUN is ON|^▶ Plan:|Plan:" <<<"$out" && ! grep -qE "^Usage: muxm" <<<"$out"; then
+    pass "M1: '-- <src>' resolves the following source (not dropped)"
+  else
+    fail "M1: '--' dropped the source positional (got usage/help instead of a plan)"
+  fi
+  # The idiom `--` exists for: a source whose name begins with '-'.
+  local _dashdir="$TESTDIR/m1_dash"; mkdir -p "$_dashdir"
+  cp "$_src" "$_dashdir/-dash.mkv"
+  local out2
+  out2="$(cd "$_dashdir" && HOME="${MUXM_HOME:-$HOME}" "$MUXM" -K --dry-run -- -dash.mkv 2>&1 || true)"
+  if grep -qiE "DRY-RUN is ON|Plan:" <<<"$out2" && ! grep -qE "^Usage: muxm" <<<"$out2"; then
+    pass "M1: '-- -dash.mkv' resolves a leading-dash source (the idiom -- exists for)"
+  else
+    fail "M1: '-- -dash.mkv' did not resolve a leading-dash source"
+  fi
+  rm -rf "$_dashdir"
+}
+
+# M5: a trailing value-flag in --create-config overrides (e.g. `--crf` with no value) must exit
+# cleanly with die 11, not crash under `set -u` with an unbound-variable ERR bundle. The config
+# sub-parser now fetches values via _cc_need_val (bounds-checked, mirrors the main _require_val).
+# Perturb MUT-M5-UNBOUND reverts one arm to the raw unchecked index read → unbound-variable crash
+# → non-11 exit → red.
+_test_cli_m5_config_missing_val() {
+  local _h="$TESTDIR/m5_home"; mkdir -p "$_h"
+  assert_exit 11 "M5: --create-config with a trailing --crf (missing value) → clean die 11" \
+    --create-config user atv-directplay-hq --crf
+  # Sanity: a present value still parses (no false die).
+  local rc=0
+  ( cd "$TESTDIR" && HOME="$_h" "$MUXM" --create-config user atv-directplay-hq --crf 20 >/dev/null 2>&1 ) || rc=$?
+  if (( rc == 0 )); then
+    pass "M5: --create-config with '--crf 20' (value present) still succeeds"
+  else
+    fail "M5: --create-config '--crf 20' wrongly failed (exit $rc) — bounds check too aggressive?"
+  fi
+  rm -rf "$_h"
+}
+
+# M6: REPLACE_SOURCE set via .muxmrc bypasses the --replace-source TTY guard, so the confirm
+# prompt's `read` hits EOF under non-interactive stdin. The fix treats EOF as a decline
+# (`read … || _confirm=""`) → clean die 11, instead of an ERR-trap crash (exit 1) under set -e.
+# Perturb MUT-M6-EOF removes the `|| _confirm=""` → EOF crashes → non-11 exit → red.
+_test_cli_m6_replace_source_eof() {
+  local _dir="$TESTDIR/m6_eof"; mkdir -p "$_dir/h"
+  cp "$TESTDIR/basic_sdr_subs.mkv" "$_dir/clip.mkv"
+  printf 'REPLACE_SOURCE=1\n' > "$_dir/.muxmrc"   # bypasses the flag's TTY guard
+  local out rc=0
+  # SRC == OUT triggers the replace-source confirm prompt; </dev/null makes read hit EOF.
+  out="$(cd "$_dir" && HOME="$_dir/h" "$MUXM" clip.mkv clip.mkv </dev/null 2>&1)" || rc=$?
+  if (( rc == 11 )) && grep -qiE "declined|Aborted" <<<"$out"; then
+    pass "M6: REPLACE_SOURCE + non-interactive stdin → clean die 11 (EOF treated as decline)"
+  else
+    fail "M6: REPLACE_SOURCE + EOF stdin → expected die 11, got exit $rc (ERR-trap crash?)"
+  fi
+  rm -rf "$_dir"
 }
 
 # L3: --level and the rate flags (--av1-maxrate/--av1-bufsize/--stereo-bitrate) are validated at
@@ -6208,6 +6276,38 @@ test_output() {
     fi
     rm -rf "$_m1_dir"
   fi
+
+  _test_output_m2_cleanup_on_checksum_fail
+}
+
+# M2: a failed final mv/checksum must not abort on_exit's cleanup and leak the workdir. The bug:
+# under `set -e`, a non-zero `(( CHECKSUM )) && write_checksum "$OUT"` (last cmd of an && list)
+# exits the shell mid-on_exit, skipping the drain/log-persist/workdir-cleanup. (Disarming the ERR
+# trap alone does NOT prevent this — `set -e` still exits; the real fix is GUARDING the call so it
+# never trips errexit, which on_exit now does via `write_checksum … || warn`.) Here the checksum
+# tools are shimmed to fail; a fixed muxm finishes cleanly and removes its .muxm.tmp.* workdir,
+# while perturb MUT-M2-CLEANUP reverts the guard to a bare `write_checksum` → errexit aborts
+# on_exit → the workdir leaks. WORKDIR_PARENT=OUT_DIR (no --workdir here), so counting leaks in the
+# output dir is exact.
+_test_output_m2_cleanup_on_checksum_fail() {
+  local _dir="$TESTDIR/m2_cleanup"; mkdir -p "$_dir/bin" "$_dir/out" "$_dir/h"
+  # Force write_checksum to return non-zero by shimming every checksum tool to fail.
+  local _t
+  for _t in shasum sha256sum b2sum; do
+    printf '#!/bin/sh\nexit 1\n' > "$_dir/bin/$_t"; chmod +x "$_dir/bin/$_t"
+  done
+  local _src="$TESTDIR/basic_sdr_subs.mkv" _out="$_dir/out/m2.mkv" rc=0
+  log "Testing M2: a failing checksum must not abort on_exit cleanup (no workdir leak)..."
+  # NOTE: invoked WITHOUT -K (KEEP_TEMP_ALWAYS would legitimately keep the workdir and mask the leak).
+  ( cd "$_dir/out" && HOME="$_dir/h" PATH="$_dir/bin:$PATH" \
+      "$MUXM" --no-skip-if-ideal --checksum --crf 30 --preset ultrafast "$_src" "$_out" >/dev/null 2>&1 ) || rc=$?
+  local _leaked; _leaked="$(find "$_dir/out" -maxdepth 1 -name '.muxm.tmp.*' -type d 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ -s "$_out" && "$_leaked" == "0" ]]; then
+    pass "M2: failed checksum did not abort cleanup — workdir removed, output intact (exit $rc)"
+  else
+    fail "M2: failed checksum leaked the workdir (leaked=$_leaked) or lost output (exists=$([[ -s "$_out" ]] && echo yes || echo no), exit $rc)"
+  fi
+  rm -rf "$_dir"
 }
 
 # === Suite: Container Formats ===
@@ -8830,6 +8930,48 @@ test_unit() {
   _test_unit_persist_helpers
   _test_unit_prefer_complete_ffmpeg
   _test_unit_parse_audio_record
+  _test_unit_m3_ffmpeg_pid_lifecycle
+}
+
+# M3: _ACTIVE_FFMPEG_PID lifecycle — on_exit SIGKILLs $_ACTIVE_FFMPEG_PID on interrupt, so every
+# backgrounded HEAVY child (ffmpeg / dovi_tool / MP4Box / OCR / cp) must (A) register its pid right
+# after launch and (B) clear it only AFTER its `wait` (clearing before wait orphans the child on a
+# SIGINT in that window, and an OCR child holding the tee write-end can hang the drain). This is a
+# STRUCTURAL invariant test (a real SIGINT race is infeasible to test deterministically — same
+# rationale as the L5 disk-hint source check). Two perturbs exercise it: MUT-M3-REGISTER removes a
+# registration (invariant A → red); MUT-M3-CLEARWAIT reorders one site to clear-before-wait
+# (invariant B → red). The DV launches are all sequential (launch→spinner→wait), so the scalar
+# _ACTIVE_FFMPEG_PID is sufficient — no two heavy children run concurrently.
+_test_unit_m3_ffmpeg_pid_lifecycle() {
+  # Invariant A: every `local <v>=$!` heavy-child launch registers _ACTIVE_FFMPEG_PID on the next
+  # line. Allowlist the light/infra launches that intentionally do NOT register (tee drain,
+  # checksum tool, tee watchdog) — orphaning those on Ctrl-C is harmless and on_exit handles the tee.
+  local _unreg
+  _unreg="$(awk '/local [A-Za-z_]+=\$!/{
+      v=$0; sub(/^[[:space:]]*local /,"",v); sub(/=\$!.*/,"",v); ln=NR; getline n;
+      if (v=="drain_pid"||v=="_cksum_pid"||v=="_tee_wd") next;
+      if (index(n,"_ACTIVE_FFMPEG_PID=$" v)==0) print ln":"v;
+    }' "$MUXM")"
+  if [[ -z "$_unreg" ]]; then
+    pass "M3: every backgrounded heavy child registers _ACTIVE_FFMPEG_PID right after launch"
+  else
+    fail "M3: backgrounded heavy child(ren) not registered (orphaned on Ctrl-C): ${_unreg//$'\n'/ }"
+  fi
+
+  # Invariant B: no clear-before-wait — neither same-line (clear position < wait position) nor
+  # cross-line (a bare `_ACTIVE_FFMPEG_PID=""` line immediately followed by a wait line).
+  local _cbw
+  _cbw="$(awk '
+    { c=index($0,"_ACTIVE_FFMPEG_PID=\"\""); w=index($0,"wait \"$");
+      if (c>0 && w>0 && c<w) print NR":same-line";
+      if (prev && $0 ~ /^[[:space:]]*(if[[:space:]]+!?[[:space:]]*)?wait "\$/) print (NR-1)":cross-line";
+      prev=($0 ~ /_ACTIVE_FFMPEG_PID=""[[:space:]]*$/);
+    }' "$MUXM")"
+  if [[ -z "$_cbw" ]]; then
+    pass "M3: _ACTIVE_FFMPEG_PID is always cleared AFTER its wait (no clear-before-wait)"
+  else
+    fail "M3: clear-before-wait at: ${_cbw//$'\n'/ } — a SIGINT there orphans the child / can hang the drain"
+  fi
 }
 
 # Regression: _parse_audio_record must preserve an EMPTY title field. A plain `IFS=$'\t' read`
@@ -9486,6 +9628,33 @@ test_setup() {
     fail "F5: --install-dependencies still uses the homebrew-ffmpeg tap (should be ffmpeg-full)"
   else
     pass "F5: --install-dependencies no longer taps homebrew-ffmpeg"
+  fi
+
+  # ---- M4: a failing _ensure_ffmpeg_full must NOT abort the installer before its summary ----
+  # Pre-fix the call was bare; a `return 1` (failed/incomplete ffmpeg-full install) exited the
+  # whole run under set -e, so the "Summary: …" line never printed. Reuse the incomplete-ffmpeg
+  # stub (forces the install path) with a brew stub that FAILS `install ffmpeg-full` (the
+  # return-1 path). The fixed `_ensure_ffmpeg_full || true` records the failure and still prints
+  # the summary. Perturb MUT-M4-SUMMARY reverts the guard → set -e abort → no summary → red.
+  local m4_bin m4_prefix m4_log
+  m4_bin="$fake_home/m4_bin"; m4_prefix="$fake_home/m4_prefix"
+  mkdir -p "$m4_bin" "$m4_prefix/share/man/man1"
+  : > "$m4_prefix/brew_calls.log"; m4_log="$m4_prefix/brew_calls.log"
+  # brew stub: answer --prefix; FAIL `install ffmpeg-full`; no-op everything else.
+  # shellcheck disable=SC2016  # stub body stays literal; only the two %s (log, prefix) expand here.
+  printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s"\n[[ "$1" == "--prefix" ]] && { printf "%%s\\n" "%s"; exit 0; }\nif [[ "$1" == "install" && "$2" == "ffmpeg-full" ]]; then exit 1; fi\nexit 0\n' \
+    "$m4_log" "$m4_prefix" > "$m4_bin/brew"
+  chmod +x "$m4_bin/brew"
+  # Incomplete ffmpeg (no libass/AV1) so _ensure_ffmpeg_full proceeds to the (failing) install.
+  # shellcheck disable=SC2016  # mock ffmpeg: $1 stays literal; it expands when the stub runs.
+  printf '#!/bin/bash\ncase "$1" in -version) echo "ffmpeg version 6.0";; *) :;; esac\nexit 0\n' > "$m4_bin/ffmpeg"
+  chmod +x "$m4_bin/ffmpeg"
+  local m4_out
+  m4_out="$(HOME="$fake_home" PATH="$m4_bin:$PATH" "$MUXM" --install-dependencies 2>&1)" || true
+  if printf '%s\n' "$m4_out" | grep -qE "^Summary: [0-9]+ checked,"; then
+    pass "M4: --install-dependencies prints its summary even when ffmpeg-full install fails"
+  else
+    fail "M4: installer aborted before the summary when _ensure_ffmpeg_full failed"
   fi
 
   # ---- --uninstall-man standalone (R24, R25) ----

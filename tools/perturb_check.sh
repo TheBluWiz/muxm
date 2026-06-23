@@ -218,6 +218,67 @@ enforce MUT-H3-SORTZ ext_subs \
   'H3: external sidecar NOT discovered under BSD sort' \
   'M-H3-SORTZ: discover_external_subtitles portable-sort fallback → BSD-sort sidecar-discovery probe'
 
+# MUT-M1-DASHDASH (Phase 3, M1): revert the `--` end-of-options handler to the old drop-positionals
+# form. `muxm -- <src>` then loses its source and falls through to usage/help instead of a plan.
+# shellcheck disable=SC2016  # $@ is literal sed text.
+enforce MUT-M1-DASHDASH cli \
+  's/    --) shift; POSITIONALS+=("$@"); break ;;.*/    --) shift; break ;;/' \
+  "M1: '--' dropped the source positional" \
+  'M-M1-DASHDASH: `--` folds remaining args into POSITIONALS → end-of-options source-resolution probe'
+
+# MUT-M2-CLEANUP (Phase 3, M2): revert the guarded checksum call to a bare `&& write_checksum`.
+# A failed checksum (last cmd of the && list) then trips `set -e` and aborts on_exit mid-way,
+# skipping the workdir cleanup → the workdir leaks. (The ERR-disarm alone does NOT prevent this —
+# set -e exits regardless; the guard is the real fix.) The leak probe goes red.
+# shellcheck disable=SC2016  # $OUT is literal sed text.
+enforce MUT-M2-CLEANUP output \
+  's#{ write_checksum "$OUT" || warn "Could not write the checksum file for $OUT."; }#write_checksum "$OUT"#' \
+  'M2: failed checksum leaked the workdir' \
+  'M-M2-CLEANUP: guarded final checksum keeps set -e from aborting on_exit → no-workdir-leak probe'
+
+# MUT-M3-REGISTER (Phase 3, M3): drop one DV child registration (inject_pid) so it is launched but
+# never recorded in _ACTIVE_FFMPEG_PID — on Ctrl-C on_exit cannot SIGKILL it (orphan). The
+# structural registration invariant goes red.
+# shellcheck disable=SC2016  # $inject_pid is literal sed text.
+enforce MUT-M3-REGISTER unit \
+  's/_ACTIVE_FFMPEG_PID=\$inject_pid.*/: # mutated/' \
+  'M3: backgrounded heavy child(ren) not registered' \
+  'M-M3-REGISTER: every backgrounded heavy child registers _ACTIVE_FFMPEG_PID → orphan-on-Ctrl-C probe'
+
+# MUT-M3-CLEARWAIT (Phase 3, M3): reorder one OCR site to clear _ACTIVE_FFMPEG_PID BEFORE its wait.
+# A SIGINT in that window orphans the OCR child (which may hold the tee write-end and hang the
+# drain). The structural clear-after-wait invariant goes red.
+# shellcheck disable=SC2016  # $ocr_sup_pid is literal sed text.
+enforce MUT-M3-CLEARWAIT unit \
+  's@wait "$ocr_sup_pid" 2>/dev/null || true; _ACTIVE_FFMPEG_PID=""@_ACTIVE_FFMPEG_PID=""; wait "$ocr_sup_pid" 2>/dev/null || true@' \
+  'M3: clear-before-wait at:' \
+  'M-M3-CLEARWAIT: _ACTIVE_FFMPEG_PID cleared only AFTER wait → orphan-during-wait-window probe'
+
+# MUT-M4-SUMMARY (Phase 3, M4): revert the guarded _ensure_ffmpeg_full call to bare. Its return-1
+# (failed ffmpeg-full install) then aborts the installer under set -e before the summary prints.
+enforce MUT-M4-SUMMARY setup \
+  's/_ensure_ffmpeg_full || true/_ensure_ffmpeg_full/' \
+  'M4: installer aborted before the summary' \
+  'M-M4-SUMMARY: guarded _ensure_ffmpeg_full call → installer-summary-still-prints probe'
+
+# MUT-M5-UNBOUND (Phase 3, M5): revert the --crf config-override arm to the raw unchecked index
+# read. A trailing `--crf` (no value) then crashes under set -u (unbound variable) instead of a
+# clean die 11. Anchored on the --crf arm so only it reverts.
+# shellcheck disable=SC2016  # ${_cc_override_argv[...]} is literal sed text.
+enforce MUT-M5-UNBOUND cli \
+  's#--crf)\(  *\)_cc_need_val;#--crf)\1_cc_val="${_cc_override_argv[$((_cc_oi+1))]}";#' \
+  'M5: --create-config with a trailing --crf (missing value)' \
+  'M-M5-UNBOUND: _cc_need_val bounds-checks config-override values → clean-die-11 probe'
+
+# MUT-M6-EOF (Phase 3, M6): drop the `|| _confirm=""` EOF guard on the replace-source prompt. A
+# non-interactive stdin (EOF) then makes `read` fail and crash under set -e instead of a clean
+# die 11 decline.
+# shellcheck disable=SC2016  # _confirm is literal sed text.
+enforce MUT-M6-EOF cli \
+  's/  read -r _confirm || _confirm="".*/  read -r _confirm/' \
+  'M6: REPLACE_SOURCE + EOF stdin → expected die 11' \
+  'M-M6-EOF: read EOF treated as decline → clean-die-11-not-crash probe'
+
 # M-AUD-1 (Phase 2.1 — was pending): the same '(10 - rank)' inversion, now caught by the new
 # direct _score_audio_stream unit test. The ch<6 scenario keeps this signature distinct from
 # M-AUD-3 (surround only applies at ≥6ch).
