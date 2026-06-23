@@ -162,6 +162,27 @@ enforce MUT-C2-MTLANG audio \
   'C2 multi-track: untagged track a:1 has garbage numeric language' \
   'M-C2-MTLANG: run_audio_pipeline_multi non-collapsing split → untagged-language output-metadata probe'
 
+# MUT-C2-CSAFETY (C2 follow-up): revert the audio-record split in _check_multitrack_container_safety
+# to the collapsing `IFS=$'\t' read`. An untagged-language commentary track then loses its title,
+# so _audio_is_commentary misses it and the track is wrongly counted as a kept lossless stream →
+# muxm die-11s the MP4 encode it should have accepted. Anchored on that site's unique inline
+# comment. The container-safety probe (untagged TrueHD commentary → MP4 must succeed) goes red.
+# shellcheck disable=SC2016  # $_info / $'\t' are literal sed text — they must NOT expand here.
+enforce MUT-C2-CSAFETY audio \
+  's|_split_tab "$_info" _codec _ch _lang _br _title  # C2: non-collapsing — keep-filter mirrors _build_audio_keep_list|IFS=$'"'"'\t'"'"' read -r _codec _ch _lang _br _title <<< "$_info"|' \
+  'C2 container-safety: MP4 encode wrongly blocked' \
+  'M-C2-CSAFETY: _check_multitrack_container_safety non-collapsing split → untagged-commentary keep-filter probe'
+
+# MUT-C2-VERIFY (C2 follow-up): revert the per-record split in mux_final's post-encode "Audio :"
+# verify summary to a collapsing read. A track with an empty bit_rate field (e.g. FLAC) then shifts
+# its channel_layout into the title slot, so the verify line shows the layout instead of the title.
+# Anchored on the unique `_split_tab "$_a_rec" …` line. The verify-display probe goes red.
+# shellcheck disable=SC2016  # $_a_rec / $'\t' are literal sed text — they must NOT expand here.
+enforce MUT-C2-VERIFY audio \
+  's|_split_tab "$_a_rec" a_codec a_ch a_lang a_br a_title a_layout|IFS=$'"'"'\t'"'"' read -r a_codec a_ch a_lang a_br a_title a_layout <<< "$_a_rec"|' \
+  'C2 verify-display: verify Audio line lost the title' \
+  'M-C2-VERIFY: mux_final verify-summary non-collapsing split → empty-bitrate title-shift probe'
+
 # M-AUD-1 (Phase 2.1 — was pending): the same '(10 - rank)' inversion, now caught by the new
 # direct _score_audio_stream unit test. The ch<6 scenario keeps this signature distinct from
 # M-AUD-3 (surround only applies at ≥6ch).

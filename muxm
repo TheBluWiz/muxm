@@ -11498,7 +11498,7 @@ _check_multitrack_container_safety() {
     _an="$(_audio_stream_count)"
     for (( _ai=0; _ai<_an; _ai++ )); do
       _info="$(_audio_stream_info "$_ai")"
-      IFS=$'\t' read -r _codec _ch _lang _br _title <<< "$_info"
+      _split_tab "$_info" _codec _ch _lang _br _title  # C2: non-collapsing — keep-filter mirrors _build_audio_keep_list
       _normalize_codec_lang _codec _lang
       [[ -n "${AUDIO_LANG_PREF:-}" ]] && ! _audio_lang_matches "$_lang" && continue
       (( ! AUDIO_KEEP_COMMENTARY )) && _audio_is_commentary "$_title" && continue
@@ -11977,8 +11977,11 @@ main() {
         .[] |
         "\(.codec_name // "?")\t\(.channels // 0)\t\(.tags.language // "und")\t\(.bit_rate // "")\t\(.tags.title // "")\t\(.channel_layout // "")"
       ' 2>/dev/null)"
-      while IFS=$'\t' read -r a_codec a_ch a_lang a_br a_title a_layout; do
+      local _a_rec a_codec a_ch a_lang a_br a_title a_layout
+      while IFS= read -r _a_rec; do
         a_had_audio=1
+        # C2: non-collapsing split — an empty bit_rate field must not shift title/layout left.
+        _split_tab "$_a_rec" a_codec a_ch a_lang a_br a_title a_layout
         local a_line a_ch_label
         # Descriptive channel label
         a_ch_label="$(_channel_label "${a_ch:-0}")"

@@ -4532,6 +4532,8 @@ EOF
   _test_audio_h3_no_audio_guard
   _test_audio_l5_disk_hint
   _test_audio_c2_untagged_lang
+  _test_audio_c2_container_safety
+  _test_audio_c2_verify_display
 }
 
 # L5: the audio copy/transcode failure paths (die 43) must surface the disk-full hint like the
@@ -4605,6 +4607,77 @@ _test_audio_c2_untagged_lang() {
     fail "C2 multi-track: untagged track a:1 has garbage numeric language=$a1_lang (must stay untagged, never digits)"
   else
     pass "C2 multi-track: untagged track a:1 stays untagged (language='$a1_lang', not a digit string)"
+  fi
+}
+
+# C2 (container-safety): _check_multitrack_container_safety parses each audio record to decide
+# which KEPT tracks an MP4/MOV target can't carry losslessly, then die 11s to prevent silent
+# quality loss. Its keep-filter mirrors _build_audio_keep_list (language + commentary). With the
+# old collapsing read, an UNTAGGED-language commentary track lost its title (the empty language
+# field collapsed and shifted fields), so `_audio_is_commentary` saw an empty title → the
+# commentary was treated as a kept lossless track → muxm wrongly REFUSED the MP4 encode. Here an
+# untagged-language TrueHD commentary track must be recognised and dropped, so an MP4 encode of an
+# (otherwise MP4-safe) EAC3 main track SUCCEEDS. Perturb MUT-C2-CSAFETY reverts this site to the
+# collapsing read → the commentary is wrongly kept → die 11 → red. Gated on the truehd encoder.
+_test_audio_c2_container_safety() {
+  if ! ffmpeg_has_encoder truehd; then
+    skip "C2 container-safety: truehd encoder unavailable (cannot build a lossless-HD fixture)"; return
+  fi
+  local src="$TESTDIR/c2_csafety.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=navy:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=660:duration=2" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -map 0:v -map 1:a -map 2:a \
+    -c:a:0 eac3 -b:a:0 448k -ac:a:0 6 \
+    -c:a:1 truehd -ac:a:1 6 -strict -2 \
+    -metadata:s:a:0 language=eng -metadata:s:a:0 title="Main Feature" \
+    -metadata:s:a:1 title="Director's Commentary" \
+    "$src" 2>/dev/null
+  if [[ ! -s "$src" ]]; then
+    fail "C2 container-safety: could not create untagged-TrueHD-commentary fixture"; return
+  fi
+  local home="$TESTDIR/c2cs_home"; mkdir -p "$home"
+  local dst="$TESTDIR/out_c2_csafety.mp4" out rc=0
+  log "Testing container-safety with an untagged-language TrueHD commentary track (C2)..."
+  out="$(cd "$TESTDIR" && HOME="$home" "$MUXM" -K --profile archive --output-ext mp4 "$src" "$dst" 2>&1)" || rc=$?
+  if (( rc == 0 )) && [[ -s "$dst" ]]; then
+    pass "C2 container-safety: untagged TrueHD commentary dropped → MP4 encode succeeds (not blocked)"
+  else
+    fail "C2 container-safety: MP4 encode wrongly blocked (rc=$rc) — commentary title lost, truehd kept: $(printf '%s' "$out" | grep -iE "can.t preserve|truehd" | head -1)"
+  fi
+}
+
+# C2 (verify display): mux_final's post-encode "Audio :" summary parses a per-track record whose
+# bit_rate field may be EMPTY (jq emits `.bit_rate // ""` — common for FLAC). With the old
+# collapsing read, that empty middle field shifted the channel_layout into the title slot, so the
+# verify line showed the layout (e.g. "stereo") instead of the real title. The fix routes the
+# split through _split_tab. Here a FLAC track (no reported bitrate) must keep its descriptive
+# title ("Stereo (FLAC)") in the verify summary. --no-skip-if-ideal forces the full mux_final path
+# (the FLAC+HEVC+MKV source is otherwise ideal for archive and would skip the verify display).
+# Perturb MUT-C2-VERIFY reverts this site to a collapsing read → the title becomes the layout → red.
+_test_audio_c2_verify_display() {
+  local src="$TESTDIR/c2_verify_flac.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=maroon:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le \
+    -map 0:v -map 1:a -c:a flac -ac 2 \
+    -metadata:s:a:0 language=eng -metadata:s:a:0 title="Original FLAC" \
+    "$src" 2>/dev/null
+  if [[ ! -s "$src" ]]; then
+    fail "C2 verify-display: could not create FLAC fixture"; return
+  fi
+  local home="$TESTDIR/c2vd_home"; mkdir -p "$home"
+  local dst="$TESTDIR/out_c2_verify.mkv" out aline
+  log "Testing verify-output display with an empty-bitrate (FLAC) track (C2)..."
+  out="$(MUXM_HOME="$home" run_muxm --profile archive --no-skip-if-ideal "$src" "$dst")"
+  aline="$(printf '%s\n' "$out" | grep -E '^[[:space:]]*Audio :' | head -1)"
+  if [[ "$aline" == *"(FLAC)"* ]]; then
+    pass "C2 verify-display: empty-bitrate track keeps its title in the verify summary ('${aline#*Audio : }')"
+  else
+    fail "C2 verify-display: verify Audio line lost the title (empty-bitrate field shifted layout→title): '$aline'"
   fi
 }
 
