@@ -5596,6 +5596,7 @@ SRT
 
   _test_subs_f3_sdh_disposition
   _test_subs_c2_untagged_forced
+  _test_subs_h2_no_reembed
 }
 
 # F3: SDH must be classified by the hearing_impaired DISPOSITION, not just an SDH/HI title. A track
@@ -5685,6 +5686,75 @@ _test_subs_c2_untagged_forced() {
     pass "C2 sub-classify: untagged forced subtitle scans as [und] — Forced (forced) (no field shift)"
   else
     fail "C2 sub-classify: untagged forced subtitle misclassified (collapse shifted lang/title/forced): '$sline'"
+  fi
+  rm -rf "$_dir"
+}
+
+# H2 (subtitle fallback): build_subtitle_plan's direct-map fallback re-embeds a soft text sub when
+# "nothing was prepared". The old guard tested only the three embed vars (SRT_FORCED/FULL/SDH). On
+# a burn+export profile (universal: SUB_BURN_FORCED=1, SUB_EXPORT_EXTERNAL=1) a forced sub routes to
+# SRT_FORCED_BURN_PATH and a full sub to EXTERNAL_SRT_PATHS, leaving the embed vars empty even
+# though subtitles WERE prepared — so the fallback fired and re-embedded a contradictory soft
+# mov_text track on top of the burn/export. The fix also gates on SRT_FORCED_BURN_PATH and
+# EXTERNAL_SRT_PATHS. This test is bidirectional:
+#   (negative) universal + an embedded English full text sub → output carries NO soft subtitle, and
+#              the full sub is exported to a sidecar (proves it WAS prepared, so 0 embedded is the
+#              correct outcome — not merely "no subs"). Perturb MUT-H2-REEMBED reverts the guard.
+#   (positive) an embed-style profile where nothing is prepared but a direct-mappable text sub
+#              exists (atv-directplay-hq --no-sub-sdh on an SDH-only source) → the legitimate
+#              direct-map fallback STILL fires. Guards against the fix over-restricting embed
+#              profiles (for which the two new clauses are no-ops: burn off + export off).
+_test_subs_h2_no_reembed() {
+  local _dir="$TESTDIR/h2_reembed"; mkdir -p "$_dir"
+  # --- negative: universal must not re-embed a soft sub ---
+  printf '1\n00:00:00,000 --> 00:00:02,000\nFull dialogue line\n' > "$_dir/d.srt"
+  local _nsrc="$_dir/full.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=teal:s=320x240:r=24:d=2" -f lavfi -i "sine=frequency=440:duration=2" -i "$_dir/d.srt" \
+    -map 0:v -map 1:a -map 2:s \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le -c:a aac -ac 2 -c:s srt \
+    -metadata:s:a:0 language=eng -metadata:s:s:0 language=eng -metadata:s:s:0 title="English" \
+    "$_nsrc" 2>/dev/null || true
+  local _home="$_dir/home"; mkdir -p "$_home"
+  local _nout="$_dir/out.mp4"
+  log "Testing H2: universal must not re-embed a soft subtitle over burn+export..."
+  if [[ -s "$_nsrc" ]]; then
+    MUXM_HOME="$_home" run_muxm --profile universal "$_nsrc" "$_nout" >/dev/null
+    local _nsub; _nsub="$(count_streams "$_nout" s)"
+    if [[ -s "$_nout" ]] && (( _nsub == 0 )); then
+      pass "H2: universal burns/exports only — no contradictory soft subtitle re-embedded (0 embedded subs)"
+    else
+      fail "H2: universal re-embedded a soft subtitle ($_nsub embedded) despite burn+export (contradictory direct-map)"
+    fi
+    if ls "$_dir"/out.*.srt >/dev/null 2>&1; then
+      pass "H2: the full subtitle was exported to an external sidecar (so 0 embedded is correct, not 'no subs')"
+    else
+      fail "H2: expected an exported .srt sidecar alongside the universal output (full sub not prepared?)"
+    fi
+  else
+    fail "H2: could not build the embedded-full-subtitle fixture"
+  fi
+
+  # --- positive: legitimate direct-map fallback must still fire for an embed profile ---
+  printf '1\n00:00:00,000 --> 00:00:02,000\n[door creaks]\n' > "$_dir/sdh.srt"
+  local _psrc="$_dir/sdh.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=gray:s=320x240:r=24:d=2" -f lavfi -i "sine=frequency=440:duration=2" -i "$_dir/sdh.srt" \
+    -map 0:v -map 1:a -map 2:s \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le -c:a aac -ac 2 -c:s srt \
+    -metadata:s:a:0 language=eng -metadata:s:s:0 language=eng -disposition:s:0 hearing_impaired \
+    "$_psrc" 2>/dev/null || true
+  # Skip-first guard (not an else→skip): only a missing fixture skips; the real assertion lives below.
+  if [[ ! -s "$_psrc" ]]; then
+    skip "H2: could not build the SDH-only fixture for the positive direct-map case"
+    rm -rf "$_dir"; return
+  fi
+  local _pout
+  _pout="$(MUXM_HOME="$_home" run_muxm --dry-run --no-skip-if-ideal --profile atv-directplay-hq --no-sub-sdh "$_psrc")"
+  if grep -q "enabling direct-map" <<<"$_pout"; then
+    pass "H2: legitimate direct-map fallback still fires for an embed profile (fix does not over-restrict)"
+  else
+    fail "H2: direct-map fallback wrongly suppressed for an embed profile (over-restricted by the H2 guard)"
   fi
   rm -rf "$_dir"
 }
@@ -9841,6 +9911,49 @@ EOF
     fi
     rm -rf "$_l2_dir"
   fi
+
+  _test_ext_subs_h3_bsd_sort
+}
+
+# H3: discover_external_subtitles sorted the null-delimited `find` output with GNU-only `sort -z`.
+# On stock-macOS BSD `sort` (no -z) the process substitution emitted nothing and EVERY sidecar was
+# silently dropped (the failure is hidden because `set -e` does not cross the `<( )` boundary). The
+# fix probes for `sort -z` support once and falls back to `cat` (find's single-dir order is fine
+# for sidecar matching), keeping null-delimiting intact on both branches. This machine's /usr/bin/sort
+# may support -z, so we SIMULATE a BSD sort: a shim on PATH that rejects -z. Under the fix the probe
+# selects `cat` and the sidecar is still discovered; perturb MUT-H3-SORTZ flips the fallback back to
+# `sort -z`, which the shim rejects → empty find output → sidecar dropped → red.
+_test_ext_subs_h3_bsd_sort() {
+  # Reuse the committed single-sidecar fixture: ext_only_source.mkv + ext_only_source.en.srt.
+  if [[ ! -s "$TESTDIR/ext_only_source.mkv" || ! -s "$TESTDIR/ext_only_source.en.srt" ]]; then
+    skip "H3: ext_only_source fixture + sidecar missing — cannot test BSD-sort discovery"; return
+  fi
+  local _bin="$TESTDIR/h3_fakebin"; mkdir -p "$_bin"
+  cat > "$_bin/sort" <<'FAKESORT'
+#!/bin/sh
+# Simulate stock-macOS BSD sort: no -z support (reject it, otherwise delegate to the real sort).
+for _a in "$@"; do
+  case "$_a" in
+    -z|--zero-terminated) echo "sort: illegal option -- z" >&2; exit 2 ;;
+  esac
+done
+exec /usr/bin/sort "$@"
+FAKESORT
+  chmod +x "$_bin/sort"
+  # The shim must actually reject -z, else the simulation proves nothing.
+  if printf '' | "$_bin/sort" -z >/dev/null 2>&1; then
+    skip "H3: BSD-sort shim unexpectedly accepts -z — cannot simulate the break"
+    rm -rf "$_bin"; return
+  fi
+  log "Testing H3: external sidecar discovery under a BSD sort (no -z)..."
+  local _out
+  _out="$(cd "$TESTDIR" && PATH="$_bin:$PATH" HOME="${MUXM_HOME:-$HOME}" "$MUXM" -K --dry-run "$TESTDIR/ext_only_source.mkv" 2>&1)" || true
+  if printf '%s\n' "$_out" | grep -qi "external subtitle found"; then
+    pass "H3: external sidecar discovered under BSD sort (no -z) — portable sort fallback works"
+  else
+    fail "H3: external sidecar NOT discovered under BSD sort (no -z) — sort -z silently dropped it"
+  fi
+  rm -rf "$_bin"
 }
 
 # === Suite: Multi-Profile ===

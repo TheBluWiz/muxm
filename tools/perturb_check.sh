@@ -196,6 +196,28 @@ enforce MUT-C2-SUBCLASS subs \
   'C2 sub-classify: untagged forced subtitle misclassified' \
   'M-C2-SUBCLASS: merge_subtitle_sources non-collapsing split → untagged-forced classification probe'
 
+# MUT-H2-REEMBED (Phase 2, H2): revert build_subtitle_plan's direct-map fallback guard to its old
+# "nothing EMBEDDED" form by neutering the two added "nothing PREPARED" clauses (collapse them to
+# `true`). On the universal profile (burn + export) the embed vars are empty even though subs were
+# prepared, so the reverted guard fires the fallback and re-embeds a contradictory soft mov_text
+# track. Both clauses are reverted as a unit (in universal each alone still suppresses the fallback,
+# so neutering only one would not reintroduce the re-embed). The H2 negative probe goes red.
+# shellcheck disable=SC2016  # $SRT_FORCED_BURN_PATH / ${#EXTERNAL_SRT_PATHS[@]} are literal sed text.
+enforce MUT-H2-REEMBED subs \
+  's|\[\[ -z "$SRT_FORCED_BURN_PATH" \]\] && (( ${#EXTERNAL_SRT_PATHS\[@\]} == 0 ))|true|' \
+  'H2: universal re-embedded a soft subtitle' \
+  'M-H2-REEMBED: build_subtitle_plan fallback gates on "nothing prepared" → universal no-reembed probe'
+
+# MUT-H3-SORTZ (Phase 2, H3): flip discover_external_subtitles' portable-sort FALLBACK from `cat`
+# back to GNU-only `sort -z`. On a sort without -z (the test shims a BSD sort on PATH) the probe
+# fails, the else-branch is taken, and `find … | sort -z` then errors → empty → every sidecar is
+# silently dropped. The BSD-sort discovery probe goes red.
+# shellcheck disable=SC2016  # literal sed text.
+enforce MUT-H3-SORTZ ext_subs \
+  's|_sub_sort=( cat )|_sub_sort=( sort -z )|' \
+  'H3: external sidecar NOT discovered under BSD sort' \
+  'M-H3-SORTZ: discover_external_subtitles portable-sort fallback → BSD-sort sidecar-discovery probe'
+
 # M-AUD-1 (Phase 2.1 — was pending): the same '(10 - rank)' inversion, now caught by the new
 # direct _score_audio_stream unit test. The ch<6 scenario keeps this signature distinct from
 # M-AUD-3 (surround only applies at ≥6ch).

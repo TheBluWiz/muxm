@@ -10412,6 +10412,19 @@ discover_external_subtitles(){
   local -a sub_exts=( srt ass ssa vtt sup idx )
   local ext fpath fname parsed lang stype codec
 
+  # H3: sort the null-delimited find output portably. `sort -z` is GNU-only; stock-macOS BSD
+  # `sort` (older Darwin) has no -z, where the old unconditional `sort -z` failed inside the
+  # process substitution and — masked by `set -e` not crossing the `<( )` boundary — yielded
+  # EMPTY output, silently dropping every sidecar. Probe once (mirrors _sed_inplace's GNU/BSD
+  # detection) and fall back to `cat` (find's single-dir order is adequate for sidecar matching).
+  # Both branches keep nulls intact, so the control-char guard / `read -d ''` stay newline-safe.
+  local -a _sub_sort
+  if printf '' | sort -z >/dev/null 2>&1; then
+    _sub_sort=( sort -z )
+  else
+    _sub_sort=( cat )
+  fi
+
   for ext in "${sub_exts[@]}"; do
     while IFS= read -r -d '' fpath; do
       [[ -z "$fpath" || ! -f "$fpath" ]] && continue
@@ -10440,9 +10453,9 @@ discover_external_subtitles(){
       EXT_SUB_CODECS+=("$codec")
 
       note "[Subs] External subtitle found: $fname [$lang] ($stype)"
-    done < <(find "$search_dir" -maxdepth 1 \
+    done < <(find "$search_dir" -maxdepth 1 -type f \
       \( -name "${src_stem}.${ext}" -o -name "${src_stem}.*.${ext}" \) \
-      -print0 2>/dev/null | LC_ALL=C sort -z)
+      -print0 2>/dev/null | LC_ALL=C "${_sub_sort[@]}")
   done
 
   local n="${#EXT_SUB_PATHS[@]}"
@@ -10946,10 +10959,16 @@ build_subtitle_plan(){
     fi
   fi
 
-  # Fallback: try direct-mapping a TEXT subtitle from embedded streams if no SRTs prepared.
+  # Fallback: try direct-mapping a TEXT subtitle from embedded streams if NOTHING was prepared.
   # Only attempt when at least one SUB_INCLUDE_* flag is enabled and all preparation failed.
   # External files are always handled via the main selection loop above (not the fallback).
+  # H2: gate on "nothing PREPARED", not just "nothing EMBEDDED". On burn+export profiles
+  # (universal: SUB_BURN_FORCED=1, SUB_EXPORT_EXTERNAL=1) a forced sub routes to
+  # SRT_FORCED_BURN_PATH and a full sub to EXTERNAL_SRT_PATHS, leaving SRT_FORCED/FULL/SDH empty
+  # even though subtitles WERE prepared — without these two extra clauses the fallback would
+  # wrongly re-embed a contradictory soft mov_text track on top of the burn + external export.
   if [[ -z "$SRT_FORCED" && -z "$SRT_FULL" && -z "$SRT_SDH" ]] \
+     && [[ -z "$SRT_FORCED_BURN_PATH" ]] && (( ${#EXTERNAL_SRT_PATHS[@]} == 0 )) \
      && (( SUB_INCLUDE_FORCED || SUB_INCLUDE_FULL || SUB_INCLUDE_SDH )); then
     DIRECT_SUB_RELIDX="$(_pick_direct_text_sub_relidx)"
     if [[ -n "$DIRECT_SUB_RELIDX" ]]; then
