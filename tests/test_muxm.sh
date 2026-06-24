@@ -11742,6 +11742,58 @@ test_dv_sw() {
   fi
   rm -f "$out"
 
+  # ---- Phase 6: real P7→P8.1 convert-SUCCESS path. The mock-driven tests cover only the convert-
+  #      FAILURE fallback (H10) and copy/re-encode; a SUCCESSFUL dovi_tool convert was never run.
+  #      Fabricate a Profile-7-labeled source (MP4Box dvp hint over the bundled P8 ES) and force a
+  #      re-encode through --dv-convert-p81: muxm must run `dovi_tool convert`, report SUCCESS (the
+  #      "DV profile converted" note fires only on rc0+non-empty output — not the fallback), and
+  #      emit a DV-bearing output. Perturb MUT-DVSW-CONVERT breaks `dovi_tool convert` → the run
+  #      takes the fallback → the success marker vanishes → red.
+  section "P7→P8.1 DV conversion (real dovi_tool convert success path)"
+  local _cv_mp4box=""
+  if command -v MP4Box >/dev/null 2>&1; then _cv_mp4box=MP4Box
+  elif command -v mp4box >/dev/null 2>&1; then _cv_mp4box=mp4box; fi
+  local _cv_bundled
+  _cv_bundled="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures/HDR1080p.MOV"
+  if [[ ! -r "$_cv_bundled" || -z "$_cv_mp4box" ]]; then
+    skip "dv_sw convert: bundled HDR1080p.MOV or MP4Box unavailable — cannot fabricate a P7 source"
+  else
+    local _cv_p8="$TESTDIR/cv_p8.mp4" _cv_es="$TESTDIR/cv_src.hevc" _cv_p7="$TESTDIR/cv_p7.mp4"
+    cp "$_cv_bundled" "$_cv_p8"
+    local _cv_fps
+    _cv_fps="$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=nk=1:nw=1 "$_cv_p8" 2>/dev/null | head -1)"
+    [[ "$_cv_fps" =~ ^[0-9]+/[0-9]+$ || "$_cv_fps" =~ ^[0-9.]+$ ]] || _cv_fps="24"
+    ffmpeg -v error -y -i "$_cv_p8" -map 0:v:0 -c copy -bsf:v hevc_mp4toannexb -f hevc "$_cv_es" 2>/dev/null
+    "$_cv_mp4box" -fps "$_cv_fps" -add "${_cv_es}:dvp=7.6" -new "$_cv_p7" >/dev/null 2>&1
+    local _cv_prof
+    _cv_prof="$(ffprobe -v error -show_streams -select_streams v:0 "$_cv_p7" 2>/dev/null | grep -m1 '^dv_profile=' | cut -d= -f2)"
+    if [[ ! -s "$_cv_p7" || "$_cv_prof" != "7" ]]; then
+      skip "dv_sw convert: could not fabricate a Profile-7-labeled source (got dv_profile='${_cv_prof:-none}')"
+    else
+      local _cv_out="$TESTDIR/cv_out.mp4" _cv_log="$TESTDIR/cv_term.log"; rm -f "$_cv_out"
+      (cd "$TESTDIR" && "$MUXM" -K --dv-convert-p81 --crf 24 --preset ultrafast --output-ext mp4 "$_cv_p7" "$_cv_out" >"$_cv_log" 2>&1) || true
+      # (1) the convert-SUCCESS path ran (the note fires only after dovi_tool convert returns 0).
+      if grep -qF "DV profile converted" "$_cv_log"; then
+        pass "dv_sw convert: real P7→P8.1 dovi_tool convert succeeded (convert path, not the fallback)"
+      else
+        fail "dv_sw convert: convert-success marker missing — P7→P8.1 convert did not run/succeed. Saw: $(grep -iE 'convert|fallback' "$_cv_log" | head -1)"
+      fi
+      # (2) the run did NOT report a convert failure / fall back to non-DV base.
+      if grep -qiE "dovi_tool convert failed" "$_cv_log"; then
+        fail "dv_sw convert: convert reported FAILURE on a real P7 source (expected success)"
+      else
+        pass "dv_sw convert: no convert-failure fallback triggered"
+      fi
+      # (3) the converted output exists and carries a Dolby Vision configuration record.
+      if [[ -s "$_cv_out" ]] && ffprobe -v error -show_streams -show_entries stream_side_data -select_streams v:0 "$_cv_out" 2>/dev/null | grep -qiE 'dovi|DOVI configuration|dv_profile'; then
+        pass "dv_sw convert: converted output carries a Dolby Vision configuration record"
+      else
+        fail "dv_sw convert: converted output missing or carries no DV configuration record"
+      fi
+    fi
+    rm -f "$_cv_p8" "$_cv_es" "$_cv_p7" "$TESTDIR/cv_out.mp4" "$TESTDIR/cv_term.log" 2>/dev/null || true
+  fi
+
   # ---- C1 regression: skip-if-ideal must evaluate the DV and bit-depth copy gates against the
   #      REAL source, not the still-default globals. IS_DV/DV_SRC_PROFILE/TARGET_PIXFMT are unset
   #      when check_skip_if_ideal runs (they are only populated later, on the non-skip path), so a

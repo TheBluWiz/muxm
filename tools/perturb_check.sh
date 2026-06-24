@@ -441,6 +441,16 @@ enforce MUT-DVSW-1 dv_sw \
   'dv_sw: no Dolby Vision configuration record' \
   'M-DVSW-1: software DV RPU round-trip caught by the dv_sw DOVI-record probe'
 
+# MUT-DVSW-CONVERT (Phase 6): break the `dovi_tool convert` subcommand so the P7→P8.1 conversion
+# fails. With ALLOW_DV_FALLBACK=1 (default) the run falls back to non-DV base (exit 0, no die), so
+# the convert-SUCCESS marker ("DV profile converted") never fires → the new P7→P8.1 convert-success
+# probe goes red. Anchored on the unique `dovi_tool convert -i "$V_INJECTED"` invocation.
+# shellcheck disable=SC2016  # $V_INJECTED is literal sed text — it must NOT expand in this shell.
+enforce MUT-DVSW-CONVERT dv_sw \
+  's/dovi_tool convert -i "$V_INJECTED"/dovi_tool convert-BROKEN -i "$V_INJECTED"/' \
+  'dv_sw convert: convert-success marker missing' \
+  'M-DVSW-CONVERT: real P7→P8.1 dovi_tool convert success path caught by the dv_sw convert probe'
+
 # 2.4a (Phase 2.4): off-by-one the relidx returned by _pick_direct_text_sub_relidx (echo i+1 on
 # the text-codec match). Anchored on the positive `if _is_text_sub_codec` (the keep-list uses the
 # negated `! _is_text_sub_codec`), the `n` advances to the unique echo line. The picker test

@@ -281,9 +281,14 @@ for spec in "${AV1_ENCODES[@]}"; do
     || die 11 "Invalid --av1-encodes spec: '$spec'  (expected label:crf:preset)"
 done
 
-# Set output directory
+# Set output directory. Phase 6: `realpath` is GNU/coreutils — absent on stock macOS — so guard it
+# with a portable `cd … && pwd` fallback (resolves the source file's directory either way).
 if [[ -z "$OUTPUT_DIR" ]]; then
-  OUTPUT_DIR="$(dirname "$(realpath "$SOURCE_FILE")")"
+  if command -v realpath >/dev/null 2>&1; then
+    OUTPUT_DIR="$(dirname "$(realpath "$SOURCE_FILE")")"
+  else
+    OUTPUT_DIR="$(cd "$(dirname -- "$SOURCE_FILE")" 2>/dev/null && pwd)"
+  fi
 fi
 [[ -d "$OUTPUT_DIR" ]] || die 12 "Output directory does not exist: $OUTPUT_DIR"
 
@@ -591,8 +596,8 @@ if (( HAS_VMAF && VMAF_ENABLED )); then
       VMAF_FILTER="libvmaf=log_fmt=json:log_path=/dev/null"
     fi
 
-    # Write VMAF JSON to a temp file
-    VMAF_TMP=$(mktemp /tmp/av1_compare_vmaf.XXXXXX.json)
+    # Write VMAF JSON to a temp file. Phase 6: honor $TMPDIR (macOS uses a per-user dir).
+    VMAF_TMP=$(mktemp "${TMPDIR:-/tmp}/av1_compare_vmaf.XXXXXX.json")
 
     # libvmaf requires: [distorted][reference]libvmaf
     # We use -filter_complex with two inputs: reference (clip) and distorted (encode)
