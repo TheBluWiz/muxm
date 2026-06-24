@@ -2490,6 +2490,7 @@ _test_config_l_create_escape() {
   if [[ ! -f "$_d/.muxmrc" ]]; then fail "L cc-escape: --create-config did not write .muxmrc"; rm -rf "$_d"; return; fi
   # Source the generated config in a clean subshell and read the value back.
   local _got
+  # shellcheck disable=SC1091  # dynamic path to a just-generated test .muxmrc — not statically analyzable
   _got="$(set +u; . "$_d/.muxmrc" 2>/dev/null; printf '%s' "$X265_PARAMS_BASE")"
   if [[ "$_got" == "$_val" ]]; then
     pass "L cc-escape: a quoted override value round-trips faithfully through the generated .muxmrc"
@@ -4691,6 +4692,7 @@ _test_audio_l5_disk_hint() {
   # `_check_disk_full "$WORKDIR/audio_primary.err"` ahead of it. Count both within run_audio_pipeline.
   local body checks dies
   body="$(awk '/^run_audio_pipeline\(\)/,/^\}/' "$MUXM")"
+  # shellcheck disable=SC2016  # $WORKDIR is a LITERAL matched in the extracted muxm source text, not expanded here
   checks="$(printf '%s\n' "$body" | grep -cE '_check_disk_full "\$WORKDIR/audio_primary\.err"')"
   dies="$(printf '%s\n' "$body" | grep -cE 'die 43 "[^"]*audio_primary\.err')"
   if (( dies > 0 && checks >= dies )); then

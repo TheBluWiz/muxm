@@ -6763,7 +6763,7 @@ report_add() {
 write_json_report() {
   (( REPORT_JSON )) || return 0
   local report_path="${OUT%."${OUTPUT_EXT}"}.report.json"
-  {
+  if {
     printf '{\n'
     printf '  "tool": "%s",\n' "$(_json_escape "$APP_NAME v$VERSION")"
     printf '  "profile": "%s",\n' "$(_json_escape "${PROFILE_NAME:-<none>}")"
@@ -6783,9 +6783,11 @@ write_json_report() {
       printf '  "timestamp": "%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     fi
     printf '}\n'
-  } > "$report_path" 2>/dev/null \
-    && note "JSON report written → $report_path" \
-    || warn "Failed to write JSON report to $report_path"   # L (Phase 5): only claim "written" on success
+  } > "$report_path" 2>/dev/null; then
+    note "JSON report written → $report_path"   # L (Phase 5): only claim "written" on success
+  else
+    warn "Failed to write JSON report to $report_path"
+  fi
 }
 
 # Check if source already matches profile requirements (skip-if-ideal)
@@ -9117,7 +9119,7 @@ select_best_audio(){
 
   # Score all tracks, select best, and collect summary in one pass
   local -a score_lines=()
-  local s_score s_idx s_codec s_ch s_lang s_title s_raw_br
+  local s_score s_idx s_codec s_ch s_lang
   for (( i=0; i<n; i++ )); do
     local line score
     line="$(_score_audio_stream "$i")"
@@ -9135,8 +9137,10 @@ select_best_audio(){
     best_idx="${best_line#*$'\t'}"; best_idx="${best_idx%%$'\t'*}"
     for (( i=0; i<n; i++ )); do
       local marker=""
-      # shellcheck disable=SC2034  # s_title, s_raw_br complete the split destructure
-      _split_tab "${score_lines[$i]}" s_score s_idx s_codec s_ch s_lang s_title s_raw_br  # C2: non-collapsing
+      # The record's trailing title/raw_br fields are irrelevant to this score-summary line, but
+      # _split_tab must still consume all 7 fields (else s_lang would absorb the remainder) — sink
+      # them into `_`. (C2: non-collapsing split.)
+      _split_tab "${score_lines[$i]}" s_score s_idx s_codec s_ch s_lang _ _
       [[ "$s_idx" == "$best_idx" ]] && marker=" ★"
       score_summary+="#${s_idx}: ${s_codec} ${s_ch}ch [${s_lang}] = ${s_score}${marker}  "
     done
