@@ -312,6 +312,37 @@ enforce MUT-MDRYC-DRIFT unit \
   'M-DRY-c: _VALID_LOGLEVEL_STR drifted from is_valid_loglevel' \
   'M-MDRYC-DRIFT: _VALID_LOGLEVEL_STR ↔ is_valid_loglevel sync → loglevel drift-guard probe'
 
+# MUT-L-FORCEAAC (Phase 5): revert the force-AAC bitrate to a hardcoded 256k, ignoring
+# STEREO_BITRATE. The forced-AAC probe (STEREO_BITRATE=96k) then logs bitrate=256k → red.
+# shellcheck disable=SC2016  # $STEREO_BITRATE is literal sed text.
+enforce MUT-L-FORCEAAC audio \
+  's/tgt_br="$STEREO_BITRATE"/tgt_br="256k"/' \
+  'L force-aac: forced-AAC bitrate ignored STEREO_BITRATE' \
+  'M-L-FORCEAAC: force-AAC honors STEREO_BITRATE → no-hardcoded-256k probe'
+
+# MUT-L-DISKNOTE (Phase 5): drop the disk-preflight "df unavailable" else-note so the preflight
+# fails open silently again when df yields nothing. The df-unavailable note probe goes red.
+enforce MUT-L-DISKNOTE unit \
+  's/note "Disk preflight skipped.*/: # mutated/' \
+  "L disk-df: no 'preflight skipped' note" \
+  'M-L-DISKNOTE: df-unavailable emits an explicit skipped-note → no-silent-fail-open probe'
+
+# MUT-L-SUBWD (Phase 5): revert _prepare_subtitle's vanished-workdir path to `return 1`, which trips
+# set -e at the `sub_path="$(...)"` callers. The unit probe expects rc0+empty → rc1 → red. Anchored
+# two lines below the unique "Workdir disappeared" warn.
+enforce MUT-L-SUBWD unit \
+  '/Workdir disappeared/{n;n;s/    return 0/    return 1/;}' \
+  'L sub-workdir: vanished-workdir path returned' \
+  'M-L-SUBWD: _prepare_subtitle workdir-gone returns ""+rc0 → no-set-e-abort probe'
+
+# MUT-L-CCESCAPE (Phase 5): neuter the _V quoted-value escaping so an embedded " in a --create-config
+# override corrupts the generated .muxmrc on round-trip. The cc-escape round-trip probe goes red.
+# shellcheck disable=SC2016  # ${qval//…} is literal sed text.
+enforce MUT-L-CCESCAPE config \
+  's#qval="${qval//.*#:#' \
+  'L cc-escape: override value corrupted on round-trip' \
+  'M-L-CCESCAPE: --create-config %q-escapes emitted values → faithful-round-trip probe'
+
 # M-AUD-1 (Phase 2.1 — was pending): the same '(10 - rank)' inversion, now caught by the new
 # direct _score_audio_stream unit test. The ch<6 scenario keeps this signature distinct from
 # M-AUD-3 (surround only applies at ≥6ch).

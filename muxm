@@ -935,8 +935,10 @@ _detect_mp4box(){
 realpath_fallback(){
   local p="$1"
   
-  # Try GNU realpath with -m (allows missing files)
-  if command -v realpath >/dev/null 2>&1; then
+  # Try GNU realpath with -m (allows missing files). Skip on macOS/BSD ($OSTYPE=darwin*), whose
+  # realpath has no -m: the call always fails there, so probing it every time is pure overhead —
+  # it just falls through to the portable resolver below. (Phase 5; perf only.)
+  if [[ "$OSTYPE" != darwin* ]] && command -v realpath >/dev/null 2>&1; then
     if realpath -m "$p" 2>/dev/null; then
       return 0
     fi
@@ -1494,6 +1496,10 @@ _dep_check_only(){
     printf "  %-14s %-24s %-24s %s\n" "tesseract"  "apt install tesseract-ocr" "dnf install tesseract" "brew install tesseract"
     printf "  %-14s %-24s %-24s %s\n" "pgsrip"     "pipx install pgsrip"    "pipx install pgsrip"    "pipx install pgsrip"
     printf '\n'
+    # Phase 5: cover Arch (pacman) and openSUSE (zypper) without widening the table to 5 columns —
+    # their package names match the dnf/apt column (gpac for mp4box; ffmpeg/jq/bc as-is).
+    printf "  %s\n" "Arch:     pacman -S <pkg>          openSUSE: zypper install <pkg>   (package names match the dnf/apt column above; pgsrip via pipx)"
+    printf '\n'
     say "After installing, re-run: ${CLI_NAME} --install-dependencies"
     note "Advisory check — $missing tool(s) missing. No automatic install available on this platform."
     exit 0  # Advisory: report only, not a failure (M8)
@@ -1809,7 +1815,7 @@ unset _arg
 _man_target_dir(){
   # Prefer Homebrew man path if brew is installed
   if command -v brew >/dev/null 2>&1; then
-    echo "$(brew --prefix)/share/man/man1"
+    echo "$(brew --prefix 2>/dev/null)/share/man/man1"  # Phase 5: suppress stderr to match the other brew --prefix call sites
   else
     echo "/usr/local/share/man/man1"
   fi
@@ -3261,9 +3267,13 @@ _install_completions(){
     mkdir -p "$comp_dir"
   fi
 
-  # Write completion script
-  _completions_emit > "$comp_file"
-  chmod +x "$comp_file"
+  # Write completion script atomically (temp + mv) so a shell never `source`s a half-written file;
+  # mode 644 (not +x) — the file is sourced, never executed. (Phase 5)
+  local _comp_tmp
+  _comp_tmp="$(mktemp "${comp_dir}/.muxm-completion.XXXXXX")" || die 11 "Cannot create temp file in $comp_dir"
+  _completions_emit > "$_comp_tmp"
+  chmod 644 "$_comp_tmp"
+  mv -f "$_comp_tmp" "$comp_file"
   printf '  ✅ Wrote %s\n' "$comp_file"
   printf '\n'
 
@@ -3507,15 +3517,24 @@ _create_config_emit() {
     local val="${!var}"
     local suffix=""
     [[ "$_manually_adjusted" == *" ${var} "* ]] && suffix=" # Manually adjusted"
+    # L (Phase 5): for quoted (string) emission, escape the characters that are special inside a
+    # double-quoted shell word ( \ " $ ` ) so a value containing them round-trips faithfully when
+    # the generated .muxmrc is sourced. Previously an embedded " corrupted/truncated the value
+    # (e.g. X265_PARAMS_BASE='aq-mode=3:foo="bar"' came back as 'aq-mode=3:foo=bar'). No-op for
+    # ordinary values, so the readable VAR="value" form is preserved.
+    local qval="$val"
+    if [[ "$quote" == "quoted" ]]; then
+      qval="${qval//\\/\\\\}"; qval="${qval//\"/\\\"}"; qval="${qval//\$/\\\$}"; qval="${qval//\`/\\\`}"
+    fi
     if [[ "$_active" == *" ${var} "* ]]; then
       if [[ "$quote" == "quoted" ]]; then
-        printf '%s="%s"%s\n' "$var" "$val" "$suffix"
+        printf '%s="%s"%s\n' "$var" "$qval" "$suffix"
       else
         printf '%s=%s%s\n' "$var" "$val" "$suffix"
       fi
     else
       if [[ "$quote" == "quoted" ]]; then
-        printf '#%s="%s"\n' "$var" "$val"
+        printf '#%s="%s"\n' "$var" "$qval"
       else
         printf '#%s=%s\n' "$var" "$val"
       fi
@@ -4762,7 +4781,9 @@ _create_config_prescan "$@"
 apply_profile
 
 # _probe_profile_ext PROFILE — return the OUTPUT_EXT that apply_profile_PROFILE sets.
-# Runs in an isolated local scope so the caller's OUTPUT_EXT is never mutated.
+# `local OUTPUT_EXT="mp4"` only gives a clean default to read back — apply_profile_* also mutates
+# many OTHER globals (CRF_VALUE, VIDEO_CODEC, …). The real isolation is the command-substitution
+# SUBSHELL at the call site ("$(_probe_profile_ext …)"); callers must invoke it that way. (Phase 5)
 _probe_profile_ext() {
   local OUTPUT_EXT="mp4"
   "apply_profile_${1//-/_}" 2>/dev/null || true
@@ -6677,7 +6698,13 @@ disk_free_warn() {
 
   # D15: confirm the preflight passed (a note → suppressed by --quiet, shown otherwise). The
   # workdir volume holds the multi-GB intermediates, so its free space is the meaningful figure.
-  [[ -n "${wd_avail_kb:-}" ]] && note "Disk OK — ~$(_gb "$(( wd_avail_kb * 1024 ))")GB free on the working volume."
+  # L (Phase 5): if df produced nothing (unavailable / unusual mount), say so explicitly instead
+  # of failing open silently — the user should know the free-space guard did not actually run.
+  if [[ -n "${wd_avail_kb:-}" ]]; then
+    note "Disk OK — ~$(_gb "$(( wd_avail_kb * 1024 ))")GB free on the working volume."
+  else
+    note "Disk preflight skipped: df unavailable — proceeding without a free-space check."
+  fi
   return 0
 }
 
@@ -6756,8 +6783,9 @@ write_json_report() {
       printf '  "timestamp": "%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     fi
     printf '}\n'
-  } > "$report_path" 2>/dev/null || warn "Failed to write JSON report to $report_path"
-  note "JSON report written → $report_path"
+  } > "$report_path" 2>/dev/null \
+    && note "JSON report written → $report_path" \
+    || warn "Failed to write JSON report to $report_path"   # L (Phase 5): only claim "written" on success
 }
 
 # Check if source already matches profile requirements (skip-if-ideal)
@@ -8893,6 +8921,7 @@ _audio_codec_rank(){
 # Globals: AUDIO_LANG_PREF (read)
 _audio_lang_matches(){
   local lang pref
+  local -a prefs   # Phase 5: declare local (sibling _sub_lang_matches does) — don't leak to global scope
   lang="$(_norm_lang_code "$1")"
   IFS=',' read -r -a prefs <<< "$AUDIO_LANG_PREF"
   for pref in "${prefs[@]}"; do
@@ -9610,7 +9639,10 @@ run_audio_pipeline(){
     else
       read -r _ tgt_br <<< "$(audio_transcode_target "$effective_ch")"
       if [[ "$tgt_codec" == "aac" ]]; then
-        tgt_br="256k"
+        # L (Phase 5): honor STEREO_BITRATE instead of a hardcoded 256k. Masked today because
+        # `universal` (the only profile forcing AAC) sets STEREO_BITRATE=256k, but --stereo-bitrate
+        # / a .muxmrc override was silently ignored on the force-AAC path.
+        tgt_br="$STEREO_BITRATE"
       fi
       [[ -n "${AUDIO_FORCE_BITRATE:-}" ]] && tgt_br="$AUDIO_FORCE_BITRATE"
       note "Force transcoding audio: $codec → $tgt_codec"
@@ -9943,8 +9975,12 @@ _prepare_subtitle(){
   local idx="$1" codec srt sup vob_base
 
   if [[ ! -d "$WORKDIR" ]]; then
+    # L (Phase 5): echo ""+rc0, not rc1. Callers capture via `sub_path="$(...)"` (a plain, non-local
+    # assignment), where a non-zero command substitution would trip set -e and abort the whole run.
+    # An exotic mid-run workdir loss should warn-and-skip the subtitle, not kill the encode.
     warn "[Subs] Workdir disappeared — cannot extract subtitle #$idx"
-    return 1
+    echo ""
+    return 0
   fi
 
   codec="$(_sp_sub_field "$idx" codec_name)"; codec="${codec,,}"
@@ -10886,7 +10922,10 @@ build_subtitle_plan(){
   # Demote to single-track if the user set overrides that are incompatible.
   if (( SUB_MULTI_TRACK )); then
     if (( SUB_BURN_FORCED )); then
-      note "[Subs] Keeping a single subtitle track: --sub-burn-forced is set (multi-track mode off)."
+      # Phase 5: warn (not note) — the user's multi-track request is being silently overridden by
+      # --sub-burn-forced. NOTE: no `return` here on purpose — this case INTENTIONALLY falls through
+      # to the single-track selection below (that IS the demotion). A return would skip it entirely.
+      warn "[Subs] --sub-burn-forced overrides multi-track: keeping a single subtitle track (multi-track mode off)."
     elif (( SUB_EXPORT_EXTERNAL )); then
       note "[Subs] Multi-track mode: --sub-export-external ignored (all subs embedded via stream-copy)."
       run_subtitle_pipeline_multi
@@ -11257,6 +11296,9 @@ mux_final() {
         for (( _epk=0; _epk<${#_ext_sub_paths[@]}; _epk++ )); do
           [[ "${_ext_sub_paths[$_epk]}" == "$_ep" ]] && { _found_eidx="${_ext_sub_idxs[$_epk]}"; break; }
         done
+        # L (Phase 5): defense-in-depth — the loop always matches today, but an empty index here
+        # would emit a malformed `-map :s:0`. Fail loudly rather than ship a corrupt ffmpeg command.
+        [[ -n "$_found_eidx" ]] || die 41 "Internal error: external subtitle '$_ep' has no registered ffmpeg input index — cannot map it. Please report this."
         ff_map+=( -map "${_found_eidx}:s:0" )
       fi
     done

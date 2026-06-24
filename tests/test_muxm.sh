@@ -2476,6 +2476,27 @@ test_config() {
   _test_config_validation
   _test_config_create_overrides
   _test_config_m7_deprecation_bridge
+  _test_config_l_create_escape
+}
+
+# L (Phase 5): --create-config must emit string override values escaped so a value containing a
+# double quote round-trips faithfully when the generated .muxmrc is sourced (previously an embedded
+# " corrupted the value, e.g. 'aq-mode=3:foo="bar"' came back as 'aq-mode=3:foo=bar'). Perturb
+# MUT-L-CCESCAPE neuters the escape → the round-trip corrupts → red.
+_test_config_l_create_escape() {
+  local _d="$TESTDIR/l_ccescape"; mkdir -p "$_d/h"
+  local _val='aq-mode=3:foo="bar"'
+  ( cd "$_d" && HOME="$_d/h" "$MUXM" --create-config project atv-directplay-hq --x265-params "$_val" >/dev/null 2>&1 )
+  if [[ ! -f "$_d/.muxmrc" ]]; then fail "L cc-escape: --create-config did not write .muxmrc"; rm -rf "$_d"; return; fi
+  # Source the generated config in a clean subshell and read the value back.
+  local _got
+  _got="$(set +u; . "$_d/.muxmrc" 2>/dev/null; printf '%s' "$X265_PARAMS_BASE")"
+  if [[ "$_got" == "$_val" ]]; then
+    pass "L cc-escape: a quoted override value round-trips faithfully through the generated .muxmrc"
+  else
+    fail "L cc-escape: override value corrupted on round-trip — wrote '$_val', sourced back '$_got'"
+  fi
+  rm -rf "$_d"
 }
 
 # M7: the AUDIO_SCORE_LANG_BONUS_ENG → AUDIO_SCORE_LANG_BONUS deprecation bridge must apply the
@@ -4636,6 +4657,29 @@ EOF
   _test_audio_c2_untagged_lang
   _test_audio_c2_container_safety
   _test_audio_c2_verify_display
+  _test_audio_l_forceaac_stereo_bitrate
+}
+
+# L (Phase 5): force-AAC must honor STEREO_BITRATE, not a hardcoded 256k. Force-transcode an ac3
+# stereo source to AAC with STEREO_BITRATE=96k (via .muxmrc); the transcode log must report
+# bitrate=96k. Perturb MUT-L-FORCEAAC reverts to the hardcoded 256k → log shows 256k → red.
+# (The output AAC bit_rate is N/A in MKV, so we log-grep rather than probe — same as the L6 test.)
+_test_audio_l_forceaac_stereo_bitrate() {
+  local _d="$TESTDIR/l_forceaac"; mkdir -p "$_d/h"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=blue:s=320x240:r=24:d=2" -f lavfi -i "sine=d=2" \
+    -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p10le -c:a ac3 -ac 2 -metadata:s:a:0 language=eng \
+    "$_d/src.mkv" 2>/dev/null || true
+  if [[ ! -s "$_d/src.mkv" ]]; then skip "L force-aac: could not build an ac3-stereo fixture"; rm -rf "$_d"; return; fi
+  printf 'STEREO_BITRATE=96k\n' > "$_d/.muxmrc"
+  ( cd "$_d" && HOME="$_d/h" "$MUXM" -K --no-skip-if-ideal --audio-force-codec aac --crf 30 --preset ultrafast src.mkv out.mkv >/dev/null 2>&1 )
+  local _tlog
+  _tlog="$(grep -rh "audio transcode:" "$_d"/.muxm.tmp.*/muxm.*.log 2>/dev/null | head -1)"
+  if [[ "$_tlog" == *"bitrate=96k"* ]]; then
+    pass "L force-aac: forced-AAC transcode honors STEREO_BITRATE (96k), not a hardcoded 256k"
+  else
+    fail "L force-aac: forced-AAC bitrate ignored STEREO_BITRATE (transcode log: '${_tlog:-<none>}')"
+  fi
+  rm -rf "$_d"
 }
 
 # L5: the audio copy/transcode failure paths (die 43) must surface the disk-full hint like the
@@ -8969,6 +9013,52 @@ test_unit() {
   _test_unit_mdry_dv_probe
   _test_unit_mdry_refresh_mandb
   _test_unit_mdry_loglevel_str
+  _test_unit_l_disk_df_unavailable
+  _test_unit_l_prepare_subtitle_workdir_gone
+}
+
+# L (Phase 5): when df yields nothing (unavailable / unusual mount), disk_free_warn must emit an
+# explicit "preflight skipped" note instead of failing open silently. Shim df to output nothing and
+# assert the skipped-note fires. Perturb MUT-L-DISKNOTE drops the else-note → no note → red.
+_test_unit_l_disk_df_unavailable() {
+  local body
+  body="$(awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ -z "$body" ]]; then fail "L disk-df: disk_free_warn extraction anchor failed"; return; fi
+  local _stubs='
+    DISK_CHECK=1; VIDEO_CODEC=libx265; CRF_VALUE=28; PRESET_VALUE=medium
+    DISABLE_DV=1; AUDIO_MULTI_TRACK=0; AUDIO_FORCE_CODEC=""; METADATA_CACHE=""
+    DISK_FREE_WARN_GB=0; WORKDIR=/tmp; OUT_DIR=/tmp
+    _get_source_duration_secs(){ echo 100; }; _audio_stream_count(){ echo 0; }; _audio_stream_info(){ echo ""; }
+    _source_has_dv_metadata(){ return 1; }; _crf_ratio(){ echo 50; }; _preset_multiplier(){ echo 1000; }
+    _av1_preset_multiplier(){ echo 1000; }; _gb(){ echo 0; }; _jq_cache(){ echo 5000000; }
+    SRC_ABS=/dev/null; VIDEO_COPY_IF_COMPLIANT=0
+    df(){ :; }                      # df unavailable: emits nothing → no avail figure
+    die(){ echo "DIE:$*"; }; say(){ :; }; log(){ :; }
+    note(){ printf "NOTE:%s\n" "$*"; }
+  '
+  local out
+  out="$(bash -c "$_stubs"$'\n'"$body"$'\n''disk_free_warn' 2>/dev/null)"
+  if printf '%s\n' "$out" | grep -qiE "NOTE:.*preflight skipped: df unavailable"; then
+    pass "L disk-df: df-unavailable emits an explicit 'preflight skipped' note (no silent fail-open)"
+  else
+    fail "L disk-df: no 'preflight skipped' note when df is unavailable (out: ${out:-<none>})"
+  fi
+}
+
+# L (Phase 5): _prepare_subtitle on a vanished workdir must echo ""+rc0 (warn-and-skip), not rc1 —
+# a non-zero rc trips set -e at the `sub_path="$(...)"` callers and aborts the whole run. Extract
+# the helper, point WORKDIR at a nonexistent dir, assert rc 0 + empty output. Perturb
+# MUT-L-SUBWD reverts to `return 1` → rc 1 → red.
+_test_unit_l_prepare_subtitle_workdir_gone() {
+  local body
+  body="$(_extract_muxm_fns _prepare_subtitle)" || { fail "L sub-workdir: could not extract _prepare_subtitle"; return; }
+  local out rc=0
+  out="$(bash -c 'warn(){ :; }; WORKDIR="/no/such/muxm/workdir/xyzzy"'$'\n'"$body"$'\n''_prepare_subtitle 0' 2>/dev/null)" || rc=$?
+  if (( rc == 0 )) && [[ -z "$out" ]]; then
+    pass "L sub-workdir: _prepare_subtitle on a vanished workdir returns ''+rc0 (warn-and-skip, no set -e abort)"
+  else
+    fail "L sub-workdir: vanished-workdir path returned rc=$rc out='$out' (expected rc0 + empty)"
+  fi
 }
 
 # M8: _pipx_resolve_bin_dir must find PIPX_BIN_DIR even on pipx <1.0, which lacks
