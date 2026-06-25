@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ## [Unreleased]
 
-## [1.5.0] - soon
+## [1.5.0] - 2026-06-25
 
 ### Added
 
@@ -450,6 +450,9 @@ Initial public release.
 - Structured exit codes for scripting and automation (10 = missing tool, 11 = bad arguments, 12 = corrupt source, 40–43 = pipeline failures)
 - Comprehensive test harness (`test_muxm.sh`) with 18 test suites and ~165 assertions
 
+[1.5.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.5.0
+[1.4.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.4.0
+[1.3.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.3.0
 [1.2.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.2.0
 [1.1.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.1.0
 [1.0.2]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.0.2
