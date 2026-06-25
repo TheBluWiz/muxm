@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-06-25
+
+### Fixed
+
+- **`--create-config` no longer lets override values inject shell into the generated `.muxmrc` (M1)** — The single-profile config emitter's `_V` helper had an unquoted branch that wrote override values raw (`printf '%s=%s\n'`). Because `--create-config` override values arrive from the CLI unvalidated, a value such as `--output-ext 'mp4; echo INJECTED'` emitted a bare `OUTPUT_EXT=mp4; echo INJECTED` line that then executed on every subsequent `muxm` invocation sourcing that config (and `--create-config system` writes `/etc/.muxmrc`, sourced by every user). `_V` now escapes the shell-special characters (`\ " $ \``) and emits the quoted `VAR="value"` form **unconditionally** for every variable (`VAR=value` and `VAR="value"` are identical when sourced, so no existing config changes meaning). Complementing this, the numeric-only overrides (`CRF_VALUE`, `THREADS`, `STEREO_BITRATE`, `AUDIO_FORCE_BITRATE`, `MAX_COPY_BITRATE`, `LEVEL_VALUE`, `AV1_MAXRATE`, `AV1_BUFSIZE`) are now validated against `^[0-9]+(\.[0-9]+)?[kKmMgG]?$` at parse time and rejected with `die 11` on mismatch — failing injection attempts fast instead of quoting them into the file.
+- **Multi-profile mode: deprecated `dv-archival` alias derived the wrong container (M2)** — A `--profile dv-archival,<other>` run validated the alias (`_is_valid_profile` accepts it) but never normalized it before use. `_probe_profile_ext "dv-archival"` called the non-existent `apply_profile_dv_archival`, swallowed the failure, and fell back to its local `OUTPUT_EXT="mp4"` default — forcing the `archive` profile (which sets `OUTPUT_EXT="mkv"`) into MP4. For a lossless/PGS/ASS source this tripped a spurious `die 11`; otherwise it produced a wrong-container `.dv-archival.mp4`. The multi-profile prescan now runs each list element through `_normalize_profile` in place, so the canonical name (`archive`) feeds the extension probe, the per-profile output filename, and the child's `--profile` flag.
+
 ## [1.5.0] - 2026-06-25
 
 ### Added
@@ -450,6 +457,7 @@ Initial public release.
 - Structured exit codes for scripting and automation (10 = missing tool, 11 = bad arguments, 12 = corrupt source, 40–43 = pipeline failures)
 - Comprehensive test harness (`test_muxm.sh`) with 18 test suites and ~165 assertions
 
+[1.5.1]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.5.1
 [1.5.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.5.0
 [1.4.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.4.0
 [1.3.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.3.0

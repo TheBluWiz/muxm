@@ -98,7 +98,7 @@ fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="1.5.0"
+readonly VERSION="1.5.1"
 
 # Canonical list of valid profile names (space-separated for compgen/iteration).
 # All profile validation, error messages, completions, and config generators
@@ -3512,32 +3512,28 @@ _create_config_emit() {
   # Membership test: _active is space-padded, so *" VARNAME "* matches whole names only.
   # Usage: _V VARNAME [quoted]
   # "quoted" wraps the value in double quotes (for strings with special chars).
+  # The optional second argument (historically "quoted") is now vestigial: every value is
+  # quoted unconditionally (see M1 below). It is still accepted so existing `_V VAR quoted`
+  # call sites keep working without change.
   _V() {
-    local var="$1" quote="${2:-}"
+    local var="$1"
     local val="${!var}"
     local suffix=""
     [[ "$_manually_adjusted" == *" ${var} "* ]] && suffix=" # Manually adjusted"
-    # L (Phase 5): for quoted (string) emission, escape the characters that are special inside a
-    # double-quoted shell word ( \ " $ ` ) so a value containing them round-trips faithfully when
-    # the generated .muxmrc is sourced. Previously an embedded " corrupted/truncated the value
-    # (e.g. X265_PARAMS_BASE='aq-mode=3:foo="bar"' came back as 'aq-mode=3:foo=bar'). No-op for
-    # ordinary values, so the readable VAR="value" form is preserved.
+    # M1 (Phase 1): ALWAYS escape the characters special inside a double-quoted shell word
+    # ( \ " $ ` ) and ALWAYS emit the quoted VAR="value" form — for every variable, not just
+    # those a call site marked "quoted". Override values arrive from the CLI unvalidated, so the
+    # old unquoted branch let a value like  mp4; echo INJECTED  emit a bare
+    # OUTPUT_EXT=mp4; echo INJECTED  line that executes on every later `. .muxmrc` source.
+    # VAR=value and VAR="value" are identical when sourced, so no existing config changes meaning.
+    # (This also subsumes the earlier Phase-5 fix for embedded quotes in string values, e.g.
+    # X265_PARAMS_BASE='aq-mode=3:foo="bar"' now round-trips faithfully.)
     local qval="$val"
-    if [[ "$quote" == "quoted" ]]; then
-      qval="${qval//\\/\\\\}"; qval="${qval//\"/\\\"}"; qval="${qval//\$/\\\$}"; qval="${qval//\`/\\\`}"
-    fi
+    qval="${qval//\\/\\\\}"; qval="${qval//\"/\\\"}"; qval="${qval//\$/\\\$}"; qval="${qval//\`/\\\`}"
     if [[ "$_active" == *" ${var} "* ]]; then
-      if [[ "$quote" == "quoted" ]]; then
-        printf '%s="%s"%s\n' "$var" "$qval" "$suffix"
-      else
-        printf '%s=%s%s\n' "$var" "$val" "$suffix"
-      fi
+      printf '%s="%s"%s\n' "$var" "$qval" "$suffix"
     else
-      if [[ "$quote" == "quoted" ]]; then
-        printf '#%s="%s"\n' "$var" "$qval"
-      else
-        printf '#%s=%s\n' "$var" "$val"
-      fi
+      printf '#%s="%s"\n' "$var" "$qval"
     fi
   }
 
@@ -4128,6 +4124,20 @@ _create_config() {
     esac
   done
 
+  # M1 (Phase 1): validate numeric-only overrides at parse time. These variables only ever hold a
+  # bare number (optionally with a k/M/G suffix), so anything else is a typo or an injection attempt
+  # — reject it with die 11 rather than quoting garbage into the generated config. Same pattern as
+  # the main CLI's _validate_rate_arg. Complements the unconditional quoting in _V above.
+  local _cc_num_var
+  for _cc_num_var in CRF_VALUE THREADS STEREO_BITRATE AUDIO_FORCE_BITRATE \
+                     MAX_COPY_BITRATE LEVEL_VALUE AV1_MAXRATE AV1_BUFSIZE; do
+    if [[ -n "${_CC_OVERRIDES[$_cc_num_var]:-}" ]] \
+       && [[ ! "${_CC_OVERRIDES[$_cc_num_var]}" =~ ^[0-9]+(\.[0-9]+)?[kKmMgG]?$ ]]; then
+      die 11 "Invalid numeric value for ${_cc_num_var}: '${_CC_OVERRIDES[$_cc_num_var]}'
+   Expected a number, optionally with a k/M/G suffix (e.g. 20, 1.5, 256k)."
+    fi
+  done
+
   # Normalize deprecated aliases (L4: single call site via _normalize_profile).
   _normalize_profile profile
 
@@ -4284,9 +4294,18 @@ if [[ "${PROFILE_NAME:-}" == *,* ]]; then
     die 11 "--profile: empty profile name in list '$PROFILE_NAME'"
   fi
   IFS=',' read -ra _MULTI_PROFILES <<< "$PROFILE_NAME"
-  for _mp in "${_MULTI_PROFILES[@]}"; do
+  for _mp_i in "${!_MULTI_PROFILES[@]}"; do
+    _mp="${_MULTI_PROFILES[$_mp_i]}"
     [[ -z "$_mp" ]] && die 11 "--profile: empty profile name in list '$PROFILE_NAME'"
     _is_valid_profile "$_mp" || die 11 "Unknown profile '${_mp}' in --profile list. Valid: $(_valid_profiles_display)"
+    # M2 (Phase 1): resolve deprecated aliases (e.g. dv-archival → archive) IN the array, before
+    # anything reads it. _MULTI_PROFILES feeds _probe_profile_ext (which dispatches to
+    # apply_profile_<name>), the per-profile output filename, and the child's --profile flag.
+    # Without this, _probe_profile_ext("dv-archival") would call the non-existent
+    # apply_profile_dv_archival, swallow the failure, and fall back to OUTPUT_EXT=mp4 — forcing an
+    # archive (mkv) into the wrong container. Single-profile mode already normalizes downstream.
+    _normalize_profile _mp
+    _MULTI_PROFILES[_mp_i]="$_mp"
   done
   _MULTI_PROFILE_MODE=1
   # Use first profile for single-pass config/conflict checks in the parent process

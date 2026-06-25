@@ -2045,7 +2045,7 @@ _test_config_create_overrides() {
   if [[ -f "$cfg_crf_dir/.muxmrc" ]]; then
     content="$(cat "$cfg_crf_dir/.muxmrc")"
     # The value should appear uncommented (not starting with #)
-    if echo "$content" | grep -qE '^CRF_VALUE=20'; then
+    if echo "$content" | grep -qE '^CRF_VALUE="?20"?'; then
       pass "--create-config --crf 20: CRF_VALUE=20 uncommented in .muxmrc"
     else
       fail "--create-config --crf 20: CRF_VALUE=20 not found uncommented (got: $(echo "$content" | grep CRF_VALUE || echo '<not present>'))"
@@ -2062,7 +2062,7 @@ _test_config_create_overrides() {
     --create-config project atv-directplay-hq --crf 20 --preset medium 2>&1)"
   if [[ -f "$cfg_multi_dir/.muxmrc" ]]; then
     content="$(cat "$cfg_multi_dir/.muxmrc")"
-    if echo "$content" | grep -qE '^CRF_VALUE=20'; then
+    if echo "$content" | grep -qE '^CRF_VALUE="?20"?'; then
       pass "--create-config multi-override: CRF_VALUE=20 uncommented"
     else
       fail "--create-config multi-override: CRF_VALUE=20 not found uncommented"
@@ -2088,7 +2088,7 @@ _test_config_create_overrides() {
   if [[ -f "$cfg_nooverride_dir/.muxmrc" ]]; then
     content="$(cat "$cfg_nooverride_dir/.muxmrc")"
     # atv-directplay-hq sets CRF_VALUE=17 — should be uncommented with no CLI override
-    if echo "$content" | grep -qE '^CRF_VALUE=17'; then
+    if echo "$content" | grep -qE '^CRF_VALUE="?17"?'; then
       pass "--create-config no-override: CRF_VALUE=17 uncommented (profile-owned)"
     else
       fail "--create-config no-override: CRF_VALUE=17 not found uncommented (got: $(echo "$content" | grep CRF_VALUE || echo '<not present>'))"
@@ -2131,7 +2131,7 @@ _test_config_create_overrides() {
     else
       pass "H1: profile-untouched MAX_AUDIO_CHANNELS not emitted uncommented (no user-config leak)"
     fi
-    if echo "$content" | grep -qE '^#MAX_AUDIO_CHANNELS=8$'; then
+    if echo "$content" | grep -qE '^#MAX_AUDIO_CHANNELS="?8"?$'; then
       pass "H1: profile-untouched MAX_AUDIO_CHANNELS stays commented at the script default (#=8)"
     else
       fail "H1: expected '#MAX_AUDIO_CHANNELS=8' (commented default), got: $(echo "$content" | grep -E 'MAX_AUDIO_CHANNELS' || echo '<not present>')"
@@ -2158,7 +2158,7 @@ _test_config_create_overrides() {
   mkdir -p "$_l3_dir" "$_l3_home"
   (cd "$_l3_dir" && HOME="$_l3_home" "$_l3_muxm" --create-config project streaming-hevc >/dev/null 2>&1) || true
   if [[ -f "$_l3_dir/.muxmrc" ]]; then
-    if grep -qE '^#DISK_FREE_WARN_GB=7$' "$_l3_dir/.muxmrc"; then
+    if grep -qE '^#DISK_FREE_WARN_GB="?7"?$' "$_l3_dir/.muxmrc"; then
       pass "L3: generated config tracks the changed Section-4 default (#DISK_FREE_WARN_GB=7), not a stale literal"
     else
       fail "L3: generated config shows a stale DISK_FREE_WARN_GB (got: $(grep DISK_FREE_WARN_GB "$_l3_dir/.muxmrc" || echo '<none>'))"
@@ -2216,7 +2216,7 @@ _test_config_create_overrides() {
   out="$(run_muxm_in "$cfg_threads_dir" --create-config project universal --threads 4 2>&1)"
   if [[ -f "$cfg_threads_dir/.muxmrc" ]]; then
     content="$(cat "$cfg_threads_dir/.muxmrc")"
-    if echo "$content" | grep -qE '^THREADS=4'; then
+    if echo "$content" | grep -qE '^THREADS="?4"?'; then
       pass "--create-config --threads 4: THREADS=4 uncommented in .muxmrc"
     else
       fail "--create-config --threads 4: THREADS=4 not found uncommented (got: $(echo "$content" | grep THREADS || echo '<not present>'))"
@@ -2234,7 +2234,7 @@ _test_config_create_overrides() {
   out="$(run_muxm_in "$cfg_nodv_dir" --create-config project archive --no-dv 2>&1)"
   if [[ -f "$cfg_nodv_dir/.muxmrc" ]]; then
     content="$(cat "$cfg_nodv_dir/.muxmrc")"
-    if echo "$content" | grep -qE '^DISABLE_DV=1'; then
+    if echo "$content" | grep -qE '^DISABLE_DV="?1"?'; then
       pass "--create-config --no-dv: DISABLE_DV=1 uncommented in .muxmrc"
     else
       fail "--create-config --no-dv: DISABLE_DV=1 not found uncommented (got: $(echo "$content" | grep DISABLE_DV || echo '<not present>'))"
@@ -2250,7 +2250,7 @@ _test_config_create_overrides() {
   out="$(run_muxm_in "$cfg_tonemap_dir" --create-config project archive --tonemap 2>&1)"
   if [[ -f "$cfg_tonemap_dir/.muxmrc" ]]; then
     content="$(cat "$cfg_tonemap_dir/.muxmrc")"
-    if echo "$content" | grep -qE '^TONEMAP_HDR_TO_SDR=1'; then
+    if echo "$content" | grep -qE '^TONEMAP_HDR_TO_SDR="?1"?'; then
       pass "--create-config --tonemap: TONEMAP_HDR_TO_SDR=1 uncommented in .muxmrc"
     else
       fail "--create-config --tonemap: TONEMAP_HDR_TO_SDR=1 not found uncommented (got: $(echo "$content" | grep TONEMAP_HDR_TO_SDR || echo '<not present>'))"
@@ -2286,7 +2286,7 @@ _test_config_create_overrides() {
   out="$(run_muxm_in "$cfg_subfmt_dir" --create-config project animation --sub-preserve-format 2>&1)"
   if [[ -f "$cfg_subfmt_dir/.muxmrc" ]]; then
     content="$(cat "$cfg_subfmt_dir/.muxmrc")"
-    if echo "$content" | grep -qE '^SUB_PRESERVE_TEXT_FORMAT=1'; then
+    if echo "$content" | grep -qE '^SUB_PRESERVE_TEXT_FORMAT="?1"?'; then
       pass "--create-config --sub-preserve-format: SUB_PRESERVE_TEXT_FORMAT=1 uncommented in .muxmrc"
     else
       fail "--create-config --sub-preserve-format: SUB_PRESERVE_TEXT_FORMAT=1 not found uncommented (got: $(echo "$content" | grep SUB_PRESERVE_TEXT_FORMAT || echo '<not present>'))"
@@ -2302,7 +2302,7 @@ _test_config_create_overrides() {
   out="$(run_muxm_in "$cfg_nosubsdh_dir" --create-config project atv-directplay-hq --no-sub-sdh 2>&1)"
   if [[ -f "$cfg_nosubsdh_dir/.muxmrc" ]]; then
     content="$(cat "$cfg_nosubsdh_dir/.muxmrc")"
-    if echo "$content" | grep -qE '^SUB_INCLUDE_SDH=0'; then
+    if echo "$content" | grep -qE '^SUB_INCLUDE_SDH="?0"?'; then
       pass "--create-config --no-sub-sdh: SUB_INCLUDE_SDH=0 uncommented in .muxmrc"
     else
       fail "--create-config --no-sub-sdh: SUB_INCLUDE_SDH=0 not found uncommented (got: $(echo "$content" | grep SUB_INCLUDE_SDH || echo '<not present>'))"
@@ -2320,7 +2320,7 @@ _test_config_create_overrides() {
   out="$(run_muxm_in "$cfg_nochap_dir" --create-config project archive --no-keep-chapters 2>&1)"
   if [[ -f "$cfg_nochap_dir/.muxmrc" ]]; then
     content="$(cat "$cfg_nochap_dir/.muxmrc")"
-    if echo "$content" | grep -qE '^KEEP_CHAPTERS=0'; then
+    if echo "$content" | grep -qE '^KEEP_CHAPTERS="?0"?'; then
       pass "--create-config --no-keep-chapters: KEEP_CHAPTERS=0 uncommented in .muxmrc"
     else
       fail "--create-config --no-keep-chapters: KEEP_CHAPTERS=0 not found uncommented (got: $(echo "$content" | grep KEEP_CHAPTERS || echo '<not present>'))"
@@ -2336,7 +2336,7 @@ _test_config_create_overrides() {
   out="$(run_muxm_in "$cfg_stripmeta_dir" --create-config project streaming --strip-metadata 2>&1)"
   if [[ -f "$cfg_stripmeta_dir/.muxmrc" ]]; then
     content="$(cat "$cfg_stripmeta_dir/.muxmrc")"
-    if echo "$content" | grep -qE '^STRIP_METADATA=1'; then
+    if echo "$content" | grep -qE '^STRIP_METADATA="?1"?'; then
       pass "--create-config --strip-metadata: STRIP_METADATA=1 uncommented in .muxmrc"
     else
       fail "--create-config --strip-metadata: STRIP_METADATA=1 not found uncommented (got: $(echo "$content" | grep STRIP_METADATA || echo '<not present>'))"
@@ -2374,17 +2374,17 @@ _test_config_create_overrides() {
     --create-config project atv-directplay-hq --crf 20 --no-dv --strip-metadata --ffmpeg-loglevel error 2>&1)"
   if [[ -f "$cfg_combo_dir/.muxmrc" ]]; then
     content="$(cat "$cfg_combo_dir/.muxmrc")"
-    if echo "$content" | grep -qE '^CRF_VALUE=20'; then
+    if echo "$content" | grep -qE '^CRF_VALUE="?20"?'; then
       pass "--create-config combo: CRF_VALUE=20 uncommented"
     else
       fail "--create-config combo: CRF_VALUE=20 not found uncommented"
     fi
-    if echo "$content" | grep -qE '^DISABLE_DV=1'; then
+    if echo "$content" | grep -qE '^DISABLE_DV="?1"?'; then
       pass "--create-config combo: DISABLE_DV=1 uncommented"
     else
       fail "--create-config combo: DISABLE_DV=1 not found uncommented"
     fi
-    if echo "$content" | grep -qE '^STRIP_METADATA=1'; then
+    if echo "$content" | grep -qE '^STRIP_METADATA="?1"?'; then
       pass "--create-config combo: STRIP_METADATA=1 uncommented"
     else
       fail "--create-config combo: STRIP_METADATA=1 not found uncommented"
@@ -2477,6 +2477,7 @@ test_config() {
   _test_config_create_overrides
   _test_config_m7_deprecation_bridge
   _test_config_l_create_escape
+  _test_config_m1_create_injection
 }
 
 # L (Phase 5): --create-config must emit string override values escaped so a value containing a
@@ -2505,6 +2506,59 @@ _test_config_l_create_escape() {
 # new var wins (the legacy value must not silently overwrite it); the rename warning fires whenever
 # the legacy alias is present. Bidirectional: both-set → new wins (+ warning); legacy-only → legacy
 # applies. Perturb MUT-M7-BRIDGE reverts to the unconditional overwrite → both-set → legacy wins → red.
+# M1 (Phase 1): --create-config must NOT let an override value inject shell into the generated
+# .muxmrc. Two arms:
+#   (a) a STRING override containing `; echo INJECTED` must be safely quoted — the generated file
+#       must parse as valid shell (bash -n), must NOT contain a bare unquoted `;`-bearing line, and
+#       sourcing it must round-trip the literal value without executing the payload.
+#   (b) a NUMERIC override (e.g. --crf) with a non-numeric/injection value must be rejected at parse
+#       time with exit 11 and write no file.
+# Perturb MUT-M1-CCQUOTE (drop the unconditional quoting in _V) → arm (a) injects → red.
+_test_config_m1_create_injection() {
+  local _d="$TESTDIR/m1_inject"; mkdir -p "$_d/h"
+
+  # (a) string override carrying a shell-injection payload
+  local _payload='mp4; echo INJECTED'
+  ( cd "$_d" && HOME="$_d/h" "$MUXM" --create-config project atv-directplay-hq \
+      --output-ext "$_payload" >/dev/null 2>&1 )
+  if [[ ! -f "$_d/.muxmrc" ]]; then
+    fail "M1 inject: --create-config did not write .muxmrc"; rm -rf "$_d"; return
+  fi
+  # The generated file must be syntactically valid shell.
+  if bash -n "$_d/.muxmrc" 2>/dev/null; then
+    pass "M1 inject: generated .muxmrc is syntactically valid shell (bash -n)"
+  else
+    fail "M1 inject: generated .muxmrc fails bash -n (override corrupted the file)"
+  fi
+  # No uncommented OUTPUT_EXT line may contain a bare (unquoted) ';' — that would be injection.
+  if grep -E '^OUTPUT_EXT=' "$_d/.muxmrc" | grep -qE '=[^"].*;'; then
+    fail "M1 inject: OUTPUT_EXT emitted with an unquoted ';' — payload not neutralised: $(grep -E '^OUTPUT_EXT=' "$_d/.muxmrc")"
+  else
+    pass "M1 inject: OUTPUT_EXT payload is quoted (no bare ';' on the emitted line)"
+  fi
+  # Sourcing must round-trip the literal value and NOT execute the payload.
+  local _src_out
+  # shellcheck disable=SC1091  # dynamic path to a just-generated test .muxmrc
+  _src_out="$(set +u; . "$_d/.muxmrc" 2>/dev/null; printf '%s' "$OUTPUT_EXT")"
+  if [[ "$_src_out" == "$_payload" ]] ; then
+    pass "M1 inject: payload round-trips as a literal value (no command execution on source)"
+  else
+    fail "M1 inject: sourcing did not preserve the literal OUTPUT_EXT (got: '$_src_out')"
+  fi
+  rm -f "$_d/.muxmrc"
+
+  # (b) numeric override with a non-numeric/injection value → rejected at parse time (exit 11).
+  local _rc=0
+  ( cd "$_d" && HOME="$_d/h" "$MUXM" --create-config project atv-directplay-hq \
+      --crf '20; echo INJECTED' >/dev/null 2>&1 ) || _rc=$?
+  if (( _rc == 11 )) && [[ ! -f "$_d/.muxmrc" ]]; then
+    pass "M1 inject: non-numeric --crf override rejected with exit 11 (no file written)"
+  else
+    fail "M1 inject: expected exit 11 + no file for non-numeric --crf, got rc=$_rc, file-exists=$([[ -f "$_d/.muxmrc" ]] && echo yes || echo no)"
+  fi
+  rm -rf "$_d"
+}
+
 _test_config_m7_deprecation_bridge() {
   local _dir="$TESTDIR/m7"; mkdir -p "$_dir/h"
   # (a) both set → new (200) wins, NOT legacy (100); warning still emitted (stderr).
@@ -10418,7 +10472,7 @@ test_multi_profile() {
   local _src="$TESTDIR/basic_sdr_subs.mkv"
   local _stem="${_src%.*}"
   local _yt_out="${_stem}.youtube-upload.mp4"
-  local _st_out="${_stem}.streaming.mp4"
+  local _st_out="${_stem}.streaming-hevc.mp4"  # 'streaming' alias normalizes to streaming-hevc (M2)
 
   # Remove any stale outputs first
   rm -f "$_yt_out" "$_st_out"
@@ -10439,7 +10493,8 @@ test_multi_profile() {
 
   # With explicit output name: per-profile files use my_video as stem
   out="$(run_muxm --profile streaming,universal --dry-run "$_src" "$_user_out" 2>&1)" || true
-  assert_contains "my_video.streaming.mp4" \
+  # The deprecated 'streaming' alias normalizes to 'streaming-hevc' in the per-profile name (M2).
+  assert_contains "my_video.streaming-hevc.mp4" \
     "multi-profile user stem: streaming output uses my_video stem" "$out"
   assert_contains "my_video.universal.mp4" \
     "multi-profile user stem: universal output uses my_video stem" "$out"
@@ -10471,6 +10526,27 @@ test_multi_profile() {
   # The pre-encode warning lists per-profile output paths; the passthrough pass uses .mp4.
   assert_contains "passthrough_hint.atv-directplay-hq.mp4" \
     "multi-profile passthrough + user .mp4 hint: passthrough output path uses .mp4 (not .mkv)" "$out"
+
+  # --- M2: deprecated 'dv-archival' alias in a multi-profile list must derive the ARCHIVE
+  #     container (.archive.mkv), not fall through to mp4. Pre-fix, the list was validated but
+  #     never normalized, so _probe_profile_ext("dv-archival") invoked the non-existent
+  #     apply_profile_dv_archival, swallowed the failure (2>/dev/null || true), and returned its
+  #     local OUTPUT_EXT="mp4" default — forcing the archive into the wrong container (and a
+  #     spurious die 11 on lossless/PGS sources). The prescan now normalizes each list element. ---
+  local _m2_src="$TESTDIR/basic_sdr_subs.mkv"
+  local _m2_out="$TESTDIR/m2_archive.mkv"
+  out="$(run_muxm --profile dv-archival,universal --dry-run "$_m2_src" "$_m2_out" 2>&1)" || true
+  assert_contains "m2_archive.archive.mkv" \
+    "M2: dv-archival in multi-profile list derives the archive container (.archive.mkv, not .mp4)" "$out"
+  # The per-profile filename must use the canonical name, never the deprecated alias.
+  if printf '%s' "$out" | grep -qE 'dv-archival\.(mp4|mkv)'; then
+    fail "M2: per-profile output still uses the deprecated 'dv-archival' name in its filename"
+  else
+    pass "M2: per-profile output uses the canonical 'archive' name, not the 'dv-archival' alias"
+  fi
+  # Normalizing the alias in the parent prescan emits the standard deprecation warning.
+  assert_contains "deprecated" \
+    "M2: dv-archival alias emits a deprecation warning in multi-profile mode" "$out"
 }
 
 # === Suite: Phase 5 Regression Tests (P5.3) ===
@@ -11401,7 +11477,7 @@ FBDOVISCRIPT
     printf 'KEEP_LOG=1\nVERBOSITY="verbose"\n' > "$ckb_home/.muxmrc"
     local ckb_gen="$ckb_dir/gen"; mkdir -p "$ckb_gen"
     ( cd "$ckb_gen" && HOME="$ckb_home" "$MUXM" --create-config project >/dev/null 2>&1 ) || true
-    if grep -qE '^#KEEP_LOG=0' "$ckb_gen/.muxmrc" && grep -qE '^#VERBOSITY="normal"' "$ckb_gen/.muxmrc"; then
+    if grep -qE '^#KEEP_LOG="?0"?' "$ckb_gen/.muxmrc" && grep -qE '^#VERBOSITY="normal"' "$ckb_gen/.muxmrc"; then
       pass "CONFIGKNOB: --create-config emits KEEP_LOG/VERBOSITY at script defaults, commented (H1)"
     else
       fail "CONFIGKNOB: generated config leaked the machine's KEEP_LOG/VERBOSITY values (H1)"
