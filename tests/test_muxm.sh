@@ -1249,6 +1249,11 @@ _test_cli_flag_drift() {
   # (c) [[ "$_arg" == "--flag" ]] if-style dispatch (install-dependencies, setup)
   # shellcheck disable=SC2016  # intentional: grep matches the literal text "$_arg" in $src, no expansion wanted
   grep -oE '"\$_arg" == "--[a-z][a-z-]*"' "$src" | grep -oE '\-\-[a-z-]+' >> "$wd/raw.txt"
+  # --profile is parser-accepted via its OWN dedicated two-pass prescan (a `[[ … == "--profile" ]]`
+  # loop over the raw args, an idiom none of the extractors above scan), and intentionally has NO
+  # §12 case arm — the unreachable `--profile) shift 2` straggler was removed in the L10 cleanup.
+  # Add it explicitly so the parser<->completion drift guard still recognises it as a real flag.
+  printf '%s\n' '--profile' >> "$wd/raw.txt"
   grep -vxE '\-\-|\-\*|\*' "$wd/raw.txt" | sort -u > "$parser"
 
   # ---- Completion flag set: the `flags="..."` block of the installed script ----
@@ -1441,6 +1446,19 @@ _test_cli_m1_dashdash() {
     fail "M1: '-- -dash.mkv' did not resolve a leading-dash source"
   fi
   rm -rf "$_dashdir"
+
+  # L10: a --profile AFTER -- is a positional, not the flag — the prescan must stop interpreting
+  # --profile at -- (mirroring _create_config_prescan). Pre-fix the prescan consumed it and applied
+  # the profile, leaving a valid one-source run; now --profile + its value fold into POSITIONALS via
+  # the main parser's `--) ` arm, so all four tokens overflow arity → "Too many arguments". That
+  # error is the discriminator: it can ONLY occur if --profile was treated as a positional after --.
+  local out3
+  out3="$(run_muxm --dry-run -- --profile streaming-hevc /tmp/l10a.mkv /tmp/l10b.mkv 2>&1 || true)"
+  if grep -qiE "Too many arguments" <<<"$out3" && ! grep -qiE "Applied profile: streaming-hevc" <<<"$out3"; then
+    pass "L10: '--profile' after '--' is treated as a positional, not applied as the profile flag"
+  else
+    fail "L10: '--profile' after '--' was wrongly interpreted as the flag (got: $(grep -iE 'Applied profile|Too many|Unknown profile' <<<"$out3" | head -1))"
+  fi
 }
 
 # M5: a trailing value-flag in --create-config overrides (e.g. `--crf` with no value) must exit
@@ -8044,13 +8062,18 @@ _test_unit_ignored_knobs() {
   # by the resolved backend/codec (C1–C5, C7–C9). Source the helper with a `warn` stub that
   # prints to stdout, set the relevant globals, and assert on the emitted text. Deterministic
   # — exercises the VideoToolbox cases (C1–C4) that can't resolve on non-macOS CI hosts.
-  local body
+  local body iav1
   body="$(awk '/^_warn_ignored_knobs\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
   if [[ -z "$body" ]]; then fail "_warn_ignored_knobs not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
+  # _warn_ignored_knobs calls the _is_av1_codec helper (L8); extract its real definition from muxm
+  # (rather than duplicating it) so the isolated bash -c below has it and stays in sync with the source.
+  iav1="$(grep -E '^_is_av1_codec\(\)' "$MUXM")"
+  if [[ -z "$iav1" ]]; then fail "_is_av1_codec not found in muxm — _warn_ignored_knobs would mis-detect AV1"; return; fi
 
   # $1 = extra global assignments (override the safe defaults below).
   _wik() {
     bash -c 'warn(){ printf "%s\n" "$*"; }
+      '"$iav1"'
       HW_ACCEL_RESOLVED=none; VIDEO_CODEC=libx265
       _CLI_CRF_EXPLICIT=0; _CLI_PRESET_EXPLICIT=0; _CLI_X265_PARAMS_EXPLICIT=0
       _CLI_X264_PARAMS_EXPLICIT=0; _CLI_HW_ACCEL_QUALITY_EXPLICIT=0

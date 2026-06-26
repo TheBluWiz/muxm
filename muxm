@@ -131,6 +131,22 @@ _normalize_profile(){
 }
 
 # ===== Section 3: Globals =====================================================================
+
+# L7: single source of truth for the numeric-value validation patterns. These were inlined ~3×
+# each across the CLI-parse validators and the post-config re-validation block; hoisting them keeps
+# the two sites from drifting. Used unquoted in [[ $x =~ $_RE_… ]] tests (quoting forces a literal
+# match). _RE_BITRATE: a bitrate like 20000k / 5M / a plain integer. _RE_LEVEL: a numeric H.26x level
+# like 5.1. (Deliberately NOT applied to the unrelated duration/framerate `^[0-9]+(\.[0-9]+)?$`
+# checks, which only coincide in shape.)
+readonly _RE_BITRATE='^[0-9]+(\.[0-9]+)?[kKmMgG]?$'
+readonly _RE_LEVEL='^[0-9]+(\.[0-9]+)?$'
+
+# L8: canonical membership test for "is $1 one of the software AV1 encoders". Replaces the
+# `[[ $VIDEO_CODEC == libsvt-av1 || $VIDEO_CODEC == libaom-av1 ]]` idiom that was repeated across
+# many sites, so adding/renaming an AV1 encoder is a one-line change. NOTE: `case` pattern arms
+# (e.g. `libsvt-av1|libaom-av1)`) cannot call a function and are intentionally left inline.
+_is_av1_codec(){ [[ "$1" == "libsvt-av1" || "$1" == "libaom-av1" ]]; }
+
 declare -a COMPLETED_STEPS=()
 declare -a MUXM_CONFIG_LOADED=()
 WORKDIR=""
@@ -674,7 +690,12 @@ ffmpeg_progress_bar() {
   trap '' ERR
   while IFS='=' read -r key val 2>/dev/null; do
     case "$key" in
-      out_time_us)
+      out_time_us|out_time_ms)
+        # L5: handle both progress fields. Older ffmpeg emits only out_time_ms; modern builds emit
+        # both. NOTE: ffmpeg's out_time_ms is a long-standing misnomer — it carries MICROSECONDS, the
+        # same value as out_time_us (verified: both print e.g. 3000000 for a 3s clip), so both route
+        # to the identical microseconds math below. (The review's "*1000" suggestion assumed true
+        # milliseconds and would run the bar 1000× fast; it is intentionally not applied.)
         elapsed_us="${val:-0}"
         # Guard against non-numeric values
         [[ "$elapsed_us" =~ ^-?[0-9]+$ ]] || continue
@@ -4132,7 +4153,7 @@ _create_config() {
   for _cc_num_var in CRF_VALUE THREADS STEREO_BITRATE AUDIO_FORCE_BITRATE \
                      MAX_COPY_BITRATE LEVEL_VALUE AV1_MAXRATE AV1_BUFSIZE; do
     if [[ -n "${_CC_OVERRIDES[$_cc_num_var]:-}" ]] \
-       && [[ ! "${_CC_OVERRIDES[$_cc_num_var]}" =~ ^[0-9]+(\.[0-9]+)?[kKmMgG]?$ ]]; then
+       && [[ ! "${_CC_OVERRIDES[$_cc_num_var]}" =~ $_RE_BITRATE ]]; then
       die 11 "Invalid numeric value for ${_cc_num_var}: '${_CC_OVERRIDES[$_cc_num_var]}'
    Expected a number, optionally with a k/M/G suffix (e.g. 20, 1.5, 256k)."
     fi
@@ -4265,7 +4286,14 @@ _prescan_args=("$@")
 _filtered_args=()
 _i=0
 while (( _i < ${#_prescan_args[@]} )); do
-  if [[ "${_prescan_args[$_i]}" == "--profile" ]]; then
+  if [[ "${_prescan_args[$_i]}" == "--" ]]; then
+    # L10: end-of-options. A --profile after -- is a positional, not the flag — stop interpreting
+    # --profile and pass -- plus everything after it through untouched (the main parser's `--` arm
+    # folds them into POSITIONALS). Mirrors _create_config_prescan's `--` handling. A plain `break`
+    # here would DROP -- and the trailing source/target, so slice the remainder in verbatim.
+    _filtered_args+=("${_prescan_args[@]:$_i}")
+    break
+  elif [[ "${_prescan_args[$_i]}" == "--profile" ]]; then
     if (( _i + 1 < ${#_prescan_args[@]} )); then
       PROFILE_NAME="${_prescan_args[$((_i+1))]}"
       _PROFILE_SOURCE="cli"
@@ -5017,8 +5045,8 @@ _require_val(){
 # user owns their own command line. A sourced .muxmrc bypasses these (it assigns the globals
 # directly), so the matching globals are re-validated after config load in Section 15.
 # Args: $1 = flag name (for the message), $2 = the value.
-_validate_level_arg(){ [[ "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die 11 "Invalid $1 '$2': expected a numeric H.265/H.264 level like 5.1 or 4.0."; }
-_validate_rate_arg(){ [[ "$2" =~ ^[0-9]+(\.[0-9]+)?[kKmMgG]?$ ]] || die 11 "Invalid $1 '$2': expected a bitrate like 20000k, 5M, or a plain integer (bits/s)."; }
+_validate_level_arg(){ [[ "$2" =~ $_RE_LEVEL ]]   || die 11 "Invalid $1 '$2': expected a numeric H.265/H.264 level like 5.1 or 4.0."; }
+_validate_rate_arg(){  [[ "$2" =~ $_RE_BITRATE ]] || die 11 "Invalid $1 '$2': expected a bitrate like 20000k, 5M, or a plain integer (bits/s)."; }
 # L4: reject an unknown --audio-force-codec encoder at parse time (die 11) instead of letting an
 # encoder muxm can't name an intermediate for surface as a cryptic late die 43 after track scanning.
 # SYNC: this allow-list must stay in step with the real (non-fallback) arms of _audio_codec_ext —
@@ -5187,8 +5215,10 @@ while [[ $# -gt 0 ]]; do
       REPLACE_SOURCE=1; shift ;;
     --force-replace-source) FORCE_REPLACE_SOURCE=1; shift ;;
 
-    # --profile was consumed by pre-scan; handle straggler gracefully
-    --profile) shift 2 ;;
+    # L10/cleanup: no `--profile)` arm here — the pre-scan strips every `--profile <val>` before
+    # this parser runs, and a post-`--` `--profile` is folded into POSITIONALS by the `--)` arm
+    # below, so the token can never reach this case. (The old arm's `shift 2` would also over-shift
+    # a lone trailing `--profile`.) A stray `--profile` now correctly hits the unknown-option guard.
 
     --) shift; POSITIONALS+=("$@"); break ;;  # M1: fold remaining args back in (the `--` end-of-options idiom, e.g. `muxm -- -dashname.mkv`); the arity check below still guards
     -*) die 11 "Unknown option: $1. $USAGE_SHORT" ;;
@@ -5232,12 +5262,10 @@ _warn_multitrack_sub_conflicts(){
 }
 
 # Warn when OUTPUT_EXT matches an unusual/unsupported container for a profile.
-# Args: profile ext msg [only_when_explicit]
-# only_when_explicit=1: skip unless _OUTPUT_EXT_EXPLICIT (e.g. ATV passthrough produces MKV legitimately).
+# Args: profile ext msg
 _warn_container_unusual(){
-  local _p="$1" _ext="$2" _msg="$3" _explicit="${4:-0}"
+  local _p="$1" _ext="$2" _msg="$3"
   [[ "$OUTPUT_EXT" != "$_ext" ]] && return 0
-  (( _explicit )) && ! (( _OUTPUT_EXT_EXPLICIT )) && return 0
   _warn_conflict "$_p" "--output-ext $_ext" "$_msg"
   return 0
 }
@@ -5275,7 +5303,7 @@ _warn_h264_drops_dv() {
 _warn_ignored_knobs() {
   local _vt=0;    [[ "$HW_ACCEL_RESOLVED" == "videotoolbox" ]] && _vt=1
   local _is_x26x=0; [[ "$VIDEO_CODEC" == "libx265" || "$VIDEO_CODEC" == "libx264" ]] && _is_x26x=1
-  local _is_av1=0;  [[ "$VIDEO_CODEC" == "libsvt-av1" || "$VIDEO_CODEC" == "libaom-av1" ]] && _is_av1=1
+  local _is_av1=0;  _is_av1_codec "$VIDEO_CODEC" && _is_av1=1
 
   # C1–C4: VideoToolbox ignores the x265/x264 software encode knobs.
   if (( _vt && _is_x26x )); then
@@ -5465,7 +5493,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       _warn_container_unusual "$PROFILE_NAME" "mov" \
         "MOV has limited AV1+HDR10 support. av1-hq uses MKV to preserve HDR10."
       # Switching off AV1 defeats the entire purpose of an AV1 archival profile.
-      if [[ "$VIDEO_CODEC" != "libsvt-av1" && "$VIDEO_CODEC" != "libaom-av1" ]]; then
+      if ! _is_av1_codec "$VIDEO_CODEC"; then
         _warn_conflict "$PROFILE_NAME" "--video-codec $VIDEO_CODEC" \
           "av1-hq is an AV1 archival profile; selecting $VIDEO_CODEC overrides its whole purpose."
       fi
@@ -5481,7 +5509,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
 
     streaming-av1)
       # C10: streaming-av1 has no dedicated conflict arm. Switching off AV1 defeats the profile.
-      if [[ "$VIDEO_CODEC" != "libsvt-av1" && "$VIDEO_CODEC" != "libaom-av1" ]]; then
+      if ! _is_av1_codec "$VIDEO_CODEC"; then
         _warn_conflict "$PROFILE_NAME" "--video-codec $VIDEO_CODEC" \
           "streaming-av1 targets AV1-capable platforms; selecting $VIDEO_CODEC overrides the profile."
       fi
@@ -5571,7 +5599,7 @@ fi
 
 # Global safeguard: AV1 + DV is not supported — DV RPU injection requires HEVC.
 # Auto-disable DV when an AV1 codec is selected.
-if [[ "$VIDEO_CODEC" == "libsvt-av1" || "$VIDEO_CODEC" == "libaom-av1" ]]; then
+if _is_av1_codec "$VIDEO_CODEC"; then
   if (( ! DISABLE_DV )); then
     warn "AV1 codec does not support Dolby Vision RPU injection — disabling DV (--no-dv)."
     DISABLE_DV=1
@@ -5864,7 +5892,7 @@ fi
 
 # Check AV1 encoder availability when libsvt-av1 or libaom-av1 is requested.
 # Non-fatal probe: warn if not available now; die when actually selected at runtime.
-if [[ "$VIDEO_CODEC" == "libsvt-av1" || "$VIDEO_CODEC" == "libaom-av1" ]]; then
+if _is_av1_codec "$VIDEO_CODEC"; then
   if [[ "$VIDEO_CODEC" == "libsvt-av1" ]] && ! ffmpeg_has_encoder libsvtav1; then
     die 10 "libsvtav1 encoder not available in this ffmpeg build. Install a complete ffmpeg (e.g., brew install ffmpeg-full, or run muxm --install-dependencies)."
   fi
@@ -5928,10 +5956,10 @@ fi
 # sourced .muxmrc assigns these directly, bypassing the parse-time guards above. LEVEL_VALUE,
 # AV1_MAXRATE, and AV1_BUFSIZE are optional (blank = let the encoder decide), so gate on -n;
 # STEREO_BITRATE always has a value (default 192k).
-[[ -n "$LEVEL_VALUE"  && ! "$LEVEL_VALUE"  =~ ^[0-9]+(\.[0-9]+)?$ ]]       && die 11 "Invalid LEVEL_VALUE from config: expected a numeric level like 5.1 (got: ${LEVEL_VALUE})"
-[[ -n "$AV1_MAXRATE"  && ! "$AV1_MAXRATE"  =~ ^[0-9]+(\.[0-9]+)?[kKmMgG]?$ ]] && die 11 "Invalid AV1_MAXRATE from config: expected a bitrate like 20000k (got: ${AV1_MAXRATE})"
-[[ -n "$AV1_BUFSIZE"  && ! "$AV1_BUFSIZE"  =~ ^[0-9]+(\.[0-9]+)?[kKmMgG]?$ ]] && die 11 "Invalid AV1_BUFSIZE from config: expected a bitrate like 40000k (got: ${AV1_BUFSIZE})"
-[[ ! "$STEREO_BITRATE" =~ ^[0-9]+(\.[0-9]+)?[kKmMgG]?$ ]]                     && die 11 "Invalid STEREO_BITRATE from config: expected a bitrate like 192k (got: ${STEREO_BITRATE})"
+[[ -n "$LEVEL_VALUE"  && ! "$LEVEL_VALUE"  =~ $_RE_LEVEL ]]   && die 11 "Invalid LEVEL_VALUE from config: expected a numeric level like 5.1 (got: ${LEVEL_VALUE})"
+[[ -n "$AV1_MAXRATE"  && ! "$AV1_MAXRATE"  =~ $_RE_BITRATE ]] && die 11 "Invalid AV1_MAXRATE from config: expected a bitrate like 20000k (got: ${AV1_MAXRATE})"
+[[ -n "$AV1_BUFSIZE"  && ! "$AV1_BUFSIZE"  =~ $_RE_BITRATE ]] && die 11 "Invalid AV1_BUFSIZE from config: expected a bitrate like 40000k (got: ${AV1_BUFSIZE})"
+[[ ! "$STEREO_BITRATE" =~ $_RE_BITRATE ]]                    && die 11 "Invalid STEREO_BITRATE from config: expected a bitrate like 192k (got: ${STEREO_BITRATE})"
 
 # Resolve and validate source file
 SRC_ABS="$(realpath_fallback "$SRC")"
@@ -6444,11 +6472,20 @@ on_exit() {
 # (util-linux) is unavailable. A pid file inside names the owner for the liveness check (mirrors
 # run_parallel.sh's stale-dir sweep). Released in on_exit, gated on _OUT_LOCK_HELD. (M4)
 _acquire_out_lock() {
-  local lock="${OUT}.lock" owner tries=0
+  local lock="${OUT}.lock" owner tries=0 empty_tries=0
   while ! mkdir "$lock" 2>/dev/null; do
     owner=""; [[ -r "$lock/pid" ]] && read -r owner < "$lock/pid" 2>/dev/null
     if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
       die 11 "Another muxm run (PID $owner) is already writing to this output: $OUT — wait for it to finish, choose a different output path, or remove the stale lock with: rm -rf '$lock'"
+    fi
+    # L2: an empty/unreadable pid file may simply mean the holder just won the mkdir race but has
+    # not yet written its pid (the write happens immediately AFTER mkdir succeeds — see below). Do
+    # not treat that sub-millisecond window as a stale lock to reclaim: give the holder a brief moment
+    # to populate the pid and re-check, and only fall through to reclaim if it stays empty. A present
+    # but non-numeric pid, or a numeric pid whose process is gone, is genuinely stale and reclaimed now.
+    if [[ -z "$owner" ]] && (( ++empty_tries <= 3 )); then
+      sleep 0.05
+      continue
     fi
     # Owner dead or unidentifiable → stale lock. Reclaim and retry, bounded so a genuinely-stuck
     # path (e.g. a permission error) can't spin forever.
@@ -7263,7 +7300,7 @@ build_videotoolbox_params() {
   case "$VIDEO_ENCODER_FFMPEG" in
     hevc_videotoolbox)
       # 10-bit HDR/SDR → Main10, 8-bit SDR → Main.
-      if [[ "$TARGET_PIXFMT" == *"10le"* ]] || [[ "$TARGET_PIXFMT" == "p010le" ]]; then
+      if [[ "$TARGET_PIXFMT" == *"10le"* ]]; then   # matches yuv420p10le AND p010le (both contain "10le")
         VIDEOTOOLBOX_ARGS+=( -profile:v main10 )
       else
         VIDEOTOOLBOX_ARGS+=( -profile:v main )
@@ -7419,7 +7456,7 @@ apply_level_vbv() {
     note "Applying VBV guardrails for level ${lvl} → maxrate=${maxrate}, bufsize=${bufsize}"
   else
     (( CONSERVATIVE_VBV )) && [[ -n "$lvl" ]] && \
-      warn "No VBV guardrail table for level ${LEVEL_VALUE}; buffer compliance NOT enforced."
+      warn "No VBV guardrail table for level ${lvl}; buffer compliance NOT enforced."
     [[ -n "$lvl" ]] && X265_PARAMS="${X265_PARAMS}:level-idc=${lvl}"
   fi
 }
@@ -7633,7 +7670,10 @@ verify_dv_container_record() {
     # mp4box fallback: natively parses RPU NALs and writes dvcC box.
     if (( ! fallback_ok )) && [[ -n "${MP4BOX_CMD:-}" && -n "${V_MIXED:-}" && -s "$V_MIXED" ]]; then
       local dvp_hint=""
-      if [[ -n "${DV_SRC_PROFILE:-}" && -n "${DV_SRC_COMPAT_ID:-}" ]]; then
+      # Defense-in-depth: require BOTH values to be plain integers before feeding them into the
+      # mp4box `:dvp=PROFILE.COMPAT_ID` hint. Safe in practice (DOVI-box integers can't carry : or =),
+      # but a numeric guard keeps a malformed probe value from ever reaching the mp4box arg string.
+      if [[ "${DV_SRC_PROFILE:-}" =~ ^[0-9]+$ && "${DV_SRC_COMPAT_ID:-}" =~ ^[0-9]+$ ]]; then
         dvp_hint=":dvp=${DV_SRC_PROFILE}.${DV_SRC_COMPAT_ID}"
       fi
 
@@ -7660,6 +7700,11 @@ verify_dv_container_record() {
 
     # If mp4box produced a dvcC-bearing video MP4, remux it with audio/subs from original output.
     if (( fallback_ok )); then
+      # L6 (known, accepted): dv_final lives in WORKDIR, so the `mv -f "$dv_final" "$TMP_OUT"` below
+      # is cross-filesystem when --workdir puts WORKDIR on a different volume than OUT_DIR — there it
+      # degrades to a full copy+unlink of the multi-GB DV file (and is not atomic). Kept in WORKDIR
+      # deliberately: a failed fallback remux is then auto-cleaned with WORKDIR instead of orphaning
+      # a partial file next to the output. Only the rare mp4box DV-container fallback path hits this.
       local dv_final="$WORKDIR/dv_final_remux.${OUTPUT_EXT}"
       local -a remux_cmd=("${FFMPEG_FLAGS[@]}")
       remux_cmd+=(-i "$dv_video_mp4")  # Video with dvcC from mp4box
@@ -7896,7 +7941,7 @@ _video_is_copy_compliant() {
     _COPY_REJECT_REASON="video codec is $src_codec (need h264)"
     return 1
   fi
-  if [[ "$VIDEO_CODEC" == "libsvt-av1" || "$VIDEO_CODEC" == "libaom-av1" ]]; then
+  if _is_av1_codec "$VIDEO_CODEC"; then
     if [[ "$src_codec" != "av1" ]]; then
       _COPY_REJECT_REASON="video codec is $src_codec (need av1)"
       return 1
@@ -8028,7 +8073,7 @@ _dv_fallback_timestamp_wrap() {
   # The raw base ES we're about to wrap is dead once V_MIXED points at the MP4 — capture
   # it now so we can reclaim it mid-run (mirrors the success-path pre-wrap at the
   # `_reclaim "$V_MIXED" "wrapped into V_DV_MP4 for mux"` site). On the give-up path this
-  # is V_BASE, which the success-path reclaims (7384/7539) intentionally skip while
+  # is V_BASE, which the success-path `_reclaim` calls intentionally skip while
   # V_MIXED==V_BASE; once we repoint V_MIXED below it is genuinely dead.
   local _superseded_es="$V_MIXED"
   local _ts_wrap="$WORKDIR/video_base_timestamped.mp4"
@@ -8354,7 +8399,7 @@ run_video_pipeline() {
   fi
 
   # Default: no DV, or DV disabled, or non-HEVC codec (no DV possible) → use base
-  if (( IS_DV == 0 || DISABLE_DV == 1 )) || [[ "$VIDEO_CODEC" == "libx264" || "$VIDEO_CODEC" == "libsvt-av1" || "$VIDEO_CODEC" == "libaom-av1" ]]; then
+  if (( IS_DV == 0 || DISABLE_DV == 1 )) || [[ "$VIDEO_CODEC" == "libx264" ]] || _is_av1_codec "$VIDEO_CODEC"; then
     V_MIXED="$V_BASE"
     mark_done "Use base video (non-DV)"
     return 0
@@ -8381,6 +8426,10 @@ run_video_pipeline() {
            -bsf:v hevc_mp4toannexb -f hevc - 2>"$WORKDIR/rpu_pipe_demux.err" \
          | dovi_tool extract-rpu - -o "$RPU_P7" >"$WORKDIR/rpu_pipe.log" 2>&1
     ) &
+    # NOTE: $! is the SUBSHELL pid, not the grandchild ffmpeg/dovi_tool pid. This is intentional and
+    # harmless: on Ctrl-C the INT handler signals the whole process group, so the grandchildren die
+    # with the subshell; _ACTIVE_FFMPEG_PID only needs to name a process whose death releases the
+    # tee pipe, and killing the subshell does that. Not a bug — don't "fix" it to a grandchild pid.
     local rpu_pipe_pid=$!
     _ACTIVE_FFMPEG_PID=$rpu_pipe_pid
     spinner "$rpu_pipe_pid" "Extracting DV RPU (piped)"
@@ -8699,7 +8748,10 @@ run_video_pipeline() {
     # correct signaling even if auto-detection is ambiguous.
     if (( ! prewrap_ok )) && [[ -n "${MP4BOX_CMD:-}" ]]; then
       local dvp_hint=""
-      if [[ -n "${DV_SRC_PROFILE:-}" && -n "${DV_SRC_COMPAT_ID:-}" ]]; then
+      # Defense-in-depth: require BOTH values to be plain integers before feeding them into the
+      # mp4box `:dvp=PROFILE.COMPAT_ID` hint. Safe in practice (DOVI-box integers can't carry : or =),
+      # but a numeric guard keeps a malformed probe value from ever reaching the mp4box arg string.
+      if [[ "${DV_SRC_PROFILE:-}" =~ ^[0-9]+$ && "${DV_SRC_COMPAT_ID:-}" =~ ^[0-9]+$ ]]; then
         dvp_hint=":dvp=${DV_SRC_PROFILE}.${DV_SRC_COMPAT_ID}"
       fi
 
@@ -8847,15 +8899,6 @@ _audio_field(){ _probe_stream_field audio "$1" "$2"; }
 # Get audio tag from cached metadata.    Args: $1 — audio stream index, $2 — tag (e.g. language, title).
 _audio_tag(){ _probe_stream_field audio "$1" "tags.$2"; }
 
-# Return language tag for audio stream (lowercased), defaulting to TAG_LANGUAGE_DEFAULT.
-# Args: $1 — audio stream index
-_audio_lang(){
-  local lang
-  lang="$(_audio_tag "$1" language)"; lang="${lang,,}"
-  [[ -z "$lang" ]] && lang="$TAG_LANGUAGE_DEFAULT"
-  echo "$lang"
-}
-
 # Return channel count for audio stream (0 if unavailable).
 # Args: $1 — audio stream index
 _audio_channels(){
@@ -8863,15 +8906,6 @@ _audio_channels(){
   ch="$(_audio_field "$1" channels)"
   [[ -z "$ch" ]] && ch=0
   echo "$ch"
-}
-
-# Return bit_rate for audio stream in bps (0 if unavailable).
-# Args: $1 — audio stream index
-_audio_bitrate(){
-  local br
-  br="$(_audio_field "$1" bit_rate)"
-  [[ -z "$br" ]] && br=0
-  echo "$br"
 }
 
 # Return codec_name for audio stream (lowercased, "unknown" if unavailable).
@@ -9934,16 +9968,6 @@ list_sub_indices(){
 _sp_sub_field() { _probe_stream_field subtitle "$1" "$2"; }
 # Get subtitle tag from cached metadata.    Args: $1 — subtitle stream index, $2 — tag (e.g. language, title).
 _sp_sub_tag() { _probe_stream_field subtitle "$1" "tags.$2"; }
-
-# Check if subtitle stream has forced disposition (single jq call)
-# Args: $1 — subtitle stream index
-# Returns: 1 if forced, 0 otherwise
-# Globals: METADATA_CACHE (read)
-_sp_sub_dispo_forced(){
-  local idx="$1"
-  _jq_cache \
-    "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx].disposition.forced // 0" | head -n1 || echo 0
-}
 
 # Return language tag for subtitle stream (lowercased), defaulting to TAG_LANGUAGE_DEFAULT.
 # Args: $1 — subtitle stream index
