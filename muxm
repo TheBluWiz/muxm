@@ -5019,6 +5019,19 @@ _require_val(){
 # Args: $1 = flag name (for the message), $2 = the value.
 _validate_level_arg(){ [[ "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die 11 "Invalid $1 '$2': expected a numeric H.265/H.264 level like 5.1 or 4.0."; }
 _validate_rate_arg(){ [[ "$2" =~ ^[0-9]+(\.[0-9]+)?[kKmMgG]?$ ]] || die 11 "Invalid $1 '$2': expected a bitrate like 20000k, 5M, or a plain integer (bits/s)."; }
+# L4: reject an unknown --audio-force-codec encoder at parse time (die 11) instead of letting an
+# encoder muxm can't name an intermediate for surface as a cryptic late die 43 after track scanning.
+# SYNC: this allow-list must stay in step with the real (non-fallback) arms of _audio_codec_ext —
+# every accepted encoder must resolve to a valid intermediate extension there. `alac` is deliberately
+# NOT accepted: it is lossless-copyable but has no _audio_codec_ext arm, so forcing a transcode to it
+# would still die 43 — failing fast here is strictly better. (Profile- or .muxmrc-supplied values
+# bypass this CLI arm, matching the existing _validate_rate_arg/_validate_level_arg scope.)
+_validate_force_codec_arg(){
+  case "$2" in
+    libopus|libmp3lame|libvorbis|aac|libfdk_aac|aac_at|ac3|eac3|flac) return 0 ;;
+    *) die 11 "Invalid $1 '$2': unknown audio encoder. Valid: libopus, libmp3lame, libvorbis, aac, libfdk_aac, aac_at, ac3, eac3, flac." ;;
+  esac
+}
 
 POSITIONALS=()
 while [[ $# -gt 0 ]]; do
@@ -5121,7 +5134,7 @@ while [[ $# -gt 0 ]]; do
     --no-prefer-stereo) AUDIO_PREFER_STEREO=0; _CLI_AUDIO_PREFER_STEREO_EXPLICIT=1; shift ;;
     --stereo-fallback) ADD_STEREO_IF_MULTICH=1; _CLI_ADD_STEREO_IF_MULTICH_EXPLICIT=1; shift ;;
     --no-stereo-fallback) ADD_STEREO_IF_MULTICH=0; _CLI_ADD_STEREO_IF_MULTICH_EXPLICIT=1; shift ;;
-    --audio-force-codec)   _require_val "$1" "$#" "${2:-}"; AUDIO_FORCE_CODEC="$2"; shift 2 ;;
+    --audio-force-codec)   _require_val "$1" "$#" "${2:-}"; _validate_force_codec_arg "$1" "$2"; AUDIO_FORCE_CODEC="$2"; shift 2 ;;
     --audio-force-bitrate) _require_val "$1" "$#" "${2:-}"; AUDIO_FORCE_BITRATE="$2"; shift 2 ;;
     --audio-lossless-passthrough) AUDIO_LOSSLESS_PASSTHROUGH=1; shift ;;
     --no-audio-lossless-passthrough) AUDIO_LOSSLESS_PASSTHROUGH=0; shift ;;
@@ -9313,14 +9326,19 @@ _audio_copy_ext(){
 # Map ffmpeg encoder name to file extension
 _audio_codec_ext() {
   case "$1" in
-    libopus)    echo "opus" ;;
-    libmp3lame) echo "mp3" ;;
-    libvorbis)  echo "ogg" ;;
-    aac)        echo "aac" ;;
-    ac3)        echo "ac3" ;;
-    eac3)       echo "eac3" ;;
-    flac)       echo "flac" ;;
-    *)          echo "$1" ;;  # fallback: use codec name as-is
+    libopus)            echo "opus" ;;
+    libmp3lame)         echo "mp3" ;;
+    libvorbis)          echo "ogg" ;;
+    aac)                echo "aac" ;;
+    # L4: the AAC encoder variants (libfdk_aac, AudioToolbox aac_at) produce raw AAC that has no
+    # bare-`.libfdk_aac`/`.aac_at` muxer — wrap in .m4a (mirrors _audio_copy_ext's alac→m4a). Without
+    # this, a --audio-force-codec libfdk_aac/aac_at transcode named the intermediate after the raw
+    # encoder, ffmpeg could not choose a muxer, and the run die 43'd late (the crash this map prevents).
+    libfdk_aac|aac_at)  echo "m4a" ;;
+    ac3)                echo "ac3" ;;
+    eac3)               echo "eac3" ;;
+    flac)               echo "flac" ;;
+    *)                  echo "$1" ;;  # fallback: use codec name as-is
   esac
 }
 

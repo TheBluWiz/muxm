@@ -1504,6 +1504,12 @@ _test_cli_l3_value_validation() {
   _l3_assert_rejected "L3: --av1-maxrate notarate rejected at parse" "Invalid --av1-maxrate"  --av1-maxrate notarate
   _l3_assert_rejected "L3: --stereo-bitrate 1x2 rejected at parse"   "Invalid --stereo-bitrate" --stereo-bitrate 1x2
 
+  # L4: an unknown --audio-force-codec encoder must be rejected at parse (die 11 with a specific
+  # message), not slip through to a cryptic late die 43. `alac` is intentionally rejected too — it is
+  # lossless-copyable but has no _audio_codec_ext arm, so forcing a transcode to it would crash.
+  _l3_assert_rejected "L4: --audio-force-codec not_a_codec rejected at parse" "Invalid --audio-force-codec" --audio-force-codec not_a_codec
+  _l3_assert_rejected "L4: --audio-force-codec alac rejected at parse"        "Invalid --audio-force-codec" --audio-force-codec alac
+
   # Valid values must NOT trip the parse guard (no "Invalid …" message; the run fails later only
   # for the missing source).
   out="$(_l3_msg --level 5.1 --av1-maxrate 5000k --av1-bufsize 40000k --stereo-bitrate 256k)"
@@ -1512,6 +1518,17 @@ _test_cli_l3_value_validation() {
   else
     pass "L3: valid level/rate values accepted at parse (5.1, 5000k, 40000k, 256k)"
   fi
+
+  # L4: every allow-listed encoder (incl. the newly-mapped libfdk_aac/aac_at) must pass the parse
+  # guard — the run fails later only for the missing source, never with "Invalid --audio-force-codec".
+  local _afc
+  for _afc in libopus libmp3lame libvorbis aac libfdk_aac aac_at ac3 eac3 flac; do
+    out="$(_l3_msg --audio-force-codec "$_afc")"
+    if printf '%s\n' "$out" | grep -qiF "Invalid --audio-force-codec"; then
+      fail "L4: --audio-force-codec $_afc wrongly rejected at parse"
+    fi
+  done
+  pass "L4: all allow-listed --audio-force-codec encoders accepted at parse (incl. libfdk_aac, aac_at)"
 
   # Config-bypass: a sourced .muxmrc assigns the global directly. The post-config re-check must
   # still reject it. Use AV1_MAXRATE (no profile overrides it; the re-check fires before source
@@ -8250,8 +8267,14 @@ _test_unit_mapping_helpers() {
   assert_muxm_fn_stdout "_audio_codec_ext(aac)=aac"          "aac"  _audio_codec_ext "" "aac"
   assert_muxm_fn_stdout "_audio_codec_ext(eac3)=eac3"        "eac3" _audio_codec_ext "" "eac3"
   assert_muxm_fn_stdout "_audio_codec_ext(flac)=flac"        "flac" _audio_codec_ext "" "flac"
-  # Fallback: unknown encoder name is echoed back unchanged.
-  assert_muxm_fn_stdout "_audio_codec_ext(libfdk_aac)=passthrough" "libfdk_aac" _audio_codec_ext "" "libfdk_aac"
+  # L4: the AAC encoder variants must resolve to a real muxer extension (.m4a), not the raw encoder
+  # name — otherwise a --audio-force-codec libfdk_aac/aac_at transcode names the intermediate after
+  # the encoder, ffmpeg cannot choose a muxer, and the run die 43's late. (Pre-fix these fell through
+  # the `*)` arm and echoed the name back; that wrong-behavior assertion has been corrected here.)
+  assert_muxm_fn_stdout "_audio_codec_ext(libfdk_aac)=m4a"   "m4a"  _audio_codec_ext "" "libfdk_aac"
+  assert_muxm_fn_stdout "_audio_codec_ext(aac_at)=m4a"       "m4a"  _audio_codec_ext "" "aac_at"
+  # Fallback: a genuinely unknown encoder name is still echoed back unchanged.
+  assert_muxm_fn_stdout "_audio_codec_ext(bogus_enc)=passthrough" "bogus_enc" _audio_codec_ext "" "bogus_enc"
 
   # ---- _ext_sub_codec_from_ext (subtitle file extension → ffprobe codec name) ----
   assert_muxm_fn_stdout "_ext_sub_codec_from_ext(srt)=subrip"        "subrip"            _ext_sub_codec_from_ext "" "srt"
