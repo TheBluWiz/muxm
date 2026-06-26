@@ -6876,6 +6876,21 @@ check_skip_if_ideal() {
         ideal=0; reason="audio codec $a_codec not Direct Play compatible"
       fi
     fi
+  elif (( ideal )) && (( AUDIO_LOSSLESS_PASSTHROUGH )); then
+    # L1: single-track WITH lossless passthrough. The two arms above both skip this case, so
+    # `ideal` would otherwise rest on video+container alone. But the single-track keep-list loop
+    # below filters audio through _sii_audio_is_container_safe and SILENTLY excludes a
+    # container-unsafe codec (e.g. FLAC/DTS-HD MA in an .mp4 — the MP4/MOV whitelist is
+    # aac|ac3|eac3|alac), shipping a video-only remux with only a log line. Force the normal
+    # pipeline instead, which transcodes/handles the lossless track rather than dropping it.
+    local _sii_lp_n _sii_lp_codec
+    _sii_lp_n="$(_audio_stream_count)"
+    if (( _sii_lp_n > 0 )); then
+      _sii_lp_codec="$(_audio_codec 0)"
+      if ! _sii_audio_is_container_safe "$_sii_lp_codec"; then
+        ideal=0; reason="lossless audio codec $_sii_lp_codec not muxable into .$OUTPUT_EXT (would be silently dropped on skip)"
+      fi
+    fi
   fi
 
   # ---- Stereo fallback check (skip-if-ideal only) ----
@@ -10633,26 +10648,35 @@ merge_subtitle_sources(){
     ALL_SUB_TITLES+=("${title:-}")
   done
 
-  # Append external subtitle files, de-duplicating against embedded streams (M3): skip a
-  # sidecar when an embedded track already provides the same normalized language + type, so a
-  # `movie.en.srt` next to an embedded `eng` track does not yield two identical subtitle tracks.
+  # Append external subtitle files, de-duplicating by normalized language + type against BOTH:
+  #   - embedded streams (M3): a `movie.en.srt` next to an embedded `eng` track is skipped; and
+  #   - externals already kept this pass (L3): two sidecars that normalize to the same (lang, type)
+  #     — e.g. `movie.en.srt` + `movie.eng.srt` — must not both survive into a multi-track output
+  #     (single-track mode already takes first-match-wins, but multi-track keeps every passing
+  #     track, so without this the duplicate ships, capped only by SUB_MAX_TRACKS).
   # `n` is the embedded count; the externals are appended after those first `n` entries.
   local j _ext_kept=0 _ext_deduped=0
+  local _ext_seen=" "   # L3: space-padded set of already-kept external "lang_n:type" pairs
   for (( j=0; j<${#EXT_SUB_PATHS[@]}; j++ )); do
     local _xlang="${EXT_SUB_LANGS[$j]}" _xtype="${EXT_SUB_TYPES[$j]}"
     local _xlang_n; _xlang_n="$(_norm_lang_code "$_xlang")"
-    local _dup=0 k
+    local _dup=0 _dup_src="" k
     for (( k=0; k<n; k++ )); do
       if [[ "$(_norm_lang_code "${ALL_SUB_LANGS[$k]}")" == "$_xlang_n" \
             && "${ALL_SUB_TYPES[$k]}" == "$_xtype" ]]; then
-        _dup=1; break
+        _dup=1; _dup_src="embedded"; break
       fi
     done
+    local _xkey="${_xlang_n}:${_xtype}"
+    if (( ! _dup )) && [[ "$_ext_seen" == *" ${_xkey} "* ]]; then
+      _dup=1; _dup_src="external"   # L3: collides with an earlier sidecar, not an embedded track
+    fi
     if (( _dup )); then
-      note "[Subs] Skipping external $(basename -- "${EXT_SUB_PATHS[$j]}") — an embedded ${_xlang_n} ${_xtype} subtitle is already present."
+      note "[Subs] Skipping external $(basename -- "${EXT_SUB_PATHS[$j]}") — a matching ${_xlang_n} ${_xtype} subtitle (${_dup_src}) is already present."
       _ext_deduped=$(( _ext_deduped + 1 ))
       continue
     fi
+    _ext_seen+="${_xkey} "
     ALL_SUB_SOURCES+=("ext:${EXT_SUB_PATHS[$j]}")
     ALL_SUB_LANGS+=("$_xlang")
     ALL_SUB_TYPES+=("$_xtype")

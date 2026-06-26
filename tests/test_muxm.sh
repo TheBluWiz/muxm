@@ -4713,6 +4713,51 @@ EOF
   _test_audio_c2_container_safety
   _test_audio_c2_verify_display
   _test_audio_l_forceaac_stereo_bitrate
+  _test_audio_l1_lossless_skip_drop
+}
+
+# L1 (Phase 2): single-track AUDIO_LOSSLESS_PASSTHROUGH must not let skip-if-ideal silently drop a
+# container-unsafe lossless track. With a single FLAC track in an .mp4 source + lossless passthrough
+# + skip-if-ideal + .mp4 output, the video and container are ideal, but FLAC is NOT MP4-muxable
+# (whitelist aac|ac3|eac3|alac). Pre-fix, check_skip_if_ideal kept ideal=1 and the single-track
+# keep-list loop excluded the FLAC track with only a log line — shipping a video-only remux. The fix
+# adds a single-track lossless arm that sets ideal=0, forcing the normal pipeline instead.
+#
+# Discriminating assertion: the dry-run must report the AUDIO reason (not a video/container reason),
+# which only fires from the new arm. Perturb: revert the L1 arm → source becomes "ideal" → red.
+# Skip-first guard (libx265 + flac muxer) per the soft-skip ratchet.
+_test_audio_l1_lossless_skip_drop() {
+  if ! ffmpeg_has_encoder libx265 || ! ffmpeg_has_encoder flac; then
+    skip "L1: ffmpeg lacks libx265/flac — cannot build the FLAC-in-MP4 fixture"
+    return
+  fi
+  local _l1_src="$TESTDIR/l1_flac_src.mp4"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=teal:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -c:v libx265 -preset ultrafast -x265-params log-level=none -pix_fmt yuv420p10le \
+    -c:a flac -strict experimental \
+    -map 0:v -map 1:a \
+    "$_l1_src" 2>/dev/null || true
+  # Require an actual single FLAC audio track in an mp4 (FLAC-in-MP4 is ffmpeg-version-dependent).
+  if [[ ! -s "$_l1_src" ]] || [[ "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$_l1_src" 2>/dev/null)" != "flac" ]]; then
+    skip "L1: could not build a FLAC-in-MP4 fixture (ffmpeg cannot mux FLAC into MP4 here)"
+    rm -f "$_l1_src" 2>/dev/null || true
+    return
+  fi
+  # atv-directplay-hq: video-copy-compliant for HEVC Main10 SDR, single-track audio, skip-if-ideal.
+  # Add --audio-lossless-passthrough so the new single-track lossless arm is the one under test.
+  # NOTE: no --crf/--preset, which would force a re-encode and short-circuit video compliance.
+  local _l1_out; _l1_out="$(run_muxm --profile atv-directplay-hq --output-ext mp4 \
+    --audio-lossless-passthrough --skip-if-ideal --dry-run "$_l1_src" "$TESTDIR/l1_out.mp4" 2>&1)" || true
+  if printf '%s' "$_l1_out" | grep -qiE 'already matches profile'; then
+    fail "L1: source treated as ideal → skip taken; single FLAC track would be silently dropped"
+  elif printf '%s' "$_l1_out" | grep -qiE 'does not match ideal:.*lossless audio codec flac not muxable'; then
+    pass "L1: single-track FLAC-in-MP4 + lossless passthrough forces the pipeline (no silent drop)"
+  else
+    fail "L1: expected the audio non-ideal reason; got: $(printf '%s' "$_l1_out" | grep -iE 'does not match ideal|already matches' | head -1)"
+  fi
+  rm -f "$_l1_src" "$TESTDIR/l1_out.mp4" 2>/dev/null || true
 }
 
 # L (Phase 5): force-AAC must honor STEREO_BITRATE, not a hardcoded 256k. Force-transcode an ac3
@@ -10328,6 +10373,40 @@ EOF
       fi
     fi
     rm -f "$_m3_src" "$_m3_out" "$TESTDIR/m3_embed.srt" "$TESTDIR/m3_dedup_source.en.srt" 2>/dev/null || true
+  fi
+
+  # ---- L3: two external sidecars normalizing to the SAME (lang, type) pair must not both survive
+  #      — merge_subtitle_sources now de-duplicates externals against EACH OTHER, not just against
+  #      embedded tracks. A source with no embedded eng track + `<stem>.en.srt` + `<stem>.eng.srt`
+  #      (both parse to eng/full) must yield exactly ONE subtitle track in multi-track mode (archive),
+  #      not two. Pre-fix the dedup loop only compared sidecars to embedded streams. Skip-first. ----
+  if ! ffmpeg_has_encoder libx265; then
+    skip "L3: ffmpeg lacks libx265 — cannot build the sidecar-dedup fixture"
+  else
+    local _l3_src="$TESTDIR/l3_dedup_source.mkv" _l3_out="$TESTDIR/l3_dedup_out.mkv"
+    # Video + audio only — NO embedded subtitle track, so the two sidecars collide only with
+    # each other (isolating the external-vs-external dedup that L3 adds).
+    ffmpeg -hide_banner -loglevel error -y \
+      -f lavfi -i "color=c=navy:s=320x240:r=24:d=2" \
+      -f lavfi -i "sine=frequency=440:duration=2" \
+      -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p10le \
+      -map 0:v -map 1:a -c:a aac \
+      "$_l3_src" 2>/dev/null
+    # Two sidecars, same normalized language (en == eng) and type (full).
+    printf '1\n00:00:00,000 --> 00:00:02,000\nSidecar EN\n'  > "$TESTDIR/l3_dedup_source.en.srt"
+    printf '1\n00:00:00,000 --> 00:00:02,000\nSidecar ENG\n' > "$TESTDIR/l3_dedup_source.eng.srt"
+    if [[ ! -s "$_l3_src" ]]; then
+      skip "L3: could not build the sidecar-dedup fixture"
+    else
+      run_muxm --profile archive --output-ext mkv "$_l3_src" "$_l3_out" >/dev/null
+      local _l3_scount; _l3_scount="$(count_streams "$_l3_out" s)"
+      if [[ -s "$_l3_out" ]] && (( _l3_scount == 1 )); then
+        pass "L3: sidecars '.en.srt' + '.eng.srt' de-duplicated to exactly 1 subtitle track"
+      else
+        fail "L3: expected exactly 1 subtitle track after external dedup, got ${_l3_scount:-?} (sidecar-vs-sidecar not deduped)"
+      fi
+    fi
+    rm -f "$_l3_src" "$_l3_out" "$TESTDIR/l3_dedup_source.en.srt" "$TESTDIR/l3_dedup_source.eng.srt" 2>/dev/null || true
   fi
 
   # ---- L2: an external subtitle whose path contains control characters must be skipped (with a
