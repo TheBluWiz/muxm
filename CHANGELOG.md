@@ -6,7 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ## [Unreleased]
 
-## [1.5.1] - 2026-06-25
+## [1.5.1] - 2026-06-27
+
+### Security
+
+- **`--create-config` multi-profile path no longer lets override values inject shell into the generated `.muxmrc` (RF1)** — the M1 fix (v1.5.1) escaped override values in the single-profile emitter's `_V` helper but not in `_create_config_emit_multi`, which kept the pre-M1 unquoted-ish `printf '%s="%s"'`. A comma-separated `--profile` plus a crafted string override (e.g. `--x265-params '$(…)'`) therefore emitted an unescaped line that executed on every later `. .muxmrc` source (and `--create-config system` writes `/etc/.muxmrc`). Both emitters now share one `_cc_shell_escape` helper and always emit the escaped, quoted form.
 
 ### Fixed
 

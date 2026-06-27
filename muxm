@@ -3472,6 +3472,18 @@ unset _arg
 # Profile:       defaults to atv-directplay-hq if omitted.
 # --force-create-config: overwrite if file already exists.
 
+# RF1 (HIGH-1): single shared escape for values emitted into a double-quoted shell
+# word in a generated .muxmrc. Escapes the four characters special inside "…" ( \ " $ ` )
+# so a crafted override value cannot inject shell that would execute on every later
+# `. .muxmrc` source. Both config emitters route every override through this one helper,
+# so the escape logic has a single definition (the prior duplication is what let
+# _create_config_emit_multi keep the pre-M1 unescaped form — see RF1 in CHANGELOG).
+_cc_shell_escape() {
+  local v="$1"
+  v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//\$/\\\$}"; v="${v//\`/\\\`}"
+  printf '%s' "$v"
+}
+
 # <<< embedded config template >>>
 _create_config_emit() {
   local profile="$1"
@@ -3549,8 +3561,7 @@ _create_config_emit() {
     # VAR=value and VAR="value" are identical when sourced, so no existing config changes meaning.
     # (This also subsumes the earlier Phase-5 fix for embedded quotes in string values, e.g.
     # X265_PARAMS_BASE='aq-mode=3:foo="bar"' now round-trips faithfully.)
-    local qval="$val"
-    qval="${qval//\\/\\\\}"; qval="${qval//\"/\\\"}"; qval="${qval//\$/\\\$}"; qval="${qval//\`/\\\`}"
+    local qval; qval="$(_cc_shell_escape "$val")"   # RF1: shared escape (was inline; see _cc_shell_escape)
     if [[ "$_active" == *" ${var} "* ]]; then
       printf '%s="%s"%s\n' "$var" "$qval" "$suffix"
     else
@@ -4023,15 +4034,15 @@ HEADER
 
   if (( ${#_CC_OVERRIDES[@]} > 0 )); then
     printf '\n'
-    local _ovr_var _ovr_val
+    local _ovr_var
+    # RF1 (HIGH-1): ALWAYS emit the escaped, double-quoted form for every override — drop the
+    # old numeric/string branch entirely. The string branch did `printf '%s="%s"'` with NO
+    # escaping, so a crafted value (e.g. --x265-params '$(touch /tmp/pwn)') emitted a line that
+    # executed on every later `. .muxmrc` source. VAR="20" sources identically to VAR=20, so the
+    # unconditional quoted form is safe for numeric values too. Same _cc_shell_escape as _V, so
+    # the two emitters can no longer drift (which is what re-opened M1 on this path).
     for _ovr_var in "${!_CC_OVERRIDES[@]}"; do
-      _ovr_val="${_CC_OVERRIDES[$_ovr_var]}"
-      # Numeric values unquoted; everything else double-quoted
-      if [[ "$_ovr_val" =~ ^[0-9]+$ ]]; then
-        printf '%s=%s\n' "$_ovr_var" "$_ovr_val"
-      else
-        printf '%s="%s"\n' "$_ovr_var" "$_ovr_val"
-      fi
+      printf '%s="%s"\n' "$_ovr_var" "$(_cc_shell_escape "${_CC_OVERRIDES[$_ovr_var]}")"   # RF1
     done
   fi
 }

@@ -2513,6 +2513,7 @@ test_config() {
   _test_config_m7_deprecation_bridge
   _test_config_l_create_escape
   _test_config_m1_create_injection
+  _test_config_rf1_multi_injection
 }
 
 # L (Phase 5): --create-config must emit string override values escaped so a value containing a
@@ -2592,6 +2593,81 @@ _test_config_m1_create_injection() {
     fail "M1 inject: expected exit 11 + no file for non-numeric --crf, got rc=$_rc, file-exists=$([[ -f "$_d/.muxmrc" ]] && echo yes || echo no)"
   fi
   rm -rf "$_d"
+}
+
+# RF1 (HIGH-1): the M1 fix escaped override values in the single-profile emitter's _V helper but
+# NOT in _create_config_emit_multi, which kept the pre-M1 `printf '%s="%s"'` with no escaping. A
+# comma-separated --profile routes to the multi emitter, so a crafted string override (e.g.
+# --x265-params '$(touch …)') emitted an unescaped line that executes on every later `. .muxmrc`
+# source. Both emitters now share _cc_shell_escape and always emit the escaped, quoted form.
+# Three arms:
+#   (a) function-level: drive _create_config_emit_multi with _CC_OVERRIDES carrying ` " $ chars and
+#       assert the emitted line equals the escaped form (media-free via _extract_muxm_fns).
+#   (b) anti-injection round-trip: a `$(touch canary)` payload through the real multi-emit CLI path
+#       must round-trip as a literal and create NO canary when the generated .muxmrc is sourced.
+#   (c) parity: the same override emitted by the single and multi paths yields a byte-identical line.
+# Perturb (revert _create_config_emit_multi to the unescaped numeric/string branch) → (a)/(b) red.
+_test_config_rf1_multi_injection() {
+  # (a) function-level escape assertion — no media, no CLI.
+  local body
+  body="$(_extract_muxm_fns _create_config_emit_multi _cc_shell_escape)" || {
+    fail "RF1: could not extract _create_config_emit_multi + _cc_shell_escape from muxm"; return; }
+  # shellcheck disable=SC2016  # literal driver body; expansions must happen inside bash -c, not now
+  local _driver='declare -gA _CC_OVERRIDES=([X265_PARAMS_BASE]='\''aq=3":x=$HOME:y=`id`'\'')
+_create_config_emit_multi "archive,streaming-hevc" | grep "^X265_PARAMS_BASE="'
+  local _line
+  _line="$(bash -c "$body"$'\n'"$_driver" 2>/dev/null)"
+  # Expected: every special char ( " $ ` ) escaped with a backslash inside the quoted value.
+  local _want='X265_PARAMS_BASE="aq=3\":x=\$HOME:y=\`id\`"'
+  if [[ "$_line" == "$_want" ]]; then
+    pass "RF1: multi-profile config emitter escapes shell-special override values"
+  else
+    fail "RF1: multi emitter did not escape — wanted [$_want], got [$_line]"
+  fi
+
+  # (b) anti-injection round-trip through the real multi-emit path (comma-separated profile).
+  local _d="$TESTDIR/rf1_multi"; mkdir -p "$_d/h"
+  local _canary="$_d/CANARY"
+  local _payload="x:\$(touch '$_canary')"   # command substitution that would fire on an unescaped source
+  rm -f "$_canary"
+  ( cd "$_d" && HOME="$_d/h" "$MUXM" --create-config project archive,streaming-hevc \
+      --x265-params "$_payload" >/dev/null 2>&1 )
+  if [[ ! -f "$_d/.muxmrc" ]]; then
+    fail "RF1: --create-config (multi) did not write .muxmrc"; rm -rf "$_d"; return
+  fi
+  if ! bash -n "$_d/.muxmrc" 2>/dev/null; then
+    fail "RF1: generated multi-profile .muxmrc fails bash -n (override corrupted the file)"
+  fi
+  local _got
+  # shellcheck disable=SC1091  # dynamic path to a just-generated test .muxmrc
+  _got="$(set +u; . "$_d/.muxmrc" 2>/dev/null; printf '%s' "$X265_PARAMS_BASE")"
+  if [[ "$_got" == "$_payload" && ! -e "$_canary" ]]; then
+    pass "RF1: emitted multi-profile config round-trips (sources cleanly, value intact, no injection)"
+  else
+    fail "RF1: multi-profile injection — value got '$_got' (want '$_payload'), canary-exists=$([[ -e "$_canary" ]] && echo yes || echo no)"
+  fi
+  rm -rf "$_d"
+
+  # (c) single vs multi emitters escape an identical override identically (guards future drift).
+  local _ds="$TESTDIR/rf1_single"; mkdir -p "$_ds/h"
+  local _dm="$TESTDIR/rf1_multi2"; mkdir -p "$_dm/h"
+  local _val='aq=3":x=$HOME:y=`id`'
+  ( cd "$_ds" && HOME="$_ds/h" "$MUXM" --create-config project atv-directplay-hq \
+      --x265-params "$_val" >/dev/null 2>&1 )
+  ( cd "$_dm" && HOME="$_dm/h" "$MUXM" --create-config project archive,streaming-hevc \
+      --x265-params "$_val" >/dev/null 2>&1 )
+  local _ls _lm
+  _ls="$(grep -E '^X265_PARAMS_BASE=' "$_ds/.muxmrc" 2>/dev/null)"
+  _lm="$(grep -E '^X265_PARAMS_BASE=' "$_dm/.muxmrc" 2>/dev/null)"
+  # The single emitter may append a trailing ` # Manually adjusted` annotation (legitimate, unrelated
+  # to escaping); strip it so the comparison is purely the escaped VAR="value" assignment.
+  _ls="${_ls%% # Manually adjusted}"
+  if [[ -n "$_ls" && "$_ls" == "$_lm" ]]; then
+    pass "RF1: single and multi emitters escape an override identically"
+  else
+    fail "RF1: single/multi escape divergence — single [$_ls] vs multi [$_lm]"
+  fi
+  rm -rf "$_ds" "$_dm"
 }
 
 _test_config_m7_deprecation_bridge() {
