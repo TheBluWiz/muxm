@@ -145,6 +145,12 @@ _normalize_profile(){
 readonly _RE_BITRATE='^[0-9]+(\.[0-9]+)?[kKmMgG]?$'
 readonly _RE_LEVEL='^[0-9]+(\.[0-9]+)?$'
 
+# CR-15: single source of truth for the binary size units. Both filesize_pretty and _gb open-coded
+# 1 GiB / 1 MiB as the bare literal (1073741824 / 1048576) AND the factored expression
+# (1024*1024*1024 / 1024*1024). Name them once so the two spellings can't drift.
+readonly BYTES_PER_GIB=1073741824   # 1024^3
+readonly BYTES_PER_MIB=1048576      # 1024^2
+
 # L8: canonical membership test for "is $1 one of the software AV1 encoders". Replaces the
 # `[[ $VIDEO_CODEC == libsvt-av1 || $VIDEO_CODEC == libaom-av1 ]]` idiom that was repeated across
 # many sites, so adding/renaming an AV1 encoder is a one-line change. NOTE: `case` pattern arms
@@ -235,8 +241,9 @@ AV1_BUFSIZE=""
 LEVEL_VALUE=""                 # e.g., 5.1 (blank = encoder decides)
 # Explicit-tracking for the advanced encode-param flags (mirrors _CLI_CRF_EXPLICIT):
 # 1 when the user typed the flag on the CLI, 0 when the value came from a profile/config
-# default. Set at parse time; recorded for the upcoming ignored-knob conflict warnings
-# (WI-1b/Section 13b) — currently set but not yet read, so no behavior change.
+# default. Set at parse time and READ by the Section-13 ignored-knob conflict warnings
+# (WI-1b/Section 13b) — e.g. --x265-params with a non-x265 codec, --level on AV1, --threads
+# under HW/copy. The advisories are warn-only, so these still drive no encode behavior.
 declare -i _CLI_X265_PARAMS_EXPLICIT=0   # --x265-params
 declare -i _CLI_X264_PARAMS_EXPLICIT=0   # --x264-params
 declare -i _CLI_AV1_PARAMS_EXPLICIT=0    # --av1-params
@@ -302,8 +309,10 @@ declare -i VT_QUALITY_DEFAULT=65
 # When empty, build_videotoolbox_params resolves VT_QUALITY_MAP[profile]
 # (or VT_QUALITY_DEFAULT if profile not in the map).
 HW_ACCEL_QUALITY=""
-# Reserved foundation (see _CLI_HW_ACCEL_EXPLICIT above): records whether --hw-accel-quality
-# was typed explicitly, for the upcoming HW-backend precedence logic. Set at parse, not yet read.
+# Records whether --hw-accel-quality was typed explicitly. Set at parse and READ by the Section-13
+# C5 advisory (warns when --hw-accel-quality is given but the resolved backend isn't VideoToolbox).
+# Warn-only — it still feeds no encode behavior. (Distinct from _CLI_HW_ACCEL_EXPLICIT above, which
+# remains genuinely reserved for the future backend-precedence decision.)
 declare -i _CLI_HW_ACCEL_QUALITY_EXPLICIT=0
 
 # Let VideoToolbox fall back to its internal software encoder path when the
@@ -493,6 +502,7 @@ declare -i AUDIO_LOSSLESS_PASSTHROUGH=0
 declare -i SUB_BURN_FORCED=0
 # Export non-forced subtitles as external .srt files alongside output
 declare -i SUB_EXPORT_EXTERNAL=0
+declare -i _EXPORT_MKV_ADVISORY_SHOWN=0   # CR-14: one-shot guard for _warn_export_external_mkv
 # Keep chapter markers in output
 declare -i KEEP_CHAPTERS=1
 # Strip non-essential metadata from output
@@ -1012,10 +1022,10 @@ filesize_pretty(){
   fi
 
   # Human-readable formatting
-  if (( bytes >= 1073741824 )); then
-    LC_NUMERIC=C printf '%.2f GB (%s bytes)\n' "$(echo "scale=2; $bytes/1073741824" | bc)" "$bytes"
-  elif (( bytes >= 1048576 )); then
-    LC_NUMERIC=C printf '%.1f MB (%s bytes)\n' "$(echo "scale=1; $bytes/1048576" | bc)" "$bytes"
+  if (( bytes >= BYTES_PER_GIB )); then
+    LC_NUMERIC=C printf '%.2f GB (%s bytes)\n' "$(echo "scale=2; $bytes/$BYTES_PER_GIB" | bc)" "$bytes"
+  elif (( bytes >= BYTES_PER_MIB )); then
+    LC_NUMERIC=C printf '%.1f MB (%s bytes)\n' "$(echo "scale=1; $bytes/$BYTES_PER_MIB" | bc)" "$bytes"
   elif (( bytes >= 1024 )); then
     LC_NUMERIC=C printf '%.0f KB\n' "$(echo "scale=0; $bytes/1024" | bc)"
   else
@@ -5300,6 +5310,21 @@ _warn_multitrack_sub_conflicts(){
   return 0
 }
 
+# CR-14: --sub-export-external + MKV advisory. Idempotent (one-shot via _EXPORT_MKV_ADVISORY_SHOWN)
+# so it can be safely called from BOTH the Section-13 conflict block (where it catches an explicit
+# --output-ext mkv / mkv-setting profile, the only state known pre-resolution — and the only state
+# available in `--print-effective-config` with no source) AND the tail of
+# _resolve_output_and_sub_policy (which catches passthrough profiles whose OUTPUT_EXT resolves to
+# mkv only there). Whichever runs first fires once; the second call is a no-op. No double-warning.
+_warn_export_external_mkv(){
+  (( _EXPORT_MKV_ADVISORY_SHOWN )) && return 0
+  if (( SUB_EXPORT_EXTERNAL )) && [[ "$OUTPUT_EXT" == "mkv" ]]; then
+    warn "[Subs] --sub-export-external with MKV: Matroska already carries multiple subtitle tracks natively, so external SRT export is unnecessary — proceeding as requested."
+    _EXPORT_MKV_ADVISORY_SHOWN=1
+  fi
+  return 0
+}
+
 # Warn when OUTPUT_EXT matches an unusual/unsupported container for a profile.
 # Args: profile ext msg
 _warn_container_unusual(){
@@ -5630,10 +5655,11 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
   if (( SUB_BURN_FORCED )) && (( ! SUB_INCLUDE_FORCED )); then
     warn "[Subs] Forced-subtitle burn-in is enabled, but forced subtitles are excluded — there is nothing to burn."
   fi
-
-  if (( SUB_EXPORT_EXTERNAL )) && [[ "$OUTPUT_EXT" == "mkv" ]]; then
-    warn "[Subs] --sub-export-external with MKV: Matroska already carries multiple subtitle tracks natively, so external SRT export is unnecessary — proceeding as requested."
-  fi
+  # CR-14: fires here for an explicit --output-ext mkv / mkv-setting profile (the only state known
+  # pre-resolution, and the only state available under --print-effective-config with no source).
+  # Passthrough profiles whose OUTPUT_EXT resolves to mkv only later are caught by the twin call at
+  # the tail of _resolve_output_and_sub_policy; the one-shot guard makes whichever runs first win.
+  _warn_export_external_mkv
 fi
 
 # Global safeguard: AV1 + DV is not supported — DV RPU injection requires HEVC.
@@ -5747,6 +5773,11 @@ _resolve_output_and_sub_policy(){
       log "[${PROFILE_NAME}] MKV output: enabling PGS bitmap preservation (stream-copy)."
     fi
   fi
+
+  # CR-14: now that OUTPUT_EXT is fully resolved, fire the export-external+MKV advisory for the
+  # passthrough case the Section-13 conflict block could not see (OUTPUT_EXT was "" there). One-shot
+  # guarded, so if the conflict block already warned (explicit mkv) this is a no-op — no double-warn.
+  _warn_export_external_mkv
 }
 
 # Display the resolved configuration from all sources (config files + profile + CLI).
@@ -6098,8 +6129,13 @@ fi
 # writable OUT_DIR (an attacker with write access there already controls the output location);
 # the random name only thwarts blind pre-creation, not an attacker who observes the listing.
 # Honest severity is Low (it needs a hostile OUT_DIR). mktemp --suffix would avoid the rm→reuse
-# but is not portable to BSD/macOS. The same observe-then-symlink applies to write_checksum's
-# deterministic ${file}.${algo} target.
+# but is not portable to BSD/macOS. CR-8: the same observe-then-symlink class — and the same Low
+# severity and hostile-OUT_DIR precondition — covers ALL the predictable post-run artifacts written
+# into OUT_DIR with a deterministic name via `>` / `cp -f` / `mkdir -p` (which follow a pre-planted
+# symlink): write_checksum's ${OUT}.${algo}, write_json_report's ${OUT%.ext}.report.json, _persist_log's
+# ${OUT%.ext}.muxm.log (--keep-log), and _persist_failure_bundle's ${OUT%.ext}.muxm-debug/ dir.
+# All share this accepted trade-off; none is separately hardened (write-to-WORKDIR-then-mv was
+# considered and deferred — it buys nothing an attacker who already controls OUT_DIR can't defeat).
 TMP_OUT="$(mktemp "$OUT_DIR/.muxm.output.XXXXXXXX")" || die 11 "Cannot create temp output file"
 rm -f "$TMP_OUT"  # Remove the file, we just wanted the name
 TMP_OUT="${TMP_OUT}.${OUTPUT_EXT}"
@@ -6270,6 +6306,11 @@ _reclaim() {
   local f="${1:-}" reason="${2:-}"
   (( DRY_RUN )) && return 0
   [[ -n "$f" && -e "$f" ]] || return 0
+  # CR-12: require a non-empty WORKDIR before the prefix guard. If WORKDIR were ever empty the
+  # `"$WORKDIR"/*` pattern degenerates to `/*`, matching any absolute path and defeating the
+  # containment check. Not reachable today (WORKDIR is set before any _reclaim), but mirrors the
+  # `-n "$WORKDIR"` precondition in _cleanup_workdir — defense-in-depth for a deletion path.
+  [[ -n "$WORKDIR" ]] || { warn "Refusing to reclaim: WORKDIR is unset"; return 0; }
   case "$f" in
     "$WORKDIR"/*) ;;
     *) warn "Refusing to reclaim path outside workdir: $f"; return 0 ;;
@@ -6622,7 +6663,7 @@ _av1_preset_multiplier() {
 }
 
 # _gb — format a byte count as "X.X" for GiB display (integer fallback).
-_gb() { LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; ${1:-0} / 1073741824" | bc 2>/dev/null)" 2>/dev/null || echo "$(( ${1:-0} / 1073741824 ))"; }
+_gb() { LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; ${1:-0} / $BYTES_PER_GIB" | bc 2>/dev/null)" 2>/dev/null || echo "$(( ${1:-0} / BYTES_PER_GIB ))"; }
 
 # disk_free_warn — smart disk space preflight
 # Estimates output size from source bitrate + CRF/preset tables, then warns
@@ -9038,12 +9079,6 @@ _audio_codec(){
   c="$(_audio_field "$1" codec_name)"; c="${c,,}"
   [[ -z "$c" ]] && c="unknown"
   echo "$c"
-}
-
-# Return title tag for audio stream (empty string if unset).
-# Args: $1 — audio stream index
-_audio_title(){
-  _audio_tag "$1" title
 }
 
 # Map channel count to a human-readable label.

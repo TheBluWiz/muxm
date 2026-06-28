@@ -3254,6 +3254,53 @@ test_conflicts() {
   else
     skip "C1–C4 (VideoToolbox software-knob conflicts): VT backend unavailable on this host (unit suite covers them)"
   fi
+
+  _test_conflicts_cr14_export_external_mkv_passthrough
+}
+
+# CR-14: the --sub-export-external + MKV advisory read OUTPUT_EXT in the Section-13 conflict block,
+# BEFORE passthrough resolution — so for a passthrough profile (atv-directplay-*, OUTPUT_EXT="" at
+# warn time) that resolves to MKV from an .mkv source it never fired. The advisory now also runs at
+# the tail of _resolve_output_and_sub_policy (post-resolution), one-shot-guarded against a double
+# warn when --output-ext mkv was explicit. Differential: a passthrough-→-MKV run must emit it; a
+# passthrough-→-MP4 run (mp4 source) must not.
+_test_conflicts_cr14_export_external_mkv_passthrough() {
+  local d="$TESTDIR/cr14_passthrough"; mkdir -p "$d"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=blue:s=320x180:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -c:v libx264 -preset ultrafast -crf 30 -c:a ac3 "$d/src.mkv" 2>/dev/null
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=blue:s=320x180:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -c:v libx264 -preset ultrafast -crf 30 -c:a aac "$d/src.mp4" 2>/dev/null
+  if [[ ! -s "$d/src.mkv" || ! -s "$d/src.mp4" ]]; then
+    skip "CR-14: could not build the passthrough mkv/mp4 fixtures"
+    rm -rf "$d"; return
+  fi
+  local out
+  # (1) passthrough profile + .mkv source → OUTPUT_EXT resolves to mkv → advisory MUST fire.
+  out="$(run_muxm --dry-run --profile atv-directplay-animation --sub-export-external "$d/src.mkv" "$d/out.mkv" 2>&1)"
+  if printf '%s\n' "$out" | grep -qiF "sub-export-external with MKV"; then
+    pass "CR-14: passthrough profile resolving to MKV emits the export-external advisory (post-resolution)"
+  else
+    fail "CR-14: passthrough-→-MKV run did NOT emit the export-external advisory (the CR-14 bug)"
+  fi
+  # (2) one-shot guard: exactly one occurrence (never double-warned).
+  local _n; _n="$(printf '%s\n' "$out" | grep -ciF "sub-export-external with MKV")"
+  if [[ "$_n" == "1" ]]; then
+    pass "CR-14: advisory fires exactly once (one-shot guard — no double-warn)"
+  else
+    fail "CR-14: advisory fired $_n times (expected exactly 1)"
+  fi
+  # (3) negative control: passthrough profile + .mp4 source → OUTPUT_EXT=mp4 → advisory must NOT fire.
+  out="$(run_muxm --dry-run --profile atv-directplay-animation --sub-export-external "$d/src.mp4" "$d/out.mp4" 2>&1)"
+  if printf '%s\n' "$out" | grep -qiF "sub-export-external with MKV"; then
+    fail "CR-14: export-external advisory wrongly fired for a passthrough-→-MP4 run"
+  else
+    pass "CR-14: no export-external advisory for a passthrough run resolving to MP4 (correct)"
+  fi
+  rm -rf "$d"
 }
 
 # === Suite: Hardware Acceleration (Phase 1 foundation) ===
@@ -7718,6 +7765,11 @@ muxm_fn() {
     _audio_descriptive_title)
       deps="$(awk '/^_channel_label\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
       ;;
+    filesize_pretty|_gb)
+      # CR-15: these consume the readonly BYTES_PER_GIB/MIB size constants; pull them in so the
+      # extracted body isn't run with the vars unset (which would mis-branch / divide by empty).
+      deps="$(grep -E '^readonly BYTES_PER_(GIB|MIB)=' "$MUXM")"
+      ;;
   esac
   bash -c "$deps"$'\n'"$body"$'\n'"$fn \"\$@\"" -- "$@"
 }
@@ -8241,6 +8293,26 @@ _test_unit_misc_helpers() {
   _test_pc "universal"           "Lowest common denominator, highest common decency."
   _test_pc "unknown"             ""
 
+  # ---- CR-12: _reclaim empty-WORKDIR guard ----
+  # If WORKDIR were ever empty the `case "$f" in "$WORKDIR"/*)` containment pattern degenerates to
+  # `/*`, which matches ANY absolute path — _reclaim would then rm a file OUTSIDE the (nonexistent)
+  # workdir. The CR-12 precondition `[[ -n "$WORKDIR" ]]` refuses up front (mirrors _cleanup_workdir).
+  local rc_body rc_dir rc_file rc_out
+  rc_body="$(awk '/^_reclaim\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  rc_dir="$TESTDIR/cr12_reclaim"; mkdir -p "$rc_dir"
+  rc_file="$rc_dir/victim.bin"; printf 'data' > "$rc_file"
+  rc_out="$(WORKDIR="" DRY_RUN=0 bash -c "warn(){ printf 'WARN %s\n' \"\$*\"; }; note(){ :; }"$'\n'"$rc_body"$'\n''_reclaim "$1" reason' -- "$rc_file" 2>&1)"
+  if [[ -e "$rc_file" ]]; then
+    pass "CR-12: _reclaim refuses to delete with WORKDIR empty (file survived the /* degeneracy)"
+  else
+    fail "CR-12: _reclaim DELETED a file outside workdir when WORKDIR was empty (guard missing)"
+  fi
+  if printf '%s\n' "$rc_out" | grep -qiF "WORKDIR is unset"; then
+    pass "CR-12: _reclaim warns 'WORKDIR is unset' on the empty-WORKDIR guard"
+  else
+    fail "CR-12: expected a 'WORKDIR is unset' warning. Saw: $(printf '%s\n' "$rc_out" | head -1)"
+  fi
+  rm -rf "$rc_dir"
 }
 
 _test_unit_disk_preflight() {
