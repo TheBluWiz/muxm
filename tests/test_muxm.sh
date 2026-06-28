@@ -8749,6 +8749,11 @@ _normalize_codec_lang c l; printf "%s|%s" "$c" "$l"')"
   _test_pes "movie" "movie.spa.srt"        "spa"$'\t'"full"   "_parse_ext_sub_filename(movie.spa.srt)=spa/full"
   _test_pes "movie" "movie.forced.en.srt"  "eng"$'\t'"forced" "_parse_ext_sub_filename(movie.forced.en.srt)=eng/forced"
   _test_pes "movie" "movie.en.sdh.srt"     "eng"$'\t'"sdh"    "_parse_ext_sub_filename(movie.en.sdh.srt)=eng/sdh"
+  # CR-13: `hi` is language-first (Hindi) when it fills the empty language slot, but stays the SDH
+  # marker once a language is already set. Explicit sdh/hearing/cc markers are unaffected.
+  _test_pes "movie" "movie.hi.srt"         "hi"$'\t'"full"    "_parse_ext_sub_filename(movie.hi.srt)=hi/full (Hindi, not SDH — CR-13)"
+  _test_pes "movie" "movie.eng.hi.srt"     "eng"$'\t'"sdh"    "_parse_ext_sub_filename(movie.eng.hi.srt)=eng/sdh (hi = SDH once lang set — CR-13)"
+  _test_pes "movie" "movie.hearing.srt"    "und"$'\t'"sdh"    "_parse_ext_sub_filename(movie.hearing.srt)=und/sdh (explicit SDH marker)"
 
   # ---- _detect_mp4box (cross-platform: MP4Box on macOS, mp4box on Linux) ----
   # Resolves which DV-muxing binary is on PATH. We mock PATH with fake
@@ -11291,6 +11296,70 @@ EOF
 
   _test_ext_subs_h3_bsd_sort
   _test_ext_subs_rf7_idx_relocate
+  _test_ext_subs_cr4_bracketed_name_sidecar
+  _test_ext_subs_cr13_hi_is_hindi
+}
+
+# CR-4: the source stem is interpolated into a `find -name` GLOB, so glob metacharacters in the
+# name (`* ? [`) match as wildcards, not literally — the anime-naming case the animation profiles
+# target. `[Grp] Show - 01 [1080p].mkv` has its `[…]` read as character classes, so the real
+# bracketed sidecar is MISSED and an unrelated decoy (`r Show - 01 0.eng.srt`, which the classes
+# DO match) is picked up instead. The fix escapes the fnmatch specials. Differential: the bracketed
+# sidecar is discovered AND the decoy is not.
+_test_ext_subs_cr4_bracketed_name_sidecar() {
+  local d="$TESTDIR/cr4_brackets"; mkdir -p "$d"
+  local base='[Grp] Show - 01 [1080p]'
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=blue:s=320x180:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -c:v libx264 -preset ultrafast -crf 30 -c:a aac "$d/$base.mkv" 2>/dev/null
+  printf '1\n00:00:00,000 --> 00:00:01,000\nreal\n'  > "$d/$base.eng.srt"
+  # Decoy whose name the UNescaped `[Grp]`/`[1080p]` character classes would over-match.
+  printf '1\n00:00:00,000 --> 00:00:01,000\ndecoy\n' > "$d/r Show - 01 0.eng.srt"
+  if [[ ! -s "$d/$base.mkv" ]]; then
+    skip "CR-4: could not build the bracketed-name fixture"
+    rm -rf "$d"; return
+  fi
+  local out
+  out="$( (cd "$d" && "$MUXM" --dry-run "$base.mkv" "$d/out.mkv") 2>&1 )"
+  local found
+  found="$(printf '%s\n' "$out" | grep -F 'External subtitle found:' | head -1)"
+  if printf '%s\n' "$found" | grep -qF "$base.eng.srt"; then
+    pass "CR-4: bracketed-name sidecar discovered literally ([…] not treated as a glob class)"
+  else
+    fail "CR-4: bracketed-name sidecar NOT discovered. Saw: ${found:-<none>}"
+  fi
+  if printf '%s\n' "$out" | grep -qF 'r Show - 01 0.eng.srt'; then
+    fail "CR-4: the decoy 'r Show - 01 0.eng.srt' was over-matched by the glob (escaping failed)"
+  else
+    pass "CR-4: unrelated decoy not mismatched by the (now literal) stem pattern"
+  fi
+  rm -rf "$d"
+}
+
+# CR-13: `hi` is BOTH the SDH keyword (hearing-impaired) and ISO-639-1 for Hindi. Pre-fix it matched
+# the SDH case first, so `movie.hi.srt` → type=sdh / lang=und. The fix classifies it as language when
+# it fills the empty language slot. e2e differential: discovery announces the sidecar as [hi] (full).
+_test_ext_subs_cr13_hi_is_hindi() {
+  local d="$TESTDIR/cr13_hi"; mkdir -p "$d"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=green:s=320x180:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -c:v libx264 -preset ultrafast -crf 30 -c:a aac "$d/movie.mkv" 2>/dev/null
+  printf '1\n00:00:00,000 --> 00:00:01,000\nनमस्ते\n' > "$d/movie.hi.srt"
+  if [[ ! -s "$d/movie.mkv" ]]; then
+    skip "CR-13: could not build the movie.hi.srt fixture"
+    rm -rf "$d"; return
+  fi
+  local out found
+  out="$( (cd "$d" && "$MUXM" --dry-run "movie.mkv" "$d/out.mkv") 2>&1 )"
+  found="$(printf '%s\n' "$out" | grep -F 'External subtitle found:' | grep -F 'movie.hi.srt' | head -1)"
+  if printf '%s\n' "$found" | grep -qF '[hi] (full)'; then
+    pass "CR-13: movie.hi.srt discovered as lang=hi, type=full (Hindi, not SDH/und)"
+  else
+    fail "CR-13: movie.hi.srt misclassified. Saw: ${found:-<none>}"
+  fi
+  rm -rf "$d"
 }
 
 # RF7 (LOW-3): a successful external VobSub `.idx` OCR writes its `.srt` next to the SOURCE, not into

@@ -10699,8 +10699,9 @@ _norm_lang_code(){
 # Qualifiers are the dot-separated segments between the source stem and the extension.
 # Segment classification (case-insensitive):
 #   forced|signs|foreign  → type = forced
-#   sdh|hi|hearing|cc     → type = sdh
+#   sdh|hearing|cc        → type = sdh
 #   2-3 letter alpha      → language code (first match wins)
+#   hi                    → language (Hindi) when it fills the empty language slot, else type=sdh (CR-13)
 #   anything else         → ignored
 #
 # Examples:
@@ -10708,6 +10709,8 @@ _norm_lang_code(){
 #   movie.en.srt          → lang=en,  type=full
 #   movie.forced.en.srt   → lang=en,  type=forced
 #   movie.en.sdh.srt      → lang=en,  type=sdh
+#   movie.hi.srt          → lang=hi,  type=full   (Hindi, not SDH — CR-13)
+#   movie.eng.hi.srt      → lang=eng, type=sdh    (language already set → hi = SDH marker)
 #
 # Args:    $1 — source file stem (basename without extension, may contain dots)
 #          $2 — subtitle filename (basename with extension)
@@ -10734,12 +10737,18 @@ _parse_ext_sub_filename(){
     seg="${seg,,}"
     case "$seg" in
       forced|signs|foreign) stype="forced" ;;
-      sdh|hi|hearing|cc)    stype="sdh"    ;;
+      sdh|hearing|cc)       stype="sdh"    ;;
       *)
-        # Accept the first 2-3 letter purely alphabetic segment as language code
-        # Normalize 2-letter ISO 639-1 codes to 3-letter ISO 639-2/T codes
+        # Accept the first 2-3 letter purely alphabetic segment as language code.
+        # Normalize 2-letter ISO 639-1 codes to 3-letter ISO 639-2/T codes.
+        # CR-13: `hi` is ambiguous — both the SDH (hearing-impaired) keyword AND ISO-639-1 for
+        # Hindi. Classify as LANGUAGE first when it fills the still-empty language slot
+        # (`movie.hi.srt` → lang=hi/full); only treat it as the SDH marker once a language is
+        # already set (`movie.eng.hi.srt` → sdh). Explicit `sdh`/`hearing`/`cc` is unaffected (above).
         if [[ -z "$lang" ]] && [[ "$seg" =~ ^[a-z]{2,3}$ ]]; then
           lang="$(_norm_lang_code "$seg")"
+        elif [[ "$seg" == "hi" ]]; then
+          stype="sdh"
         fi
         ;;
     esac
@@ -10784,6 +10793,18 @@ discover_external_subtitles(){
 
   local src_stem
   src_stem="$(basename -- "${SRC_ABS%.*}")"
+
+  # CR-4: src_stem is interpolated into a `find -name` glob below, so any glob metacharacter in the
+  # source name (`* ? [`) is matched as a wildcard, not literally — extremely common in anime naming
+  # like `[Group] Show - 01 [1080p].mkv` (the very files the animation profiles target). `[1080p]`
+  # then becomes a one-char class, so the real sidecar is MISSED and an unrelated `… 1.srt` decoy can
+  # over-match. Backslash-escape the fnmatch specials (backslash FIRST, so it can't double-escape the
+  # others) to match the stem literally; the structural `.*.` wildcard built below stays intact.
+  local src_stem_glob="$src_stem"
+  src_stem_glob="${src_stem_glob//\\/\\\\}"   # \ → \\  (must be first)
+  src_stem_glob="${src_stem_glob//\*/\\*}"    # * → \*
+  src_stem_glob="${src_stem_glob//\?/\\?}"    # ? → \?
+  src_stem_glob="${src_stem_glob//\[/\\[}"    # [ → \[  (neutralizes the whole class; ] needs no escape)
 
   # Process each supported extension in priority order
   local -a sub_exts=( srt ass ssa vtt sup idx )
@@ -10831,7 +10852,7 @@ discover_external_subtitles(){
 
       note "[Subs] External subtitle found: $fname [$lang] ($stype)"
     done < <(find "$search_dir" -maxdepth 1 -type f \
-      \( -name "${src_stem}.${ext}" -o -name "${src_stem}.*.${ext}" \) \
+      \( -name "${src_stem_glob}.${ext}" -o -name "${src_stem_glob}.*.${ext}" \) \
       -print0 2>/dev/null | LC_ALL=C "${_sub_sort[@]}")
   done
 
