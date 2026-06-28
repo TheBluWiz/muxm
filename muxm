@@ -6680,7 +6680,7 @@ disk_free_warn() {
     for (( i=0; i<max_tracks; i++ )); do
       local a_info a_codec a_channels _a_lang a_bitrate _a_title
       a_info="$(_audio_stream_info "$i")"
-      _split_tab "$a_info" a_codec a_channels _a_lang a_bitrate _a_title  # C2: non-collapsing
+      _split_tab "$a_info" a_codec a_channels _a_lang a_bitrate _a_title _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
 
       local -i ch=0
       [[ "$a_channels" =~ ^[0-9]+$ ]] && ch="$a_channels"
@@ -9081,14 +9081,20 @@ _audio_is_commentary(){
 }
 
 # _audio_stream_info — Fetch all scoring-relevant fields for one audio stream
-# in a single jq call (replaces 5 separate jq forks per stream).
-# Returns: codec\tchannels\tlanguage\tbit_rate\ttitle  (tab-delimited)
+# in a single jq call (replaces separate jq forks per stream).
+# Returns: codec\tchannels\tlanguage\tbit_rate\ttitle\tdisposition.comment\t
+#          disposition.visual_impaired\tdisposition.hearing_impaired  (tab-delimited)
+# RF3: the three trailing disposition flags (0/1) let _score_audio_stream demote a
+# flagged-but-untitled commentary/description track and let the stereo paths drop one
+# without separate disposition jq probes. They are APPENDED after title (which has
+# \t\n\r stripped, so it is one field) — every _split_tab consumer of this record reads
+# the extra fields (real vars or `_` sinks) so the flags never fold into `title`.
 # Args: $1 — audio stream index (0-based, relative to audio streams)
 # Globals: METADATA_CACHE (read)
 _audio_stream_info(){
   local idx="$1"
   _jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$idx] |
-    \"\(.codec_name // \"unknown\")\t\(.channels // 0)\t\(.tags.language // \"\")\t\(.bit_rate // \"0\")\t\(.tags.title // \"\" | gsub(\"[\\t\\n\\r]\";\" \"))\"" | head -n1 || printf 'unknown\t0\t\t0\t\n'
+    \"\(.codec_name // \"unknown\")\t\(.channels // 0)\t\(.tags.language // \"\")\t\(.bit_rate // \"0\")\t\(.tags.title // \"\" | gsub(\"[\\t\\n\\r]\";\" \"))\t\(.disposition.comment // 0)\t\(.disposition.visual_impaired // 0)\t\(.disposition.hearing_impaired // 0)\"" | head -n1 || printf 'unknown\t0\t\t0\t\t0\t0\t0\n'
 }
 
 # Audio stream scoring algorithm for automatic track selection.
@@ -9115,9 +9121,10 @@ _score_audio_stream(){
   local idx="$1"
 
   # Single jq call fetches all fields at once
-  local info codec lang ch br title rank score
+  local info codec lang ch br title rank score comment vi hi
   info="$(_audio_stream_info "$idx")"
-  _split_tab "$info" codec ch lang br title  # C2: non-collapsing — preserve empty lang/title
+  # RF3: also read the three disposition flags (comment / visual_impaired / hearing_impaired).
+  _split_tab "$info" codec ch lang br title comment vi hi  # C2: non-collapsing — preserve empty lang/title
 
   _normalize_codec_lang codec lang
   [[ -z "$ch" || ! "$ch" =~ ^[0-9]+$ ]] && ch=0
@@ -9158,8 +9165,12 @@ _score_audio_stream(){
     score=$(( score + br_bonus ))
   fi
 
-  # Commentary/descriptive track penalty
-  if _audio_is_commentary "$title"; then
+  # Commentary/descriptive track penalty — RF3: demote on the DISPOSITION flags
+  # (comment / visual_impaired / hearing_impaired), not just a title keyword. A track
+  # flagged disposition.comment with an empty/non-English title would otherwise escape
+  # the penalty and, under the default codec preference (lossless mains rank last), could
+  # outscore the main feature and be stream-copied as the primary audio.
+  if _audio_is_commentary "$title" || (( comment )) || (( vi )) || (( hi )); then
     score=$(( score - AUDIO_SCORE_COMMENTARY_PENALTY ))
   fi
 
@@ -9187,7 +9198,7 @@ select_best_audio(){
       # Fetch full record for the overridden track so caller can destructure (L2b).
       local _ov_info _ov_codec _ov_ch _ov_lang _ov_br _ov_title
       _ov_info="$(_audio_stream_info "$AUDIO_TRACK_OVERRIDE")"
-      _split_tab "$_ov_info" _ov_codec _ov_ch _ov_lang _ov_br _ov_title  # C2: non-collapsing
+      _split_tab "$_ov_info" _ov_codec _ov_ch _ov_lang _ov_br _ov_title _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
       _normalize_codec_lang _ov_codec _ov_lang
       [[ -z "$_ov_ch"  || ! "$_ov_ch"  =~ ^[0-9]+$ ]] && _ov_ch=0
       [[ -z "$_ov_br"  || ! "$_ov_br"  =~ ^[0-9]+$ ]] && _ov_br=0
@@ -9203,16 +9214,29 @@ select_best_audio(){
   if (( AUDIO_PREFER_STEREO )); then
     local ps_best_line="" ps_best_score=-999999
     for (( i=0; i<n; i++ )); do
-      local ps_ch ps_vi ps_hi ps_title ps_line ps_score
-      ps_ch="$(_audio_channels "$i")"
+      # RF3: read channels/title/disposition from the single _audio_stream_info record
+      # (collapses the two separate disposition jq probes this loop used to fork per stream).
+      local ps_info ps_ch ps_lang ps_title ps_comment ps_vi ps_hi ps_line ps_score
+      ps_info="$(_audio_stream_info "$i")"
+      _split_tab "$ps_info" _ ps_ch ps_lang _ ps_title ps_comment ps_vi ps_hi  # C2: non-collapsing (codec/br unused here)
       [[ -z "$ps_ch" || ! "$ps_ch" =~ ^[0-9]+$ ]] && ps_ch=0
       (( ps_ch != 2 )) && continue
-      ps_title="$(_audio_title "$i")"
       _audio_is_commentary "$ps_title" && continue
-      ps_vi="$(_jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$i].disposition.visual_impaired // 0")"
-      ps_hi="$(_jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$i].disposition.hearing_impaired // 0")"
+      (( ps_comment )) && continue
       (( ps_vi )) && continue
       (( ps_hi )) && continue
+      # RF4: honor AUDIO_LANG_PREF — skip a wrong-language stereo so an English-preferring
+      # encode of an English-5.1 + foreign-2.0 source does not pick the foreign stereo. Only
+      # gates when a preference is set; an empty AUDIO_LANG_PREF keeps the old language-agnostic
+      # behavior. When no preferred-language stereo exists, the loop finds nothing and falls
+      # through to the score-all / downmix path (mirroring the native-stereo fallback's gate).
+      # Lowercase + und-default mirrors _normalize_codec_lang's lang handling (used by the
+      # sibling _build_audio_keep_list before its own _audio_lang_matches gate).
+      if [[ -n "${AUDIO_LANG_PREF:-}" ]]; then
+        local ps_match_lang="${ps_lang,,}"
+        [[ -z "$ps_match_lang" ]] && ps_match_lang="$TAG_LANGUAGE_DEFAULT"
+        _audio_lang_matches "$ps_match_lang" || continue
+      fi
       ps_line="$(_score_audio_stream "$i")"
       ps_score="${ps_line%%$'\t'*}"
       if [[ "$ps_score" =~ ^-?[0-9]+$ ]] && (( ps_score > ps_best_score )); then
@@ -9266,7 +9290,7 @@ select_best_audio(){
     warn "Audio scoring failed for all tracks; defaulting to track 0."
     local _g_info _g_codec _g_ch _g_lang _g_br _g_title
     _g_info="$(_audio_stream_info "0")"
-    _split_tab "$_g_info" _g_codec _g_ch _g_lang _g_br _g_title  # C2: non-collapsing
+    _split_tab "$_g_info" _g_codec _g_ch _g_lang _g_br _g_title _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
     _normalize_codec_lang _g_codec _g_lang
     [[ -z "$_g_ch" || ! "$_g_ch" =~ ^[0-9]+$ ]] && _g_ch=0
     [[ -z "$_g_br" || ! "$_g_br" =~ ^[0-9]+$ ]] && _g_br=0
@@ -9484,7 +9508,7 @@ _build_audio_keep_list(){
   for (( i=0; i<n; i++ )); do
     local info codec lang ch br title
     info="$(_audio_stream_info "$i")"
-    _split_tab "$info" codec ch lang br title  # C2: non-collapsing — preserve empty lang/title
+    _split_tab "$info" codec ch lang br title _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
     _normalize_codec_lang codec lang
 
     # Filter 1: language
@@ -9557,7 +9581,7 @@ run_audio_pipeline_multi(){
   for idx in $keep_list; do
     local info codec ch lang br title
     info="$(_audio_stream_info "$idx")"
-    _split_tab "$info" codec ch lang br title  # C2: non-collapsing — untagged lang/title into MT output metadata
+    _split_tab "$info" codec ch lang br title _ _ _  # C2: non-collapsing — untagged lang/title into MT output metadata (RF3: sink disposition fields)
     _normalize_codec_lang codec lang
 
     AUDIO_MT_INDICES+=("$idx")
@@ -9582,7 +9606,7 @@ run_audio_pipeline_multi(){
   for (( i=0; i<n_total; i++ )); do
     local _ainfo _c _ch_i _l _br_i _t pretty marker=""
     _ainfo="$(_audio_stream_info "$i")"
-    _split_tab "$_ainfo" _c _ch_i _l _br_i _t  # C2: non-collapsing
+    _split_tab "$_ainfo" _c _ch_i _l _br_i _t _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
     _normalize_codec_lang _c _l
     [[ -z "$_br_i" || ! "$_br_i" =~ ^[0-9]+$ ]] && _br_i=0
 
@@ -9689,7 +9713,7 @@ run_audio_pipeline(){
   for (( i=0; i<n; i++ )); do
     local _ainfo _c _ch_i _l _br_i _t pretty
     _ainfo="$(_audio_stream_info "$i")"
-    _split_tab "$_ainfo" _c _ch_i _l _br_i _t  # C2: non-collapsing
+    _split_tab "$_ainfo" _c _ch_i _l _br_i _t _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
     _normalize_codec_lang _c _l
     [[ -z "$_br_i" || ! "$_br_i" =~ ^[0-9]+$ ]] && _br_i=0
 
@@ -9893,12 +9917,14 @@ run_audio_pipeline(){
   if (( ADD_STEREO_IF_MULTICH )) && (( effective_ch > 2 )); then
     # Scan for a native stereo track before falling back to a synthetic downmix.
     local _native_si="" _native_sc="" _native_sl=""
-    local _ns_total _ns_i _ns_info _ns_c _ns_ch _ns_l _ns_br _ns_t _ns_vi _ns_hi
+    local _ns_total _ns_i _ns_info _ns_c _ns_ch _ns_l _ns_br _ns_t _ns_comment _ns_vi _ns_hi
     _ns_total="$(_audio_stream_count)"
     for (( _ns_i = 0; _ns_i < _ns_total; _ns_i++ )); do
       (( _ns_i == idx )) && continue
+      # RF3: disposition flags now come from the single _audio_stream_info record (no extra
+      # per-stream disposition jq probes).
       _ns_info="$(_audio_stream_info "$_ns_i")"
-      _split_tab "$_ns_info" _ns_c _ns_ch _ns_l _ns_br _ns_t  # C2: non-collapsing
+      _split_tab "$_ns_info" _ns_c _ns_ch _ns_l _ns_br _ns_t _ns_comment _ns_vi _ns_hi  # C2: non-collapsing
       _ns_c="${_ns_c,,}"; _ns_l="${_ns_l,,}"
       [[ -z "$_ns_l" ]] && _ns_l="$TAG_LANGUAGE_DEFAULT"
       [[ -z "$_ns_ch" || ! "$_ns_ch" =~ ^[0-9]+$ ]] && _ns_ch=0
@@ -9906,11 +9932,9 @@ run_audio_pipeline(){
       (( _ns_ch != 2 )) && continue
       # Language must match primary track (und matches anything)
       if [[ "$_ns_l" != "und" && "$lang" != "und" && "$_ns_l" != "$lang" ]]; then continue; fi
-      # Not commentary or descriptive audio (title check)
+      # Not commentary or descriptive audio (title keyword OR disposition flags)
       _audio_is_commentary "$_ns_t" && continue
-      # Not flagged as visually impaired or hearing impaired (disposition flags)
-      _ns_vi="$(_jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$_ns_i].disposition.visual_impaired // 0")"
-      _ns_hi="$(_jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$_ns_i].disposition.hearing_impaired // 0")"
+      (( _ns_comment )) && continue
       (( _ns_vi )) && continue
       (( _ns_hi )) && continue
       _native_si="$_ns_i"
@@ -11726,7 +11750,7 @@ _check_multitrack_container_safety() {
     _an="$(_audio_stream_count)"
     for (( _ai=0; _ai<_an; _ai++ )); do
       _info="$(_audio_stream_info "$_ai")"
-      _split_tab "$_info" _codec _ch _lang _br _title  # C2: non-collapsing — keep-filter mirrors _build_audio_keep_list
+      _split_tab "$_info" _codec _ch _lang _br _title _ _ _  # C2: non-collapsing — keep-filter mirrors _build_audio_keep_list (RF3: sink disposition fields)
       _normalize_codec_lang _codec _lang
       [[ -n "${AUDIO_LANG_PREF:-}" ]] && ! _audio_lang_matches "$_lang" && continue
       (( ! AUDIO_KEEP_COMMENTARY )) && _audio_is_commentary "$_title" && continue

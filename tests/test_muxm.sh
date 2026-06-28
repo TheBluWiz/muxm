@@ -4825,6 +4825,46 @@ EOF
   _test_audio_c2_verify_display
   _test_audio_l_forceaac_stereo_bitrate
   _test_audio_l1_lossless_skip_drop
+  _test_audio_rf3_disposition_commentary
+}
+
+# RF3 (e2e): primary audio selection must demote a commentary track flagged by DISPOSITION even
+# when its title is empty. Fixture: track0 = FLAC 6ch eng main (codec rank 10 → low codec score),
+# track1 = E-AC-3 6ch eng flagged `-disposition:a:1 comment`, BOTH untitled. Pre-fix the scorer
+# consulted only the title, so the un-penalized E-AC-3 (codec rank 0) outscored the rank-10 FLAC
+# main and was selected as the primary audio. Now the disposition.comment flag applies the penalty
+# and the FLAC main (#0) wins.
+_test_audio_rf3_disposition_commentary() {
+  local src="$TESTDIR/rf3_dispo_comm.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=blue:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=660:duration=2" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -map 0:v -map 1:a -map 2:a \
+    -c:a:0 flac -ac:a:0 6 -c:a:1 eac3 -b:a:1 256k -ac:a:1 6 \
+    -metadata:s:a:0 language=eng -metadata:s:a:1 language=eng \
+    -disposition:a:0 0 -disposition:a:1 comment \
+    "$src" 2>/dev/null
+  # Fixture must carry the disposition.comment flag on track 1 (and empty titles), else it proves nothing.
+  local _d1 _t1
+  _d1="$(ffprobe -v error -select_streams a:1 -show_entries stream_disposition=comment -of csv=p=0 "$src" 2>/dev/null || true)"
+  _t1="$(probe_stream_tag "$src" a:1 title 2>/dev/null || true)"
+  if [[ ! -s "$src" || "$_d1" != "1" || -n "$_t1" ]]; then
+    skip "RF3 (e2e): could not build a disposition-flagged untitled-commentary fixture (comment=$_d1 title='$_t1')"
+    return
+  fi
+  local home="$TESTDIR/rf3_home"; mkdir -p "$home"
+  log "Testing RF3: disposition-flagged (untitled) commentary must not win primary audio selection..."
+  local out
+  out="$(MUXM_HOME="$home" run_muxm --no-stereo-fallback "$src" "$TESTDIR/out_rf3_dispo.mkv")"
+  # The main feature (#0) must be the selected primary, NOT the flagged commentary (#1).
+  if printf '%s\n' "$out" | grep -qE '\[Audio\] Selected track #0:'; then
+    pass "RF3 (e2e): disposition-flagged commentary demoted — main feature track #0 selected as primary"
+  else
+    local _sel; _sel="$(printf '%s\n' "$out" | grep -oE 'Selected track #[0-9]+' | head -1)"
+    fail "RF3 (e2e): expected primary = track #0, but muxm selected '${_sel:-<none>}' (flagged commentary won)"
+  fi
 }
 
 # L1 (Phase 2): single-track AUDIO_LOSSLESS_PASSTHROUGH must not let skip-if-ideal silently drop a
@@ -8781,6 +8821,64 @@ select_best_audio | cut -f1" -- "$tracks" "$override"
   _sba_assert "2.2 select: en-tagged English wins lang bonus over a 6ch foreign track (H2)" 1 "$(_sba_idx "$h2lang")"
 }
 
+# RF3 + RF4: audio-selection correctness driven by DISPOSITION flags and prefer-stereo language.
+# Unlike 2.1/2.2 (which mock _audio_stream_info with a canned tab record), this drives the REAL
+# _audio_stream_info + _jq_cache over a mocked METADATA_CACHE JSON, so the disposition.* jq
+# extraction is exercised end-to-end. select_best_audio runs the full score-all / prefer-stereo
+# paths; we assert the chosen audio-relative index.
+#   RF3: a track flagged disposition.comment / visual_impaired / hearing_impaired must be demoted
+#        even with an EMPTY title (pre-fix it escaped the title-only penalty and, under the default
+#        codec preference where lossless mains rank last, could outscore the main feature).
+#   RF4: --prefer-stereo must honor AUDIO_LANG_PREF — skip a wrong-language native stereo and fall
+#        through to downmixing the preferred-language track instead.
+_test_unit_rf3_rf4_audio_disposition() {
+  local body defaults
+  body="$(_extract_muxm_fns select_best_audio _score_audio_stream _audio_stream_info _audio_stream_count \
+                            _split_tab _normalize_codec_lang _audio_codec_rank _audio_lang_matches \
+                            _norm_lang_code audio_is_lossless _audio_is_commentary _jq_cache)" \
+    || { fail "RF3/RF4: could not extract audio-selection fns"; return; }
+  defaults="$(grep -E '^(declare -i )?(AUDIO_SCORE_[A-Z_]+|AUDIO_CODEC_PREFERENCE|AUDIO_LANG_PREF|TAG_LANGUAGE_DEFAULT|_AUDIO_CODEC_RANK_PREF)=' "$MUXM")"
+  # $1=METADATA_CACHE JSON  $2=AUDIO_PREFER_STEREO  $3=AUDIO_LANG_PREF → emits the selected idx.
+  _rf_idx(){
+    bash -c "$defaults
+AUDIO_TRACK_OVERRIDE=\"\"; AUDIO_PREFER_STEREO=\"\$2\"; AUDIO_LANG_PREF=\"\$3\"
+warn(){ :; }; note(){ :; }; log(){ :; }
+METADATA_CACHE=\"\$1\"
+$body
+select_best_audio | cut -f1" -- "$1" "$2" "$3"
+  }
+  _rf_assert(){ local label="$1" want="$2" got="$3"; if [[ "$got" == "$want" ]]; then pass "$label (idx=$got)"; else fail "$label — selected idx='$got', expected '$want'"; fi; }
+
+  # --- RF3: disposition-based commentary/description demotion (track0 = TrueHD 7.1 main, empty
+  #     title; track1 = E-AC-3 5.1, empty title, but a disposition flag set). Pre-fix, the flagged
+  #     E-AC-3 (rank 0) outscored the unlisted TrueHD (rank 10 / score 0) and won. ---
+  local j_comment='{"streams":[{"codec_type":"audio","codec_name":"truehd","channels":8,"tags":{"language":"eng"},"disposition":{}},{"codec_type":"audio","codec_name":"eac3","channels":6,"bit_rate":"448000","tags":{"language":"eng"},"disposition":{"comment":1}}]}'
+  _rf_assert "RF3: disposition.comment (empty title) loses to TrueHD main" 0 "$(_rf_idx "$j_comment" 0 eng)"
+  local j_vi='{"streams":[{"codec_type":"audio","codec_name":"truehd","channels":8,"tags":{"language":"eng"},"disposition":{}},{"codec_type":"audio","codec_name":"eac3","channels":6,"bit_rate":"448000","tags":{"language":"eng"},"disposition":{"visual_impaired":1}}]}'
+  _rf_assert "RF3: disposition.visual_impaired (empty title) demoted" 0 "$(_rf_idx "$j_vi" 0 eng)"
+  local j_hi='{"streams":[{"codec_type":"audio","codec_name":"truehd","channels":8,"tags":{"language":"eng"},"disposition":{}},{"codec_type":"audio","codec_name":"eac3","channels":6,"bit_rate":"448000","tags":{"language":"eng"},"disposition":{"hearing_impaired":1}}]}'
+  _rf_assert "RF3: disposition.hearing_impaired (empty title) demoted" 0 "$(_rf_idx "$j_hi" 0 eng)"
+  # No-regression: a titled-English commentary with NO disposition flag is still demoted via the
+  # title keyword path (proves RF3 added to, not replaced, the existing classifier).
+  local j_title='{"streams":[{"codec_type":"audio","codec_name":"truehd","channels":8,"tags":{"language":"eng"},"disposition":{}},{"codec_type":"audio","codec_name":"eac3","channels":6,"bit_rate":"448000","tags":{"language":"eng","title":"Directors Commentary"},"disposition":{}}]}'
+  _rf_assert "RF3: titled-English commentary still demoted (no regression)" 0 "$(_rf_idx "$j_title" 0 eng)"
+  # Sanity: with NO commentary signal at all, the flagged-track's twin (un-flagged E-AC-3 5.1)
+  # DOES win over the rank-10 TrueHD — proving the RF3 cases above flip on the demotion, not on a
+  # blanket TrueHD preference.
+  local j_none='{"streams":[{"codec_type":"audio","codec_name":"truehd","channels":8,"tags":{"language":"eng"},"disposition":{}},{"codec_type":"audio","codec_name":"eac3","channels":6,"bit_rate":"448000","tags":{"language":"eng"},"disposition":{}}]}'
+  _rf_assert "RF3 sanity: un-flagged E-AC-3 5.1 outscores rank-10 TrueHD (demotion is the variable)" 1 "$(_rf_idx "$j_none" 0 eng)"
+
+  # --- RF4: --prefer-stereo + AUDIO_LANG_PREF=eng. track0 = E-AC-3 5.1 eng, track1 = AAC 2.0 spa.
+  #     Pre-fix the prefer-stereo prescan picked the Spanish stereo (only 2ch candidate). Now it
+  #     skips the wrong-language stereo, finds no eng stereo, and falls through to downmixing the
+  #     eng 5.1 (idx 0). ---
+  local j_ps='{"streams":[{"codec_type":"audio","codec_name":"eac3","channels":6,"bit_rate":"448000","tags":{"language":"eng"},"disposition":{}},{"codec_type":"audio","codec_name":"aac","channels":2,"bit_rate":"128000","tags":{"language":"spa"},"disposition":{}}]}'
+  _rf_assert "RF4: prefer-stereo skips wrong-language (spa) stereo → eng 5.1 for downmix" 0 "$(_rf_idx "$j_ps" 1 eng)"
+  # No-regression: when a preferred-language native stereo exists, prefer-stereo still picks it.
+  local j_ps2='{"streams":[{"codec_type":"audio","codec_name":"eac3","channels":6,"bit_rate":"448000","tags":{"language":"eng"},"disposition":{}},{"codec_type":"audio","codec_name":"aac","channels":2,"bit_rate":"128000","tags":{"language":"eng"},"disposition":{}}]}'
+  _rf_assert "RF4: prefer-stereo still picks a preferred-language (eng) stereo when present" 1 "$(_rf_idx "$j_ps2" 1 eng)"
+}
+
 _test_unit_build_subtitle_lists() {
   # 2.4: direct unit tests for the subtitle-selection decision functions.
   #   _pick_direct_text_sub_relidx — had ZERO coverage; returns the relative index of the
@@ -9292,6 +9390,7 @@ test_unit() {
   _test_unit_extract_helper
   _test_unit_score_audio_stream
   _test_unit_select_best_audio
+  _test_unit_rf3_rf4_audio_disposition
   _test_unit_decide_color_and_pixfmt
   _test_unit_build_subtitle_lists
   _test_unit_report_add_escaping
