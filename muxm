@@ -9597,9 +9597,13 @@ _build_audio_keep_list(){
   local -a dropped_reasons=()
 
   for (( i=0; i<n; i++ )); do
-    local info codec lang ch br title
+    local info codec lang ch br title comment vi hi
     info="$(_audio_stream_info "$i")"
-    _split_tab "$info" codec ch lang br title _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
+    # CR-3: capture the three trailing disposition flags (comment / visual_impaired /
+    # hearing_impaired) instead of sinking them — the commentary filter below ORs them in,
+    # mirroring _score_audio_stream so a disposition-flagged but untitled/foreign-titled
+    # commentary/AD track is dropped, not just one matched by the title keyword regex.
+    _split_tab "$info" codec ch lang br title comment vi hi  # C2: non-collapsing — preserve empty lang/title
     _normalize_codec_lang codec lang
 
     # Filter 1: language
@@ -9610,8 +9614,8 @@ _build_audio_keep_list(){
       fi
     fi
 
-    # Filter 2: commentary
-    if (( ! AUDIO_KEEP_COMMENTARY )) && _audio_is_commentary "$title"; then
+    # Filter 2: commentary — RF3/CR-3: drop on the DISPOSITION flags too, not just a title keyword.
+    if (( ! AUDIO_KEEP_COMMENTARY )) && { _audio_is_commentary "$title" || (( comment )) || (( vi )) || (( hi )); }; then
       dropped_reasons+=("#$i: ${codec} ${ch}ch [$lang] — commentary/descriptive")
       continue
     fi
@@ -11879,14 +11883,16 @@ _check_multitrack_container_safety() {
   # ---- Audio: every kept track is stream-copied (-c copy); MP4/MOV can't carry the
   # lossless HD codecs.  Keep-filter mirrors _build_audio_keep_list (language + commentary).
   if (( AUDIO_MULTI_TRACK )) && (( ! SKIP_AUDIO )); then
-    local _an _ai _info _codec _ch _lang _br _title _profile
+    local _an _ai _info _codec _ch _lang _br _title _comment _vi _hi _profile
     _an="$(_audio_stream_count)"
     for (( _ai=0; _ai<_an; _ai++ )); do
       _info="$(_audio_stream_info "$_ai")"
-      _split_tab "$_info" _codec _ch _lang _br _title _ _ _  # C2: non-collapsing — keep-filter mirrors _build_audio_keep_list (RF3: sink disposition fields)
+      # CR-3: capture the disposition flags and OR them into the commentary drop, matching
+      # the keep-filter in _build_audio_keep_list (this must stay in sync with it).
+      _split_tab "$_info" _codec _ch _lang _br _title _comment _vi _hi  # C2: non-collapsing — keep-filter mirrors _build_audio_keep_list
       _normalize_codec_lang _codec _lang
       [[ -n "${AUDIO_LANG_PREF:-}" ]] && ! _audio_lang_matches "$_lang" && continue
-      (( ! AUDIO_KEEP_COMMENTARY )) && _audio_is_commentary "$_title" && continue
+      (( ! AUDIO_KEEP_COMMENTARY )) && { _audio_is_commentary "$_title" || (( _comment )) || (( _vi )) || (( _hi )); } && continue
       case "$_codec" in
         truehd|mlp) _blk+=("audio #${_ai}: ${_codec} (lossless)") ;;
         dts|dca)

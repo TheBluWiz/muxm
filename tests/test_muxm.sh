@@ -4828,6 +4828,61 @@ EOF
   _test_audio_l_forceaac_stereo_bitrate
   _test_audio_l1_lossless_skip_drop
   _test_audio_rf3_disposition_commentary
+  _test_audio_cr3_multitrack_disposition_commentary
+}
+
+# CR-3: the MULTI-TRACK keep-list (the only commentary filter in multi-track mode) must drop a
+# disposition-flagged commentary/AD track even when its title is empty — matching the RF3
+# single-track hardening. Fixture: track0 = ac3 6ch eng main (untitled, no disposition),
+# track1 = eac3 6ch eng flagged `-disposition:a:1 comment` (untitled). Pre-fix _build_audio_keep_list
+# sank the disposition fields and filtered commentary by title only, so the untitled flagged track
+# survived: "keeping 2 of 2". With the fix it ORs the flags in → "keeping 1 of 2". A positive control
+# (AUDIO_KEEP_COMMENTARY=1) proves the track is retained when commentary-keeping is on.
+_test_audio_cr3_multitrack_disposition_commentary() {
+  local src="$TESTDIR/cr3_mt_dispo.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=blue:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=660:duration=2" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -map 0:v -map 1:a -map 2:a \
+    -c:a:0 ac3 -ac:a:0 6 -c:a:1 eac3 -b:a:1 256k -ac:a:1 6 \
+    -metadata:s:a:0 language=eng -metadata:s:a:1 language=eng \
+    -disposition:a:0 0 -disposition:a:1 comment \
+    "$src" 2>/dev/null
+  # Fixture must carry disposition.comment on track 1 with empty titles, else it proves nothing.
+  local _d1 _t1
+  _d1="$(ffprobe -v error -select_streams a:1 -show_entries stream_disposition=comment -of csv=p=0 "$src" 2>/dev/null || true)"
+  _t1="$(probe_stream_tag "$src" a:1 title 2>/dev/null || true)"
+  if [[ ! -s "$src" || "$_d1" != "1" || -n "$_t1" ]]; then
+    skip "CR-3: could not build a disposition-flagged untitled-commentary multi-track fixture (comment=$_d1 title='$_t1')"
+    return
+  fi
+
+  # Negative (the bug): multi-track + AUDIO_KEEP_COMMENTARY=0 → the flagged track must be filtered.
+  # Use a project-dir .muxmrc (default AUDIO_LANG_PREF=eng keeps both eng tracks, so only the
+  # commentary filter differs them). --no-skip-if-ideal forces the keep-list to run.
+  local drop_proj="$TESTDIR/cr3_drop_proj"; mkdir -p "$drop_proj"
+  printf 'AUDIO_MULTI_TRACK=1\nAUDIO_KEEP_COMMENTARY=0\n' > "$drop_proj/.muxmrc"
+  local out
+  out="$(run_muxm_in "$drop_proj" --dry-run --no-skip-if-ideal "$src" "$TESTDIR/cr3_out.mkv")"
+  if printf '%s\n' "$out" | grep -qF "keeping 1 of 2 tracks"; then
+    pass "CR-3: disposition-flagged untitled commentary dropped from multi-track keep-list (1 of 2 kept)"
+  else
+    fail "CR-3: flagged commentary survived the multi-track keep-list. Saw: $(printf '%s\n' "$out" | grep -oE 'keeping [0-9]+ of [0-9]+ tracks' | head -1)"
+  fi
+
+  # Positive control: AUDIO_KEEP_COMMENTARY=1 → the commentary track is retained (both kept).
+  local keep_proj="$TESTDIR/cr3_keep_proj"; mkdir -p "$keep_proj"
+  printf 'AUDIO_MULTI_TRACK=1\nAUDIO_KEEP_COMMENTARY=1\n' > "$keep_proj/.muxmrc"
+  out="$(run_muxm_in "$keep_proj" --dry-run --no-skip-if-ideal "$src" "$TESTDIR/cr3_out.mkv")"
+  if printf '%s\n' "$out" | grep -qF "keeping 2 of 2 tracks"; then
+    pass "CR-3 control: AUDIO_KEEP_COMMENTARY=1 retains the flagged commentary track (2 of 2 kept)"
+  else
+    fail "CR-3 control: expected 2 of 2 kept with AUDIO_KEEP_COMMENTARY=1. Saw: $(printf '%s\n' "$out" | grep -oE 'keeping [0-9]+ of [0-9]+ tracks' | head -1)"
+  fi
+
+  rm -f "$src" "$TESTDIR/cr3_out.mkv" 2>/dev/null || true
 }
 
 # RF3 (e2e): primary audio selection must demote a commentary track flagged by DISPOSITION even
