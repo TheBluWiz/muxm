@@ -99,6 +99,10 @@ fi
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
 readonly VERSION="1.5.1"
+# RF11: release date for the man-page .TH line, co-located with VERSION so a release bump updates
+# both together. _man_emit substitutes it for the __DATE__ token (like __VERSION__) — the date is no
+# longer a hidden literal buried mid-heredoc that the docs-parity guard can't see drifting.
+readonly RELEASE_DATE="2026-06-27"
 
 # Canonical list of valid profile names (space-separated for compgen/iteration).
 # All profile validation, error messages, completions, and config generators
@@ -1846,8 +1850,10 @@ _man_target_dir(){
 
 # <<< embedded man page >>>
 _man_emit(){
-  sed "s/__VERSION__/$VERSION/" <<'MANPAGE_EOF'
-.TH MUXM 1 "2026-06-25" "MuxMaster v__VERSION__" "User Commands"
+  # RF11: substitute __DATE__ (release date) alongside __VERSION__, so the .TH date is generated
+  # from the RELEASE_DATE variable (next to VERSION) rather than hardcoded inside this heredoc.
+  sed "s/__VERSION__/$VERSION/; s/__DATE__/$RELEASE_DATE/" <<'MANPAGE_EOF'
+.TH MUXM 1 "__DATE__" "MuxMaster v__VERSION__" "User Commands"
 .SH NAME
 muxm \- Universal AV1/DV/HLG/HDR10/SDR video encoder/muxer with format profiles
 .SH SYNOPSIS
@@ -4748,7 +4754,7 @@ _profile_comment() {
     hdr10-hq)                   echo "All the nits, none of the drama." ;;
     atv-directplay-hq)          echo "Shaped to please the most demanding rectangle in your living room." ;;
     atv-directplay-animation)   echo "Studio Ghibli didn't suffer for mov_text." ;;
-    streaming|streaming-hevc)   echo "Lean, mean, streaming machine." ;;
+    streaming-hevc)             echo "Lean, mean, streaming machine." ;;   # RF12: dropped unreachable 'streaming' alias arm (apply_profile normalizes PROFILE_NAME first)
     av1-hq)                     echo "Fewer bits, same nits." ;;
     streaming-av1)              echo "Stream smarter, not larger." ;;
     animation)                  echo "psy-rd turned down, sakuga turned up." ;;
@@ -6150,6 +6156,14 @@ WORKDIR="$(
 [[ -n "$WORKDIR_BASE" ]] && note "Workdir relocated to: $WORKDIR (intermediates kept off the output volume)"
 LOGFILE="$WORKDIR/muxm.$(date +%Y%m%d-%H%M%S).log"
 
+# RF12: arm the EXIT trap NOW — immediately after the workdir exists — instead of later (before the
+# output-lock acquisition). This closes the sub-second window in which a SIGINT/SIGTERM between
+# workdir creation and the old arm point would leak the (possibly multi-GB) workdir. on_exit is safe
+# to run with the still-partial state here: _drain_tee no-ops while TEE_PID/TERM_FD are empty (the tee
+# is set up just below), the lock release is gated on _OUT_LOCK_HELD (not yet set), and TMP_OUT/OUT
+# are ${VAR:-}-guarded, so a signal now performs a clean workdir-only teardown.
+trap 'on_exit' EXIT
+
 # ---- Begin logging to file ----
 # Redirect stdout and stderr through tee to capture all output in the log file
 # while still displaying it on the terminal.
@@ -6526,11 +6540,11 @@ _acquire_out_lock() {
   printf '%s\n' "$$" > "$lock/pid" 2>/dev/null || true
   _OUT_LOCK_HELD=1
 }
-trap 'on_exit' EXIT
 
-# M4: with the EXIT trap now armed (so the lock is guaranteed to be released) and the
-# print-config / multi-profile early exits already behind us, take an advisory lock on $OUT so two
-# concurrent runs can't clobber each other's output, report, or log. Dry runs write nothing — skip.
+# M4: the EXIT trap is already armed (just after workdir creation, RF12) so the lock is guaranteed to
+# be released, and the print-config / multi-profile early exits are already behind us — take an
+# advisory lock on $OUT so two concurrent runs can't clobber each other's output, report, or log.
+# Dry runs write nothing — skip.
 (( DRY_RUN )) || _acquire_out_lock
 
 # ===== Section 19: Disk space preflight =======================================================
@@ -7330,6 +7344,12 @@ build_videotoolbox_params() {
   # Encoder-specific profile + container tag.
   case "$VIDEO_ENCODER_FFMPEG" in
     hevc_videotoolbox)
+      # RF12: hevc_videotoolbox encodes only 4:2:0 (8-bit Main / 10-bit Main10). Reject a 4:2:2/4:4:4
+      # target up front with a clean error instead of forwarding an unsupported pix_fmt into a VT
+      # encode that would fail cryptically mid-run. (Software libx265 honors 4:2:2/4:4:4; VT does not.)
+      if [[ "$TARGET_PIXFMT" == *422* || "$TARGET_PIXFMT" == *444* ]]; then
+        die 11 "hevc_videotoolbox does not support a 4:2:2/4:4:4 pixel format (TARGET_PIXFMT=$TARGET_PIXFMT). Use software encoding (--no-hw-accel) or a 4:2:0 target."
+      fi
       # 10-bit HDR/SDR → Main10, 8-bit SDR → Main.
       if [[ "$TARGET_PIXFMT" == *"10le"* ]]; then   # matches yuv420p10le AND p010le (both contain "10le")
         VIDEOTOOLBOX_ARGS+=( -profile:v main10 )
@@ -8947,8 +8967,10 @@ _audio_stream_count(){
 # Globals: METADATA_CACHE (read)
 _probe_stream_field(){
   local type="$1" idx="$2" field="$3"
+  # RF12 (E4): no head -n1 — `.[$idx].$field // empty` selects ONE stream's scalar field, so jq emits
+  # at most a single line already; the head was redundant.
   _jq_cache -r \
-    "[.streams[] | select(.codec_type==\"$type\")] | .[$idx].$field // empty" | head -n1 || true
+    "[.streams[] | select(.codec_type==\"$type\")] | .[$idx].$field // empty" || true
 }
 
 # Get audio field from cached metadata.  Args: $1 — audio stream index, $2 — field (e.g. codec_name).
@@ -9628,7 +9650,8 @@ run_audio_pipeline_multi(){
   n_kept="${#AUDIO_MT_INDICES[@]}"
   n_dropped=$(( n_total - n_kept ))
 
-  # SYNC: mirror of display loop in run_audio_pipeline — keep both in sync
+  # SYNC: only the per-stream `pretty=` line construction must stay in sync with the display loop in
+  # run_audio_pipeline (the surrounding filter/keep logic differs by design). (RF12: narrowed.)
   say "→ Scanning audio streams (multi-track mode):"
   local i
   for (( i=0; i<n_total; i++ )); do
@@ -9735,7 +9758,8 @@ run_audio_pipeline(){
   _parse_audio_record "$_best_record"
   idx="$_AREC_IDX"; codec="$_AREC_CODEC"; ch="$_AREC_CH"; lang="$_AREC_LANG"; title="$_AREC_TITLE"; br="$_AREC_BR"
 
-  # SYNC: mirror of display loop in run_audio_pipeline_multi — keep both in sync
+  # SYNC: only the per-stream `pretty=` line construction must stay in sync with the display loop in
+  # run_audio_pipeline_multi (the surrounding select/keep logic differs by design). (RF12: narrowed.)
   log "• Detected audio streams:"
   local i
   for (( i=0; i<n; i++ )); do

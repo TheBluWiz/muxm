@@ -8065,7 +8065,12 @@ _test_unit_misc_helpers() {
   _test_pc "hdr10-hq"            "All the nits, none of the drama."
   _test_pc "atv-directplay-hq"   "Shaped to please the most demanding rectangle in your living room."
   _test_pc "atv-directplay-animation" "Studio Ghibli didn't suffer for mov_text."
-  _test_pc "streaming"           "Lean, mean, streaming machine."
+  # RF12: _profile_comment now keys on the CANONICAL profile name only (apply_profile normalizes
+  # PROFILE_NAME before any _profile_comment call), so the canonical 'streaming-hevc' yields the
+  # tagline and the deprecated raw 'streaming' alias — which production never passes here — returns
+  # empty. (Intentional behavior change: the dead 'streaming' alias arm was removed.)
+  _test_pc "streaming-hevc"      "Lean, mean, streaming machine."
+  _test_pc "streaming"           ""
   _test_pc "animation"           "psy-rd turned down, sakuga turned up."
   _test_pc "universal"           "Lowest common denominator, highest common decency."
   _test_pc "unknown"             ""
@@ -9211,6 +9216,86 @@ _test_unit_rf10_grep_flags() {
   fi
 }
 
+# RF11 (LOW-5): the man-page .TH date must be a generated __DATE__ token (substituted from
+# RELEASE_DATE by _man_emit), NOT a hardcoded literal the docs-parity guard can't see drifting.
+_test_unit_rf11_man_date_token() {
+  # (1) The .TH heredoc line carries the __DATE__ token (no hardcoded date).
+  local th_line; th_line="$(grep -E '^\.TH MUXM 1 ' "$MUXM" | head -1)"
+  if [[ "$th_line" == *'"__DATE__"'* ]]; then
+    pass "RF11: man-page .TH heredoc uses the __DATE__ token (no hardcoded date)"
+  else
+    fail "RF11: man-page .TH line has no __DATE__ token (hardcoded date?): $th_line"
+  fi
+  # (2) RELEASE_DATE is a defined ISO constant, co-located with VERSION.
+  if grep -qE '^readonly RELEASE_DATE="[0-9]{4}-[0-9]{2}-[0-9]{2}"' "$MUXM"; then
+    pass "RF11: RELEASE_DATE is a defined ISO constant in muxm"
+  else
+    fail "RF11: RELEASE_DATE constant not found (or not ISO) in muxm"
+  fi
+  # (3) --emit-man substitutes the token to a real ISO date (no leaked __DATE__).
+  local emitted; emitted="$("$MUXM" --emit-man 2>/dev/null | grep -E '^\.TH MUXM 1 ' | head -1)"
+  if [[ "$emitted" == *'__DATE__'* ]]; then
+    fail "RF11: --emit-man left an unsubstituted __DATE__ token: $emitted"
+  elif [[ "$emitted" =~ ^\.TH\ MUXM\ 1\ \"[0-9]{4}-[0-9]{2}-[0-9]{2}\" ]]; then
+    pass "RF11: --emit-man substitutes __DATE__ to a real ISO release date"
+  else
+    fail "RF11: --emit-man .TH date is not a valid ISO date: $emitted"
+  fi
+}
+
+# RF12 (Nits): targeted asserts for the polish changes that are cheaply testable —
+#   - _profile_comment: the unreachable 'streaming' alias arm is gone (canonical name still works).
+#   - build_videotoolbox_params: hevc_videotoolbox rejects a 4:2:2/4:4:4 target with a clean die.
+#   - _probe_stream_field (E4): dropping `head -n1` leaves the single-scalar output unchanged.
+# (Deferred nits — internal audio-helper `_` renaming, and the E1/E3/E5 efficiency restructurings —
+#  are not asserted here: the renaming is purely cosmetic and referenced by ~30 test strings, and the
+#  efficiency items are immaterial vs. transcode and behavior-preserving.)
+_test_unit_rf12_nits() {
+  # ---- _profile_comment: dead 'streaming' alias arm removed ----
+  assert_muxm_fn_stdout "RF12: _profile_comment(streaming-hevc) returns the canonical tagline" \
+    "Lean, mean, streaming machine." _profile_comment 'PROFILE_NAME=streaming-hevc'
+  local _pc_body; _pc_body="$(awk '/^_profile_comment\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  # The dead alias arm is `streaming|` (pipe) or a bare `streaming)`; the canonical arms are
+  # `streaming-hevc)` / `streaming-av1)` (always `streaming-…`), so `streaming[|)]` matches only the
+  # unreachable alias form.
+  if printf '%s\n' "$_pc_body" | grep -qE 'streaming[|)]'; then
+    fail "RF12: _profile_comment still has an unreachable 'streaming' alias arm"
+  else
+    pass "RF12: _profile_comment has no unreachable 'streaming' alias arm"
+  fi
+
+  # ---- build_videotoolbox_params: reject 4:2:2/4:4:4 for hevc_videotoolbox ----
+  local _vtenv='die(){ exit "${1:-1}"; }; HW_ACCEL_QUALITY=80; HW_ACCEL_ALLOW_SW=1; VT_QUALITY_DEFAULT=65; X264_PARAMS_BASE=""; VIDEO_ENCODER_FFMPEG=hevc_videotoolbox; OUTPUT_EXT=mkv'
+  assert_muxm_fn_exit "RF12 VT: hevc_videotoolbox rejects a 4:4:4 target (clean die)" 1 \
+    build_videotoolbox_params "${_vtenv}; TARGET_PIXFMT=yuv444p10le"
+  assert_muxm_fn_exit "RF12 VT: hevc_videotoolbox rejects a 4:2:2 target (clean die)" 1 \
+    build_videotoolbox_params "${_vtenv}; TARGET_PIXFMT=yuv422p"
+  assert_muxm_fn_exit "RF12 VT: hevc_videotoolbox accepts a 4:2:0 target (control)" 0 \
+    build_videotoolbox_params "${_vtenv}; TARGET_PIXFMT=yuv420p10le"
+
+  # ---- _probe_stream_field (E4): output unchanged after dropping head -n1 ----
+  local _pf_body; _pf_body="$(_extract_muxm_fns _probe_stream_field _jq_cache)" \
+    || { fail "RF12 E4: could not extract _probe_stream_field + _jq_cache"; return; }
+  local _json='{"streams":[{"codec_type":"video","codec_name":"hevc","width":1920},{"codec_type":"audio","codec_name":"eac3"}]}'
+  local _got _empty
+  _got="$(bash -c "METADATA_CACHE=\"\$1\"; DEBUG=0
+$_pf_body
+_probe_stream_field video 0 codec_name" -- "$_json" 2>/dev/null)"
+  _empty="$(bash -c "METADATA_CACHE=\"\$1\"; DEBUG=0
+$_pf_body
+_probe_stream_field video 0 nonexistent_field" -- "$_json" 2>/dev/null)"
+  if [[ "$_got" == "hevc" ]]; then
+    pass "RF12 E4: _probe_stream_field returns the single scalar field (head -n1 removal harmless)"
+  else
+    fail "RF12 E4: _probe_stream_field returned '$_got' (expected 'hevc')"
+  fi
+  if [[ -z "$_empty" ]]; then
+    pass "RF12 E4: _probe_stream_field returns empty for a missing field (// empty preserved)"
+  else
+    fail "RF12 E4: _probe_stream_field returned '$_empty' for a missing field (expected empty)"
+  fi
+}
+
 _test_unit_report_add_escaping() {
   # 2.5: report_add was stubbed to `:` in tests, so its JSON escaping was never exercised. Call it
   # with a value containing quote/backslash/newline/tab/CR, emit the resulting object, and assert
@@ -9671,6 +9756,8 @@ test_unit() {
   _test_unit_rf8_metadata_sanitize
   _test_unit_rf9_empty_array_safe
   _test_unit_rf10_grep_flags
+  _test_unit_rf11_man_date_token
+  _test_unit_rf12_nits
   _test_unit_report_add_escaping
   _test_unit_duration_tier3
   _test_unit_video_copy_compliant

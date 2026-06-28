@@ -55,6 +55,20 @@ trap 'rm -f "$tmp"' EXIT
   printf '%s\n' "$HEADER"
   "$MUXM" --emit-man
 } > "$tmp"
+
+# RF11: the .TH date is generated from muxm's RELEASE_DATE via the __DATE__ token. Assert the
+# substitution actually happened — a leaked literal __DATE__ (or a missing/garbled date) means the
+# man-emit substitution broke, which the docs-parity guard alone could NOT catch (both sides derive
+# from the same heredoc). A real ISO date in the .TH line must be present.
+if grep -q '__DATE__' "$tmp"; then
+  printf '❌ gen-docs.sh: man page still contains an unsubstituted __DATE__ token (RELEASE_DATE/_man_emit broken)\n' >&2
+  rm -f "$tmp"; exit 1
+fi
+if ! grep -qE '^\.TH MUXM 1 "[0-9]{4}-[0-9]{2}-[0-9]{2}"' "$tmp"; then
+  printf '❌ gen-docs.sh: man page .TH line is missing a valid ISO release date\n' >&2
+  rm -f "$tmp"; exit 1
+fi
+
 mv "$tmp" "$OUT"
 trap - EXIT
 
