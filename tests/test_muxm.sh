@@ -5955,6 +5955,62 @@ SRT
   _test_subs_f3_sdh_disposition
   _test_subs_c2_untagged_forced
   _test_subs_h2_no_reembed
+  _test_subs_rf2_forced_copy_gate
+}
+
+# RF2 (HIGH-2, e2e): with --sub-burn-forced and a video stream eligible for stream-copy (a
+# compliant HEVC under atv-directplay-hq), the copy path used to skip the burn-in filter and the
+# forced subtitle was silently dropped. _video_is_copy_compliant now forces a re-encode when
+# SUB_BURN_FORCED is set (and, via check_skip_if_ideal's delegation, the milder skip-if-ideal
+# variant too). Bidirectional:
+#   (control) atv-directplay-hq on the compliant forced-sub source WITHOUT --sub-burn-forced takes
+#             the no-op path (skip-if-ideal / copy) — proving the source IS genuinely copy-compliant,
+#             so the gate is what changes behavior (not an already-failing source).
+#   (RF2)     adding --sub-burn-forced flips it to a re-encode that actually burns the forced track
+#             in — copy path NOT taken, forced sub not silently lost.
+_test_subs_rf2_forced_copy_gate() {
+  local _dir="$TESTDIR/rf2_forced_copy"; mkdir -p "$_dir/home"
+  printf '1\n00:00:00,000 --> 00:00:01,000\n[Foreign dialogue]\n' > "$_dir/forced.srt"
+  local _src="$_dir/src.mkv"
+  # Compliant HEVC (yuv420p10le SDR, copy-eligible under atv-directplay-hq) + ac3 5.1 eng audio +
+  # a single forced eng subtitle.
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=red:s=320x240:r=24:d=2" -f lavfi -i "sine=frequency=440:duration=2" -i "$_dir/forced.srt" \
+    -map 0:v -map 1:a -map 2:s \
+    -c:v libx265 -preset ultrafast -crf 28 -pix_fmt yuv420p10le -c:a ac3 -b:a 384k -ac 6 -c:s srt \
+    -metadata:s:a:0 language=eng \
+    -disposition:s:0 forced -metadata:s:s:0 language=eng -metadata:s:s:0 title="Forced" \
+    "$_src" 2>/dev/null || true
+  # Fixture must carry a forced subtitle, else the test proves nothing.
+  local _fd
+  _fd="$(ffprobe -v error -select_streams s:0 -show_entries stream_disposition=forced -of csv=p=0 "$_src" 2>/dev/null || true)"
+  if [[ ! -s "$_src" || "$_fd" != "1" ]]; then
+    skip "RF2 (e2e): could not build a compliant forced-subtitle HEVC fixture (forced=$_fd)"
+    rm -rf "$_dir"; return
+  fi
+
+  # (control) no --sub-burn-forced → copy/skip-if-ideal path (no re-encode). Proves compliance.
+  local _ctrl
+  _ctrl="$(MUXM_HOME="$_dir/home" run_muxm_in "$_dir" --profile atv-directplay-hq "src.mkv" "out_ctrl")"
+  if printf '%s\n' "$_ctrl" | grep -qiE 'will copy directly from source|already matches profile|skipping processing'; then
+    pass "RF2 (e2e): control (no burn) takes the copy/skip-if-ideal path — source is genuinely compliant"
+  else
+    fail "RF2 (e2e): control did not copy/skip — source not actually copy-compliant, test inconclusive"
+  fi
+
+  # (RF2) --sub-burn-forced → re-encode that burns the forced track in; copy path NOT taken.
+  local _rf2
+  _rf2="$(MUXM_HOME="$_dir/home" run_muxm_in "$_dir" --profile atv-directplay-hq --sub-burn-forced "src.mkv" "out_rf2")"
+  local _reencoded=0 _burned=0 _nocopy=1
+  printf '%s\n' "$_rf2" | grep -qiE 'will re-encode|forced-subtitle burn-in requires a re-encode' && _reencoded=1
+  printf '%s\n' "$_rf2" | grep -qiE 'Burning forced subtitles into video stream' && _burned=1
+  printf '%s\n' "$_rf2" | grep -qi 'will copy directly from source' && _nocopy=0
+  if (( _reencoded && _burned && _nocopy )); then
+    pass "RF2 (e2e): --sub-burn-forced forces re-encode and burns the forced sub (copy path not taken, no silent loss)"
+  else
+    fail "RF2 (e2e): forced sub not safely burned — re-encode=$_reencoded burned=$_burned copy-avoided=$_nocopy"
+  fi
+  rm -rf "$_dir"
 }
 
 # F3: SDH must be classified by the hearing_impaired DISPOSITION, not just an SDH/HI title. A track
@@ -8938,6 +8994,23 @@ if _video_is_copy_compliant; then printf "0|%s" "$_COPY_REJECT_REASON"; else pri
   # Under the ceiling: 5 Mbps source below the 10000k cap → still copyable (the ceiling only
   # rejects when exceeded — proves the guard isn't a blanket reject).
   _vcc_assert "3.5 copy-compliant: bitrate under ceiling → copyable" 0 ""              "$(_vcc hevc yuv420p '' '' 5000000 'MAX_COPY_BITRATE=10000k')"
+
+  # ---- RF2 (HIGH-2): forced-subtitle burn-in cannot be stream-copied → must re-encode. Keyed on
+  #      the config flag SUB_BURN_FORCED (known at both call sites, unlike the runtime burn path).
+  #      Without this gate the copy branch returned 0 before the burn filter and the forced track was
+  #      silently dropped. A compliant HEVC source that would otherwise copy must now be rejected. ----
+  _vcc_assert "RF2: SUB_BURN_FORCED=1 forces re-encode" 1 "burn-in" "$(_vcc hevc yuv420p '' '' 5000000 'SUB_BURN_FORCED=1')"
+  # Control: same compliant source WITHOUT forced-burn is still copyable (RF2 is not a blanket reject).
+  _vcc_assert "RF2: no forced-burn → still copyable" 0 "" "$(_vcc hevc yuv420p '' '' 5000000 'SUB_BURN_FORCED=0')"
+
+  # ---- RF2b (HIGH-2, secondary): chroma downsampling (FORCE_CHROMA_420=1) on a 4:2:2/4:4:4 source
+  #      cannot be stream-copied → re-encode. 10-bit src so the bit-depth gate doesn't pre-empt. ----
+  _vcc_assert "RF2b: FORCE_CHROMA_420 + 4:2:2 source → re-encode" 1 "chroma downsampling" "$(_vcc hevc yuv422p10le '' '' 5000000 'FORCE_CHROMA_420=1')"
+  _vcc_assert "RF2b: FORCE_CHROMA_420 + 4:4:4 source → re-encode" 1 "chroma downsampling" "$(_vcc hevc yuv444p10le '' '' 5000000 'FORCE_CHROMA_420=1')"
+  # Control A: 4:2:0 source with chroma-420 enforced → copyable (no downsample needed).
+  _vcc_assert "RF2b: FORCE_CHROMA_420 + 4:2:0 source → copyable" 0 "" "$(_vcc hevc yuv420p '' '' 5000000 'FORCE_CHROMA_420=1')"
+  # Control B: 4:2:2 source but chroma preservation ON (FORCE_CHROMA_420=0) → not RF2b-gated.
+  _vcc_assert "RF2b: chroma preservation on + 4:2:2 → not gated" 0 "" "$(_vcc hevc yuv422p10le '' '' 5000000 'FORCE_CHROMA_420=0')"
 
   # 3.6: --max-copy-bitrate non-`k` rate formats. The `%k` strip makes the trailing 'k' optional,
   # so a bare integer ("80000") is a valid kbps ceiling: 100 Mbps exceeds it → re-encode, 20 Mbps

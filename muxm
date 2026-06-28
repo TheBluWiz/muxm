@@ -7982,6 +7982,28 @@ _video_is_copy_compliant() {
     fi
   fi
 
+  # RF2 (HIGH-2): forced-subtitle burn-in requires a re-encode — a stream-copy cannot
+  # burn the forced track into the video. Gate on the config flag SUB_BURN_FORCED (set at
+  # both call sites, unlike the runtime SRT_FORCED_BURN_PATH which is not yet populated when
+  # check_skip_if_ideal calls us). Without this, the copy branch returned 0 before the burn
+  # filter, the plan had routed the forced track to the (unread) burn path, the direct-map
+  # fallback was suppressed, and the plan was not rebuilt — so the forced subtitle reached
+  # neither the video nor a soft track, with no warning. Also fixes the milder skip-if-ideal
+  # variant (forced sub silently un-burned), since check_skip_if_ideal delegates here.
+  if (( SUB_BURN_FORCED )); then
+    _COPY_REJECT_REASON="forced-subtitle burn-in requires a re-encode"
+    return 1
+  fi
+
+  # RF2b (HIGH-2, secondary): reject copy when chroma downsampling is required — a 4:2:2/4:4:4
+  # source under a Direct-Play profile (FORCE_CHROMA_420=1) must be re-encoded to 4:2:0, not
+  # shipped verbatim. Chroma is read from the source pix_fmt exactly as decide_color_and_pixfmt
+  # derives it.
+  if (( FORCE_CHROMA_420 )) && [[ "$src_pix" =~ (422|444) ]]; then
+    _COPY_REJECT_REASON="chroma downsampling required (4:2:0 enforced; source pix_fmt is $src_pix)"
+    return 1
+  fi
+
   # DV-profile gate. For atv-directplay-hq, only Profile 8 may be stream-copied;
   # P7/P5 etc. need RPU conversion to P8.1 and cannot be copied verbatim.
   #

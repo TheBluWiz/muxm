@@ -377,4 +377,11 @@ muxm --profile universal --video-codec libx265 input.mkv
 
 The full set of checked conflicts is in Section 13 of the script.
 
+> **Note:** `--sub-burn-forced` (and the `universal` profile, which burns by default)
+> forces a re-encode of the video stream — burning a subtitle into the picture is
+> incompatible with a pure stream-copy. So combining `--sub-burn-forced` with a
+> copy-compliant profile such as `atv-directplay-hq` overrides
+> `VIDEO_COPY_IF_COMPLIANT`/skip-if-ideal and re-encodes (the forced track is burned
+> in rather than silently dropped).
+
 ---
