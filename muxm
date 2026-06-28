@@ -10103,6 +10103,21 @@ _is_text_sub_codec(){
 
 _container_supports_bitmap_subs(){ [[ "$MUX_FORMAT" == "matroska" ]]; }
 
+# RF6: a single-track subtitle CANDIDATE that cannot be turned into a track for the current output
+# container — a bitmap codec (PGS/VobSub/DVD) when the container can't carry it (non-MKV) AND OCR is
+# disabled, so it can neither be stream-copied nor OCR'd to text. Used to (a) keep a usable text
+# sidecar that would otherwise be deduped against such an embedded bitmap, and (b) skip the bitmap in
+# single-track selection so a same-type text candidate (e.g. a `.srt` sidecar) is chosen instead —
+# mirroring the multi-track keep-list's Filter 3 "never silently lose a track" intent.
+# Args: $1 — codec name.  Reads: MUX_FORMAT, SUB_ENABLE_OCR.
+_sub_candidate_undeliverable(){
+  local c="$1"
+  _is_text_sub_codec "$c" && return 1            # text is always deliverable
+  _container_supports_bitmap_subs && return 1     # MKV stream-copies the bitmap as-is
+  (( SUB_ENABLE_OCR )) && return 1                # OCR converts the bitmap → text
+  return 0                                        # bitmap, non-MKV, OCR off → undeliverable
+}
+
 # Find the first text-based subtitle in a preferred language for direct stream copy.
 # Returns: relative subtitle index on stdout (empty string if none found).
 # Used as a fast path when no OCR or conversion is needed.
@@ -10452,6 +10467,14 @@ _prepare_ext_subtitle(){
       spinner "$ocr_pid" "OCR external VobSub: $basename_label"
       wait "$ocr_pid" 2>/dev/null || true; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait (avoid orphaning the OCR child on SIGINT)
 
+      # RF7: some OCR tools write the .srt next to the source .idx, not into the workdir. Relocate
+      # it before the existence check (mirrors the .sup branch above) — otherwise a SUCCESSFUL
+      # VobSub OCR left $srt_out empty and was misreported as "OCR failed" and dropped.
+      local vob_srt="${ext_path%.idx}.srt"
+      if [[ -s "$vob_srt" ]]; then
+        mv -f "$vob_srt" "$srt_out" || true
+      fi
+
       if [[ -s "$srt_out" ]] && grep -q ' --> ' "$srt_out"; then
         echo "$srt_out"
         return 0
@@ -10781,6 +10804,11 @@ merge_subtitle_sources(){
     for (( k=0; k<n; k++ )); do
       if [[ "$(_norm_lang_code "${ALL_SUB_LANGS[$k]}")" == "$_xlang_n" \
             && "${ALL_SUB_TYPES[$k]}" == "$_xtype" ]]; then
+        # RF6: an embedded match only suppresses an external sidecar if the embedded track is
+        # actually DELIVERABLE in the target container. An undeliverable embedded bitmap (non-MKV
+        # output, OCR off) can't produce a track, so it must NOT dedup away a usable text sidecar —
+        # otherwise the bitmap is dropped at mux and the sidecar is already gone (silent loss).
+        _sub_candidate_undeliverable "${ALL_SUB_CODECS[$k]}" && continue
         _dup=1; _dup_src="embedded"; break
       fi
     done
@@ -11127,6 +11155,15 @@ build_subtitle_plan(){
     # Language filter (normalized both sides — H2)
     if [[ -n "${SUB_LANG_PREF:-}" ]]; then
       _sub_lang_matches "$lang" || continue
+    fi
+
+    # RF6: skip a candidate that can't be delivered as a single track in this container — a bitmap
+    # subtitle with a non-MKV output and OCR disabled. Skipping it lets selection fall through to a
+    # container-usable same-type candidate (e.g. a text `.srt` sidecar, kept by the codec-aware
+    # dedup above) instead of choosing a bitmap that fails to prepare and silently drops the track.
+    # (Mirrors _build_subtitle_keep_list's Filter 3 on the multi-track path.)
+    if _sub_candidate_undeliverable "${ALL_SUB_CODECS[$i]}"; then
+      continue
     fi
 
     case "$stype" in
