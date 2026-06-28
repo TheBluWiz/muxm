@@ -5737,8 +5737,7 @@ _resolve_output_and_sub_policy(){
   # When either ATV profile produces MKV output (via passthrough or explicit --output-ext mkv),
   # enable native ASS/SSA format and PGS bitmap preservation — UNLESS the user explicitly asked
   # otherwise on the CLI (D1: gate on _CLI_SUB_PRESERVE_*_EXPLICIT so --no-… is not clobbered).
-  if [[ "${PROFILE_NAME:-}" == "atv-directplay-hq" || "${PROFILE_NAME:-}" == "atv-directplay-animation" ]] \
-      && [[ "$OUTPUT_EXT" == "mkv" ]]; then
+  if _is_atv_directplay_profile "${PROFILE_NAME:-}" && [[ "$OUTPUT_EXT" == "mkv" ]]; then
     if (( ! _CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT )); then
       SUB_PRESERVE_TEXT_FORMAT=1
       log "[${PROFILE_NAME}] MKV output: enabling native ASS/SSA format preservation."
@@ -7946,6 +7945,15 @@ declare -a ALL_SUB_TITLES=()      # title tag per entry (empty for external file
 
 # ===== Section 26: Video pipeline =============================================================
 
+# True (rc 0) iff $1 is one of the Apple TV Direct-Play profiles. These share the
+# same Direct-Play contract (single-layer DV P8.1, copy-if-compliant, ≤50 Mbps) and
+# must be gated together everywhere; a single literal `== atv-directplay-hq` silently
+# excludes the animation sibling (CR-2). Route Direct-Play-intent checks through here
+# so a future Direct-Play profile inherits the gate by being added in one place.
+_is_atv_directplay_profile() {
+  [[ "$1" == "atv-directplay-hq" || "$1" == "atv-directplay-animation" ]]
+}
+
 # Check if source video can be stream-copied (no re-encode) for the target profile.
 # Tests: codec match (hevc/h264), pixel format (10-bit for HDR), tone-map requirement,
 #        DV profile compatibility (atv-directplay-hq requires P8 for copy),
@@ -8072,8 +8080,8 @@ _video_is_copy_compliant() {
     return 1
   fi
 
-  # DV-profile gate. For atv-directplay-hq, only Profile 8 may be stream-copied;
-  # P7/P5 etc. need RPU conversion to P8.1 and cannot be copied verbatim.
+  # DV-profile gate. For the Apple TV Direct-Play profiles, only Profile 8 may be
+  # stream-copied; P7/P5 etc. need RPU conversion to P8.1 and cannot be copied verbatim.
   #
   # Must be correct on BOTH call paths. On the normal pipeline path detect_dv/
   # detect_dv_info have run, so IS_DV/DV_SRC_PROFILE are authoritative (and stay so
@@ -8081,7 +8089,7 @@ _video_is_copy_compliant() {
   # record). On the skip-if-ideal path they are still their defaults (IS_DV=0,
   # DV_SRC_PROFILE="") — the C1 bug — so fall back to a read-only probe of the
   # source's DV profile from the metadata cache.
-  if (( ! DISABLE_DV )) && [[ "${PROFILE_NAME:-}" == "atv-directplay-hq" ]]; then
+  if (( ! DISABLE_DV )) && _is_atv_directplay_profile "${PROFILE_NAME:-}"; then
     local _cc_is_dv="$IS_DV" _cc_dv_profile="${DV_SRC_PROFILE:-}"
     if (( ! _cc_is_dv )) && [[ -z "$_cc_dv_profile" ]]; then
       if _source_has_dv_metadata; then

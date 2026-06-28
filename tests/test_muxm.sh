@@ -12808,6 +12808,24 @@ test_dv_sw() {
       fi
     fi
 
+    # (b2) CR-2 sibling-parity: the SAME Profile-7 source must be rejected from skip-copy under
+    #      atv-directplay-animation too — the DV→P8 copy gate was keyed to the single literal
+    #      `atv-directplay-hq`, so its Direct-Play sibling silently stream-copied/hardlinked
+    #      dual-layer P7 verbatim. Differential: same fixture, only the profile differs.
+    #      Skip-first guard (not an else-skip) per the ratchet.
+    if [[ ! -s "$_c1_p7" ]] || \
+       [[ "$(ffprobe -v error -show_streams -select_streams v:0 "$_c1_p7" 2>/dev/null | grep -m1 '^dv_profile=' | cut -d= -f2)" != "7" ]]; then
+      skip "dv_sw C1/CR-2: could not fabricate a Profile-7-labeled fixture — skipping the animation parity assertion"
+    else
+      local _cr2_out
+      _cr2_out="$( (cd "$TESTDIR" && "$MUXM" --profile atv-directplay-animation --dry-run "$_c1_p7" "$TESTDIR/c1_out.mp4" 2>&1) || true )"
+      if printf '%s\n' "$_cr2_out" | grep -qiE 'does not match ideal:.*DV profile 7.*requires conversion'; then
+        pass "dv_sw C1/CR-2: DV Profile-7 source rejected from skip-copy under atv-directplay-animation (gate parity with -hq)"
+      else
+        fail "dv_sw C1/CR-2: DV Profile-7 source still skip-copied under atv-directplay-animation (CR-2). Saw: $(printf '%s\n' "$_cr2_out" | grep -iE 'match|skip' | head -1)"
+      fi
+    fi
+
     # (c) 8-bit source must NOT skip-copy under a 10-bit profile; the reason must cite the bit-depth.
     #     Skip-first guard (not an else-skip) per the ratchet.
     if [[ ! -s "$_c1_8bit" || "$_c1_8cs" != "bt2020nc" ]]; then
