@@ -421,6 +421,13 @@ muxm --profile youtube-upload,streaming-hevc source.mkv
 # → source.youtube-upload.mp4  source.streaming-hevc.mp4
 ```
 
+By default each profile uses its own natural container (e.g. `archive` → MKV). An explicit `--output-ext` applies to **every** profile, so the per-profile filename and the actual container always agree:
+
+```bash
+muxm --output-ext mp4 --profile archive,streaming-hevc source.mkv
+# → source.archive.mp4  source.streaming-hevc.mp4   (both real MP4)
+```
+
 **Output container inference:** When you provide an explicit output filename, `muxm` infers the container from its extension — `output.mkv` forces MKV regardless of the profile default.
 
 Run `muxm --help` for the full flag reference.

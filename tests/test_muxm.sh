@@ -10920,6 +10920,64 @@ test_multi_profile() {
   # Normalizing the alias in the parent prescan emits the standard deprecation warning.
   assert_contains "deprecated" \
     "M2: dv-archival alias emits a deprecation warning in multi-profile mode" "$out"
+
+  _test_mp_rf5_output_ext_container
+}
+
+# Map a probed format_name to the container extension it represents, then assert it matches the
+# filename's extension. format_name is a comma-joined demuxer list: matroska→mkv, mov/mp4→mp4-family.
+_assert_container_matches_ext() {
+  local label="$1" file="$2"
+  if [[ ! -f "$file" || ! -s "$file" ]]; then fail "$label — no output produced ($file)"; return; fi
+  local ext="${file##*.}"; ext="${ext,,}"
+  local fmt; fmt="$(probe_format "$file" format_name)"
+  local ok=0
+  case "$ext" in
+    mkv)            [[ "$fmt" == *matroska* ]] && ok=1 ;;
+    mp4|m4v|mov)    [[ "$fmt" == *mov* || "$fmt" == *mp4* ]] && [[ "$fmt" != matroska* ]] && ok=1 ;;
+  esac
+  if (( ok )); then
+    pass "$label (.$ext ↔ format_name='$fmt')"
+  else
+    fail "$label — filename says .$ext but container format_name='$fmt' (mislabel)"
+  fi
+}
+
+# RF5 (MED-2): a CLI --output-ext combined with a comma-separated --profile carried the user's value
+# into each child AFTER the injected per-profile --output-ext, so the user's value won the actual
+# container while the auto-generated filename kept the profile's natural extension — e.g. an
+# `.archive.mkv` that was really MP4. The fix drops the user's --output-ext from the child flags and
+# makes the explicit ext the per-profile ext for EVERY profile, so name and container always agree.
+_test_mp_rf5_output_ext_container() {
+  # h264 + aac source so `archive` (video copy + audio copy) succeeds into an MP4 container.
+  local _src="$TESTDIR/rf5_src.mkv"
+  gen_media "$_src" green \
+    -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -c:a aac -b:a 128k -ac 2 \
+    -metadata:s:a:0 language=eng
+  if [[ ! -s "$_src" ]]; then fail "RF5: could not create h264+aac multi-profile fixture"; return; fi
+  local _home="$TESTDIR/rf5_home"; mkdir -p "$_home"
+  local _stem="${_src%.*}"
+
+  # --- RF5: explicit --output-ext mp4 → BOTH children produce real MP4 containers, named .mp4. ---
+  rm -f "${_stem}".archive.* "${_stem}".streaming-hevc.*
+  log "Testing RF5: multi-profile --output-ext mp4 → container matches filename..."
+  MUXM_HOME="$_home" run_muxm --output-ext mp4 --profile archive,streaming-hevc "$_src" >/dev/null 2>&1
+  _assert_container_matches_ext "RF5: archive child container matches its .mp4 filename" "${_stem}.archive.mp4"
+  _assert_container_matches_ext "RF5: streaming-hevc child container matches its .mp4 filename" "${_stem}.streaming-hevc.mp4"
+  # The mislabeled name the bug produced (.archive.mkv) must NOT exist — the user's mp4 won the name too.
+  if [[ -e "${_stem}.archive.mkv" ]]; then
+    fail "RF5: a mislabeled .archive.mkv was produced despite --output-ext mp4 (filename ignored the explicit ext)"
+  else
+    pass "RF5: no mislabeled .archive.mkv produced (explicit --output-ext owns the filename too)"
+  fi
+
+  # --- RF5 control (no regression): without --output-ext, each profile names by its NATURAL ext
+  #     (archive→mkv, streaming-hevc→mp4) and the container still matches the filename. ---
+  rm -f "${_stem}".archive.* "${_stem}".streaming-hevc.*
+  log "Testing RF5 control: multi-profile without --output-ext uses each profile's natural ext..."
+  MUXM_HOME="$_home" run_muxm --profile archive,streaming-hevc "$_src" >/dev/null 2>&1
+  _assert_container_matches_ext "RF5 control: archive uses its natural .mkv (container matches)" "${_stem}.archive.mkv"
+  _assert_container_matches_ext "RF5 control: streaming-hevc uses its natural .mp4 (container matches)" "${_stem}.streaming-hevc.mp4"
 }
 
 # === Suite: Phase 5 Regression Tests (P5.3) ===

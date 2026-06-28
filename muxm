@@ -4893,7 +4893,16 @@ _run_multi_profiles() {
   local -a _child_flags=()
   local -a _pos_pending=("${POSITIONALS[@]}")   # multiset of positional values to drop
   local _ofa _ppi _dropped
+  local -i _skip_next=0
   for _ofa in "${_ORIG_FILTERED_ARGS[@]}"; do
+    # RF5: strip the user's --output-ext (and its value) here — the per-profile --output-ext is
+    # injected at the child invocation below, and it comes BEFORE _child_flags, so a retained user
+    # value would re-override it in the child parser (last --output-ext wins) and mislabel the
+    # container (file named .archive.mkv but actually MP4). The user's intent is instead honored by
+    # making OUTPUT_EXT the per-profile ext for EVERY profile (see _OUTPUT_EXT_EXPLICIT below).
+    # (muxm's parser has no --flag=value form, so the space-separated pair is the only case.)
+    if (( _skip_next )); then _skip_next=0; continue; fi
+    if [[ "$_ofa" == "--output-ext" ]]; then _skip_next=1; continue; fi
     _dropped=0
     for _ppi in "${!_pos_pending[@]}"; do
       if [[ "$_ofa" == "${_pos_pending[$_ppi]}" ]]; then
@@ -4910,16 +4919,25 @@ _run_multi_profiles() {
   local -a _child_outs=()
   local _mp _prof_ext
   for _mp in "${_MULTI_PROFILES[@]}"; do
-    _prof_ext="$(_probe_profile_ext "$_mp")"
-    # Passthrough profiles (atv-directplay-hq, atv-directplay-animation) set OUTPUT_EXT=""
-    # — fall back to the user extension (if an explicit output filename with a recognised
-    # container extension was given) or the source extension. (archive now forces MKV, so
-    # it returns a concrete ext here and never takes this fallback.)
-    if [[ -z "$_prof_ext" ]]; then
-      if (( _user_provided )) && [[ -n "${_user_ext:-}" ]]; then
-        _prof_ext="$_user_ext"
-      else
-        _prof_ext="$_src_ext"
+    if (( _OUTPUT_EXT_EXPLICIT )); then
+      # RF5: an explicit CLI --output-ext applies to EVERY profile, so the per-profile filename
+      # and the child's actual container always agree. This mirrors single-profile behavior, where
+      # an explicit --output-ext overrides the profile's natural container. (In multi-profile mode
+      # _resolve_output_and_sub_policy is skipped, so OUTPUT_EXT here is exactly the user's CLI
+      # value — not the output-filename inference, which the per-child resolution handles.)
+      _prof_ext="$OUTPUT_EXT"
+    else
+      _prof_ext="$(_probe_profile_ext "$_mp")"
+      # Passthrough profiles (atv-directplay-hq, atv-directplay-animation) set OUTPUT_EXT=""
+      # — fall back to the user extension (if an explicit output filename with a recognised
+      # container extension was given) or the source extension. (archive now forces MKV, so
+      # it returns a concrete ext here and never takes this fallback.)
+      if [[ -z "$_prof_ext" ]]; then
+        if (( _user_provided )) && [[ -n "${_user_ext:-}" ]]; then
+          _prof_ext="$_user_ext"
+        else
+          _prof_ext="$_src_ext"
+        fi
       fi
     fi
     _prof_ext="${_prof_ext,,}"
