@@ -9127,6 +9127,90 @@ _sub_stream_info 0" -- "$_json" 2>/dev/null)"
   fi
 }
 
+# RF9 (LOW-2): a conditionally-built array (e.g. fps_arg, _ts_fps, fps_in, _ocr_lang, thread_args,
+# _child_flags, _cc_override_args) expanded as bare "${arr[@]}" raises `unbound variable` under
+# `set -u` on bash < 4.4 when empty — and the documented floor is 4.3. muxm now uses the array-safe
+# ${arr[@]+"${arr[@]}"} form, which yields the elements when present and NOTHING (no spurious empty
+# argument) when empty. This test locks both the idiom's behavior AND that muxm's real call sites use
+# it. NOTE: on this host bash (>= 4.4) the OLD bare form would NOT error, so the true 4.3 failure can
+# only be reproduced on a 4.3 interpreter — run there too if $BASH_43 points to one, else skip.
+_test_unit_rf9_empty_array_safe() {
+  # (1) Idiom behavior: empty → 0 extra args (NOT one empty arg, as "${arr[@]:-}" would give).
+  local n_empty n_full
+  n_empty="$(bash -c 'set -u; arr=(); set -- PRE ${arr[@]+"${arr[@]}"} POST; echo $#' 2>/dev/null)"
+  n_full="$(bash -c 'set -u; arr=(-fps 24); set -- PRE ${arr[@]+"${arr[@]}"} POST; echo $#' 2>/dev/null)"
+  if [[ "$n_empty" == 2 ]]; then
+    pass "RF9: empty array expands to ZERO args under set -u (no spurious empty argument)"
+  else
+    fail "RF9: empty array produced $n_empty args (expected 2 = PRE+POST; a ':-' form would give 3)"
+  fi
+  if [[ "$n_full" == 4 ]]; then
+    pass "RF9: populated array expands to its elements (PRE + 2 + POST = 4)"
+  else
+    fail "RF9: populated array produced $n_full args (expected 4)"
+  fi
+  # (2) No 'unbound variable' under set -u for the empty case.
+  local err; err="$(bash -c 'set -u; arr=(); printf "%s" ${arr[@]+"${arr[@]}"}' 2>&1 >/dev/null)"
+  if [[ -z "$err" ]]; then
+    pass "RF9: array-safe expansion raises no error under set -u (empty array)"
+  else
+    fail "RF9: set -u empty-array expansion errored: $err"
+  fi
+  # (3) Static: muxm's known empty-prone command-arg arrays use the safe form, never bare "${x[@]}".
+  # A "bare" expansion is "${arr[@]}" NOT preceded by '+' (the safe form is ${arr[@]+"${arr[@]}"}).
+  # Grep the file directly (matching LINES), then keep only NON-comment matches so the RF9
+  # explanatory comment (which quotes the unsafe form) doesn't false-positive.
+  local arr unsafe=""
+  for arr in fps_arg _ts_fps fps_in _ocr_lang thread_args _child_flags _cc_override_args; do
+    if grep -E "[^+]\"\\\$\{${arr}\[@\]\}\"" "$MUXM" | grep -qvE '^[[:space:]]*#'; then
+      unsafe+="$arr "
+    fi
+  done
+  if [[ -z "$unsafe" ]]; then
+    pass "RF9: no bare \"\${arr[@]}\" expansion remains for the empty-prone command-arg arrays"
+  else
+    fail "RF9: bare (4.3-unsafe) array expansion still present for: $unsafe"
+  fi
+  # (4) True bash-4.3 coverage when an interpreter is available. Skip-first guard (not an else→skip)
+  # per the soft-skip ratchet: a genuine host/version skip belongs in `if [[ ! cond ]]; then skip`.
+  if [[ -z "${BASH_43:-}" || ! -x "${BASH_43:-}" ]]; then
+    skip "RF9: no bash-4.3 interpreter (\$BASH_43 unset) — host bash exercises the idiom; true 4.3 coverage needs a 4.3 binary"
+  else
+    local rc=0
+    "$BASH_43" -c 'set -u; arr=(); printf "%s" ${arr[@]+"${arr[@]}"}' >/dev/null 2>&1 || rc=$?
+    if (( rc == 0 )); then
+      pass "RF9: array-safe expansion works on bash 4.3 (\$BASH_43)"
+    else
+      fail "RF9: \$BASH_43 errored on the array-safe expansion (rc=$rc)"
+    fi
+  fi
+}
+
+# RF10 (LOW-4): every grep invocation in muxm must use only the POSIX-portable flags documented in
+# the §5 audit comment — {i, E, o, q, v, x, F}. This both validates the -m1 removal and keeps the
+# audit comment test-enforced so it can't silently rot again (a reintroduced non-POSIX flag fails).
+_test_unit_rf10_grep_flags() {
+  local allow="iEoqvxF" bad="" tok flags ch i
+  while IFS= read -r tok; do
+    flags="${tok#grep -}"
+    for (( i=0; i<${#flags}; i++ )); do
+      ch="${flags:$i:1}"
+      [[ "$allow" == *"$ch"* ]] || bad+="${tok}(${ch}) "
+    done
+  done < <(grep -oE 'grep -[A-Za-z]+' "$MUXM")
+  if [[ -z "$bad" ]]; then
+    pass "RF10: all grep invocations in muxm use only POSIX-portable flags ($allow)"
+  else
+    fail "RF10: non-allow-listed grep flag(s) in muxm: $bad (allow-list: $allow)"
+  fi
+  # Explicit guard: the non-POSIX -m (max-count, redundant with -q) must never reappear.
+  if grep -qE 'grep -[A-Za-z]*m' "$MUXM"; then
+    fail "RF10: a non-POSIX 'grep -…m…' (e.g. -m1) was reintroduced into muxm"
+  else
+    pass "RF10: no non-POSIX 'grep -m' present in muxm"
+  fi
+}
+
 _test_unit_report_add_escaping() {
   # 2.5: report_add was stubbed to `:` in tests, so its JSON escaping was never exercised. Call it
   # with a value containing quote/backslash/newline/tab/CR, emit the resulting object, and assert
@@ -9585,6 +9669,8 @@ test_unit() {
   _test_unit_build_subtitle_lists
   _test_unit_rf6_subtitle_fallback
   _test_unit_rf8_metadata_sanitize
+  _test_unit_rf9_empty_array_safe
+  _test_unit_rf10_grep_flags
   _test_unit_report_add_escaping
   _test_unit_duration_tier3
   _test_unit_video_copy_compliant

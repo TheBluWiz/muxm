@@ -928,7 +928,9 @@ need(){
 #                GNU extensions — portable on both BSD/macOS and GNU/Linux
 #   - date:      all calls use POSIX-compatible format strings (+%Y%m%d, etc.)
 #   - mktemp:    template-argument form used (POSIX-compatible on BSD and GNU)
-#   - grep:      only -i, -E, -o, -q, -v flags used (all POSIX/BSD-compatible)
+#   - grep:      only -i, -E, -o, -q, -v, -x, -F flags used (all POSIX-compatible)
+#                RF10: -m is NON-POSIX and was redundant with -q, so it was removed; the grep
+#                flag allow-list above is enforced by the unit suite (_test_unit_rf10_grep_flags).
 #   - readlink:  not used; path resolution handled via realpath_fallback
 #   - seq:       eliminated; replaced with _repeat_char (pure bash, fully portable)
 
@@ -4830,7 +4832,7 @@ _create_config_prescan() {
       _cc_override_args+=("${_cc_args[$_cc_oi]}")
       _cc_oi=$(( _cc_oi + 1 ))
     done
-    _create_config "$_cc_scope" "$_cc_profile" "$_cc_force" "${_cc_override_args[@]}"
+    _create_config "$_cc_scope" "$_cc_profile" "$_cc_force" ${_cc_override_args[@]+"${_cc_override_args[@]}"}
     # _create_config always exits; this line is unreachable
   fi
 }
@@ -4968,7 +4970,7 @@ _run_multi_profiles() {
     # Re-invoke muxm for this profile
     local -i _child_rc=0
     "$0" --profile "$_mp" --output-ext "$_prof_ext" \
-      "${_child_flags[@]}" "$SRC_ABS" "$_child_out" || _child_rc=$?
+      ${_child_flags[@]+"${_child_flags[@]}"} "$SRC_ABS" "$_child_out" || _child_rc=$?
 
     if (( _child_rc == 0 )); then
       _results+=("${_mp}:PASS")
@@ -7511,7 +7513,7 @@ detect_dv() {
     return 1
   }
   
-  if printf '%s\n' "$probe_output" | grep -m1 -qiE 'dolby_vision|dv_profile|dovi|dvhe|dvh1|com\.dolby\.vision'; then
+  if printf '%s\n' "$probe_output" | grep -qiE 'dolby_vision|dv_profile|dovi|dvhe|dvh1|com\.dolby\.vision'; then
     return 0
   fi
   
@@ -7521,7 +7523,7 @@ detect_dv() {
     return 1
   }
   
-  printf '%s\n' "$probe_output" | grep -m1 -qiE 'DOVI|dolby' && return 0
+  printf '%s\n' "$probe_output" | grep -qiE 'DOVI|dolby' && return 0
   return 1
 }
 
@@ -7710,7 +7712,7 @@ verify_dv_container_record() {
       # pre-wrap path for the full rationale.
       local -a fps_arg=()
       [[ -n "$SRC_FPS" ]] && fps_arg=(-fps "$SRC_FPS")
-      "$MP4BOX_CMD" "${fps_arg[@]}" -add "${V_MIXED}${dvp_hint}" \
+      "$MP4BOX_CMD" ${fps_arg[@]+"${fps_arg[@]}"} -add "${V_MIXED}${dvp_hint}" \
            -new "$dv_video_mp4" >"$WORKDIR/dovi_mux_mp4box.log" 2>&1 &
       local mp4box_fb_pid=$!
       _ACTIVE_FFMPEG_PID=$mp4box_fb_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
@@ -8131,7 +8133,7 @@ _dv_fallback_timestamp_wrap() {
   local -a _ts_fps=()
   # Raw-hevc demuxer defaults headerless ES to 25fps; stamp the real source fps.
   [[ -n "$SRC_FPS" ]] && _ts_fps=(-r "$SRC_FPS")
-  ffmpeg "${FFMPEG_FLAGS[@]}" "${_ts_fps[@]}" -i "$V_MIXED" \
+  ffmpeg "${FFMPEG_FLAGS[@]}" ${_ts_fps[@]+"${_ts_fps[@]}"} -i "$V_MIXED" \
        -c:v copy -tag:v hvc1 -movflags +faststart \
        -f mp4 "$_ts_wrap" >"$WORKDIR/base_timestamp_wrap.log" 2>&1 &
   local _ts_pid=$!
@@ -8262,7 +8264,7 @@ run_video_pipeline() {
   local -a vf_filters=()
   local -a encode_args=()
   local _enc_cwd=""    # if set, run the encode ffmpeg from this dir (forced-sub burn-in)
-  local thread_args=()
+  local thread_args=()   # RF9: expanded array-safe below (empty when THREADS unset — bash-4.3 set -u)
   [[ -n "${THREADS:-}" ]] && thread_args=(-threads "$THREADS")
 
   # Tone-mapping filter (universal profile: HDR→SDR)
@@ -8422,9 +8424,9 @@ run_video_pipeline() {
     local -a ff_cmd=("${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0)
     [[ -n "$vf_str" ]] && ff_cmd+=(-vf "$vf_str")
     if (( v_needs_raw_es )); then
-      ff_cmd+=("${encode_args[@]}" "${thread_args[@]}" -an -sn -dn -f hevc "$V_BASE")
+      ff_cmd+=("${encode_args[@]}" ${thread_args[@]+"${thread_args[@]}"} -an -sn -dn -f hevc "$V_BASE")
     else
-      ff_cmd+=("${encode_args[@]}" "${thread_args[@]}" -an -sn -dn -f matroska "$V_BASE")
+      ff_cmd+=("${encode_args[@]}" ${thread_args[@]+"${thread_args[@]}"} -an -sn -dn -f matroska "$V_BASE")
     fi
 
     local total_secs
@@ -8810,9 +8812,13 @@ run_video_pipeline() {
       # mp4box defaults headerless ES (e.g. from hevc_videotoolbox, which omits VUI
       # timing) to 25fps — corrupting timing on 23.976/24/30 content. Skipped only
       # when SRC_FPS is undeterminable.
+      # RF9: expand with the array-safe ${fps_arg[@]+"${fps_arg[@]}"} form below — a bare
+      # "${fps_arg[@]}" raises `unbound variable` under `set -u` on bash < 4.4 (the documented
+      # floor is 4.3) when the array is empty. The alternate-value form yields the elements when
+      # present and NOTHING when empty (no spurious empty argument, unlike "${fps_arg[@]:-}").
       local -a fps_arg=()
       [[ -n "$SRC_FPS" ]] && fps_arg=(-fps "$SRC_FPS")
-      "$MP4BOX_CMD" "${fps_arg[@]}" -add "${V_MIXED}${dvp_hint}" \
+      "$MP4BOX_CMD" ${fps_arg[@]+"${fps_arg[@]}"} -add "${V_MIXED}${dvp_hint}" \
            -new "$dv_prewrap" >"$WORKDIR/dv_prewrap_mp4box.log" 2>&1 &
       local pw_mp4box_pid=$!
       _ACTIVE_FFMPEG_PID=$pw_mp4box_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
@@ -8844,7 +8850,7 @@ run_video_pipeline() {
       local -a fps_in=()
       [[ -n "$SRC_FPS" ]] && fps_in=(-r "$SRC_FPS")
       ffmpeg "${FFMPEG_FLAGS[@]}" \
-           "${fps_in[@]}" \
+           ${fps_in[@]+"${fps_in[@]}"} \
            -i "$V_MIXED" \
            -c:v copy \
            -strict unofficial \
@@ -10295,7 +10301,7 @@ _prepare_subtitle(){
 
         # Run OCR tool on VobSub .idx
         (
-          "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "${vob_base}.idx" >"$WORKDIR/sub_${idx}_ocr.log" 2>&1 || true
+          "$SUB_OCR_TOOL" ${_ocr_lang[@]+"${_ocr_lang[@]}"} "${vob_base}.idx" >"$WORKDIR/sub_${idx}_ocr.log" 2>&1 || true
         ) &
         local ocr_pid=$!
         _ACTIVE_FFMPEG_PID=$ocr_pid
@@ -10316,7 +10322,7 @@ _prepare_subtitle(){
 
       # Fallback: try OCR tool directly on .sup
       (
-        "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "$sup" >"$WORKDIR/sub_${idx}_ocr_sup.log" 2>&1 || true
+        "$SUB_OCR_TOOL" ${_ocr_lang[@]+"${_ocr_lang[@]}"} "$sup" >"$WORKDIR/sub_${idx}_ocr_sup.log" 2>&1 || true
       ) &
       local ocr_sup_pid=$!
       _ACTIVE_FFMPEG_PID=$ocr_sup_pid
@@ -10421,7 +10427,7 @@ _prepare_ext_subtitle(){
         *)       [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(-l "$SUB_OCR_LANG") ;;
       esac
       (
-        "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "$ext_path" >"$WORKDIR/ext_ocr_sup.log" 2>&1 || true
+        "$SUB_OCR_TOOL" ${_ocr_lang[@]+"${_ocr_lang[@]}"} "$ext_path" >"$WORKDIR/ext_ocr_sup.log" 2>&1 || true
       ) &
       local ocr_pid=$!
       _ACTIVE_FFMPEG_PID=$ocr_pid
@@ -10467,7 +10473,7 @@ _prepare_ext_subtitle(){
         *)       [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(-l "$SUB_OCR_LANG") ;;
       esac
       (
-        "$SUB_OCR_TOOL" "${_ocr_lang[@]}" "$ext_path" >"$WORKDIR/ext_ocr_vobsub.log" 2>&1 || true
+        "$SUB_OCR_TOOL" ${_ocr_lang[@]+"${_ocr_lang[@]}"} "$ext_path" >"$WORKDIR/ext_ocr_vobsub.log" 2>&1 || true
       ) &
       local ocr_pid=$!
       _ACTIVE_FFMPEG_PID=$ocr_pid
