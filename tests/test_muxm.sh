@@ -2618,6 +2618,7 @@ _create_config_emit_multi "archive,streaming-hevc" | grep "^X265_PARAMS_BASE="'
   local _line
   _line="$(bash -c "$body"$'\n'"$_driver" 2>/dev/null)"
   # Expected: every special char ( " $ ` ) escaped with a backslash inside the quoted value.
+  # shellcheck disable=SC2016  # literal expected escaped form — $HOME/`id` must NOT expand here
   local _want='X265_PARAMS_BASE="aq=3\":x=\$HOME:y=\`id\`"'
   if [[ "$_line" == "$_want" ]]; then
     pass "RF1: multi-profile config emitter escapes shell-special override values"
@@ -2651,6 +2652,7 @@ _create_config_emit_multi "archive,streaming-hevc" | grep "^X265_PARAMS_BASE="'
   # (c) single vs multi emitters escape an identical override identically (guards future drift).
   local _ds="$TESTDIR/rf1_single"; mkdir -p "$_ds/h"
   local _dm="$TESTDIR/rf1_multi2"; mkdir -p "$_dm/h"
+  # shellcheck disable=SC2016  # literal injection-payload fixture — $HOME/`id` must stay unexpanded
   local _val='aq=3":x=$HOME:y=`id`'
   ( cd "$_ds" && HOME="$_ds/h" "$MUXM" --create-config project atv-directplay-hq \
       --x265-params "$_val" >/dev/null 2>&1 )
@@ -9182,6 +9184,7 @@ _test_unit_rf9_empty_array_safe() {
     skip "RF9: no bash-4.3 interpreter (\$BASH_43 unset) — host bash exercises the idiom; true 4.3 coverage needs a 4.3 binary"
   else
     local rc=0
+    # shellcheck disable=SC2016  # the ${arr[@]+…} idiom must reach $BASH_43 as a literal, unexpanded
     "$BASH_43" -c 'set -u; arr=(); printf "%s" ${arr[@]+"${arr[@]}"}' >/dev/null 2>&1 || rc=$?
     if (( rc == 0 )); then
       pass "RF9: array-safe expansion works on bash 4.3 (\$BASH_43)"
@@ -9265,6 +9268,7 @@ _test_unit_rf12_nits() {
   fi
 
   # ---- build_videotoolbox_params: reject 4:2:2/4:4:4 for hevc_videotoolbox ----
+  # shellcheck disable=SC2016  # literal env-setup string for assert_muxm_fn_exit — must not expand now
   local _vtenv='die(){ exit "${1:-1}"; }; HW_ACCEL_QUALITY=80; HW_ACCEL_ALLOW_SW=1; VT_QUALITY_DEFAULT=65; X264_PARAMS_BASE=""; VIDEO_ENCODER_FFMPEG=hevc_videotoolbox; OUTPUT_EXT=mkv'
   assert_muxm_fn_exit "RF12 VT: hevc_videotoolbox rejects a 4:4:4 target (clean die)" 1 \
     build_videotoolbox_params "${_vtenv}; TARGET_PIXFMT=yuv444p10le"
