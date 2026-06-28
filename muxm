@@ -8950,8 +8950,11 @@ run_video_pipeline() {
         # Stamp source fps as an INPUT option (raw-hevc demuxer defaults to 25/50fps).
         local -a fps_in2=()
         [[ -n "$SRC_FPS" ]] && fps_in2=(-r "$SRC_FPS")
+        # CR-5/RF9: array-safe expansion — a bare "${fps_in2[@]}" raises `unbound variable`
+        # under set -u on bash < 4.4 (documented floor 4.3) when SRC_FPS is empty (0-element
+        # array). Matches the four sibling fps expansions; see the RF9 note above (~fps_arg).
         ffmpeg "${FFMPEG_FLAGS[@]}" \
-             "${fps_in2[@]}" \
+             ${fps_in2[@]+"${fps_in2[@]}"} \
              -i "$V_MIXED" \
              -c:v copy \
              -strict unofficial \
@@ -9125,6 +9128,11 @@ _audio_codec_rank(){
 _audio_lang_matches(){
   local lang pref
   local -a prefs   # Phase 5: declare local (sibling _sub_lang_matches does) — don't leak to global scope
+  # CR-6: empty AUDIO_LANG_PREF (the documented keep-all `--audio-lang-pref ""`) yields a
+  # 0-element prefs array; `for pref in "${prefs[@]}"` aborts under set -u on bash < 4.4.
+  # Guard at entry (empty pref matches nothing — callers treat empty as keep-all upstream),
+  # mirroring the `-n` gating the other call sites already apply and the _sub_lang_matches note.
+  [[ -n "$AUDIO_LANG_PREF" ]] || return 1
   lang="$(_norm_lang_code "$1")"
   IFS=',' read -r -a prefs <<< "$AUDIO_LANG_PREF"
   for pref in "${prefs[@]}"; do
@@ -9144,8 +9152,10 @@ _audio_lang_matches(){
 # Args: $1 — language tag. Globals: SUB_LANG_PREF (read).
 _sub_lang_matches(){
   local lang pref
-  lang="$(_norm_lang_code "$1")"
   local -a prefs
+  # CR-6 (symmetry/defense-in-depth): same empty-array footgun as _audio_lang_matches.
+  [[ -n "$SUB_LANG_PREF" ]] || return 1
+  lang="$(_norm_lang_code "$1")"
   IFS=',' read -r -a prefs <<< "$SUB_LANG_PREF"
   for pref in "${prefs[@]}"; do
     pref="${pref// /}"
@@ -10027,8 +10037,15 @@ run_audio_pipeline(){
       [[ -z "$_ns_ch" || ! "$_ns_ch" =~ ^[0-9]+$ ]] && _ns_ch=0
       # Must be exactly 2 channels
       (( _ns_ch != 2 )) && continue
-      # Language must match primary track (und matches anything)
-      if [[ "$_ns_l" != "und" && "$lang" != "und" && "$_ns_l" != "$lang" ]]; then continue; fi
+      # Language must match primary track (und matches anything). CR-7: normalize BOTH sides via
+      # _norm_lang_code so an `en`-tagged native stereo matches an `eng` primary (and 639-2/B vs /T),
+      # mirroring _audio_lang_matches — otherwise a code mismatch needlessly synthesizes an AAC
+      # downmix instead of stream-copying the existing native stereo. `und` normalizes to `und`,
+      # preserving the wildcard. The raw tag (_ns_l) is still kept below for honest muxing.
+      local _ns_l_norm _lang_norm
+      _ns_l_norm="$(_norm_lang_code "$_ns_l")"
+      _lang_norm="$(_norm_lang_code "$lang")"
+      if [[ "$_ns_l_norm" != "und" && "$_lang_norm" != "und" && "$_ns_l_norm" != "$_lang_norm" ]]; then continue; fi
       # Not commentary or descriptive audio (title keyword OR disposition flags)
       _audio_is_commentary "$_ns_t" && continue
       (( _ns_comment )) && continue

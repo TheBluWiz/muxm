@@ -4829,6 +4829,115 @@ EOF
   _test_audio_l1_lossless_skip_drop
   _test_audio_rf3_disposition_commentary
   _test_audio_cr3_multitrack_disposition_commentary
+  _test_audio_cr6_empty_langpref_no_crash
+  _test_audio_cr7_native_stereo_en_eng_copy
+}
+
+# CR-6: `_audio_lang_matches` is the one of four call sites NOT gated on `[[ -n "$AUDIO_LANG_PREF" ]]`
+# (the scorer reaches it unguarded). With the documented keep-all `--audio-lang-pref ""`, the empty
+# read yields a 0-element prefs array and `for pref in "${prefs[@]}"` aborts under set -u on bash < 4.4
+# (floor 4.3). The fix adds an entry guard to BOTH matchers. On host bash >= 4.4 the OLD form does NOT
+# crash, so the genuine cross-host guard is STATIC (assert the guard line exists); a true-4.3 run via
+# $BASH_43 reproduces the crash, and an e2e smoke proves keep-all still encodes.
+_test_audio_cr6_empty_langpref_no_crash() {
+  # (1) Static drift guard (host-independent): both matchers must carry the empty-pref entry guard.
+  local a_body s_body
+  a_body="$(_extract_muxm_fns _audio_lang_matches)" || { fail "CR-6: could not extract _audio_lang_matches"; return; }
+  s_body="$(_extract_muxm_fns _sub_lang_matches)"   || { fail "CR-6: could not extract _sub_lang_matches"; return; }
+  if printf '%s\n' "$a_body" | grep -qF '[[ -n "$AUDIO_LANG_PREF" ]] || return 1'; then
+    pass "CR-6: _audio_lang_matches has the empty-AUDIO_LANG_PREF entry guard"
+  else
+    fail "CR-6: _audio_lang_matches is missing the [[ -n \"\$AUDIO_LANG_PREF\" ]] || return 1 entry guard"
+  fi
+  if printf '%s\n' "$s_body" | grep -qF '[[ -n "$SUB_LANG_PREF" ]] || return 1'; then
+    pass "CR-6: _sub_lang_matches has the empty-SUB_LANG_PREF entry guard (symmetry)"
+  else
+    fail "CR-6: _sub_lang_matches is missing the [[ -n \"\$SUB_LANG_PREF\" ]] || return 1 entry guard"
+  fi
+
+  # (2) True bash-4.3 crash repro when available, else host smoke. The matcher + _norm_lang_code run
+  # under `set -u` with AUDIO_LANG_PREF="" must return non-zero (no match) WITHOUT an unbound-var abort.
+  local runner_bash="${BASH_43:-bash}"
+  local body err rc=0
+  body="$(_extract_muxm_fns _audio_lang_matches _norm_lang_code)" || { fail "CR-6: could not extract matcher+norm"; return; }
+  # shellcheck disable=SC2016  # body must reach the sub-bash unexpanded; vars expand THERE under set -u
+  err="$("$runner_bash" -c "$body"$'\n''set -u; AUDIO_LANG_PREF=""; _audio_lang_matches eng; echo "rc=$?"' 2>&1)" || rc=$?
+  if printf '%s\n' "$err" | grep -qiE 'unbound variable'; then
+    fail "CR-6: empty AUDIO_LANG_PREF aborted with unbound variable on ${runner_bash}: $(printf '%s' "$err" | head -1)"
+  elif printf '%s\n' "$err" | grep -qF 'rc=1'; then
+    pass "CR-6: empty AUDIO_LANG_PREF returns no-match cleanly under set -u (${runner_bash}; no unbound-var crash)"
+  else
+    fail "CR-6: unexpected matcher result under set -u (${runner_bash}). Saw: $(printf '%s' "$err" | head -1)"
+  fi
+
+  # (3) e2e smoke: --audio-lang-pref '' (keep-all) single-track encodes cleanly (genuine on a 4.3 host).
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=teal:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -map 0:v -map 1:a -c:a:0 ac3 -ac:a:0 6 -metadata:s:a:0 language=eng \
+    "$TESTDIR/cr6_src.mkv" 2>/dev/null
+  local _cr6_out="$TESTDIR/cr6_out.mkv"; rm -f "$_cr6_out"
+  local out
+  out="$(run_muxm --crf 51 --preset ultrafast --output-ext mkv --audio-lang-pref '' "$TESTDIR/cr6_src.mkv" "$_cr6_out" 2>&1)"
+  if printf '%s\n' "$out" | grep -qiE 'unbound variable'; then
+    fail "CR-6 (e2e): --audio-lang-pref '' single-track run hit an unbound variable. Saw: $(printf '%s\n' "$out" | grep -i 'unbound' | head -1)"
+  elif [[ -s "$_cr6_out" ]]; then
+    pass "CR-6 (e2e): --audio-lang-pref '' (keep-all) single-track encodes cleanly"
+  else
+    fail "CR-6 (e2e): --audio-lang-pref '' produced no output"
+  fi
+  rm -f "$TESTDIR/cr6_src.mkv" "$_cr6_out" 2>/dev/null || true
+}
+
+# CR-7: the native-stereo scan hand-rolled its primary-vs-stereo language compare without
+# _norm_lang_code (unlike the sibling _audio_lang_matches), so an `eng` primary did not match an
+# `en`-tagged native stereo — and muxm synthesized an AAC downmix instead of stream-copying the
+# existing native stereo. Fixture: a0 = eac3 6ch `eng` (selected primary), a1 = eac3 2ch `en`
+# (copyable native stereo). With the fix the stereo is COPIED (output 2ch stays eac3); pre-fix it
+# was re-encoded to aac. Differential is the output 2ch codec, plus the "Native stereo track found" note.
+_test_audio_cr7_native_stereo_en_eng_copy() {
+  local src="$TESTDIR/cr7_en_eng.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=blue:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -f lavfi -i "sine=frequency=660:duration=1" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -map 0:v -map 1:a -map 2:a \
+    -c:a:0 eac3 -ac:a:0 6 -c:a:1 eac3 -ac:a:1 2 \
+    -metadata:s:a:0 language=eng -metadata:s:a:1 language=en \
+    "$src" 2>/dev/null
+  # Fixture must carry a 6ch eng primary + a 2ch en native stereo, else it proves nothing.
+  local _a0 _a1
+  _a0="$(ffprobe -v error -select_streams a:0 -show_entries stream=channels:stream_tags=language -of csv=p=0 "$src" 2>/dev/null || true)"
+  _a1="$(ffprobe -v error -select_streams a:1 -show_entries stream=channels:stream_tags=language -of csv=p=0 "$src" 2>/dev/null || true)"
+  if [[ ! -s "$src" || "$_a0" != "6,eng" || "$_a1" != "2,en" ]]; then
+    skip "CR-7: could not build a 6ch-eng + 2ch-en fixture (a0='$_a0' a1='$_a1')"
+    rm -f "$src" 2>/dev/null || true
+    return
+  fi
+  local out="$TESTDIR/cr7_out.mkv"; rm -f "$out"
+  local log
+  log="$(run_muxm --crf 51 --preset ultrafast --output-ext mkv --stereo-fallback "$src" "$out" 2>&1)"
+  # (1) The en-tagged native stereo must be FOUND (not skipped to a downmix) now that codes normalize.
+  if printf '%s\n' "$log" | grep -qF "Native stereo track found"; then
+    pass "CR-7: en-tagged native stereo matched the eng primary (normalized) — used instead of a downmix"
+  else
+    fail "CR-7: en-tagged native stereo not matched to eng primary. Saw: $(printf '%s\n' "$log" | grep -iE 'native stereo|downmix' | head -1)"
+  fi
+  # (2) Value assertion: the kept 2ch stream is COPIED (eac3), not re-encoded to aac.
+  if [[ -s "$out" ]]; then
+    local _stereo_codec
+    _stereo_codec="$(ffprobe -v error -select_streams a -show_entries stream=codec_name,channels -of csv=p=0 "$out" 2>/dev/null | awk -F, '$2==2{print $1; exit}')"
+    if [[ "$_stereo_codec" == "eac3" ]]; then
+      pass "CR-7: native stereo stream-copied (output 2ch codec=eac3, not a synthesized aac downmix)"
+    else
+      fail "CR-7: output 2ch stream codec='${_stereo_codec:-none}' (expected eac3 copy; aac means a needless transcode)"
+    fi
+  else
+    fail "CR-7: --stereo-fallback produced no output"
+  fi
+  rm -f "$src" "$out" 2>/dev/null || true
 }
 
 # CR-3: the MULTI-TRACK keep-list (the only commentary filter in multi-track mode) must drop a
@@ -9223,7 +9332,7 @@ _test_unit_rf9_empty_array_safe() {
   # Grep the file directly (matching LINES), then keep only NON-comment matches so the RF9
   # explanatory comment (which quotes the unsafe form) doesn't false-positive.
   local arr unsafe=""
-  for arr in fps_arg _ts_fps fps_in _ocr_lang thread_args _child_flags _cc_override_args; do
+  for arr in fps_arg _ts_fps fps_in fps_in2 _ocr_lang thread_args _child_flags _cc_override_args; do
     if grep -E "[^+]\"\\\$\{${arr}\[@\]\}\"" "$MUXM" | grep -qvE '^[[:space:]]*#'; then
       unsafe+="$arr "
     fi
@@ -9246,6 +9355,27 @@ _test_unit_rf9_empty_array_safe() {
     else
       fail "RF9: \$BASH_43 errored on the array-safe expansion (rc=$rc)"
     fi
+  fi
+}
+
+# CR-5: the DV→MKV give-up timestamp wrap expanded the fps array as a bare "${fps_in2[@]}" — the
+# lone violation of the RF9 array-safe rule (its four siblings already use ${arr[@]+"${arr[@]}"}).
+# Empty SRC_FPS → 0-element array → `unbound variable` under set -u on bash < 4.4 (documented floor
+# 4.3), aborting the wrap. This guard makes the RF9 rule self-enforcing for the WHOLE fps family —
+# a reintroduced bare expansion of any of them fails here. Mirrors _test_unit_rf9_empty_array_safe (3).
+_test_unit_cr5_no_bare_fps_array() {
+  local arr unsafe=""
+  for arr in fps_in fps_in2 fps_arg _ts_fps; do
+    # A "bare" expansion is "${arr[@]}" NOT preceded by '+' (safe form is ${arr[@]+"${arr[@]}"}).
+    # Keep only NON-comment matches so an explanatory comment quoting the unsafe form can't false-fire.
+    if grep -E "[^+]\"\\\$\{${arr}\[@\]\}\"" "$MUXM" | grep -qvE '^[[:space:]]*#'; then
+      unsafe+="$arr "
+    fi
+  done
+  if [[ -z "$unsafe" ]]; then
+    pass "CR-5: no bare (bash-4.3-unsafe) expansion remains for any fps array (fps_in/fps_in2/fps_arg/_ts_fps)"
+  else
+    fail "CR-5: bare \"\${arr[@]}\" fps expansion still present for: $unsafe"
   fi
 }
 
@@ -9438,8 +9568,10 @@ _test_unit_video_copy_compliant() {
   # covered e2e by the output suite (sii_mt: commentary forces remux; sii_subs: 5 subs preserved
   # through the ideal path). Not duplicated here — this item adds the missing reject-reason cover.
   local body
-  body="$(_extract_muxm_fns _video_is_copy_compliant _lower _output_pixfmt_is_10bit)" \
-    || { fail "3.5: could not extract _video_is_copy_compliant + _lower + _output_pixfmt_is_10bit"; return; }
+  # CR-2: the DV gate now delegates to _is_atv_directplay_profile (shared Direct-Play predicate) —
+  # extract it too, else the gate's `if` references an undefined function and never fires here.
+  body="$(_extract_muxm_fns _video_is_copy_compliant _lower _output_pixfmt_is_10bit _is_atv_directplay_profile)" \
+    || { fail "3.5: could not extract _video_is_copy_compliant + _lower + _output_pixfmt_is_10bit + _is_atv_directplay_profile"; return; }
   # $1=src_codec $2=src_pix $3=src_prim $4=src_trc $5=src_bitrate(bps) $6=extra global overrides.
   # Emits "<rc>|<reject reason>". Bitrate is always a real number so the size/duration stat
   # fallback in the ceiling check is never reached (keeps the ceiling scenario deterministic).
@@ -9814,6 +9946,7 @@ test_unit() {
   _test_unit_rf6_subtitle_fallback
   _test_unit_rf8_metadata_sanitize
   _test_unit_rf9_empty_array_safe
+  _test_unit_cr5_no_bare_fps_array
   _test_unit_rf10_grep_flags
   _test_unit_rf11_man_date_token
   _test_unit_rf12_nits
