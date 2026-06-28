@@ -198,6 +198,8 @@ DV_SRC_PROFILE=""        # DV profile number (5, 7, 8, etc.)
 DV_SRC_COMPAT_ID=""      # BL signal compatibility ID (1=PQ/HDR10, 2=SDR, 4=HLG)
 DV_SRC_BL_PRESENT=""     # Base layer present flag
 DV_SRC_EL_PRESENT=""     # Enhancement layer present flag
+DV_OUT_PROFILE=""        # DV profile actually muxed into the output (defaults to source; →8 on P7/P5 convert)
+DV_OUT_COMPAT_ID=""      # BL compat id actually muxed into the output (defaults to source; →1 on convert)
 MP4BOX_CMD=""            # Path to mp4box/MP4Box binary (detected at runtime)
 
 # Deferred warning flag: set in Section 13 when H.264 + no tone-mapping is
@@ -7614,6 +7616,12 @@ detect_dv_info() {
     DV_SRC_EL_PRESENT="$(printf '%s\n' "$probe_out" | grep -oiE 'el.flag: [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
   fi
 
+  # Seed the output-profile vars to the source values. This is correct for the
+  # genuine P8 passthrough path (output stays 8.<source-compat>); the P7/P5→P8.1
+  # convert-success branch in run_video_pipeline overrides these to 8/1 (CR-1).
+  DV_OUT_PROFILE="$DV_SRC_PROFILE"
+  DV_OUT_COMPAT_ID="$DV_SRC_COMPAT_ID"
+
   note "DV source info: profile=${DV_SRC_PROFILE:-?}, compat_id=${DV_SRC_COMPAT_ID:-?}, bl=${DV_SRC_BL_PRESENT:-?}, el=${DV_SRC_EL_PRESENT:-?}"
   report_add "dv_src_profile" "${DV_SRC_PROFILE:-unknown}"
   report_add "dv_src_compat_id" "${DV_SRC_COMPAT_ID:-unknown}"
@@ -7701,6 +7709,24 @@ verify_dv_container_record() {
   fi
 
   if printf '%s\n' "$out_probe" | grep -qiE "$DV_CONTAINER_PATTERN"; then
+    # CR-1: a DOVI record being *present* is not enough on the converted path — MP4Box's
+    # `:dvp=` overrides the written dv_profile regardless of the RPU NALs, so a stale source
+    # value here ships a container that mis-signals the (now single-layer P8.1) stream. When
+    # this run converted P7/P5 → P8.1 (DV_OUT_PROFILE=8), assert the *value*, not just presence.
+    if [[ "${DV_OUT_PROFILE:-}" == "8" ]]; then
+      local out_dv_profile
+      out_dv_profile="$(printf '%s\n' "$out_probe" | grep -oiE 'dv_profile=[0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+      if [[ -n "$out_dv_profile" && "$out_dv_profile" != "8" ]]; then
+        warn "Output container signals dv_profile=${out_dv_profile} but the stream was converted to P8.1."
+        warn "  Strict DV players (Apple TV, iOS) may reject the DV layer and fall back to HDR10."
+        report_add "dv_container_record" "present but mis-signaled (dv_profile=${out_dv_profile}, expected 8)"
+        OUTPUT_HAS_DV=0
+        return 0
+      fi
+      note "✅ DOVI configuration record confirmed in output container (dv_profile=${out_dv_profile:-8})."
+      report_add "dv_container_record" "present (dv_profile=${out_dv_profile:-8})"
+      return 0
+    fi
     note "✅ DOVI configuration record confirmed in output container."
     report_add "dv_container_record" "present"
     return 0
@@ -7724,8 +7750,10 @@ verify_dv_container_record() {
       # Defense-in-depth: require BOTH values to be plain integers before feeding them into the
       # mp4box `:dvp=PROFILE.COMPAT_ID` hint. Safe in practice (DOVI-box integers can't carry : or =),
       # but a numeric guard keeps a malformed probe value from ever reaching the mp4box arg string.
-      if [[ "${DV_SRC_PROFILE:-}" =~ ^[0-9]+$ && "${DV_SRC_COMPAT_ID:-}" =~ ^[0-9]+$ ]]; then
-        dvp_hint=":dvp=${DV_SRC_PROFILE}.${DV_SRC_COMPAT_ID}"
+      # CR-1: consume the OUTPUT profile (8.1 after a P7/P5 convert; otherwise the
+      # source value) so the dvcC box never mis-signals a converted single-layer stream.
+      if [[ "${DV_OUT_PROFILE:-}" =~ ^[0-9]+$ && "${DV_OUT_COMPAT_ID:-}" =~ ^[0-9]+$ ]]; then
+        dvp_hint=":dvp=${DV_OUT_PROFILE}.${DV_OUT_COMPAT_ID}"
       fi
 
       # Force source frame rate (mp4box defaults headerless ES to 25fps). See the
@@ -8704,6 +8732,9 @@ run_video_pipeline() {
     if (( _conv_rc == 0 )) && [[ -s "$V_MIXED" ]]; then
       note "DV profile converted (P${DV_SRC_PROFILE} → P8.1)"
       report_add "dv_rpu_action" "converted P${DV_SRC_PROFILE} → P8.1"
+      # CR-1: the muxed stream is now single-layer P8.1 — the container dvcC/dvvC
+      # box must signal 8.1, NOT the stale source profile. Override the output vars.
+      DV_OUT_PROFILE=8; DV_OUT_COMPAT_ID=1
       # video_injected is now superseded by the converted V_MIXED — reclaim it.
       _reclaim "$V_INJECTED" "P${DV_SRC_PROFILE}→P8 convert done"
     else
@@ -8824,8 +8855,10 @@ run_video_pipeline() {
       # Defense-in-depth: require BOTH values to be plain integers before feeding them into the
       # mp4box `:dvp=PROFILE.COMPAT_ID` hint. Safe in practice (DOVI-box integers can't carry : or =),
       # but a numeric guard keeps a malformed probe value from ever reaching the mp4box arg string.
-      if [[ "${DV_SRC_PROFILE:-}" =~ ^[0-9]+$ && "${DV_SRC_COMPAT_ID:-}" =~ ^[0-9]+$ ]]; then
-        dvp_hint=":dvp=${DV_SRC_PROFILE}.${DV_SRC_COMPAT_ID}"
+      # CR-1: consume the OUTPUT profile (8.1 after a P7/P5 convert; otherwise the
+      # source value) so the dvcC box never mis-signals a converted single-layer stream.
+      if [[ "${DV_OUT_PROFILE:-}" =~ ^[0-9]+$ && "${DV_OUT_COMPAT_ID:-}" =~ ^[0-9]+$ ]]; then
+        dvp_hint=":dvp=${DV_OUT_PROFILE}.${DV_OUT_COMPAT_ID}"
       fi
 
       # Force the source frame rate: raw HEVC ES carries no container timing, and

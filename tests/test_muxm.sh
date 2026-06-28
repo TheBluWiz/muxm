@@ -12708,6 +12708,29 @@ test_dv_sw() {
       else
         fail "dv_sw convert: converted output missing or carries no DV configuration record"
       fi
+      # (4) CR-1 (value, not presence): the converted output's CONTAINER must signal Profile 8.1
+      #     — dv_profile=8 AND dv_bl_signal_compatibility_id=1 — NOT the stale source 7.6. MP4Box's
+      #     `:dvp=` overrides the written profile regardless of the (now P8.1) RPU NALs, so the
+      #     presence-only check (3) stays green even when the container mis-signals (the CR-1 bug).
+      local _cv_side
+      _cv_side="$(ffprobe -v error -show_streams -show_entries stream_side_data -select_streams v:0 "$_cv_out" 2>/dev/null)"
+      local _cv_outprof _cv_outcompat
+      _cv_outprof="$(printf '%s\n' "$_cv_side" | grep -m1 -oiE 'dv_profile=[0-9]+' | grep -oE '[0-9]+')"
+      _cv_outcompat="$(printf '%s\n' "$_cv_side" | grep -m1 -oiE 'dv_bl_signal_compatibility_id=[0-9]+' | grep -oE '[0-9]+')"
+      if [[ -z "$_cv_outprof" ]]; then
+        skip "dv_sw convert CR-1: output exposes no dv_profile side-data field — cannot assert the converted value"
+      elif [[ "$_cv_outprof" == "8" ]]; then
+        pass "dv_sw convert CR-1: converted output signals dv_profile=8 (P8.1, not stale source P7)"
+      else
+        fail "dv_sw convert CR-1: converted output signals dv_profile=${_cv_outprof} (expected 8 — stale-source dvcC mis-signaling)"
+      fi
+      if [[ -z "$_cv_outcompat" ]]; then
+        skip "dv_sw convert CR-1: output exposes no dv_bl_signal_compatibility_id field — cannot assert compat_id"
+      elif [[ "$_cv_outcompat" == "1" ]]; then
+        pass "dv_sw convert CR-1: converted output signals compat_id=1 (BL HDR10-compatible)"
+      else
+        fail "dv_sw convert CR-1: converted output signals compat_id=${_cv_outcompat} (expected 1 — stale source 7.6)"
+      fi
     fi
     rm -f "$_cv_p8" "$_cv_es" "$_cv_p7" "$TESTDIR/cv_out.mp4" "$TESTDIR/cv_term.log" 2>/dev/null || true
   fi
