@@ -9104,15 +9104,19 @@ _audio_is_commentary(){
 #          disposition.visual_impaired\tdisposition.hearing_impaired  (tab-delimited)
 # RF3: the three trailing disposition flags (0/1) let _score_audio_stream demote a
 # flagged-but-untitled commentary/description track and let the stereo paths drop one
-# without separate disposition jq probes. They are APPENDED after title (which has
-# \t\n\r stripped, so it is one field) — every _split_tab consumer of this record reads
+# without separate disposition jq probes. They are APPENDED after title (which has the full
+# control range stripped, so it is one field) — every _split_tab consumer of this record reads
 # the extra fields (real vars or `_` sinks) so the flags never fold into `title`.
+# RF8 (security): title AND language are sanitized at extraction — the full C0 control range plus
+# DEL (jq gsub on U+0000..U+001F and U+007F) is replaced with a space, so a hostile track title
+# can't inject terminal escape sequences into output or the persistent log. (This subsumes the
+# earlier \t\n\r-only strip on title.)
 # Args: $1 — audio stream index (0-based, relative to audio streams)
 # Globals: METADATA_CACHE (read)
 _audio_stream_info(){
   local idx="$1"
   _jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$idx] |
-    \"\(.codec_name // \"unknown\")\t\(.channels // 0)\t\(.tags.language // \"\")\t\(.bit_rate // \"0\")\t\(.tags.title // \"\" | gsub(\"[\\t\\n\\r]\";\" \"))\t\(.disposition.comment // 0)\t\(.disposition.visual_impaired // 0)\t\(.disposition.hearing_impaired // 0)\"" | head -n1 || printf 'unknown\t0\t\t0\t\t0\t0\t0\n'
+    \"\(.codec_name // \"unknown\")\t\(.channels // 0)\t\(.tags.language // \"\" | gsub(\"[\\u0000-\\u001f\\u007f]\";\" \"))\t\(.bit_rate // \"0\")\t\(.tags.title // \"\" | gsub(\"[\\u0000-\\u001f\\u007f]\";\" \"))\t\(.disposition.comment // 0)\t\(.disposition.visual_impaired // 0)\t\(.disposition.hearing_impaired // 0)\"" | head -n1 || printf 'unknown\t0\t\t0\t\t0\t0\t0\n'
 }
 
 # Audio stream scoring algorithm for automatic track selection.
@@ -10081,12 +10085,15 @@ _is_sdh_title(){
 # F3: hearing_impaired disposition is emitted so SDH can be classified by disposition, not just
 #     title. ALL consumers `read -r codec lang title forced hi` — a 4-field read would fold the
 #     hi field into `forced`, corrupting the `(( forced ))` checks (see the fallback below too).
+# RF8 (security): attacker-controlled title/language tags are sanitized at extraction — the full C0
+#     control range plus DEL (jq gsub on U+0000..U+001F and U+007F) is replaced with a space, so
+#     a hostile track title can't inject terminal escape sequences into the scan output or log.
 # Args: $1 — subtitle stream index (0-based, relative to subtitle streams)
 # Globals: METADATA_CACHE (read)
 _sub_stream_info(){
   local idx="$1"
   _jq_cache -r "[.streams[] | select(.codec_type==\"subtitle\")] | .[$idx] |
-    \"\(.codec_name // \"?\")\t\(.tags.language // \"\")\t\(.tags.title // \"\")\t\(.disposition.forced // 0)\t\(.disposition.hearing_impaired // 0)\"" | head -n1 || printf '?\t\t\t0\t0\n'
+    \"\(.codec_name // \"?\")\t\(.tags.language // \"\" | gsub(\"[\\u0000-\\u001f\\u007f]\";\" \"))\t\(.tags.title // \"\" | gsub(\"[\\u0000-\\u001f\\u007f]\";\" \"))\t\(.disposition.forced // 0)\t\(.disposition.hearing_impaired // 0)\"" | head -n1 || printf '?\t\t\t0\t0\n'
 }
 
 # Check if codec is text-based (can be stream-copied to MP4 as mov_text or MKV as srt).

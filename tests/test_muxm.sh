@@ -7092,6 +7092,48 @@ test_metadata() {
   # Validates the flag is accepted by the parser without error.
   out="$(run_muxm --ffprobe-loglevel warning --print-effective-config)"
   assert_contains "FFPROBE_LOGLEVEL" "--ffprobe-loglevel: flag registered in effective config" "$out"
+
+  _test_metadata_rf8_escape_sanitize
+}
+
+# RF8 (e2e): a source whose audio title carries terminal escape bytes (ESC[2J + BEL) must not let
+# those bytes reach muxm's output or the persistent log — they are sanitized at extraction. Build the
+# fixture with ANSI-C-quoted control bytes (so only the metadata VALUE holds them, never this source),
+# run a dry-run scan, and assert the captured output and the run log contain no raw ESC/BEL/DEL byte.
+_test_metadata_rf8_escape_sanitize() {
+  local _dir="$TESTDIR/rf8_escape"; mkdir -p "$_dir/home"
+  local _src="$_dir/src.mkv"
+  local _htitle; _htitle=$'Hostile\033[2J\007Title'   # ESC[2J clear-screen + BEL
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=red:s=320x240:r=24:d=2" -f lavfi -i "sine=frequency=440:duration=2" \
+    -c:v libx264 -preset ultrafast -crf 28 -c:a aac -ac 2 \
+    -metadata:s:a:0 language=eng -metadata:s:a:0 title="$_htitle" \
+    "$_src" 2>/dev/null
+  # Confirm the fixture actually stored the control chars (else the test proves nothing).
+  local _stored; _stored="$(ffprobe -v error -select_streams a:0 -show_entries stream_tags=title -of json "$_src" 2>/dev/null)"
+  if [[ ! -s "$_src" ]] || ! printf '%s' "$_stored" | grep -q 'u001b'; then
+    skip "RF8 (e2e): could not build a control-char-titled fixture (ffmpeg/ffprobe did not preserve the escape)"
+    rm -rf "$_dir"; return
+  fi
+  local _out _log_path="$_dir/src.muxm.log"
+  _out="$(MUXM_HOME="$_dir/home" run_muxm_in "$_dir" --dry-run "src.mkv" "out.mkv")"
+  # Count raw ESC(033)/BEL(007)/DEL(177) bytes that survived into the captured output.
+  local _bad; _bad="$(printf '%s' "$_out" | LC_ALL=C tr -cd '\033\007\177' | wc -c | tr -d ' ')"
+  if [[ "$_bad" == "0" ]]; then
+    pass "RF8 (e2e): hostile audio title leaves no raw escape byte in muxm output (sanitized at scan)"
+  else
+    fail "RF8 (e2e): $_bad raw control byte(s) leaked into muxm output for an escape-laden title"
+  fi
+  # The persistent log (if written) must likewise be free of raw escape bytes.
+  if [[ -f "$_log_path" ]]; then
+    local _bad_log; _bad_log="$(LC_ALL=C tr -cd '\033\007\177' < "$_log_path" | wc -c | tr -d ' ')"
+    if [[ "$_bad_log" == "0" ]]; then
+      pass "RF8 (e2e): persistent log is free of raw escape bytes"
+    else
+      fail "RF8 (e2e): $_bad_log raw control byte(s) leaked into the persistent log"
+    fi
+  fi
+  rm -rf "$_dir"
 }
 
 # === Suite: Edge Cases & Security ===
@@ -9033,6 +9075,58 @@ printf '%s\n' \"\$SRT_FULL\"" -- "$1" "$2"
   fi
 }
 
+# RF8 (LOW-1, security): attacker-controlled track title/language tags must be stripped of the full
+# C0 control range + DEL at the jq extraction choke points (_audio_stream_info / _sub_stream_info),
+# so a hostile title can't inject terminal escape sequences into the scan output or the persistent
+# log. Drives the REAL functions + _jq_cache over a mocked METADATA_CACHE whose tags carry ESC, BEL
+# and DEL. The control chars are written as JSON \u escapes (built with printf so this test source
+# stays pure ASCII — exactly how ffprobe JSON-escapes control bytes); jq decodes them, then gsub
+# must replace each with a space.
+_test_unit_rf8_metadata_sanitize() {
+  local body_a body_s
+  body_a="$(_extract_muxm_fns _audio_stream_info _jq_cache)" || { fail "RF8: could not extract _audio_stream_info"; return; }
+  body_s="$(_extract_muxm_fns _sub_stream_info _jq_cache)"   || { fail "RF8: could not extract _sub_stream_info"; return; }
+  # JSON \u escapes for ESC (27), BEL (7), DEL (127) — generated, not typed, so no raw control byte
+  # ever lands in this file.
+  local E B D
+  E="$(printf '\\u%04x' 27)"; B="$(printf '\\u%04x' 7)"; D="$(printf '\\u%04x' 127)"
+  local _atitle="Main${E}[2J${B}Feat${D}ure" _alang="${E}eng"
+  local _stitle="Sub${E}[2Jt${B}itle${D}" _slang="${E}spa"
+  local _json
+  _json="$(printf '{"streams":[{"codec_type":"audio","codec_name":"eac3","channels":6,"bit_rate":"448000","tags":{"title":"%s","language":"%s"},"disposition":{}},{"codec_type":"subtitle","codec_name":"subrip","tags":{"title":"%s","language":"%s"},"disposition":{}}]}' "$_atitle" "$_alang" "$_stitle" "$_slang")"
+
+  local _a _s
+  _a="$(bash -c "METADATA_CACHE=\"\$1\"; DEBUG=0
+$body_a
+_audio_stream_info 0" -- "$_json" 2>/dev/null)"
+  _s="$(bash -c "METADATA_CACHE=\"\$1\"; DEBUG=0
+$body_s
+_sub_stream_info 0" -- "$_json" 2>/dev/null)"
+
+  # No raw ESC / BEL / DEL byte may survive (tabs are legit field separators, so not flagged).
+  _rf8_clean(){
+    local label="$1" out="$2"
+    if LC_ALL=C grep -q $'[\033\007\177]' <<<"$out"; then
+      fail "$label -- a raw control byte (ESC/BEL/DEL) survived: $(printf '%q' "$out")"
+    else
+      pass "$label"
+    fi
+  }
+  _rf8_clean "RF8: _audio_stream_info strips control chars from title+language" "$_a"
+  _rf8_clean "RF8: _sub_stream_info strips control chars from title+language" "$_s"
+  # Sanitization REPLACES with a space (does not blank the field) -- the printable text survives.
+  if [[ "$_a" == *Main* && "$_a" == *eng* ]]; then
+    pass "RF8: audio title/language text preserved (control chars -> space, not dropped)"
+  else
+    fail "RF8: audio title/language text lost after sanitization: $(printf '%q' "$_a")"
+  fi
+  if [[ "$_s" == *Sub* && "$_s" == *spa* ]]; then
+    pass "RF8: subtitle title/language text preserved"
+  else
+    fail "RF8: subtitle title/language text lost after sanitization: $(printf '%q' "$_s")"
+  fi
+}
+
 _test_unit_report_add_escaping() {
   # 2.5: report_add was stubbed to `:` in tests, so its JSON escaping was never exercised. Call it
   # with a value containing quote/backslash/newline/tab/CR, emit the resulting object, and assert
@@ -9490,6 +9584,7 @@ test_unit() {
   _test_unit_decide_color_and_pixfmt
   _test_unit_build_subtitle_lists
   _test_unit_rf6_subtitle_fallback
+  _test_unit_rf8_metadata_sanitize
   _test_unit_report_add_escaping
   _test_unit_duration_tier3
   _test_unit_video_copy_compliant

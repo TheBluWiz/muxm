@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 ### Security
 
 - **`--create-config` multi-profile path no longer lets override values inject shell into the generated `.muxmrc` (RF1)** — the M1 fix (v1.5.1) escaped override values in the single-profile emitter's `_V` helper but not in `_create_config_emit_multi`, which kept the pre-M1 unquoted-ish `printf '%s="%s"'`. A comma-separated `--profile` plus a crafted string override (e.g. `--x265-params '$(…)'`) therefore emitted an unescaped line that executed on every later `. .muxmrc` source (and `--create-config system` writes `/etc/.muxmrc`). Both emitters now share one `_cc_shell_escape` helper and always emit the escaped, quoted form.
+- **Embedded track metadata can no longer inject terminal escape sequences into output or the log (RF8)** — attacker-controlled `title`/`language` tags from a source file were printed (and tee'd to the persistent log) without control-character neutralization, enabling output spoofing on terminals that honor escape sequences. `_audio_stream_info` and `_sub_stream_info` now strip the full C0 control range plus DEL from titles and languages at extraction, covering every display and log site (matching the existing control-char rejection for filenames).
 
 ### Fixed
 
