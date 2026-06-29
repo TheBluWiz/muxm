@@ -7988,6 +7988,91 @@ declare -a SUB_MT_LANGS=()        # language tag per kept track
 declare -a SUB_MT_TITLES=()       # title tag per kept track (empty if unset)
 declare -a SUB_MT_TYPES=()        # "forced" | "full" | "sdh" per kept track
 
+# ── Unified subtitle track list (Subs_Fix Phase 2) ──────────────────────────
+# One data model shared by both selectors (single-track build_subtitle_plan and
+# multi-track run_subtitle_pipeline_multi) and consumed by the one emitter
+# (_emit_sub_tracks in mux_final). Each index is one output subtitle track.
+# Parallel arrays, appended via _sub_track_add and read via _sub_track_field.
+#
+# Fields:
+#   KIND        — source kind: "embedded" (map from source) or "file" (-i input).
+#   VALUE       — for "embedded": the 0-based subtitle-relative stream index in the
+#                 source (mapped as $src:s:VALUE — this is the desync fix: embedded
+#                 subs are mapped from the source, never round-tripped through a
+#                 standalone .sup). For "file": the path to a workdir/OCR/converted
+#                 file or an external sidecar (added as a deduplicated -i input).
+#   LANG        — language tag (e.g. "eng"); empty if unset.
+#   TITLE       — title tag; empty means "derive from TYPE" at emit time.
+#   TYPE        — "forced" | "full" | "sdh" (drives disposition + title fallback).
+#   CODEC       — desired -c:s codec ("copy" | "srt" | "mov_text") or the source
+#                 codec name for the emitter to decide from.
+#   DISPOSITION — "forced" | "hearing_impaired" | "0".
+#   ROUTING     — "embed" (default) | "burn" | "export". Phases 4–5 populate this;
+#                 the emitter only emits ROUTING=embed tracks (burn/export are
+#                 handled by the video-burn / external-export paths respectively).
+#
+# Additive in Phase 2: declared and unit-tested, but nothing populates or reads
+# these yet — the selectors and emitter are wired up in Phases 3–5.
+declare -a SUB_TRACKS_KIND=()
+declare -a SUB_TRACKS_VALUE=()
+declare -a SUB_TRACKS_LANG=()
+declare -a SUB_TRACKS_TITLE=()
+declare -a SUB_TRACKS_TYPE=()
+declare -a SUB_TRACKS_CODEC=()
+declare -a SUB_TRACKS_DISPOSITION=()
+declare -a SUB_TRACKS_ROUTING=()
+
+# _sub_tracks_reset — clear the unified track list (idempotent; also (re)creates
+# the arrays, so callers extracted in isolation get a clean, defined state).
+_sub_tracks_reset() {
+  SUB_TRACKS_KIND=()
+  SUB_TRACKS_VALUE=()
+  SUB_TRACKS_LANG=()
+  SUB_TRACKS_TITLE=()
+  SUB_TRACKS_TYPE=()
+  SUB_TRACKS_CODEC=()
+  SUB_TRACKS_DISPOSITION=()
+  SUB_TRACKS_ROUTING=()
+}
+
+# _sub_track_add KIND VALUE LANG TITLE TYPE CODEC DISPOSITION [ROUTING]
+# Append one subtitle track to the unified list. ROUTING defaults to "embed".
+_sub_track_add() {
+  SUB_TRACKS_KIND+=( "$1" )
+  SUB_TRACKS_VALUE+=( "$2" )
+  SUB_TRACKS_LANG+=( "$3" )
+  SUB_TRACKS_TITLE+=( "$4" )
+  SUB_TRACKS_TYPE+=( "$5" )
+  SUB_TRACKS_CODEC+=( "$6" )
+  SUB_TRACKS_DISPOSITION+=( "$7" )
+  SUB_TRACKS_ROUTING+=( "${8:-embed}" )
+}
+
+# _sub_track_count — number of tracks in the unified list (stdout).
+# Body kept multi-line (closing brace on its own line) so the unit harness's awk
+# extraction anchor (/^fn\(\)/,/^\}/) captures exactly this function.
+_sub_track_count() {
+  printf '%s\n' "${#SUB_TRACKS_KIND[@]}"
+}
+
+# _sub_track_field IDX FIELD — echo one field of track IDX (mirrors _sp_sub_field's
+# (index, field) accessor convention). FIELD is one of: kind value lang title type
+# codec disposition routing. Returns 2 (and emits nothing) on an unknown field.
+_sub_track_field() {
+  local idx="$1" field="$2"
+  case "$field" in
+    kind)        printf '%s\n' "${SUB_TRACKS_KIND[$idx]}" ;;
+    value)       printf '%s\n' "${SUB_TRACKS_VALUE[$idx]}" ;;
+    lang)        printf '%s\n' "${SUB_TRACKS_LANG[$idx]}" ;;
+    title)       printf '%s\n' "${SUB_TRACKS_TITLE[$idx]}" ;;
+    type)        printf '%s\n' "${SUB_TRACKS_TYPE[$idx]}" ;;
+    codec)       printf '%s\n' "${SUB_TRACKS_CODEC[$idx]}" ;;
+    disposition) printf '%s\n' "${SUB_TRACKS_DISPOSITION[$idx]}" ;;
+    routing)     printf '%s\n' "${SUB_TRACKS_ROUTING[$idx]}" ;;
+    *)           return 2 ;;
+  esac
+}
+
 # External subtitle discovery (populated by discover_external_subtitles)
 declare -a EXT_SUB_PATHS=()       # absolute paths to discovered external subtitle files
 declare -a EXT_SUB_LANGS=()       # language codes parsed from filename segments

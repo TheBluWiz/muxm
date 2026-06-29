@@ -10128,6 +10128,7 @@ test_unit() {
   section "Pure-Function Unit Tests"
   _test_unit_audio_helpers
   _test_unit_sub_helpers
+  _test_unit_sub_track_model
   _test_unit_validation_helpers
   _test_unit_filesize
   _test_unit_sii_container_safety
@@ -10173,6 +10174,72 @@ test_unit() {
   _test_unit_mdry_loglevel_str
   _test_unit_l_disk_df_unavailable
   _test_unit_l_prepare_subtitle_workdir_gone
+}
+
+# Subs_Fix Phase 2: the unified subtitle track-list model (SUB_TRACKS_* parallel
+# arrays + _sub_tracks_reset / _sub_track_add / _sub_track_count / _sub_track_field).
+# Additive in muxm (nothing populates/reads it yet), so this is its only coverage:
+# append/iterate/field-access round-trips, empty + multi-entry, the ROUTING default
+# (embed) and explicit embed/burn/export, and the unknown-field guard. Driven in a
+# single `set -u` subshell so the shared arrays persist across calls.
+_test_unit_sub_track_model() {
+  local body out
+  body="$(_extract_muxm_fns _sub_tracks_reset _sub_track_add _sub_track_count _sub_track_field)" \
+    || { fail "sub-track-model: could not extract unified track-list helpers"; return; }
+  # shellcheck disable=SC2016  # body must reach the sub-bash unexpanded; arrays live THERE
+  out="$(bash -c "$body"$'\n''
+    set -u
+    _sub_tracks_reset
+    echo "empty_count=$(_sub_track_count)"
+    # ROUTING omitted on the first two → must default to "embed".
+    _sub_track_add embedded 2 eng "" forced copy forced
+    _sub_track_add file /work/sub.0.srt spa "Spanish" full srt 0
+    # Explicit ROUTING values.
+    _sub_track_add embedded 5 fra "Forced FR" forced copy forced burn
+    _sub_track_add file /ext/movie.en.srt eng "" full srt 0 export
+    echo "count=$(_sub_track_count)"
+    echo "t0_kind=$(_sub_track_field 0 kind)"
+    echo "t0_value=$(_sub_track_field 0 value)"
+    echo "t0_lang=$(_sub_track_field 0 lang)"
+    echo "t0_title=[$(_sub_track_field 0 title)]"
+    echo "t0_type=$(_sub_track_field 0 type)"
+    echo "t0_codec=$(_sub_track_field 0 codec)"
+    echo "t0_disp=$(_sub_track_field 0 disposition)"
+    echo "t0_routing=$(_sub_track_field 0 routing)"
+    echo "t1_kind=$(_sub_track_field 1 kind)"
+    echo "t1_value=$(_sub_track_field 1 value)"
+    echo "t1_title=[$(_sub_track_field 1 title)]"
+    echo "t1_routing=$(_sub_track_field 1 routing)"
+    echo "t2_routing=$(_sub_track_field 2 routing)"
+    echo "t3_routing=$(_sub_track_field 3 routing)"
+    _sub_track_field 0 bogus; echo "bogus_rc=$?"
+    _sub_tracks_reset
+    echo "reset_count=$(_sub_track_count)"
+  ' 2>&1)"
+
+  assert_contains "empty_count=0"        "sub-track-model: empty list has count 0"                 "$out"
+  assert_contains "count=4"              "sub-track-model: four appended tracks counted"           "$out"
+  # Track 0 — embedded, every field round-trips; empty title stays empty.
+  assert_contains "t0_kind=embedded"     "sub-track-model: t0 kind=embedded"                       "$out"
+  assert_contains "t0_value=2"           "sub-track-model: t0 value (embedded stream index)"       "$out"
+  assert_contains "t0_lang=eng"          "sub-track-model: t0 lang round-trips"                    "$out"
+  assert_contains "t0_title=[]"          "sub-track-model: t0 empty title stays empty"             "$out"
+  assert_contains "t0_type=forced"       "sub-track-model: t0 type round-trips"                    "$out"
+  assert_contains "t0_codec=copy"        "sub-track-model: t0 codec round-trips"                   "$out"
+  assert_contains "t0_disp=forced"       "sub-track-model: t0 disposition round-trips"             "$out"
+  assert_contains "t0_routing=embed"     "sub-track-model: t0 ROUTING defaults to embed"           "$out"
+  # Track 1 — file kind, path preserved as value, title with a space round-trips.
+  assert_contains "t1_kind=file"         "sub-track-model: t1 kind=file"                           "$out"
+  assert_contains "t1_value=/work/sub.0.srt" "sub-track-model: t1 value (file path) round-trips"  "$out"
+  assert_contains "t1_title=[Spanish]"   "sub-track-model: t1 title round-trips"                   "$out"
+  assert_contains "t1_routing=embed"     "sub-track-model: t1 ROUTING defaults to embed"           "$out"
+  # ROUTING flag values.
+  assert_contains "t2_routing=burn"      "sub-track-model: explicit ROUTING=burn round-trips"      "$out"
+  assert_contains "t3_routing=export"    "sub-track-model: explicit ROUTING=export round-trips"    "$out"
+  # Unknown field is a clean nonzero (2), not a crash.
+  assert_contains "bogus_rc=2"           "sub-track-model: unknown field returns 2 (no crash)"     "$out"
+  # Reset clears back to empty.
+  assert_contains "reset_count=0"        "sub-track-model: reset clears the list"                  "$out"
 }
 
 # L (Phase 5): when df yields nothing (unavailable / unusual mount), disk_free_warn must emit an
