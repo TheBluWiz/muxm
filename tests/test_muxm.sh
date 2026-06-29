@@ -4891,11 +4891,15 @@ _test_audio_cr6_empty_langpref_no_crash() {
   local a_body s_body
   a_body="$(_extract_muxm_fns _audio_lang_matches)" || { fail "CR-6: could not extract _audio_lang_matches"; return; }
   s_body="$(_extract_muxm_fns _sub_lang_matches)"   || { fail "CR-6: could not extract _sub_lang_matches"; return; }
+  # shellcheck disable=SC2016  # single quotes are deliberate: grep -F matches the guard line as a
+  # LITERAL in the extracted muxm source ($AUDIO_LANG_PREF must stay unexpanded, not be substituted).
   if printf '%s\n' "$a_body" | grep -qF '[[ -n "$AUDIO_LANG_PREF" ]] || return 1'; then
     pass "CR-6: _audio_lang_matches has the empty-AUDIO_LANG_PREF entry guard"
   else
     fail "CR-6: _audio_lang_matches is missing the [[ -n \"\$AUDIO_LANG_PREF\" ]] || return 1 entry guard"
   fi
+  # shellcheck disable=SC2016  # single quotes are deliberate: literal grep -F of the guard line
+  # in the extracted source ($SUB_LANG_PREF must stay unexpanded, not be substituted).
   if printf '%s\n' "$s_body" | grep -qF '[[ -n "$SUB_LANG_PREF" ]] || return 1'; then
     pass "CR-6: _sub_lang_matches has the empty-SUB_LANG_PREF entry guard (symmetry)"
   else
