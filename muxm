@@ -12210,9 +12210,13 @@ main() {
           fi
           [[ "$MUX_FORMAT" != "matroska" ]] && _sii_meta+=( -movflags +faststart )
           _sii_meta+=( -f "$MUX_FORMAT" "$TMP_OUT" )
-          ffmpeg "${_sii_meta[@]}" 2>"$WORKDIR/skip_ideal_remux.err" &
-          local _sii_pid=$!
-          local _sii_ok=0; _await_tracked_pid "$_sii_pid" "Applying metadata (copy-remux)" || _sii_ok=$?
+          # Use the shared progress-bar UI: a copy-remux of a full-length source can
+          # take many minutes (it rewrites the entire container), so track ffmpeg's
+          # out_time against the source duration instead of a blind spinner. Falls back
+          # to the spinner automatically when duration is unknown or there's no TTY.
+          local _sii_secs; _sii_secs="$(_get_source_duration_secs)"
+          local _sii_ok=0
+          _ffmpeg_run_with_ui _sii_meta "Applying metadata (copy-remux)" "$WORKDIR/skip_ideal_remux.err" "$_sii_secs" || _sii_ok=$?
           if (( _sii_ok != 0 )); then
             _check_disk_full "$WORKDIR/skip_ideal_remux.err"
             die 41 "Skip-if-ideal metadata remux failed. See: $WORKDIR/skip_ideal_remux.err"
