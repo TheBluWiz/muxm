@@ -791,6 +791,23 @@ _ffmpeg_run_with_ui() {
   fi
 }
 
+# _await_tracked_pid PID MSG — CR-10: the shared tail for the ~20 "backgrounded child → register
+# _ACTIVE_FFMPEG_PID → spinner → wait → clear PID" sites. Enforces the SIGINT-safety contract in ONE
+# place: register the pid BEFORE wait (so on_exit can SIGKILL the child on Ctrl-C) and clear it AFTER
+# (so a stale pid can't be killed later). Returns the child's exit code, so callers keep their exact
+# rc handling: `local rc=0; _await_tracked_pid "$pid" "msg" || rc=$?` then die/warn/fallback on rc.
+# NOTE: this is a plain function (no subshell), so the `wait` here still reaps a child started by the
+# CALLER's shell. The fire-and-forget OCR sites intentionally do NOT use this (they `wait … || true`
+# and read output files, not rc) — routing them through an rc-returning helper would trip set -e.
+_await_tracked_pid(){
+  local _atp_pid="$1" _atp_msg="$2" _atp_rc=0
+  _ACTIVE_FFMPEG_PID="$_atp_pid"   # register BEFORE wait (SIGINT-safety contract)
+  spinner "$_atp_pid" "$_atp_msg"
+  wait "$_atp_pid" 2>/dev/null || _atp_rc=$?
+  _ACTIVE_FFMPEG_PID=""            # clear AFTER wait
+  return "$_atp_rc"
+}
+
 # _get_source_duration_secs — extract source video duration in whole seconds.
 #
 # Three-tier lookup (each tier falls through on null, "N/A", or non-numeric):
@@ -6333,10 +6350,7 @@ _ensure_src_es() {
   [[ -s "$V_SRC_ES" ]] && return 0
   ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy -bsf:v hevc_mp4toannexb -f hevc "$V_SRC_ES" 2>"$WORKDIR/demux.err" &
   local _es_pid=$!
-  _ACTIVE_FFMPEG_PID=$_es_pid
-  spinner "$_es_pid" "Demuxing video elementary stream (on demand)"
-  if ! wait "$_es_pid" 2>/dev/null; then
-    _ACTIVE_FFMPEG_PID=""
+  if ! _await_tracked_pid "$_es_pid" "Demuxing video elementary stream (on demand)"; then
     local codec; codec="$(_probe_field codec_name)"
     warn "Could not demux raw HEVC ES (source codec: ${codec:-unknown})."
     warn "  DV RPU extraction requires an HEVC source stream. Use --no-dv to skip DV processing."
@@ -6344,7 +6358,6 @@ _ensure_src_es() {
     : > "$V_SRC_ES" 2>/dev/null || true
     return 1
   fi
-  _ACTIVE_FFMPEG_PID=""
   return 0
 }
 
@@ -7803,9 +7816,7 @@ verify_dv_container_record() {
       "$MP4BOX_CMD" ${fps_arg[@]+"${fps_arg[@]}"} -add "${V_MIXED}${dvp_hint}" \
            -new "$dv_video_mp4" >"$WORKDIR/dovi_mux_mp4box.log" 2>&1 &
       local mp4box_fb_pid=$!
-      _ACTIVE_FFMPEG_PID=$mp4box_fb_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
-      spinner "$mp4box_fb_pid" "DV fallback: muxing with mp4box"
-      local _mp4box_fb_rc=0; wait "$mp4box_fb_pid" 2>/dev/null || _mp4box_fb_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+      local _mp4box_fb_rc=0; _await_tracked_pid "$mp4box_fb_pid" "DV fallback: muxing with mp4box" || _mp4box_fb_rc=$?
       if (( _mp4box_fb_rc == 0 )) && [[ -s "$dv_video_mp4" ]]; then
         if _dv_probe_has_config_record "$dv_video_mp4"; then  # M-DRY-a
           fallback_ok=1
@@ -7844,10 +7855,7 @@ verify_dv_container_record() {
 
       ffmpeg "${remux_cmd[@]}" 2>"$WORKDIR/dv_remux.err" &
       local remux_fb_pid=$!
-      _ACTIVE_FFMPEG_PID=$remux_fb_pid
-      spinner "$remux_fb_pid" "DV fallback: remuxing with dvcC"
-      local _remux_fb_rc; wait "$remux_fb_pid" 2>/dev/null && _remux_fb_rc=0 || _remux_fb_rc=$?
-      _ACTIVE_FFMPEG_PID=""
+      local _remux_fb_rc=0; _await_tracked_pid "$remux_fb_pid" "DV fallback: remuxing with dvcC" || _remux_fb_rc=$?
       if (( _remux_fb_rc == 0 )) && [[ -s "$dv_final" ]]; then
         if _dv_probe_has_config_record "$dv_final"; then  # M-DRY-a
           mv -f "$dv_final" "$TMP_OUT"
@@ -8234,10 +8242,8 @@ _dv_fallback_timestamp_wrap() {
        -c:v copy -tag:v hvc1 -movflags +faststart \
        -f mp4 "$_ts_wrap" >"$WORKDIR/base_timestamp_wrap.log" 2>&1 &
   local _ts_pid=$!
-  _ACTIVE_FFMPEG_PID=$_ts_pid
-  spinner "$_ts_pid" "Wrapping base video for MKV mux (timestamps)"
-  if wait "$_ts_pid" 2>/dev/null && [[ -s "$_ts_wrap" ]]; then
-    _ACTIVE_FFMPEG_PID=""
+  local _ts_rc=0; _await_tracked_pid "$_ts_pid" "Wrapping base video for MKV mux (timestamps)" || _ts_rc=$?
+  if (( _ts_rc == 0 )) && [[ -s "$_ts_wrap" ]]; then
     note "✅ Base video wrapped into timestamped MP4 for the MKV mux (no Dolby Vision)."
     report_add "dv_fallback_wrap" "timestamped wrap (mkv, no dv)"
     V_MIXED="$_ts_wrap"
@@ -8245,7 +8251,6 @@ _dv_fallback_timestamp_wrap() {
     # (no-op in dry-run / outside WORKDIR; runs even under -k/-K, like every _reclaim).
     _reclaim "$_superseded_es" "wrapped into timestamped MP4 for MKV mux"
   else
-    _ACTIVE_FFMPEG_PID=""
     warn "Could not wrap base video into a timestamped container — the MKV final mux may fail."
     report_add "dv_fallback_wrap" "failed (mkv timestamp wrap)"
   fi
@@ -8285,9 +8290,7 @@ run_video_pipeline() {
                | dovi_tool extract-rpu - -o "$rpu_check" >/dev/null 2>&1
           ) &
           local rpu_val_pid=$!
-          _ACTIVE_FFMPEG_PID=$rpu_val_pid
-          spinner "$rpu_val_pid" "Validating DV RPU integrity"
-          local _rpu_val_rc=0; wait "$rpu_val_pid" 2>/dev/null || _rpu_val_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+          local _rpu_val_rc=0; _await_tracked_pid "$rpu_val_pid" "Validating DV RPU integrity" || _rpu_val_rc=$?
           if (( _rpu_val_rc == 0 )) && [[ -s "$rpu_check" ]]; then
             if _validate_dv_rpu "$rpu_check"; then
               note "DV RPU integrity verified for copy path."
@@ -8581,9 +8584,7 @@ run_video_pipeline() {
     # with the subshell; _ACTIVE_FFMPEG_PID only needs to name a process whose death releases the
     # tee pipe, and killing the subshell does that. Not a bug — don't "fix" it to a grandchild pid.
     local rpu_pipe_pid=$!
-    _ACTIVE_FFMPEG_PID=$rpu_pipe_pid
-    spinner "$rpu_pipe_pid" "Extracting DV RPU (piped)"
-    local _rpu_pipe_rc=0; wait "$rpu_pipe_pid" 2>/dev/null || _rpu_pipe_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+    local _rpu_pipe_rc=0; _await_tracked_pid "$rpu_pipe_pid" "Extracting DV RPU (piped)" || _rpu_pipe_rc=$?
     if (( _rpu_pipe_rc == 0 )); then
       if [[ -s "$RPU_P7" ]]; then
         rpu_extracted=1
@@ -8604,9 +8605,7 @@ run_video_pipeline() {
       log "→ Extracting DV RPU from demuxed ES file (fallback)…"
       dovi_tool extract-rpu -i "$V_SRC_ES" -o "$RPU_P7" >"$WORKDIR/rpu_file.log" 2>&1 &
       local rpu_file_pid=$!
-      _ACTIVE_FFMPEG_PID=$rpu_file_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
-      spinner "$rpu_file_pid" "Extracting DV RPU (file fallback)"
-      local _rpu_file_rc=0; wait "$rpu_file_pid" 2>/dev/null || _rpu_file_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+      local _rpu_file_rc=0; _await_tracked_pid "$rpu_file_pid" "Extracting DV RPU (file fallback)" || _rpu_file_rc=$?
       if (( _rpu_file_rc == 0 )); then
         if [[ -s "$RPU_P7" ]]; then
           rpu_extracted=1
@@ -8740,9 +8739,7 @@ run_video_pipeline() {
 
   dovi_tool inject-rpu -i "$V_BASE" --rpu-in "$RPU_FINAL" -o "$inject_target" >"$WORKDIR/rpu_inject.log" 2>&1 &
   local inject_pid=$!
-  _ACTIVE_FFMPEG_PID=$inject_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
-  spinner "$inject_pid" "Injecting DV RPU into video"
-  local _inject_rc=0; wait "$inject_pid" 2>/dev/null || _inject_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+  local _inject_rc=0; _await_tracked_pid "$inject_pid" "Injecting DV RPU into video" || _inject_rc=$?
   if (( _inject_rc != 0 )); then
     warn "DV RPU injection failed. See: $WORKDIR/rpu_inject.log"
     if (( ALLOW_DV_FALLBACK )); then
@@ -8775,9 +8772,7 @@ run_video_pipeline() {
   if (( dv_needs_convert )); then
     dovi_tool convert -i "$V_INJECTED" -o "$V_MIXED" -d >"$WORKDIR/rpu_convert.log" 2>&1 &
     local conv_pid=$!
-    _ACTIVE_FFMPEG_PID=$conv_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
-    spinner "$conv_pid" "Converting DV RPU (P${DV_SRC_PROFILE} → P8.1)"
-    local _conv_rc=0; wait "$conv_pid" 2>/dev/null || _conv_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+    local _conv_rc=0; _await_tracked_pid "$conv_pid" "Converting DV RPU (P${DV_SRC_PROFILE} → P8.1)" || _conv_rc=$?
     if (( _conv_rc == 0 )) && [[ -s "$V_MIXED" ]]; then
       note "DV profile converted (P${DV_SRC_PROFILE} → P8.1)"
       report_add "dv_rpu_action" "converted P${DV_SRC_PROFILE} → P8.1"
@@ -8923,9 +8918,7 @@ run_video_pipeline() {
       "$MP4BOX_CMD" ${fps_arg[@]+"${fps_arg[@]}"} -add "${V_MIXED}${dvp_hint}" \
            -new "$dv_prewrap" >"$WORKDIR/dv_prewrap_mp4box.log" 2>&1 &
       local pw_mp4box_pid=$!
-      _ACTIVE_FFMPEG_PID=$pw_mp4box_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
-      spinner "$pw_mp4box_pid" "Pre-wrapping DV video (mp4box)"
-      local _pw_mp4box_rc=0; wait "$pw_mp4box_pid" 2>/dev/null || _pw_mp4box_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+      local _pw_mp4box_rc=0; _await_tracked_pid "$pw_mp4box_pid" "Pre-wrapping DV video (mp4box)" || _pw_mp4box_rc=$?
       if (( _pw_mp4box_rc == 0 )) && [[ -s "$dv_prewrap" ]]; then
         if _dv_probe_has_config_record "$dv_prewrap"; then  # M-DRY-a
           V_DV_MP4="$dv_prewrap"
@@ -8960,9 +8953,7 @@ run_video_pipeline() {
            -movflags +faststart \
            -f mp4 "$dv_prewrap" >"$WORKDIR/dv_prewrap.log" 2>&1 &
       local pw_ff_pid=$!
-      _ACTIVE_FFMPEG_PID=$pw_ff_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
-      spinner "$pw_ff_pid" "Pre-wrapping DV video (ffmpeg fallback)"
-      local _pw_ff_rc=0; wait "$pw_ff_pid" 2>/dev/null || _pw_ff_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+      local _pw_ff_rc=0; _await_tracked_pid "$pw_ff_pid" "Pre-wrapping DV video (ffmpeg fallback)" || _pw_ff_rc=$?
       if (( _pw_ff_rc == 0 )) && [[ -s "$dv_prewrap" ]]; then
         if _dv_probe_has_config_record "$dv_prewrap"; then  # M-DRY-a
           V_DV_MP4="$dv_prewrap"
@@ -9003,9 +8994,7 @@ run_video_pipeline() {
              -movflags +faststart \
              -f mp4 "$dv_prewrap" >"$WORKDIR/dv_prewrap.log" 2>&1 &
         local pw_ts_pid=$!
-        _ACTIVE_FFMPEG_PID=$pw_ts_pid  # M3: register the DV child so on_exit can SIGKILL it on Ctrl-C
-        spinner "$pw_ts_pid" "Wrapping DV video for MKV mux (timestamps)"
-        local _pw_ts_rc=0; wait "$pw_ts_pid" 2>/dev/null || _pw_ts_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+        local _pw_ts_rc=0; _await_tracked_pid "$pw_ts_pid" "Wrapping DV video for MKV mux (timestamps)" || _pw_ts_rc=$?
         if (( _pw_ts_rc == 0 )) && [[ -s "$dv_prewrap" ]]; then
           V_DV_MP4="$dv_prewrap"
           note "✅ DV video wrapped into timestamped MP4 for MKV mux (RPU preserved in-band)."
@@ -10014,11 +10003,8 @@ run_audio_pipeline(){
   if (( do_copy )); then
     ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:a:"$idx" -c copy "$A_PRIMARY" 2>"$WORKDIR/audio_primary.err" &
     local acopy_pid=$!
-    _ACTIVE_FFMPEG_PID=$acopy_pid
-    spinner "$acopy_pid" "Copying audio stream"
-    local _acopy_rc; wait "$acopy_pid" 2>/dev/null || _acopy_rc=$?
-    _ACTIVE_FFMPEG_PID=""
-    if (( ${_acopy_rc:-0} != 0 )); then
+    local _acopy_rc=0; _await_tracked_pid "$acopy_pid" "Copying audio stream" || _acopy_rc=$?
+    if (( _acopy_rc != 0 )); then
       _check_disk_full "$WORKDIR/audio_primary.err"   # L5: surface ENOSPC, like the die 40/41 paths
       die 43 "Audio copy failed. See: $WORKDIR/audio_primary.err"
     fi
@@ -10139,10 +10125,7 @@ run_audio_pipeline(){
         ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map "0:a:${_native_si}" -c copy "$AAC_STEREO" \
           2>"$WORKDIR/audio_stereo.err" &
         local _ns_pid=$!
-        _ACTIVE_FFMPEG_PID=$_ns_pid
-        spinner "$_ns_pid" "Copying native stereo track"
-        # M3: capture wait result, THEN clear (clearing before wait would orphan the child on SIGINT).
-        local _ns_rc=0; wait "$_ns_pid" 2>/dev/null || _ns_rc=$?; _ACTIVE_FFMPEG_PID=""
+        local _ns_rc=0; _await_tracked_pid "$_ns_pid" "Copying native stereo track" || _ns_rc=$?
         if (( _ns_rc != 0 )); then
           warn "Native stereo copy failed - continuing without it. See: $WORKDIR/audio_stereo.err"
           AAC_STEREO=""
@@ -10330,9 +10313,7 @@ _prepare_subtitle(){
     subrip|srt)
       ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" -c copy "$srt" 2>"$WORKDIR/sub_${idx}.err" &
       local sub_pid=$!
-      _ACTIVE_FFMPEG_PID=$sub_pid
-      spinner "$sub_pid" "Extracting subtitle #${idx} (SRT copy)"
-      wait "$sub_pid" 2>/dev/null; local _sub_ok=$?; _ACTIVE_FFMPEG_PID=""
+      local _sub_ok=0; _await_tracked_pid "$sub_pid" "Extracting subtitle #${idx} (SRT copy)" || _sub_ok=$?
       if (( _sub_ok == 0 )); then
         echo "$srt"
         return 0
@@ -10346,9 +10327,7 @@ _prepare_subtitle(){
         local native_out="$WORKDIR/sub.${idx}.${codec}"
         ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" -c:s copy "$native_out" 2>"$WORKDIR/sub_${idx}.err" &
         local sub_pid=$!
-        _ACTIVE_FFMPEG_PID=$sub_pid
-        spinner "$sub_pid" "Extracting subtitle #${idx} (${codec} native copy)"
-        wait "$sub_pid" 2>/dev/null; local _sub_ok=$?; _ACTIVE_FFMPEG_PID=""
+        local _sub_ok=0; _await_tracked_pid "$sub_pid" "Extracting subtitle #${idx} (${codec} native copy)" || _sub_ok=$?
         if (( _sub_ok == 0 )); then
           echo "$native_out"
           return 0
@@ -10358,9 +10337,7 @@ _prepare_subtitle(){
         # Convert to SRT (legacy behavior)
         ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" "$srt" 2>"$WORKDIR/sub_${idx}.err" &
         local sub_pid=$!
-        _ACTIVE_FFMPEG_PID=$sub_pid
-        spinner "$sub_pid" "Converting subtitle #${idx} (${codec} → SRT)"
-        wait "$sub_pid" 2>/dev/null; local _sub_ok=$?; _ACTIVE_FFMPEG_PID=""
+        local _sub_ok=0; _await_tracked_pid "$sub_pid" "Converting subtitle #${idx} (${codec} → SRT)" || _sub_ok=$?
         if (( _sub_ok == 0 )); then
           echo "$srt"
           return 0
@@ -10375,9 +10352,7 @@ _prepare_subtitle(){
 
       ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" -c:s copy "$sup" 2>"$WORKDIR/sub_${idx}_extract.err" &
       local sup_pid=$!
-      _ACTIVE_FFMPEG_PID=$sup_pid
-      spinner "$sup_pid" "Extracting PGS subtitle #${idx} to SUP"
-      wait "$sup_pid" 2>/dev/null; local _sup_ok=$?; _ACTIVE_FFMPEG_PID=""
+      local _sup_ok=0; _await_tracked_pid "$sup_pid" "Extracting PGS subtitle #${idx} to SUP" || _sup_ok=$?
       if (( _sup_ok != 0 )); then
         warn "[Subs] Failed extracting PGS #$idx to .sup — skipping. See: $WORKDIR/sub_${idx}_extract.err"
         echo ""
@@ -10411,9 +10386,7 @@ _prepare_subtitle(){
         vob_base="$WORKDIR/sub.${idx}.vob"
         ffmpeg "${FFMPEG_FLAGS[@]}" -i "$sup" -map 0:s:0 -c:s dvdsub -f vobsub "$vob_base" 2>"$WORKDIR/sub_${idx}_vobsub.err" &
         local vob_pid=$!
-        _ACTIVE_FFMPEG_PID=$vob_pid
-        spinner "$vob_pid" "Converting PGS #${idx} to VobSub"
-        wait "$vob_pid" 2>/dev/null; local _vob_ok=$?; _ACTIVE_FFMPEG_PID=""
+        local _vob_ok=0; _await_tracked_pid "$vob_pid" "Converting PGS #${idx} to VobSub" || _vob_ok=$?
         if (( _vob_ok != 0 )); then
           warn "[Subs] PGS→VobSub conversion failed for #$idx. See: $WORKDIR/sub_${idx}_vobsub.err"
           echo ""
@@ -11918,9 +11891,7 @@ mux_final() {
   # Execute final mux
   ffmpeg "${ff_in[@]}" "${ff_map[@]}" "${ff_codec[@]}" -f "$MUX_FORMAT" "$TMP_OUT" 2>"$WORKDIR/mux.err" &
   local mux_pid=$!
-  _ACTIVE_FFMPEG_PID=$mux_pid
-  spinner "$mux_pid" "Muxing final ${OUTPUT_EXT^^}"
-  wait "$mux_pid" 2>/dev/null; local _mux_ok=$?; _ACTIVE_FFMPEG_PID=""
+  local _mux_ok=0; _await_tracked_pid "$mux_pid" "Muxing final ${OUTPUT_EXT^^}" || _mux_ok=$?
   if (( _mux_ok != 0 )); then
     _check_disk_full "$WORKDIR/mux.err"
     die 41 "ffmpeg final mux failed. See: $WORKDIR/mux.err"
@@ -12166,9 +12137,7 @@ main() {
           _sii_meta+=( -f "$MUX_FORMAT" "$TMP_OUT" )
           ffmpeg "${_sii_meta[@]}" 2>"$WORKDIR/skip_ideal_remux.err" &
           local _sii_pid=$!
-          _ACTIVE_FFMPEG_PID=$_sii_pid
-          spinner "$_sii_pid" "Applying metadata (copy-remux)"
-          wait "$_sii_pid" 2>/dev/null; local _sii_ok=$?; _ACTIVE_FFMPEG_PID=""
+          local _sii_ok=0; _await_tracked_pid "$_sii_pid" "Applying metadata (copy-remux)" || _sii_ok=$?
           if (( _sii_ok != 0 )); then
             _check_disk_full "$WORKDIR/skip_ideal_remux.err"
             die 41 "Skip-if-ideal metadata remux failed. See: $WORKDIR/skip_ideal_remux.err"
@@ -12185,9 +12154,7 @@ main() {
           if ! ln -f "$SRC_ABS" "$TMP_OUT" 2>/dev/null; then
             cp -f "$SRC_ABS" "$TMP_OUT" &
             local _sii_cp_pid=$!
-            _ACTIVE_FFMPEG_PID=$_sii_cp_pid
-            spinner "$_sii_cp_pid" "Copying source to output"
-            local _sii_cp_rc=0; wait "$_sii_cp_pid" 2>/dev/null || _sii_cp_rc=$?; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait
+            local _sii_cp_rc=0; _await_tracked_pid "$_sii_cp_pid" "Copying source to output" || _sii_cp_rc=$?
             (( _sii_cp_rc == 0 )) || die 41 "Failed to copy source to output (skip-if-ideal)"
           fi
           _validate_media_file "$TMP_OUT" "Skip-if-ideal copy"

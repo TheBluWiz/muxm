@@ -9890,7 +9890,9 @@ _test_unit_ocr_dispatch() {
   # PLAN-vs-CODE (flagged): catalog 3.2 specified a VobSub/dvdsub fixture, but muxm's OCR branch is
   # PGS-only and ffmpeg has no PGS encoder — the fixture route cannot reach the code under test.
   local body
-  body="$(_extract_muxm_fns _prepare_subtitle)" || { fail "3.2: could not extract _prepare_subtitle"; return; }
+  # CR-10: _prepare_subtitle's extract/convert sites now await via _await_tracked_pid — pull the
+  # helper in too (it calls the mocked spinner + the wait builtin), else the calls fail in isolation.
+  body="$(_extract_muxm_fns _prepare_subtitle _await_tracked_pid)" || { fail "3.2: could not extract _prepare_subtitle"; return; }
   local wd; wd="$(mktemp -d "${TMPDIR:-/tmp}/muxm-ocr.XXXXXX")" || { fail "3.2: mktemp failed"; return; }
   local sentinel="$wd/ocr_invoked"
   # Mock OCR tool: record the invocation, then emit a canned SRT beside the .sup (strip .sup→.srt),
@@ -10080,7 +10082,7 @@ _test_unit_l_disk_df_unavailable() {
 # MUT-L-SUBWD reverts to `return 1` → rc 1 → red.
 _test_unit_l_prepare_subtitle_workdir_gone() {
   local body
-  body="$(_extract_muxm_fns _prepare_subtitle)" || { fail "L sub-workdir: could not extract _prepare_subtitle"; return; }
+  body="$(_extract_muxm_fns _prepare_subtitle _await_tracked_pid)" || { fail "L sub-workdir: could not extract _prepare_subtitle"; return; }
   local out rc=0
   out="$(bash -c 'warn(){ :; }; WORKDIR="/no/such/muxm/workdir/xyzzy"'$'\n'"$body"$'\n''_prepare_subtitle 0' 2>/dev/null)" || rc=$?
   if (( rc == 0 )) && [[ -z "$out" ]]; then
@@ -10193,15 +10195,20 @@ _test_unit_mdry_loglevel_str() {
 # registration (invariant A → red); MUT-M3-CLEARWAIT reorders one site to clear-before-wait
 # (invariant B → red). The DV launches are all sequential (launch→spinner→wait), so the scalar
 # _ACTIVE_FFMPEG_PID is sufficient — no two heavy children run concurrently.
+# CR-10: most heavy children now register+wait+clear via the shared _await_tracked_pid helper
+# (register-before-wait, clear-after, all in one place), so a registration is satisfied EITHER by an
+# inline `_ACTIVE_FFMPEG_PID=$<v>` (OCR fire-and-forget sites, _ffmpeg_run_with_ui) OR by passing the
+# pid to `_await_tracked_pid "$<v>"` — both forms count as "registered on the next line".
 _test_unit_m3_ffmpeg_pid_lifecycle() {
   # Invariant A: every `local <v>=$!` heavy-child launch registers _ACTIVE_FFMPEG_PID on the next
-  # line. Allowlist the light/infra launches that intentionally do NOT register (tee drain,
-  # checksum tool, tee watchdog) — orphaning those on Ctrl-C is harmless and on_exit handles the tee.
+  # line — inline OR via _await_tracked_pid "$<v>". Allowlist the light/infra launches that
+  # intentionally do NOT register (tee drain, checksum tool, tee watchdog) — orphaning those on
+  # Ctrl-C is harmless and on_exit handles the tee.
   local _unreg
   _unreg="$(awk '/local [A-Za-z_]+=\$!/{
       v=$0; sub(/^[[:space:]]*local /,"",v); sub(/=\$!.*/,"",v); ln=NR; getline n;
       if (v=="drain_pid"||v=="_cksum_pid"||v=="_tee_wd") next;
-      if (index(n,"_ACTIVE_FFMPEG_PID=$" v)==0) print ln":"v;
+      if (index(n,"_ACTIVE_FFMPEG_PID=$" v)==0 && index(n,"_await_tracked_pid \"$" v "\"")==0) print ln":"v;
     }' "$MUXM")"
   if [[ -z "$_unreg" ]]; then
     pass "M3: every backgrounded heavy child registers _ACTIVE_FFMPEG_PID right after launch"
