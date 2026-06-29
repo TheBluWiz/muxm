@@ -5732,6 +5732,17 @@ fi
 _warn_ignored_knobs
 
 
+# True (rc 0) iff $1 is one of the Apple TV Direct-Play profiles. These share the same Direct-Play
+# contract (single-layer DV P8.1, copy-if-compliant, ≤50 Mbps) and must be gated together
+# everywhere; a single literal `== atv-directplay-hq` silently excludes the animation sibling (CR-2).
+# Route Direct-Play-intent checks through here so a future Direct-Play profile inherits the gate by
+# being added in one place. MUST be defined BEFORE _resolve_output_and_sub_policy (its first caller),
+# which runs at top level on the print-effective-config path well before Section 26 — defining it in
+# Section 26 made it "command not found" there, silently skipping the ATV MKV subtitle adjustment.
+_is_atv_directplay_profile() {
+  [[ "$1" == "atv-directplay-hq" || "$1" == "atv-directplay-animation" ]]
+}
+
 # _resolve_output_and_sub_policy — resolve the final output container and the ATV subtitle
 # policy from the source/output filenames and the active profile. Extracted from Section 15
 # so --print-effective-config (Section 13) can resolve the same way and report the RESOLVED
@@ -7993,15 +8004,6 @@ declare -a ALL_SUB_CODECS=()      # codec name per entry
 declare -a ALL_SUB_TITLES=()      # title tag per entry (empty for external files)
 
 # ===== Section 26: Video pipeline =============================================================
-
-# True (rc 0) iff $1 is one of the Apple TV Direct-Play profiles. These share the
-# same Direct-Play contract (single-layer DV P8.1, copy-if-compliant, ≤50 Mbps) and
-# must be gated together everywhere; a single literal `== atv-directplay-hq` silently
-# excludes the animation sibling (CR-2). Route Direct-Play-intent checks through here
-# so a future Direct-Play profile inherits the gate by being added in one place.
-_is_atv_directplay_profile() {
-  [[ "$1" == "atv-directplay-hq" || "$1" == "atv-directplay-animation" ]]
-}
 
 # Check if source video can be stream-copied (no re-encode) for the target profile.
 # Tests: codec match (hevc/h264), pixel format (10-bit for HDR), tone-map requirement,
