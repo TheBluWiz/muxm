@@ -10842,7 +10842,9 @@ SRT_FULL=""
 SRT_SDH=""
 SRT_FORCED_BURN_PATH=""           # Set when SUB_BURN_FORCED=1; used by video pipeline
 declare -a EXTERNAL_SRT_PATHS=()  # Paths of external SRT files exported alongside output
-declare -i SRT_DIRECT_MAP=0
+# DIRECT_SUB_RELIDX — relative index of a text subtitle the single-track fallback
+# direct-maps from source (Subs_Fix Phase 6 removed the old SRT_DIRECT_MAP signal
+# flag; build_subtitle_plan now records the fallback straight into SUB_TRACKS_*).
 DIRECT_SUB_RELIDX=""
 
 # Subtitle metadata for mux tagging (populated by build_subtitle_plan)
@@ -11285,10 +11287,11 @@ _build_subtitle_keep_list(){
 # Embedded streams are copied directly from source (-c:s copy).
 # External text subs are added as separate ffmpeg inputs in mux_final.
 #
-# Sets: SUB_COPY_FROM_SOURCE, SUB_MT_SOURCES[], SUB_MT_INDICES[],
-#       SUB_MT_CODECS[], SUB_MT_LANGS[], SUB_MT_TITLES[], SUB_MT_TYPES[],
-#       SRT_FORCED (cleared), SRT_FULL (cleared), SRT_SDH (cleared),
-#       SRT_DIRECT_MAP (cleared), DIRECT_SUB_RELIDX (cleared)
+# Sets: SUB_TRACKS_* (the unified track list consumed by _emit_sub_tracks),
+#       SUB_COPY_FROM_SOURCE, SUB_MT_SOURCES[], SUB_MT_INDICES[], SUB_MT_CODECS[],
+#       SUB_MT_LANGS[], SUB_MT_TITLES[], SUB_MT_TYPES[] (legacy arrays kept only for
+#       the log/report summaries below), SRT_FORCED/FULL/SDH (cleared),
+#       DIRECT_SUB_RELIDX (cleared)
 # Globals: ALL_SUB_SOURCES[] (read), METADATA_CACHE (read)
 run_subtitle_pipeline_multi(){
   local keep_list
@@ -11315,7 +11318,6 @@ run_subtitle_pipeline_multi(){
   SRT_FULL=""
   SRT_SDH=""
   SRT_FORCED_BURN_PATH=""
-  SRT_DIRECT_MAP=0
   DIRECT_SUB_RELIDX=""
 
   # Populate parallel metadata arrays from the unified ALL_SUB_SOURCES[] list
@@ -11465,8 +11467,13 @@ run_subtitle_pipeline_multi(){
 # if no prepared subtitles were produced and at least one SUB_INCLUDE_* flag
 # is enabled (embedded-only fallback — external files are handled in main loop).
 #
-# Sets: SRT_FORCED, SRT_FULL, SRT_SDH, SRT_FORCED_BURN_PATH, SRT_DIRECT_MAP,
-#       DIRECT_SUB_RELIDX, EXTERNAL_SRT_PATHS[], and associated *_LANG/*_TITLE vars
+# Sets: SUB_TRACKS_* (the unified track list consumed by _emit_sub_tracks — via
+#       _sub_plan_add_embed and the direct-map fallback), SRT_FORCED_BURN_PATH (burn
+#       path read by the video pipeline), EXTERNAL_SRT_PATHS[] (external export), and
+#       DIRECT_SUB_RELIDX. SRT_FORCED/FULL/SDH + their *_LANG/*_TITLE companions are
+#       still set as selection-side "prepared" markers (the empty-check below gates
+#       the direct-map fallback) and as the lang/title args passed to the emitter;
+#       they no longer drive mux_final, which reads only SUB_TRACKS_*.
 # Globals: ALL_SUB_SOURCES[] (read), SUB_* config vars (read)
 # _sub_plan_add_embed SRC SUB_PATH LANG TITLE TYPE SRCCODEC — record one
 # single-track-selected subtitle (embed routing) into the unified SUB_TRACKS_*
@@ -11508,14 +11515,14 @@ build_subtitle_plan(){
 
   if (( SKIP_SUBS )); then
     SRT_FORCED=""; SRT_FULL=""; SRT_SDH=""
-    SRT_DIRECT_MAP=0; DIRECT_SUB_RELIDX=""
+    DIRECT_SUB_RELIDX=""
     return 0
   fi
 
   # No subtitle sources at all (neither embedded nor external)
   if (( ${#ALL_SUB_SOURCES[@]} == 0 )); then
     note "[Subs] No subtitle streams detected."
-    SRT_DIRECT_MAP=0
+    DIRECT_SUB_RELIDX=""
     return 0
   fi
 
@@ -11689,7 +11696,6 @@ build_subtitle_plan(){
      && (( SUB_INCLUDE_FORCED || SUB_INCLUDE_FULL || SUB_INCLUDE_SDH )); then
     DIRECT_SUB_RELIDX="$(_pick_direct_text_sub_relidx)"
     if [[ -n "$DIRECT_SUB_RELIDX" ]]; then
-      SRT_DIRECT_MAP=1
       # Unified: the direct-map text fallback folds into an embedded:N track — mapped
       # straight from the source by the emitter (the same mechanism PGS now uses).
       local _dm_lang _dm_codec
@@ -11698,11 +11704,8 @@ build_subtitle_plan(){
       _sub_track_add embedded "$DIRECT_SUB_RELIDX" "$_dm_lang" "" full "$_dm_codec" 0 embed
       note "[Subs] No external SRTs prepared — enabling direct-map of TEXT subtitle stream #$DIRECT_SUB_RELIDX."
     else
-      SRT_DIRECT_MAP=0
       note "[Subs] No usable subtitles prepared. Proceeding without subtitles."
     fi
-  else
-    SRT_DIRECT_MAP=0
   fi
 }
 
@@ -11744,9 +11747,9 @@ mux_final() {
 
   local next_idx=0
   local vid_idx="" a_primary_idx="" a_stereo_idx=""
-  local s_forced_idx="" s_full_idx="" s_sdh_idx=""
-  local forced_present=0 full_present=0 sdh_present=0
-  local src_sub_idx=""
+  # (Subs_Fix Phase 6: the old single-track subtitle locals — s_forced_idx/s_full_idx/
+  # s_sdh_idx, forced_present/full_present/sdh_present, src_sub_idx — are gone; the
+  # unified _emit_sub_tracks now owns subtitle input/-map/-c:s for both modes.)
   local _src_input_idx=""   # shared index when source is used as ffmpeg input
   # Parallel arrays for deduplicating external subtitle file inputs in multi-track mode
   local -a _ext_sub_paths=()   # unique external subtitle file paths (insertion order)
