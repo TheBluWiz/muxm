@@ -11468,7 +11468,44 @@ run_subtitle_pipeline_multi(){
 # Sets: SRT_FORCED, SRT_FULL, SRT_SDH, SRT_FORCED_BURN_PATH, SRT_DIRECT_MAP,
 #       DIRECT_SUB_RELIDX, EXTERNAL_SRT_PATHS[], and associated *_LANG/*_TITLE vars
 # Globals: ALL_SUB_SOURCES[] (read), SUB_* config vars (read)
+# _sub_plan_add_embed SRC SUB_PATH LANG TITLE TYPE SRCCODEC — record one
+# single-track-selected subtitle (embed routing) into the unified SUB_TRACKS_*
+# model. THE DESYNC FIX lives in the embedded branch: a preserved PGS bitmap (a
+# .sup produced from an embedded source) is recorded as embedded:N so the emitter
+# maps it straight from the source (-map $src:s:N) instead of re-importing the
+# standalone .sup elementary stream (which ffmpeg rebases to t=0 without -copyts).
+# Everything else — OCR'd / format-converted / native-extracted workdir files and
+# external sidecars — is a file: input. CODEC carries the EFFECTIVE codec the
+# emitter keys its one codec rule on: the source stream codec for the embedded
+# (PGS) branch, the prepared file's extension for the file branch.
+#
+# NOTE: for a preserved PGS the .sup is still extracted by _prepare_subtitle and
+# left orphaned in the workdir (cleaned up on exit). Only the ffmpeg COMMAND
+# changes (no -i .sup), so this stays a pure command-shape cutover with no new
+# logic in the extraction path. It can later be optimized to skip the extraction
+# entirely via a shared _sub_is_preserved_pgs predicate.
+_sub_plan_add_embed(){
+  local src="$1" sub_path="$2" lang="$3" title="$4" stype="$5" srccodec="$6"
+  local disp
+  case "$stype" in
+    forced) disp=forced ;;
+    sdh)    disp=hearing_impaired ;;
+    *)      disp=0 ;;
+  esac
+  if [[ "$src" == embedded:* && "$sub_path" == *.sup ]]; then
+    _sub_track_add embedded "${src#embedded:}" "$lang" "$title" "$stype" "${srccodec,,}" "$disp" embed
+  else
+    local ext="${sub_path##*.}"; ext="${ext,,}"
+    _sub_track_add file "$sub_path" "$lang" "$title" "$stype" "$ext" "$disp" embed
+  fi
+}
+
 build_subtitle_plan(){
+  # Subs_Fix Phase 5: reset the unified model up front so it covers the single-track
+  # path, the multi-track delegate (harmless double-reset), AND the early returns
+  # below — otherwise a prior file's tracks could leak into a SKIP_SUBS/no-subs file.
+  _sub_tracks_reset
+
   if (( SKIP_SUBS )); then
     SRT_FORCED=""; SRT_FULL=""; SRT_SDH=""
     SRT_DIRECT_MAP=0; DIRECT_SUB_RELIDX=""
@@ -11606,6 +11643,7 @@ build_subtitle_plan(){
       SRT_FORCED_LANG="${ALL_SUB_LANGS[$forced_uidx]}"
       SRT_FORCED_TITLE="Forced"
       SRT_FORCED="$sub_path"
+      _sub_plan_add_embed "${ALL_SUB_SOURCES[$forced_uidx]}" "$sub_path" "$SRT_FORCED_LANG" "$SRT_FORCED_TITLE" forced "${ALL_SUB_CODECS[$forced_uidx]}"
       pick_count=$(( pick_count + 1 ))
       note "[Subs] Prepared Forced → $SRT_FORCED"
       report_add "sub_forced" "embedded"
@@ -11619,6 +11657,7 @@ build_subtitle_plan(){
       _export_or_embed_sub "$sub_path" "full"
       if [[ -n "$_SUB_EMBED_PATH" ]]; then
         SRT_FULL="$_SUB_EMBED_PATH"
+        _sub_plan_add_embed "${ALL_SUB_SOURCES[$full_uidx]}" "$_SUB_EMBED_PATH" "$SRT_FULL_LANG" "$SRT_FULL_TITLE" full "${ALL_SUB_CODECS[$full_uidx]}"
         pick_count=$(( pick_count + 1 ))
       fi
     fi
@@ -11631,6 +11670,7 @@ build_subtitle_plan(){
       _export_or_embed_sub "$sub_path" "sdh"
       if [[ -n "$_SUB_EMBED_PATH" ]]; then
         SRT_SDH="$_SUB_EMBED_PATH"
+        _sub_plan_add_embed "${ALL_SUB_SOURCES[$sdh_uidx]}" "$_SUB_EMBED_PATH" "$SRT_SDH_LANG" "$SRT_SDH_TITLE" sdh "${ALL_SUB_CODECS[$sdh_uidx]}"
         pick_count=$(( pick_count + 1 ))
       fi
     fi
@@ -11650,6 +11690,12 @@ build_subtitle_plan(){
     DIRECT_SUB_RELIDX="$(_pick_direct_text_sub_relidx)"
     if [[ -n "$DIRECT_SUB_RELIDX" ]]; then
       SRT_DIRECT_MAP=1
+      # Unified: the direct-map text fallback folds into an embedded:N track — mapped
+      # straight from the source by the emitter (the same mechanism PGS now uses).
+      local _dm_lang _dm_codec
+      _dm_lang="$(_sp_sub_lang "$DIRECT_SUB_RELIDX")"
+      _dm_codec="$(_sp_sub_field "$DIRECT_SUB_RELIDX" codec_name)"; _dm_codec="${_dm_codec,,}"
+      _sub_track_add embedded "$DIRECT_SUB_RELIDX" "$_dm_lang" "" full "$_dm_codec" 0 embed
       note "[Subs] No external SRTs prepared — enabling direct-map of TEXT subtitle stream #$DIRECT_SUB_RELIDX."
     else
       SRT_DIRECT_MAP=0
@@ -11764,42 +11810,9 @@ mux_final() {
     fi
   fi
 
-  # Add subtitle streams.
-  # Multi-track (SUB_COPY_FROM_SOURCE): inputs are registered by _emit_sub_tracks
-  # below (via _add_sub_stream), so there is nothing to register here.
-  # Single-track: use the prepared subtitle files.
-  if (( ! SKIP_SUBS )) && (( ! SUB_COPY_FROM_SOURCE )); then
-    if [[ -n "${SRT_FORCED:-}" && -s "$SRT_FORCED" ]]; then
-      ff_in+=( -i "$SRT_FORCED" )
-      s_forced_idx=$next_idx
-      next_idx=$(( next_idx + 1 ))
-      forced_present=1
-    fi
-
-    if [[ -n "${SRT_FULL:-}" && -s "$SRT_FULL" ]]; then
-      ff_in+=( -i "$SRT_FULL" )
-      s_full_idx=$next_idx
-      next_idx=$(( next_idx + 1 ))
-      full_present=1
-    fi
-
-    if [[ -n "${SRT_SDH:-}" && -s "$SRT_SDH" ]]; then
-      ff_in+=( -i "$SRT_SDH" )
-      s_sdh_idx=$next_idx
-      next_idx=$(( next_idx + 1 ))
-      sdh_present=1
-    fi
-  fi
-
-  # Add source for direct subtitle mapping if needed (single-track fallback only)
-  if (( ! SKIP_SUBS )) && (( ! SUB_COPY_FROM_SOURCE )) && (( SRT_DIRECT_MAP )) && [[ -n "${DIRECT_SUB_RELIDX:-}" ]]; then
-    if [[ -z "$_src_input_idx" ]]; then
-      ff_in+=( -i "$SRC_ABS" )
-      _src_input_idx=$next_idx
-      next_idx=$(( next_idx + 1 ))
-    fi
-    src_sub_idx="$_src_input_idx"
-  fi
+  # Subtitle inputs (both modes) are registered by _emit_sub_tracks below, via
+  # _add_sub_stream: embedded tracks reuse the shared source input ($_src_input_idx),
+  # file tracks add deduped -i inputs (Subs_Fix Phase 5).
 
   # Build stream mapping
   # When VIDEO_COPY_FROM_SOURCE, source is the first input; -map N:v:0
@@ -11817,90 +11830,17 @@ mux_final() {
     [[ -n "$a_stereo_idx"  ]] && ff_map+=( -map "$a_stereo_idx":a:0 )
   fi
 
-  # Subtitle mapping: multi-track is emitted by _emit_sub_tracks below (it appends
-  # both the -i inputs and their -map entries). Here we handle only single-track
-  # (prepared files + optional direct-map from source).
-  if (( ! SUB_COPY_FROM_SOURCE )); then
-    (( forced_present )) && ff_map+=( -map "$s_forced_idx":s:0 )
-    (( full_present   )) && ff_map+=( -map "$s_full_idx":s:0 )
-    (( sdh_present    )) && ff_map+=( -map "$s_sdh_idx":s:0 )
-
-    if [[ -n "$src_sub_idx" ]]; then
-      ff_map+=( -map "$src_sub_idx":s:"$DIRECT_SUB_RELIDX"? )
-    fi
-  fi
+  # Subtitle -map entries (both modes) are emitted by _emit_sub_tracks below,
+  # alongside the inputs and per-stream tagging (Subs_Fix Phase 5).
 
   # Codec settings: copy everything; subtitle codecs are assigned per-stream below
   ff_codec+=( -c copy )
 
-  # _sub_codec_for_file — Determine the ffmpeg subtitle codec flag for a prepared file.
-  # ASS/SSA files in MKV are stream-copied to preserve styling; all others convert.
-  # Args: $1 — path to prepared subtitle file
-  # Stdout: codec name suitable for -c:s:N (e.g., "copy", "srt", "mov_text")
-  _sub_codec_for_file(){
-    local ext="${1##*.}"
-    if [[ "$MUX_FORMAT" == "matroska" ]]; then
-      case "$ext" in
-        ass|ssa) echo "copy" ;;   # preserve native ASS/SSA in MKV
-        sup)     echo "copy" ;;   # preserve PGS bitmap in MKV
-        *)       echo "srt" ;;
-      esac
-    else
-      case "$ext" in
-        sup|idx) die 12 "PGS/VobSub subtitles cannot be muxed into MP4/MOV; use MKV output or enable OCR." ;;
-      esac
-      echo "mov_text"
-    fi
-  }
-
-  # Subtitle metadata: language, title, disposition, and per-stream codec tagging.
-  # Output subtitle index tracks which output stream we're tagging.
-  local -i out_s_idx=0
-  if (( SUB_COPY_FROM_SOURCE )); then
-    # Multi-track: the unified emitter registers the inputs, emits the -map entries,
-    # and tags every kept subtitle track from the source in one pass (Subs_Fix
-    # Phase 4). It keeps its own output-stream index, so out_s_idx is unused here.
-    _emit_sub_tracks
-  else
-    # Single-track: hardcoded forced/full/sdh slots
-    if (( forced_present )); then
-      ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_FORCED")" )
-      [[ -n "$SRT_FORCED_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FORCED_LANG" )
-      [[ -n "$SRT_FORCED_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FORCED_TITLE" )
-      ff_codec+=( "-disposition:s:${out_s_idx}" forced )
-      out_s_idx=$(( out_s_idx + 1 ))
-    fi
-    if (( full_present )); then
-      ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_FULL")" )
-      [[ -n "$SRT_FULL_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_FULL_LANG" )
-      [[ -n "$SRT_FULL_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_FULL_TITLE" )
-      ff_codec+=( "-disposition:s:${out_s_idx}" 0 )
-      out_s_idx=$(( out_s_idx + 1 ))
-    fi
-    if (( sdh_present )); then
-      ff_codec+=( "-c:s:${out_s_idx}" "$(_sub_codec_for_file "$SRT_SDH")" )
-      [[ -n "$SRT_SDH_LANG" ]]  && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$SRT_SDH_LANG" )
-      [[ -n "$SRT_SDH_TITLE" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$SRT_SDH_TITLE" )
-      ff_codec+=( "-disposition:s:${out_s_idx}" hearing_impaired )
-      out_s_idx=$(( out_s_idx + 1 ))
-    fi
-    if [[ -n "$src_sub_idx" ]]; then
-      # Direct-mapped subtitle from source: check if we should preserve native format
-      local _dm_codec
-      _dm_codec="$(_sp_sub_field "$DIRECT_SUB_RELIDX" codec_name)"; _dm_codec="${_dm_codec,,}"
-      if (( SUB_PRESERVE_TEXT_FORMAT )) && [[ "$MUX_FORMAT" == "matroska" ]]; then
-        case "$_dm_codec" in
-          ass|ssa) ff_codec+=( "-c:s:${out_s_idx}" copy ) ;;
-          *)       ff_codec+=( "-c:s:${out_s_idx}" srt ) ;;
-        esac
-      elif [[ "$MUX_FORMAT" == "matroska" ]]; then
-        ff_codec+=( "-c:s:${out_s_idx}" srt )
-      else
-        ff_codec+=( "-c:s:${out_s_idx}" mov_text )
-      fi
-      out_s_idx=$(( out_s_idx + 1 ))
-    fi
-  fi
+  # Subtitle inputs, -map entries, and per-stream tagging — emitted in ONE pass by
+  # the unified emitter for BOTH single- and multi-track modes (Subs_Fix Phase 5).
+  # SUB_TRACKS_* is populated by build_subtitle_plan (single) or
+  # run_subtitle_pipeline_multi (multi); empty (e.g. --no-subtitles) is a no-op.
+  (( ! SKIP_SUBS )) && _emit_sub_tracks
 
   # Audio metadata: language, title, and disposition tagging.
   # Output audio index tracks which output stream we're tagging.

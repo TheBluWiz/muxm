@@ -5868,9 +5868,11 @@ test_subs() {
   local cz_cmd cz_log
 
   # T1 + T2(single-text) + T4(sync): single-track text path.
-  # offset_subs.mkv carries ONE SRT track whose first cue is at 5.000 s. With the
-  # default profile (SUB_MULTI_TRACK=0) muxm extracts it to a workdir file and
-  # re-inputs it, converting to srt.
+  # offset_subs.mkv carries ONE SRT track whose first cue is at 5.000 s. muxm
+  # extracts it to a workdir file (sub.0.srt) and re-inputs it. Post-Phase-5 the
+  # unified emitter stream-copies that text file (-c:s:0 copy) instead of the
+  # pre-unification -c:s:0 srt — identical subrip output in MKV (intentional
+  # convergence; see Subs_Fix.md). The -i/-map shape is unchanged.
   local cz_single="$TESTDIR/charz_single.mkv"
   run_muxm --keep-log --output-ext mkv --crf 28 --preset ultrafast \
     "$TESTDIR/offset_subs.mkv" "$cz_single" >/dev/null 2>&1
@@ -5882,8 +5884,8 @@ test_subs() {
     "T2 single-text: subtitle taken from an extracted file input (sub.0.srt)" "$cz_cmd"
   assert_contains "-map 2:s:0" \
     "T2 single-text: subtitle mapped from the file input (-map 2:s:0)" "$cz_cmd"
-  assert_contains "-c:s:0 srt" \
-    "T2 single-text: subtitle codec is srt" "$cz_cmd"
+  assert_contains "-c:s:0 copy" \
+    "T2 single-text: text file stream-copied (-c:s:0 copy; unified rule, was srt)" "$cz_cmd"
   # T4: text has no desync bug — first-sub PTS must survive at 5.000 s. A rebase
   #     (the PGS bug class) would pull it to 0; this proves the probe can see it.
   if [[ -f "$cz_single" ]]; then
@@ -5927,8 +5929,8 @@ test_subs() {
   cz_cmd="$(extract_mux_cmd "$cz_log")"
   assert_contains "-i ext_only_source.en.srt" \
     "T2 ext: external sidecar added as a file input" "$cz_cmd"
-  assert_contains "-c:s:0 srt" \
-    "T2 ext: sidecar tagged -c:s:0 srt" "$cz_cmd"
+  assert_contains "-c:s:0 copy" \
+    "T2 ext: sidecar stream-copied (-c:s:0 copy; unified rule, was srt)" "$cz_cmd"
 
   # T10 (Phase 4): multi-track + external sidecar — the case the all-embedded multi
   # fixture never exercised, and the one that exposed the wrong (extension-based) file
@@ -5946,6 +5948,37 @@ test_subs() {
     "T10 multi+ext: embedded sub stream-copied" "$cz_cmd"
   assert_contains "-c:s:1 copy -metadata:s:s:1 language=spa" \
     "T10 multi+ext: external sidecar stream-COPIED, not re-encoded to srt (the bug guard)" "$cz_cmd"
+
+  # T11 (Phase 5): end-to-end PGS desync guard — the true regression test for the bug
+  # this whole refactor fixes. ffmpeg cannot synthesize an embedded PGS fixture from
+  # text (Subs_Fix constraint #1), so it is gated on a bundled-or-supplied PGS source
+  # via MUXM_PGS_FIXTURE (mirrors MUXM_DV_FIXTURE). Without one it SKIPs; the
+  # always-runnable guarantee is carried by T6 (emitter maps embedded PGS from source,
+  # never a .sup) + the sub-plan-add unit test (single-track PGS → embedded:N) + the
+  # structural fact that single-track PGS now uses the byte-identical, desync-free
+  # source-mapping mechanism Phase 4 locked in for multi-track.
+  # Skip-first guard (not an else-skip) per the soft-skip ratchet, _test_meta_soft_skip.
+  if [[ -z "${MUXM_PGS_FIXTURE:-}" || ! -s "${MUXM_PGS_FIXTURE:-}" ]]; then
+    skip "T11 PGS e2e sync: no MUXM_PGS_FIXTURE (ffmpeg cannot synthesize PGS — set MUXM_PGS_FIXTURE=/path/to/pgs_source.mkv with a non-zero first cue)"
+  else
+    local pgs_off pgs_out="$TESTDIR/charz_pgs.mkv"
+    pgs_off="$(ffprobe -v error -select_streams s:0 -show_entries packet=pts_time -of csv=p=0 "$MUXM_PGS_FIXTURE" 2>/dev/null | grep -E '^[0-9]' | head -1)"
+    run_muxm --keep-log --output-ext mkv --crf 28 --preset ultrafast "$MUXM_PGS_FIXTURE" "$pgs_out" >/dev/null 2>&1
+    cz_cmd="$(extract_mux_cmd "$TESTDIR/charz_pgs.muxm.log")"
+    assert_not_contains ".sup" \
+      "T11 PGS: mux command has NO standalone .sup input (maps from source)" "$cz_cmd"
+    if [[ -f "$pgs_out" ]]; then
+      local out_off
+      out_off="$(ffprobe -v error -select_streams s:0 -show_entries packet=pts_time -of csv=p=0 "$pgs_out" 2>/dev/null | grep -E '^[0-9]' | head -1)"
+      if [[ -n "$pgs_off" && "$out_off" == "$pgs_off" ]]; then
+        pass "T11 PGS e2e: output first-sub PTS preserved ($out_off == source $pgs_off; no rebase)"
+      else
+        fail "T11 PGS e2e: first-sub PTS expected '$pgs_off', got '${out_off:-none}' (desync regression?)"
+      fi
+    else
+      fail "T11 PGS e2e: encode produced no output"
+    fi
+  fi
 
   # Basic encode with subs
   outfile="$TESTDIR/subs_test1.mkv"
@@ -10178,6 +10211,7 @@ test_unit() {
   _test_unit_sub_helpers
   _test_unit_sub_track_model
   _test_unit_sub_emitter
+  _test_unit_sub_plan_add_embed
   _test_unit_validation_helpers
   _test_unit_filesize
   _test_unit_sii_container_safety
@@ -10223,6 +10257,45 @@ test_unit() {
   _test_unit_mdry_loglevel_str
   _test_unit_l_disk_df_unavailable
   _test_unit_l_prepare_subtitle_workdir_gone
+}
+
+# Subs_Fix Phase 5: build_subtitle_plan's _sub_plan_add_embed routing — the
+# single-track desync fix at the model level. A preserved PGS bitmap (a .sup from an
+# embedded source) MUST become an embedded:N track (mapped from source by the
+# emitter — see T6), NOT a file: input (which mux_final would re-import as a
+# standalone .sup elementary stream, rebasing it to t=0). Converted/extracted files
+# and external sidecars stay file:. Combined with T6, this is the always-runnable
+# single-track desync guard (the e2e T11 is fixture-gated, see test_subs).
+_test_unit_sub_plan_add_embed() {
+  local body out
+  body="$(_extract_muxm_fns _sub_tracks_reset _sub_track_add _sub_track_count _sub_track_field _sub_plan_add_embed)" \
+    || { fail "sub-plan-add: could not extract _sub_plan_add_embed"; return; }
+  out="$(bash -c "$body"$'\n''
+    set -u
+    _sub_tracks_reset
+    # Preserved PGS bitmap (.sup, embedded source) → embedded:N (THE desync fix).
+    _sub_plan_add_embed embedded:3 /work/sub.3.sup eng "Full" full hdmv_pgs_subtitle
+    # Converted/extracted text file → file: input.
+    _sub_plan_add_embed embedded:0 /work/sub.0.srt eng English full subrip
+    # External sidecar → file: input.
+    _sub_plan_add_embed ext:/x/movie.en.srt /x/movie.en.srt spa "" full subrip
+    # Forced PGS preserved → embedded:N with forced disposition.
+    _sub_plan_add_embed embedded:1 /work/sub.1.sup eng "Forced" forced hdmv_pgs_subtitle
+    echo "n=$(_sub_track_count)"
+    echo "t0=$(_sub_track_field 0 kind):$(_sub_track_field 0 value):$(_sub_track_field 0 codec):$(_sub_track_field 0 disposition)"
+    echo "t1=$(_sub_track_field 1 kind):$(_sub_track_field 1 value)"
+    echo "t2=$(_sub_track_field 2 kind):$(_sub_track_field 2 value)"
+    echo "t3=$(_sub_track_field 3 kind):$(_sub_track_field 3 value):$(_sub_track_field 3 disposition)"
+  ' 2>&1)"
+  assert_contains "n=4" "sub-plan-add: four tracks recorded" "$out"
+  assert_contains "t0=embedded:3:hdmv_pgs_subtitle:0" \
+    "sub-plan-add: preserved PGS (.sup) → embedded:N from source (desync fix — no .sup -i)" "$out"
+  assert_contains "t1=file:/work/sub.0.srt" \
+    "sub-plan-add: extracted text file → file: input" "$out"
+  assert_contains "t2=file:/x/movie.en.srt" \
+    "sub-plan-add: external sidecar → file: input" "$out"
+  assert_contains "t3=embedded:1:forced" \
+    "sub-plan-add: forced PGS → embedded:N with forced disposition" "$out"
 }
 
 # Subs_Fix Phase 3: the shared subtitle emitter (_add_sub_stream + _emit_sub_tracks).
