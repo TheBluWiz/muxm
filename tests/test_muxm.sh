@@ -314,6 +314,32 @@ assert_contains() {
   fi
 }
 
+# Assert output does NOT contain string (fixed-string, case-insensitive).
+# Mirror of assert_contains; used by the subtitle command-shape guards (e.g.
+# "no per-track file round-trip", and the Phase-5 "no standalone .sup input").
+assert_not_contains() {
+  local needle="$1" label="$2" haystack="$3"
+  if grep -qiF -- "$needle" <<<"$haystack"; then
+    fail "$label — output unexpectedly contains: '$needle'"
+    (( VERBOSE )) && echo "    Output: ${haystack:0:300}" || true
+  else
+    pass "$label"
+  fi
+}
+
+# Extract muxm's assembled final-mux ffmpeg command from a --keep-log persisted
+# run log (<output>.muxm.log), normalizing absolute paths to basenames so the
+# command-shape assertions are stable across workdirs. This is the Phase-1
+# observability seam (mux_final logs "ffmpeg mux command: …"); Phases 4–5 assert
+# the unified emitter reproduces the frozen shape.
+# Usage: cmd="$(extract_mux_cmd "$logpath")"
+extract_mux_cmd() {
+  local logpath="$1"
+  [[ -f "$logpath" ]] || { echo ""; return 0; }
+  grep -aoE 'ffmpeg mux command:.*' "$logpath" | head -1 \
+    | sed -E 's#/[^[:space:]]*/([^/[:space:]]+)#\1#g'
+}
+
 # Assert output matches an extended regex (for anchored / exact-value checks
 # that fixed-string assert_contains cannot express, e.g. an empty config value).
 # Usage: assert_matches REGEX LABEL HAYSTACK
@@ -1041,6 +1067,29 @@ SRT
     -metadata:s:a:0 language=eng \
     "$TESTDIR/hevc_dv_p5_tagged.mp4"
   if [[ -s "$TESTDIR/hevc_dv_p5_tagged.mp4" ]]; then pass "hevc_dv_p5_tagged.mp4 created"; else fail "hevc_dv_p5_tagged.mp4 NOT created (missing or empty)"; fi
+
+  # 13) Non-zero-offset subtitle fixture (Subs_Fix T3). H.264 + AAC + a single
+  #     SRT track whose FIRST cue is at 5.000 s (all existing SRT fixtures start
+  #     at 00:00:00,000, so none can detect a timestamp rebase). Duration 8 s so
+  #     the cue fits. Used by the text-path sync assertion (T4) and, later, as the
+  #     template for the PGS desync e2e guard (T11).
+  log "Creating offset_subs.mkv (H.264 + AAC + SRT first cue @ 5.000 s)"
+  cat > "$TESTDIR/offset.srt" <<'SRT'
+1
+00:00:05,000 --> 00:00:07,000
+Offset subtitle line
+SRT
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=blue:s=320x240:r=24:d=8" \
+    -f lavfi -i "sine=frequency=440:duration=8" \
+    -i "$TESTDIR/offset.srt" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -c:a aac -b:a 128k -ac 2 \
+    -c:s srt \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:s:0 language=eng -metadata:s:s:0 title="English" \
+    "$TESTDIR/offset_subs.mkv"
+  if [[ -s "$TESTDIR/offset_subs.mkv" ]]; then pass "offset_subs.mkv created"; else fail "offset_subs.mkv NOT created (missing or empty)"; fi
 
   log "All extended test media ready in $TESTDIR"
 }
@@ -5775,6 +5824,80 @@ test_subs() {
   section "Subtitle Pipeline"
 
   local outfile out
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Phase 1 (Subs_Fix): observability seam + command-shape characterization.
+  # mux_final now logs "ffmpeg mux command: …"; with --keep-log that line is
+  # persisted to <output>.muxm.log and read back via extract_mux_cmd (paths
+  # normalized to basenames). T1–T4 FREEZE the current -i/-map/-c:s shape for the
+  # three representative subtitle paths so the later unification (Phases 4–5) can
+  # be proven equivalent, plus a non-zero-offset sync assertion proving the
+  # harness can detect a timestamp rebase.
+  # ───────────────────────────────────────────────────────────────────────────
+  local cz_cmd cz_log
+
+  # T1 + T2(single-text) + T4(sync): single-track text path.
+  # offset_subs.mkv carries ONE SRT track whose first cue is at 5.000 s. With the
+  # default profile (SUB_MULTI_TRACK=0) muxm extracts it to a workdir file and
+  # re-inputs it, converting to srt.
+  local cz_single="$TESTDIR/charz_single.mkv"
+  run_muxm --keep-log --output-ext mkv --crf 28 --preset ultrafast \
+    "$TESTDIR/offset_subs.mkv" "$cz_single" >/dev/null 2>&1
+  cz_log="$TESTDIR/charz_single.muxm.log"
+  cz_cmd="$(extract_mux_cmd "$cz_log")"
+  assert_contains "ffmpeg mux command:" \
+    "T1: mux_final logs its assembled ffmpeg command" "$cz_cmd"
+  assert_contains "-i sub.0.srt" \
+    "T2 single-text: subtitle taken from an extracted file input (sub.0.srt)" "$cz_cmd"
+  assert_contains "-map 2:s:0" \
+    "T2 single-text: subtitle mapped from the file input (-map 2:s:0)" "$cz_cmd"
+  assert_contains "-c:s:0 srt" \
+    "T2 single-text: subtitle codec is srt" "$cz_cmd"
+  # T4: text has no desync bug — first-sub PTS must survive at 5.000 s. A rebase
+  #     (the PGS bug class) would pull it to 0; this proves the probe can see it.
+  if [[ -f "$cz_single" ]]; then
+    local cz_pts
+    cz_pts="$(ffprobe -v error -select_streams s:0 -show_entries packet=pts_time \
+      -of csv=p=0 "$cz_single" 2>/dev/null | head -1)"
+    if [[ "$cz_pts" == "5.000000" ]]; then
+      pass "T4: text-path output preserves first-sub PTS at 5.000 s (no rebase)"
+    else
+      fail "T4: text-path first-sub PTS expected 5.000000, got '${cz_pts:-none}'"
+    fi
+  else
+    fail "T4: single-track characterization encode produced no output"
+  fi
+
+  # T2(multi): multi-track copy-from-source path. The archive profile enables
+  # SUB_MULTI_TRACK; multi_subs_multilang.mkv's 3 text subs (eng/spa/fra) are kept
+  # and mapped straight from the source input — the path Phase 4 cuts over.
+  local cz_multi="$TESTDIR/charz_multi.mkv"
+  run_muxm --keep-log --profile archive --crf 28 --preset ultrafast \
+    "$TESTDIR/multi_subs_multilang.mkv" "$cz_multi" >/dev/null 2>&1
+  cz_log="$TESTDIR/charz_multi.muxm.log"
+  cz_cmd="$(extract_mux_cmd "$cz_log")"
+  assert_contains "ffmpeg mux command:" \
+    "T1: mux_final logs its command (multi-track)" "$cz_cmd"
+  assert_contains "-i multi_subs_multilang.mkv" \
+    "T2 multi: subtitles sourced from the source input, not extracted files" "$cz_cmd"
+  assert_contains "-map 1:s:0 -map 1:s:1 -map 1:s:2" \
+    "T2 multi: all three subs mapped from the shared source input (1:s:0..2)" "$cz_cmd"
+  assert_contains "-c:s:0 copy" \
+    "T2 multi: subtitles stream-copied (-c:s:0 copy)" "$cz_cmd"
+  assert_not_contains "-i sub.0.srt" \
+    "T2 multi: no per-track file round-trip (no extracted sub.0.srt input)" "$cz_cmd"
+
+  # T2(ext): external sidecar path. ext_only_source.mkv has no embedded subs; its
+  # ext_only_source.en.srt sidecar is discovered and added as a file input.
+  local cz_ext="$TESTDIR/charz_ext.mkv"
+  run_muxm --keep-log --output-ext mkv --crf 28 --preset ultrafast \
+    "$TESTDIR/ext_only_source.mkv" "$cz_ext" >/dev/null 2>&1
+  cz_log="$TESTDIR/charz_ext.muxm.log"
+  cz_cmd="$(extract_mux_cmd "$cz_log")"
+  assert_contains "-i ext_only_source.en.srt" \
+    "T2 ext: external sidecar added as a file input" "$cz_cmd"
+  assert_contains "-c:s:0 srt" \
+    "T2 ext: sidecar tagged -c:s:0 srt" "$cz_cmd"
 
   # Basic encode with subs
   outfile="$TESTDIR/subs_test1.mkv"

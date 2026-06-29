@@ -11891,6 +11891,7 @@ mux_final() {
   fi
 
   # Execute final mux
+  log "ffmpeg mux command: ffmpeg ${ff_in[*]} ${ff_map[*]} ${ff_codec[*]} -f $MUX_FORMAT $TMP_OUT"
   ffmpeg "${ff_in[@]}" "${ff_map[@]}" "${ff_codec[@]}" -f "$MUX_FORMAT" "$TMP_OUT" 2>"$WORKDIR/mux.err" &
   local mux_pid=$!
   local _mux_ok=0; _await_tracked_pid "$mux_pid" "Muxing final ${OUTPUT_EXT^^}" || _mux_ok=$?
