@@ -7978,9 +7978,9 @@ declare -a AUDIO_MT_LANGS=()      # language tag per kept track
 declare -a AUDIO_MT_TITLES=()     # title tag per kept track (empty if unset)
 
 # Multi-track subtitles: when SUB_MULTI_TRACK=1, subtitle streams are mapped
-# directly from source in mux_final (no extraction, OCR, or conversion).
-# SUB_COPY_FROM_SOURCE is the runtime flag set by run_subtitle_pipeline_multi.
-declare -i SUB_COPY_FROM_SOURCE=0
+# directly from source by the unified emitter (no extraction, OCR, or conversion).
+# These SUB_MT_* arrays are populated by run_subtitle_pipeline_multi and retained
+# only for its log/report summaries; mux_final consumes the unified SUB_TRACKS_*.
 declare -a SUB_MT_INDICES=()      # 0-based embedded subtitle index per kept track (-1 for external)
 declare -a SUB_MT_SOURCES=()      # unified source per kept track ("embedded:N" or "ext:/path")
 declare -a SUB_MT_CODECS=()       # codec per kept track (e.g., subrip, hdmv_pgs_subtitle)
@@ -11288,10 +11288,9 @@ _build_subtitle_keep_list(){
 # External text subs are added as separate ffmpeg inputs in mux_final.
 #
 # Sets: SUB_TRACKS_* (the unified track list consumed by _emit_sub_tracks),
-#       SUB_COPY_FROM_SOURCE, SUB_MT_SOURCES[], SUB_MT_INDICES[], SUB_MT_CODECS[],
-#       SUB_MT_LANGS[], SUB_MT_TITLES[], SUB_MT_TYPES[] (legacy arrays kept only for
-#       the log/report summaries below), SRT_FORCED/FULL/SDH (cleared),
-#       DIRECT_SUB_RELIDX (cleared)
+#       SUB_MT_SOURCES[], SUB_MT_INDICES[], SUB_MT_CODECS[], SUB_MT_LANGS[],
+#       SUB_MT_TITLES[], SUB_MT_TYPES[] (legacy arrays kept only for the log/report
+#       summaries below), SRT_FORCED/FULL/SDH (cleared), DIRECT_SUB_RELIDX (cleared)
 # Globals: ALL_SUB_SOURCES[] (read), METADATA_CACHE (read)
 run_subtitle_pipeline_multi(){
   local keep_list
@@ -11299,7 +11298,6 @@ run_subtitle_pipeline_multi(){
 
   if [[ -z "$keep_list" ]]; then
     note "[Subs] Multi-track filter: no subtitle tracks survived filtering."
-    SUB_COPY_FROM_SOURCE=0
     return 0
   fi
 
@@ -11359,9 +11357,9 @@ run_subtitle_pipeline_multi(){
     # never burns or exports, so ROUTING is always embed.
     local _kind _value _disp
     if [[ "$src" == embedded:* ]]; then
-      _kind=embedded; _value="${src#embedded:}"
+      _kind="embedded"; _value="${src#embedded:}"
     else
-      _kind=file;     _value="${src#ext:}"
+      _kind="file";     _value="${src#ext:}"
     fi
     case "$stype" in
       forced) _disp=forced ;;
@@ -11370,8 +11368,6 @@ run_subtitle_pipeline_multi(){
     esac
     _sub_track_add "$_kind" "$_value" "$lang" "$title" "$stype" "$codec" "$_disp" embed
   done
-
-  SUB_COPY_FROM_SOURCE=1
 
   # Log summary: show all unified sources with ✓/✗ markers
   local n_total n_kept n_dropped

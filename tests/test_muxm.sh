@@ -10315,6 +10315,9 @@ _test_unit_sub_emitter() {
   # _sub_track_add lines. Echoes labeled ff_in/ff_map/ff_codec lines (2>&1 so a
   # die() abort surfaces as "DIE:<code>").
   local _emit_run
+  # shellcheck disable=SC2016  # single quotes are deliberate: this body is run LATER in a
+  # sub-bash (bash -c "$body"$'\n'"$_emit_run"), where $MF/$PTF/$SEED/$ADDS and the ff_*/
+  # SUB_TRACKS_* arrays must expand THERE — not in this scope.
   _emit_run='
     set -u
     die(){ echo "DIE:${1:-1}" >&2; exit "${1:-1}"; }
