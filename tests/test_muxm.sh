@@ -1091,6 +1091,37 @@ SRT
     "$TESTDIR/offset_subs.mkv"
   if [[ -s "$TESTDIR/offset_subs.mkv" ]]; then pass "offset_subs.mkv created"; else fail "offset_subs.mkv NOT created (missing or empty)"; fi
 
+  # 14) Multi-track MIXED source (Subs_Fix Phase 4): 1 embedded sub + 1 external
+  #     sidecar. Under a multi-track profile the external sidecar must be
+  #     stream-copied (-c:s copy) from a deduped -i input — the path the all-embedded
+  #     multi fixture (multi_subs_multilang.mkv) never exercised.
+  log "Creating mt_mixed_subs.mkv (1 embedded eng sub + external .es.srt sidecar)"
+  cat > "$TESTDIR/_mt_emb.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+Embedded English
+SRT
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=teal:s=320x240:r=24:d=2" \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -i "$TESTDIR/_mt_emb.srt" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -c:a aac -b:a 128k -ac 2 \
+    -c:s srt \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:s:0 language=eng \
+    "$TESTDIR/mt_mixed_subs.mkv"
+  cat > "$TESTDIR/mt_mixed_subs.es.srt" <<'SRT'
+1
+00:00:00,000 --> 00:00:02,000
+Subtítulo externo
+SRT
+  if [[ -s "$TESTDIR/mt_mixed_subs.mkv" && -s "$TESTDIR/mt_mixed_subs.es.srt" ]]; then
+    pass "mt_mixed_subs.mkv + sidecar created"
+  else
+    fail "mt_mixed_subs.mkv + sidecar NOT created (missing or empty)"
+  fi
+
   log "All extended test media ready in $TESTDIR"
 }
 
@@ -5899,6 +5930,23 @@ test_subs() {
   assert_contains "-c:s:0 srt" \
     "T2 ext: sidecar tagged -c:s:0 srt" "$cz_cmd"
 
+  # T10 (Phase 4): multi-track + external sidecar — the case the all-embedded multi
+  # fixture never exercised, and the one that exposed the wrong (extension-based) file
+  # codec rule. The external sidecar must be stream-copied (-c:s copy) from a deduped
+  # -i input, byte-equivalent to the pre-unification multi-track path.
+  local cz_mtext="$TESTDIR/charz_mtext.mkv"
+  run_muxm --keep-log --profile archive --crf 28 --preset ultrafast \
+    "$TESTDIR/mt_mixed_subs.mkv" "$cz_mtext" >/dev/null 2>&1
+  cz_cmd="$(extract_mux_cmd "$TESTDIR/charz_mtext.muxm.log")"
+  assert_contains "-i mt_mixed_subs.es.srt" \
+    "T10 multi+ext: external sidecar added as a file input" "$cz_cmd"
+  assert_contains "-map 1:s:0 -map 2:s:0" \
+    "T10 multi+ext: embedded from source (1:s:0) + external sidecar (2:s:0)" "$cz_cmd"
+  assert_contains "-c:s:0 copy -metadata:s:s:0 language=eng" \
+    "T10 multi+ext: embedded sub stream-copied" "$cz_cmd"
+  assert_contains "-c:s:1 copy -metadata:s:s:1 language=spa" \
+    "T10 multi+ext: external sidecar stream-COPIED, not re-encoded to srt (the bug guard)" "$cz_cmd"
+
   # Basic encode with subs
   outfile="$TESTDIR/subs_test1.mkv"
   log "Testing subtitle inclusion in MKV..."
@@ -10226,17 +10274,20 @@ _test_unit_sub_emitter() {
   assert_contains "CODEC: -c:s:0 copy -metadata:s:s:0 language=eng -metadata:s:s:0 title=Full -disposition:s:0 0 -c:s:1 copy -metadata:s:s:1 language=spa -metadata:s:s:1 title=Full -disposition:s:1 0 -c:s:2 copy -metadata:s:s:2 language=fra -metadata:s:s:2 title=Full -disposition:s:2 0" \
     "emitter[multi]: tagging fragment matches the Phase-1 frozen multi shape" "$out"
 
-  # ── Frozen SINGLE-TEXT shape (1 file sub.0.srt, full, source title "English";
-  #    MKV, file input at idx 2). ──
+  # ── Unified SINGLE-TEXT shape (1 file sub.0.srt, full, source title "English";
+  #    MKV, file input at idx 2). NOTE: the unified rule stream-copies a text file
+  #    (-c:s:0 copy) where the pre-unification single-track path emitted -c:s:0 srt.
+  #    Both yield identical subrip in MKV; single-track folds onto this in Phase 5,
+  #    at which point the Phase-1 frozen single assertion is updated copy←srt. ──
   out="$(MF=matroska PTF=1 SEED=2 ADDS='
     _sub_track_add file /work/sub.0.srt eng English full srt 0
   ' bash -c "$body"$'\n'"$_emit_run" 2>&1)"
   assert_contains "IN: -i /work/sub.0.srt" \
     "emitter[single-text]: file added as -i input" "$out"
   assert_contains "MAP: -map 2:s:0" \
-    "emitter[single-text]: file mapped at idx:s:0 (frozen shape)" "$out"
-  assert_contains "CODEC: -c:s:0 srt -metadata:s:s:0 language=eng -metadata:s:s:0 title=English -disposition:s:0 0" \
-    "emitter[single-text]: tagging fragment matches the Phase-1 frozen single shape" "$out"
+    "emitter[single-text]: file mapped at idx:s:0" "$out"
+  assert_contains "CODEC: -c:s:0 copy -metadata:s:s:0 language=eng -metadata:s:s:0 title=English -disposition:s:0 0" \
+    "emitter[single-text]: text file stream-copied + tagged (unified rule)" "$out"
 
   # ── T6 (core desync guard): embedded PGS bitmap ⇒ mapped from source, NEVER a
   #    standalone .sup input. This is the whole reason the refactor exists. ──

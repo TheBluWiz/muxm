@@ -8136,21 +8136,24 @@ _add_sub_stream() {
 # the video-burn and external-export paths). The output subtitle stream index is
 # function-local, so audio tagging downstream is untouched.
 #
-# Codec rule (folds the old _sub_codec_for_file + multi-track codec case into one):
-#   embedded (decide from the source codec name in SUB_TRACKS_CODEC):
-#     MKV     : ass/ssa → copy if SUB_PRESERVE_TEXT_FORMAT else srt; everything
-#               else (other text or bitmap) → copy (stream-copied from source).
-#     MP4/MOV : bitmap → die 12 (PGS/VobSub can't live in MP4); text → mov_text.
-#   file (decide from the file extension of SUB_TRACKS_VALUE — the extension already
-#         encodes the extract/convert/OCR decision made upstream):
-#     MKV     : ass/ssa → copy; sup → copy; else → srt.
-#     MP4/MOV : sup/idx → die 12; else → mov_text.
+# Codec rule — ONE decision for both modes, keyed on the track's EFFECTIVE codec
+# (SUB_TRACKS_CODEC = the codec of the data actually muxed: the source stream codec
+# for embedded tracks, the prepared-file codec for file tracks; both selectors set
+# it). This is the pre-unification multi-track codec case verbatim, so multi-track
+# output is identical by construction (Phase 4 populates SUB_TRACKS_CODEC from
+# SUB_MT_CODECS):
+#   MKV     : ass/ssa → copy if SUB_PRESERVE_TEXT_FORMAT else srt; everything else
+#             (other text or bitmap) → copy (stream-copied).
+#   MP4/MOV : text → mov_text; bitmap (PGS/VobSub) → die 12 (can't live in MP4).
+# (The old single-track _sub_codec_for_file emitted `srt` for a prepared text file;
+# the unified rule emits `copy` instead — identical subrip output in MKV, just a
+# different command token. Single-track folds onto this in Phase 5.)
 # Title + disposition derive from TYPE (forced→Forced/forced, sdh→SDH/
 # hearing_impaired, *→<Type>/0), a near-verbatim lift of the pre-unification
 # mux_final logic; SUB_TRACKS_DISPOSITION carries the same resolved value for a
 # self-describing model but the emitter is the single owner of the type→ rule.
 _emit_sub_tracks() {
-  local i n kind value lang title type codec oc ext label c
+  local i n kind value lang title type codec oc label c
   local -i out=0
   n=${#SUB_TRACKS_KIND[@]}
   for (( i=0; i<n; i++ )); do
@@ -8165,34 +8168,18 @@ _emit_sub_tracks() {
     # 1) input + -map
     _add_sub_stream "$kind" "$value"
 
-    # 2) output codec — one rule set
-    if [[ "$kind" == "embedded" ]]; then
-      c="${codec,,}"
-      if [[ "$MUX_FORMAT" == "matroska" ]]; then
-        case "$c" in
-          ass|ssa) if (( SUB_PRESERVE_TEXT_FORMAT )); then oc="copy"; else oc="srt"; fi ;;
-          *)       oc="copy" ;;
-        esac
+    # 2) output codec — ONE rule set, keyed on the track's effective codec
+    c="${codec,,}"
+    if [[ "$MUX_FORMAT" == "matroska" ]]; then
+      case "$c" in
+        ass|ssa) if (( SUB_PRESERVE_TEXT_FORMAT )); then oc="copy"; else oc="srt"; fi ;;
+        *)       oc="copy" ;;
+      esac
+    else
+      if _is_text_sub_codec "$c"; then
+        oc="mov_text"
       else
-        if _is_text_sub_codec "$c"; then
-          oc="mov_text"
-        else
-          die 12 "PGS/VobSub subtitles cannot be muxed into MP4/MOV; use MKV output or enable OCR."
-        fi
-      fi
-    else  # file
-      ext="${value##*.}"; ext="${ext,,}"
-      if [[ "$MUX_FORMAT" == "matroska" ]]; then
-        case "$ext" in
-          ass|ssa) oc="copy" ;;
-          sup)     oc="copy" ;;
-          *)       oc="srt" ;;
-        esac
-      else
-        case "$ext" in
-          sup|idx) die 12 "PGS/VobSub subtitles cannot be muxed into MP4/MOV; use MKV output or enable OCR." ;;
-          *)       oc="mov_text" ;;
-        esac
+        die 12 "PGS/VobSub subtitles cannot be muxed into MP4/MOV; use MKV output or enable OCR."
       fi
     fi
     ff_codec+=( "-c:s:${out}" "$oc" )
@@ -11339,6 +11326,11 @@ run_subtitle_pipeline_multi(){
   SUB_MT_TITLES=()
   SUB_MT_TYPES=()
 
+  # Subs_Fix Phase 4: also populate the unified SUB_TRACKS_* model so mux_final can
+  # render every kept track through the shared _emit_sub_tracks emitter. The legacy
+  # SUB_MT_* arrays are retained for the multi-track log/report summaries below.
+  _sub_tracks_reset
+
   local uidx
   for uidx in $keep_list; do
     local src="${ALL_SUB_SOURCES[$uidx]}"
@@ -11358,6 +11350,23 @@ run_subtitle_pipeline_multi(){
     SUB_MT_LANGS+=("$lang")
     SUB_MT_TITLES+=("$title")
     SUB_MT_TYPES+=("$stype")
+
+    # Mirror into the unified model. KIND/VALUE: embedded:N → map from source;
+    # ext:/path → file input. CODEC is the source-stream codec (the effective codec,
+    # since multi-track stream-copies). DISPOSITION derives from type. Multi-track
+    # never burns or exports, so ROUTING is always embed.
+    local _kind _value _disp
+    if [[ "$src" == embedded:* ]]; then
+      _kind=embedded; _value="${src#embedded:}"
+    else
+      _kind=file;     _value="${src#ext:}"
+    fi
+    case "$stype" in
+      forced) _disp=forced ;;
+      sdh)    _disp=hearing_impaired ;;
+      *)      _disp=0 ;;
+    esac
+    _sub_track_add "$_kind" "$_value" "$lang" "$title" "$stype" "$codec" "$_disp" embed
   done
 
   SUB_COPY_FROM_SOURCE=1
@@ -11755,46 +11764,11 @@ mux_final() {
     fi
   fi
 
-  # Add subtitle streams — multi-track or single-track
-  if (( ! SKIP_SUBS )) && (( SUB_COPY_FROM_SOURCE )) && (( ${#SUB_MT_SOURCES[@]} > 0 )); then
-    # Multi-track mode: embedded streams reuse the shared source input;
-    # external files each get their own -i input (deduplicated by path).
-
-    # Determine if any embedded subtitle streams are in the kept list
-    local _has_emb_mt_subs=0
-    local _chk_src
-    for _chk_src in "${SUB_MT_SOURCES[@]}"; do
-      [[ "$_chk_src" == embedded:* ]] && { _has_emb_mt_subs=1; break; }
-    done
-
-    # Add source as input if needed (shared with video/audio)
-    if (( _has_emb_mt_subs )) && [[ -z "$_src_input_idx" ]]; then
-      ff_in+=( -i "$SRC_ABS" )
-      _src_input_idx=$next_idx
-      next_idx=$(( next_idx + 1 ))
-    fi
-
-    # Add unique external subtitle files as separate ffmpeg inputs
-    local _mt_src
-    for _mt_src in "${SUB_MT_SOURCES[@]}"; do
-      if [[ "$_mt_src" == ext:* ]]; then
-        local _ep="${_mt_src#ext:}"
-        # Check whether this path has already been registered
-        local _ep_found=0 _epk
-        for (( _epk=0; _epk<${#_ext_sub_paths[@]}; _epk++ )); do
-          [[ "${_ext_sub_paths[$_epk]}" == "$_ep" ]] && { _ep_found=1; break; }
-        done
-        if (( ! _ep_found )); then
-          ff_in+=( -i "$_ep" )
-          _ext_sub_paths+=("$_ep")
-          _ext_sub_idxs+=("$next_idx")
-          next_idx=$(( next_idx + 1 ))
-        fi
-      fi
-    done
-    # Stream mapping and codec tagging handled below in the multi-track subtitle section.
-  elif (( ! SKIP_SUBS )); then
-    # Single-track: use prepared subtitle files
+  # Add subtitle streams.
+  # Multi-track (SUB_COPY_FROM_SOURCE): inputs are registered by _emit_sub_tracks
+  # below (via _add_sub_stream), so there is nothing to register here.
+  # Single-track: use the prepared subtitle files.
+  if (( ! SKIP_SUBS )) && (( ! SUB_COPY_FROM_SOURCE )); then
     if [[ -n "${SRT_FORCED:-}" && -s "$SRT_FORCED" ]]; then
       ff_in+=( -i "$SRT_FORCED" )
       s_forced_idx=$next_idx
@@ -11843,31 +11817,10 @@ mux_final() {
     [[ -n "$a_stereo_idx"  ]] && ff_map+=( -map "$a_stereo_idx":a:0 )
   fi
 
-  # Subtitle mapping: multi-track (mixed embedded/external) or single-track from files
-  if (( SUB_COPY_FROM_SOURCE )) && (( ${#SUB_MT_SOURCES[@]} > 0 )); then
-    local _mt_si
-    for (( _mt_si=0; _mt_si<${#SUB_MT_SOURCES[@]}; _mt_si++ )); do
-      local _mt_src="${SUB_MT_SOURCES[$_mt_si]}"
-      if [[ "$_mt_src" == embedded:* ]]; then
-        # _emb_idx is the 0-based subtitle-stream-relative index as assigned by
-        # merge_subtitle_sources (which iterates 0..sub_count-1).  ffmpeg's :s:N
-        # selector also uses the subtitle-relative index, so no remapping is needed.
-        local _emb_idx="${_mt_src#embedded:}"
-        ff_map+=( -map "${_src_input_idx}:s:${_emb_idx}" )
-      else
-        # External file: find the pre-registered ffmpeg input index
-        local _ep="${_mt_src#ext:}"
-        local _found_eidx="" _epk
-        for (( _epk=0; _epk<${#_ext_sub_paths[@]}; _epk++ )); do
-          [[ "${_ext_sub_paths[$_epk]}" == "$_ep" ]] && { _found_eidx="${_ext_sub_idxs[$_epk]}"; break; }
-        done
-        # L (Phase 5): defense-in-depth — the loop always matches today, but an empty index here
-        # would emit a malformed `-map :s:0`. Fail loudly rather than ship a corrupt ffmpeg command.
-        [[ -n "$_found_eidx" ]] || die 41 "Internal error: external subtitle '$_ep' has no registered ffmpeg input index — cannot map it. Please report this."
-        ff_map+=( -map "${_found_eidx}:s:0" )
-      fi
-    done
-  else
+  # Subtitle mapping: multi-track is emitted by _emit_sub_tracks below (it appends
+  # both the -i inputs and their -map entries). Here we handle only single-track
+  # (prepared files + optional direct-map from source).
+  if (( ! SUB_COPY_FROM_SOURCE )); then
     (( forced_present )) && ff_map+=( -map "$s_forced_idx":s:0 )
     (( full_present   )) && ff_map+=( -map "$s_full_idx":s:0 )
     (( sdh_present    )) && ff_map+=( -map "$s_sdh_idx":s:0 )
@@ -11903,65 +11856,11 @@ mux_final() {
   # Subtitle metadata: language, title, disposition, and per-stream codec tagging.
   # Output subtitle index tracks which output stream we're tagging.
   local -i out_s_idx=0
-  if (( SUB_COPY_FROM_SOURCE )) && (( ${#SUB_MT_SOURCES[@]} > 0 )); then
-    # Multi-track: tag each kept subtitle stream copied from source
-    local _mt_si
-    for (( _mt_si=0; _mt_si<${#SUB_MT_INDICES[@]}; _mt_si++ )); do
-      local _mt_slang="${SUB_MT_LANGS[$_mt_si]}"
-      local _mt_stitle="${SUB_MT_TITLES[$_mt_si]}"
-      local _mt_stype="${SUB_MT_TYPES[$_mt_si]}"
-
-      # Codec: copy by default; convert ASS/SSA when SUB_PRESERVE_TEXT_FORMAT=0
-      # or when the container can't carry ASS (MP4/MOV).
-      local _mt_scodec="${SUB_MT_CODECS[$_mt_si]}"
-      case "$_mt_scodec" in
-        ass|ssa)
-          if (( SUB_PRESERVE_TEXT_FORMAT )) && [[ "$MUX_FORMAT" == "matroska" ]]; then
-            ff_codec+=( "-c:s:${out_s_idx}" copy )
-          elif [[ "$MUX_FORMAT" == "matroska" ]]; then
-            ff_codec+=( "-c:s:${out_s_idx}" srt )
-          else
-            ff_codec+=( "-c:s:${out_s_idx}" mov_text )
-          fi
-          ;;
-        *)
-          if [[ "$MUX_FORMAT" == "matroska" ]]; then
-            ff_codec+=( "-c:s:${out_s_idx}" copy )
-          else
-            # MP4/MOV: plain-text subs (subrip/webvtt/mov_text) must convert to mov_text —
-            # `copy` of a subrip stream into MP4 fails ("Subtitle codec ... not supported").
-            # Bitmap subs (PGS/VobSub) never reach here for MP4: _build_subtitle_keep_list
-            # drops them and the multi-track pre-encode safety check hard-stops on them.
-            ff_codec+=( "-c:s:${out_s_idx}" mov_text )
-          fi
-          ;;
-      esac
-
-      # Language
-      [[ -n "$_mt_slang" ]] && ff_codec+=( "-metadata:s:s:${out_s_idx}" "language=$_mt_slang" )
-
-      # Title: preserve source title if present, otherwise use type label
-      if [[ -n "$_mt_stitle" ]]; then
-        ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$_mt_stitle" )
-      else
-        # Capitalize first letter: forced→Forced, full→Full, sdh→SDH
-        local _mt_type_label
-        case "$_mt_stype" in
-          sdh) _mt_type_label="SDH" ;;
-          *)   _mt_type_label="${_mt_stype^}" ;;
-        esac
-        ff_codec+=( "-metadata:s:s:${out_s_idx}" "title=$_mt_type_label" )
-      fi
-
-      # Disposition from type
-      case "$_mt_stype" in
-        forced) ff_codec+=( "-disposition:s:${out_s_idx}" forced ) ;;
-        sdh)    ff_codec+=( "-disposition:s:${out_s_idx}" hearing_impaired ) ;;
-        *)      ff_codec+=( "-disposition:s:${out_s_idx}" 0 ) ;;
-      esac
-
-      out_s_idx=$(( out_s_idx + 1 ))
-    done
+  if (( SUB_COPY_FROM_SOURCE )); then
+    # Multi-track: the unified emitter registers the inputs, emits the -map entries,
+    # and tags every kept subtitle track from the source in one pass (Subs_Fix
+    # Phase 4). It keeps its own output-stream index, so out_s_idx is unused here.
+    _emit_sub_tracks
   else
     # Single-track: hardcoded forced/full/sdh slots
     if (( forced_present )); then
