@@ -8073,6 +8073,155 @@ _sub_track_field() {
   esac
 }
 
+# ── Shared subtitle emitter (Subs_Fix Phase 3) ──────────────────────────────
+# The one place that turns chosen subtitle tracks into ffmpeg input/-map/-c:s/
+# metadata/disposition arguments, for BOTH single- and multi-track modes. Built
+# and unit-tested here; mux_final is wired to call _emit_sub_tracks in Phases 4–5
+# (multi first, then single). These functions mutate the mux_final-scoped arrays
+# and counters: ff_in, ff_map, ff_codec, next_idx, _src_input_idx, _ext_sub_paths,
+# _ext_sub_idxs (bash dynamic scope — they are mux_final locals at call time).
+
+# _add_sub_stream KIND VALUE — register one subtitle track's ffmpeg input and
+# append its -map to ff_map. The desync fix lives here: an "embedded" track is
+# mapped straight from the source input ("$_src_input_idx:s:VALUE"), never written
+# to a standalone .sup elementary stream and re-imported (which, without -copyts,
+# rebased its first cue to t=0).
+#
+#   KIND=embedded — VALUE is the 0-based subtitle-relative stream index in the
+#     source. Registers SRC_ABS as a shared input ONCE (idempotent via
+#     _src_input_idx, shared with video-copy / audio-copy) and maps
+#     "$_src_input_idx:s:VALUE".
+#   KIND=file — VALUE is a path (workdir OCR/converted file or external sidecar).
+#     Added as a DEDUPLICATED -i input (same path reused, not re-added) and mapped
+#     as "$idx:s:0".
+#
+# Out-of-scope (Subs_Fix.md §8): embedded subs are mapped without -copyts, so a
+# source whose container start_time != 0 leaves the same small residual offset the
+# multi-track path already has today — deliberately not compensated here.
+_add_sub_stream() {
+  local kind="$1" value="$2"
+  case "$kind" in
+    embedded)
+      if [[ -z "$_src_input_idx" ]]; then
+        ff_in+=( -i "$SRC_ABS" )
+        _src_input_idx=$next_idx
+        next_idx=$(( next_idx + 1 ))
+      fi
+      ff_map+=( -map "${_src_input_idx}:s:${value}" )
+      ;;
+    file)
+      local idx="" k
+      for (( k=0; k<${#_ext_sub_paths[@]}; k++ )); do
+        [[ "${_ext_sub_paths[$k]}" == "$value" ]] && { idx="${_ext_sub_idxs[$k]}"; break; }
+      done
+      if [[ -z "$idx" ]]; then
+        ff_in+=( -i "$value" )
+        idx=$next_idx
+        _ext_sub_paths+=( "$value" )
+        _ext_sub_idxs+=( "$idx" )
+        next_idx=$(( next_idx + 1 ))
+      fi
+      ff_map+=( -map "${idx}:s:0" )
+      ;;
+    *)
+      die 41 "Internal error: _add_sub_stream: unknown subtitle source kind '$kind' (expected 'embedded' or 'file'). Please report this."
+      ;;
+  esac
+}
+
+# _emit_sub_tracks — the single subtitle emitter. Iterates the unified SUB_TRACKS_*
+# list and, for every ROUTING=embed track, appends its input + -map (via
+# _add_sub_stream) and its -c:s / language / title / disposition to ff_codec using
+# ONE rule set for both modes. ROUTING=burn / =export tracks are skipped (handled by
+# the video-burn and external-export paths). The output subtitle stream index is
+# function-local, so audio tagging downstream is untouched.
+#
+# Codec rule (folds the old _sub_codec_for_file + multi-track codec case into one):
+#   embedded (decide from the source codec name in SUB_TRACKS_CODEC):
+#     MKV     : ass/ssa → copy if SUB_PRESERVE_TEXT_FORMAT else srt; everything
+#               else (other text or bitmap) → copy (stream-copied from source).
+#     MP4/MOV : bitmap → die 12 (PGS/VobSub can't live in MP4); text → mov_text.
+#   file (decide from the file extension of SUB_TRACKS_VALUE — the extension already
+#         encodes the extract/convert/OCR decision made upstream):
+#     MKV     : ass/ssa → copy; sup → copy; else → srt.
+#     MP4/MOV : sup/idx → die 12; else → mov_text.
+# Title + disposition derive from TYPE (forced→Forced/forced, sdh→SDH/
+# hearing_impaired, *→<Type>/0), a near-verbatim lift of the pre-unification
+# mux_final logic; SUB_TRACKS_DISPOSITION carries the same resolved value for a
+# self-describing model but the emitter is the single owner of the type→ rule.
+_emit_sub_tracks() {
+  local i n kind value lang title type codec oc ext label c
+  local -i out=0
+  n=${#SUB_TRACKS_KIND[@]}
+  for (( i=0; i<n; i++ )); do
+    [[ "${SUB_TRACKS_ROUTING[$i]}" == "embed" ]] || continue
+    kind="${SUB_TRACKS_KIND[$i]}"
+    value="${SUB_TRACKS_VALUE[$i]}"
+    lang="${SUB_TRACKS_LANG[$i]}"
+    title="${SUB_TRACKS_TITLE[$i]}"
+    type="${SUB_TRACKS_TYPE[$i]}"
+    codec="${SUB_TRACKS_CODEC[$i]}"
+
+    # 1) input + -map
+    _add_sub_stream "$kind" "$value"
+
+    # 2) output codec — one rule set
+    if [[ "$kind" == "embedded" ]]; then
+      c="${codec,,}"
+      if [[ "$MUX_FORMAT" == "matroska" ]]; then
+        case "$c" in
+          ass|ssa) if (( SUB_PRESERVE_TEXT_FORMAT )); then oc="copy"; else oc="srt"; fi ;;
+          *)       oc="copy" ;;
+        esac
+      else
+        if _is_text_sub_codec "$c"; then
+          oc="mov_text"
+        else
+          die 12 "PGS/VobSub subtitles cannot be muxed into MP4/MOV; use MKV output or enable OCR."
+        fi
+      fi
+    else  # file
+      ext="${value##*.}"; ext="${ext,,}"
+      if [[ "$MUX_FORMAT" == "matroska" ]]; then
+        case "$ext" in
+          ass|ssa) oc="copy" ;;
+          sup)     oc="copy" ;;
+          *)       oc="srt" ;;
+        esac
+      else
+        case "$ext" in
+          sup|idx) die 12 "PGS/VobSub subtitles cannot be muxed into MP4/MOV; use MKV output or enable OCR." ;;
+          *)       oc="mov_text" ;;
+        esac
+      fi
+    fi
+    ff_codec+=( "-c:s:${out}" "$oc" )
+
+    # 3) language
+    [[ -n "$lang" ]] && ff_codec+=( "-metadata:s:s:${out}" "language=$lang" )
+
+    # 4) title — source title if present, else capitalized type label
+    if [[ -n "$title" ]]; then
+      ff_codec+=( "-metadata:s:s:${out}" "title=$title" )
+    else
+      case "$type" in
+        sdh) label="SDH" ;;
+        *)   label="${type^}" ;;
+      esac
+      ff_codec+=( "-metadata:s:s:${out}" "title=$label" )
+    fi
+
+    # 5) disposition — derived from type
+    case "$type" in
+      forced) ff_codec+=( "-disposition:s:${out}" forced ) ;;
+      sdh)    ff_codec+=( "-disposition:s:${out}" hearing_impaired ) ;;
+      *)      ff_codec+=( "-disposition:s:${out}" 0 ) ;;
+    esac
+
+    out=$(( out + 1 ))
+  done
+}
+
 # External subtitle discovery (populated by discover_external_subtitles)
 declare -a EXT_SUB_PATHS=()       # absolute paths to discovered external subtitle files
 declare -a EXT_SUB_LANGS=()       # language codes parsed from filename segments

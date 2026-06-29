@@ -10129,6 +10129,7 @@ test_unit() {
   _test_unit_audio_helpers
   _test_unit_sub_helpers
   _test_unit_sub_track_model
+  _test_unit_sub_emitter
   _test_unit_validation_helpers
   _test_unit_filesize
   _test_unit_sii_container_safety
@@ -10174,6 +10175,170 @@ test_unit() {
   _test_unit_mdry_loglevel_str
   _test_unit_l_disk_df_unavailable
   _test_unit_l_prepare_subtitle_workdir_gone
+}
+
+# Subs_Fix Phase 3: the shared subtitle emitter (_add_sub_stream + _emit_sub_tracks).
+# Built but not yet wired into mux_final. Driven by extraction: declare the
+# mux_final-scoped arrays/counters the emitter mutates (ff_in ff_map ff_codec
+# next_idx _src_input_idx _ext_sub_paths _ext_sub_idxs) and the globals it reads
+# (SRC_ABS MUX_FORMAT SUB_PRESERVE_TEXT_FORMAT), populate SUB_TRACKS_* like the
+# selectors will, run _emit_sub_tracks, and assert the emitted ff_* fragments.
+# The headline guard is T6 (embedded bitmap ⇒ map from source, never a .sup input).
+_test_unit_sub_emitter() {
+  local body
+  body="$(_extract_muxm_fns _sub_tracks_reset _sub_track_add _add_sub_stream _emit_sub_tracks _is_text_sub_codec)" \
+    || { fail "sub-emitter: could not extract emitter helpers"; return; }
+
+  # Run a scenario in one subshell. $1 = MUX_FORMAT, $2 = SUB_PRESERVE_TEXT_FORMAT,
+  # $3 = next_idx seed (simulates inputs video/audio already consumed), $4 = the
+  # _sub_track_add lines. Echoes labeled ff_in/ff_map/ff_codec lines (2>&1 so a
+  # die() abort surfaces as "DIE:<code>").
+  local _emit_run
+  _emit_run='
+    set -u
+    die(){ echo "DIE:${1:-1}" >&2; exit "${1:-1}"; }
+    MUX_FORMAT="$MF"; SUB_PRESERVE_TEXT_FORMAT="$PTF"; SRC_ABS="/src.mkv"
+    ff_in=(); ff_map=(); ff_codec=(); next_idx="$SEED"; _src_input_idx=""
+    _ext_sub_paths=(); _ext_sub_idxs=()
+    _sub_tracks_reset
+    eval "$ADDS"
+    _emit_sub_tracks
+    echo "IN: ${ff_in[*]}"
+    echo "MAP: ${ff_map[*]}"
+    echo "CODEC: ${ff_codec[*]}"
+  '
+  local out
+
+  # ── Frozen MULTI shape (archive: 3 embedded subrip, eng/spa/fra, full, no source
+  #    title → "Full" label; MKV, src registered at input idx 1). Must equal the
+  #    Phase-1 captured multi-track sub fragment token-for-token. ──
+  out="$(MF=matroska PTF=1 SEED=1 ADDS='
+    _sub_track_add embedded 0 eng "" full subrip 0
+    _sub_track_add embedded 1 spa "" full subrip 0
+    _sub_track_add embedded 2 fra "" full subrip 0
+  ' bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "IN: -i /src.mkv" \
+    "emitter[multi]: one shared source input (idempotent registration)" "$out"
+  assert_not_contains "-i /src.mkv -i /src.mkv" \
+    "emitter[multi]: source input not added per-track" "$out"
+  assert_contains "MAP: -map 1:s:0 -map 1:s:1 -map 1:s:2" \
+    "emitter[multi]: all subs mapped from the shared source input (frozen shape)" "$out"
+  assert_contains "CODEC: -c:s:0 copy -metadata:s:s:0 language=eng -metadata:s:s:0 title=Full -disposition:s:0 0 -c:s:1 copy -metadata:s:s:1 language=spa -metadata:s:s:1 title=Full -disposition:s:1 0 -c:s:2 copy -metadata:s:s:2 language=fra -metadata:s:s:2 title=Full -disposition:s:2 0" \
+    "emitter[multi]: tagging fragment matches the Phase-1 frozen multi shape" "$out"
+
+  # ── Frozen SINGLE-TEXT shape (1 file sub.0.srt, full, source title "English";
+  #    MKV, file input at idx 2). ──
+  out="$(MF=matroska PTF=1 SEED=2 ADDS='
+    _sub_track_add file /work/sub.0.srt eng English full srt 0
+  ' bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "IN: -i /work/sub.0.srt" \
+    "emitter[single-text]: file added as -i input" "$out"
+  assert_contains "MAP: -map 2:s:0" \
+    "emitter[single-text]: file mapped at idx:s:0 (frozen shape)" "$out"
+  assert_contains "CODEC: -c:s:0 srt -metadata:s:s:0 language=eng -metadata:s:s:0 title=English -disposition:s:0 0" \
+    "emitter[single-text]: tagging fragment matches the Phase-1 frozen single shape" "$out"
+
+  # ── T6 (core desync guard): embedded PGS bitmap ⇒ mapped from source, NEVER a
+  #    standalone .sup input. This is the whole reason the refactor exists. ──
+  out="$(MF=matroska PTF=1 SEED=1 ADDS='
+    _sub_track_add embedded 0 eng "" full hdmv_pgs_subtitle 0
+  ' bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "MAP: -map 1:s:0" \
+    "T6: embedded PGS mapped from source (-map src:s:N)" "$out"
+  assert_contains "IN: -i /src.mkv" \
+    "T6: embedded PGS uses the source input" "$out"
+  assert_not_contains ".sup" \
+    "T6: embedded PGS produces NO standalone .sup input (desync cannot recur)" "$out"
+  assert_contains "CODEC: -c:s:0 copy" \
+    "T6: embedded PGS stream-copied in MKV" "$out"
+
+  # ── file: dedup — same path twice ⇒ ONE -i input, TWO -map idx:s:0. ──
+  out="$(MF=matroska PTF=1 SEED=2 ADDS='
+    _sub_track_add file /work/dup.srt eng "A" full srt 0
+    _sub_track_add file /work/dup.srt eng "B" full srt 0
+  ' bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "IN: -i /work/dup.srt" \
+    "emitter[dedup]: duplicated file path registered" "$out"
+  assert_not_contains "-i /work/dup.srt -i /work/dup.srt" \
+    "emitter[dedup]: duplicated file path added only ONCE" "$out"
+  assert_contains "MAP: -map 2:s:0 -map 2:s:0" \
+    "emitter[dedup]: both tracks map the same deduped input idx:s:0" "$out"
+
+  # ── file: distinct paths ⇒ TWO -i inputs at consecutive indices. ──
+  out="$(MF=matroska PTF=1 SEED=2 ADDS='
+    _sub_track_add file /work/a.srt eng "A" full srt 0
+    _sub_track_add file /work/b.srt spa "B" full srt 0
+  ' bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "IN: -i /work/a.srt -i /work/b.srt" \
+    "emitter[distinct]: two distinct file paths each added as -i" "$out"
+  assert_contains "MAP: -map 2:s:0 -map 3:s:0" \
+    "emitter[distinct]: distinct files mapped at consecutive input indices" "$out"
+
+  # ── source idempotency: embedded + file + embedded ⇒ ONE -i SRC, file interleaved. ──
+  out="$(MF=matroska PTF=1 SEED=1 ADDS='
+    _sub_track_add embedded 0 eng "" full subrip 0
+    _sub_track_add file /work/x.srt spa "X" full srt 0
+    _sub_track_add embedded 1 fra "" full subrip 0
+  ' bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "IN: -i /src.mkv -i /work/x.srt" \
+    "emitter[idempotent]: source added once, file once, in registration order" "$out"
+  assert_contains "MAP: -map 1:s:0 -map 2:s:0 -map 1:s:1" \
+    "emitter[idempotent]: both embedded tracks share source idx 1; file at idx 2" "$out"
+
+  # ── Tagging matrix: disposition + title-label from TYPE. ──
+  out="$(MF=matroska PTF=1 SEED=1 ADDS='
+    _sub_track_add embedded 0 eng "" forced subrip forced
+    _sub_track_add embedded 1 eng "" sdh    subrip hearing_impaired
+    _sub_track_add embedded 2 eng "" full   subrip 0
+  ' bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "title=Forced -disposition:s:0 forced" \
+    "emitter[matrix]: type forced → title Forced + disposition forced" "$out"
+  assert_contains "title=SDH -disposition:s:1 hearing_impaired" \
+    "emitter[matrix]: type sdh → title SDH + disposition hearing_impaired" "$out"
+  assert_contains "title=Full -disposition:s:2 0" \
+    "emitter[matrix]: type full → title Full + disposition 0" "$out"
+
+  # ── Title fallback: a source title overrides the type label. ──
+  out="$(MF=matroska PTF=1 SEED=1 ADDS='
+    _sub_track_add embedded 0 eng "Director Commentary" full subrip 0
+  ' bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "title=Director Commentary" \
+    "emitter[matrix]: non-empty source title wins over the type label" "$out"
+
+  # ── Codec matrix: ASS preserve vs convert; MP4 text → mov_text. ──
+  out="$(MF=matroska PTF=1 SEED=1 ADDS='_sub_track_add embedded 0 eng "" full ass 0' \
+    bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "CODEC: -c:s:0 copy" \
+    "emitter[codec]: embedded ASS in MKV with preserve=1 → copy" "$out"
+  out="$(MF=matroska PTF=0 SEED=1 ADDS='_sub_track_add embedded 0 eng "" full ass 0' \
+    bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "CODEC: -c:s:0 srt" \
+    "emitter[codec]: embedded ASS in MKV with preserve=0 → srt" "$out"
+  out="$(MF=mp4 PTF=1 SEED=1 ADDS='_sub_track_add embedded 0 eng "" full subrip 0' \
+    bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "CODEC: -c:s:0 mov_text" \
+    "emitter[codec]: embedded text into MP4 → mov_text" "$out"
+
+  # ── MP4/MOV bitmap hard-stop preserved: embedded PGS into MP4 ⇒ die 12. ──
+  # The stub die() exits 12, so the command substitution exits nonzero; `|| true`
+  # keeps that intentional abort from tripping the harness's set -e.
+  out="$(MF=mp4 PTF=1 SEED=1 ADDS='_sub_track_add embedded 0 eng "" full hdmv_pgs_subtitle 0' \
+    bash -c "$body"$'\n'"$_emit_run" 2>&1)" || true
+  assert_contains "DIE:12" \
+    "emitter[safety]: embedded bitmap into MP4 hard-stops (die 12)" "$out"
+
+  # ── ROUTING: burn/export tracks are skipped by the emitter. ──
+  out="$(MF=matroska PTF=1 SEED=1 ADDS='
+    _sub_track_add embedded 0 eng "" forced subrip forced burn
+    _sub_track_add file /work/exp.srt spa "X" full srt 0 export
+    _sub_track_add embedded 1 eng "" full subrip 0 embed
+  ' bash -c "$body"$'\n'"$_emit_run" 2>&1)"
+  assert_contains "MAP: -map 1:s:1" \
+    "emitter[routing]: only the embed track is emitted (burn/export skipped)" "$out"
+  assert_not_contains "/work/exp.srt" \
+    "emitter[routing]: export track not added as an input" "$out"
+  assert_not_contains "-map 1:s:0" \
+    "emitter[routing]: burn track not mapped into the container" "$out"
 }
 
 # Subs_Fix Phase 2: the unified subtitle track-list model (SUB_TRACKS_* parallel
