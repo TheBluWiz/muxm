@@ -1786,9 +1786,6 @@ test_toggles() {
     "--no-sub-sole-ext-fallback|SUB_SOLE_EXT_FALLBACK     = 0"
     # ---- Conservative VBV positive toggle ----
     "--conservative-vbv|CONSERVATIVE_VBV          = 1"
-    # ---- Profile comment toggles ----
-    "--profile-comment|PROFILE_COMMENT           = 1"
-    "--no-profile-comment|PROFILE_COMMENT           = 0"
     # ---- SDH subtitle inclusion toggle ----
     "--no-sub-sdh|SUB_INCLUDE_SDH           = 0"
     # ---- Hardware acceleration allow-sw toggles ----

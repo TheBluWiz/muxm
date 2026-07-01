@@ -1415,14 +1415,14 @@ readonly CONFIG_TRACKED_VARS=(
   SUB_MULTI_TRACK
   SUB_PRESERVE_BITMAP SUB_OCR_LANG EXT_SUB_ENABLED SUB_SOLE_EXT_FALLBACK DISK_CHECK FFPROBE_LOGLEVEL
   SUB_ENABLE_OCR SUB_OCR_TOOL
-  OUTPUT_EXT KEEP_CHAPTERS STRIP_METADATA PROFILE_COMMENT INCLUDE_AUDIO_TITLES
+  OUTPUT_EXT KEEP_CHAPTERS STRIP_METADATA INCLUDE_AUDIO_TITLES
   CHECKSUM CHECKSUM_ALGO SKIP_IF_IDEAL REPORT_JSON
   FFMPEG_LOGLEVEL
   # L3: vars previously emitted as hardcoded literals in the config template — tracked here
   # so _create_config_emit emits their live defaults (no drift from the Section-4 values).
   AUDIO_SCORE_CHANNEL_MULTIPLIER AUDIO_SCORE_SURROUND_BONUS AUDIO_SCORE_LANG_BONUS AUDIO_SCORE_COMMENTARY_PENALTY
   TAG_LANGUAGE_DEFAULT DISK_FREE_WARN_GB TONEMAP_FILTER
-  DRY_RUN KEEP_TEMP KEEP_TEMP_ALWAYS KEEP_LOG VERBOSITY REPLACE_SOURCE FORCE_REPLACE_SOURCE
+  KEEP_TEMP KEEP_TEMP_ALWAYS KEEP_LOG VERBOSITY REPLACE_SOURCE FORCE_REPLACE_SOURCE
   FFMPEG_HIDE_BANNER FFMPEG_OVERWRITE
 )
 
@@ -3975,9 +3975,6 @@ HEADER
   echo "# Strip non-essential metadata from output"
   _V STRIP_METADATA
   printf '\n'
-  echo "# Embed profile tagline in container comment metadata (on by default when a profile is active)"
-  _V PROFILE_COMMENT
-  printf '\n'
   echo "# Default language tag for streams missing language metadata"
   _V TAG_LANGUAGE_DEFAULT
   printf '\n'
@@ -3995,9 +3992,6 @@ HEADER
   printf '\n'
   echo "# Checksum algorithm: sha256 | blake2b | auto (auto prefers b2sum, falls back to sha256)"
   _V CHECKSUM_ALGO
-  printf '\n'
-  echo "# Dry-run: plan the steps without generating real outputs"
-  _V DRY_RUN
   printf '\n'
   echo "# Skip processing if source already matches profile requirements"
   _V SKIP_IF_IDEAL
@@ -4181,8 +4175,6 @@ _create_config() {
       --no-strip-metadata)          _CC_OVERRIDES[STRIP_METADATA]=0;                                                                    (( ++_cc_oi )) ;;
       --report-json)                _CC_OVERRIDES[REPORT_JSON]=1;                                                                       (( ++_cc_oi )) ;;
       --no-report-json)             _CC_OVERRIDES[REPORT_JSON]=0;                                                                       (( ++_cc_oi )) ;;
-      --profile-comment)            _CC_OVERRIDES[PROFILE_COMMENT]=1;                                                                   (( ++_cc_oi )) ;;
-      --no-profile-comment)         _CC_OVERRIDES[PROFILE_COMMENT]=0;                                                                   (( ++_cc_oi )) ;;
       # Logging
       --ffmpeg-loglevel)            _cc_need_val;_CC_OVERRIDES[FFMPEG_LOGLEVEL]="$_cc_val";           (( _cc_oi += 2 )) ;;
       --ffprobe-loglevel)           _cc_need_val;_CC_OVERRIDES[FFPROBE_LOGLEVEL]="$_cc_val";          (( _cc_oi += 2 )) ;;
@@ -5898,7 +5890,6 @@ Effective config (post config-files + profile + CLI):
   INCLUDE_AUDIO_TITLES      = $INCLUDE_AUDIO_TITLES
   KEEP_CHAPTERS             = $KEEP_CHAPTERS
   STRIP_METADATA            = $STRIP_METADATA
-  PROFILE_COMMENT           = $PROFILE_COMMENT
 
   [Pipeline Control]
   SKIP_IF_IDEAL             = $SKIP_IF_IDEAL

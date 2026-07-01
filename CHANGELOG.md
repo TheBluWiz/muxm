@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ## [Unreleased]
 
+### Changed
+
+- **Config-surface cleanup: `DRY_RUN` and `PROFILE_COMMENT` no longer leak into generated configs (Adjustments Phase 1)** — `--create-config` templates no longer emit a `DRY_RUN` line (a per-invocation mode; a persisted `DRY_RUN=1` silently makes every encode produce nothing) or a `PROFILE_COMMENT` line (documenting the profile-tagline easter egg in a file users routinely open spoils the surprise). Both were removed from `CONFIG_TRACKED_VARS` and from the hand-maintained emit lines in `_create_config_emit`. `PROFILE_COMMENT` is additionally dropped from the `--print-effective-config` dump; `DRY_RUN` is deliberately **kept** in that dump (its runtime state is worth showing). The `--dry-run` CLI flag, the runtime `--profile-comment` / `--no-profile-comment` opt-out flags, and the easter egg itself are all unchanged and fully functional. Because `PROFILE_COMMENT` is no longer a config-generation surface, the now-meaningless `--create-config --profile-comment` / `--no-profile-comment` config-override arms were removed (they would otherwise be silently dropped — the exact bug the `_test_cli_flag_drift` Assertion-B guard rejects); passing them to `--create-config` now fails fast with `die 11` instead of being a no-op.
+
 ## [1.5.1] - 2026-06-27
 
 ### Security
