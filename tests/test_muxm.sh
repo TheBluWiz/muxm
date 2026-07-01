@@ -7695,6 +7695,8 @@ test_collision() {
   else
     local _m4_dir; _m4_dir="$(mktemp -d "$TESTDIR/m4.XXXXXX")"
     local _m4_src="$_m4_dir/src.mkv" _m4_out="$_m4_dir/out.mkv"
+    # Hidden output lock: muxm computes "$(dirname OUT)/.$(basename OUT).lock" (Adjustments Phase 2).
+    local _m4_lock="$_m4_dir/.$(basename "$_m4_out").lock"
     ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=320x180:rate=24:duration=1" \
       -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p "$_m4_src" 2>/dev/null
     if [[ ! -s "$_m4_src" ]]; then
@@ -7702,7 +7704,7 @@ test_collision() {
     else
       # (a) Live owner → refuse with exit 11.
       sleep 30 & local _m4_live=$!
-      mkdir "${_m4_out}.lock"; printf '%s\n' "$_m4_live" > "${_m4_out}.lock/pid"
+      mkdir "$_m4_lock"; printf '%s\n' "$_m4_live" > "$_m4_lock/pid"
       local _m4_code
       (cd "$_m4_dir" && "$MUXM" --output-ext mkv "$_m4_src" "$_m4_out" >/dev/null 2>&1) && _m4_code=$? || _m4_code=$?
       if [[ "$_m4_code" == 11 ]]; then
@@ -7710,18 +7712,18 @@ test_collision() {
       else
         fail "M4: expected exit 11 against a live lock, got $_m4_code (output clobbered?)"
       fi
-      kill "$_m4_live" 2>/dev/null || true; wait "$_m4_live" 2>/dev/null || true; rm -rf "${_m4_out}.lock"
+      kill "$_m4_live" 2>/dev/null || true; wait "$_m4_live" 2>/dev/null || true; rm -rf "$_m4_lock"
 
       # (b) Stale owner (a reaped/dead PID) → reclaim and proceed.
       local _m4_dead; sleep 0.1 & _m4_dead=$!; wait "$_m4_dead" 2>/dev/null || true
-      mkdir "${_m4_out}.lock"; printf '%s\n' "$_m4_dead" > "${_m4_out}.lock/pid"
+      mkdir "$_m4_lock"; printf '%s\n' "$_m4_dead" > "$_m4_lock/pid"
       (cd "$_m4_dir" && "$MUXM" --output-ext mkv "$_m4_src" "$_m4_out" >/dev/null 2>&1) && _m4_code=$? || _m4_code=$?
       # The successful run must also RELEASE its own lock (on_exit), or every output litters a
-      # leaked ${OUT}.lock that the staleness escape would silently reclaim — masking a release bug.
-      if [[ "$_m4_code" == 0 && -s "$_m4_out" && ! -d "${_m4_out}.lock" ]]; then
+      # leaked hidden .<basename>.lock that the staleness escape would silently reclaim — masking a release bug.
+      if [[ "$_m4_code" == 0 && -s "$_m4_out" && ! -d "$_m4_lock" ]]; then
         pass "M4: a stale lock is reclaimed, the run proceeds, and its own lock is released on success"
       else
-        fail "M4: stale-lock reclaim/release failed (exit $_m4_code, output: $([[ -s "$_m4_out" ]] && echo yes || echo no), lock left: $([[ -d "${_m4_out}.lock" ]] && echo yes || echo no))"
+        fail "M4: stale-lock reclaim/release failed (exit $_m4_code, output: $([[ -s "$_m4_out" ]] && echo yes || echo no), lock left: $([[ -d "$_m4_lock" ]] && echo yes || echo no))"
       fi
     fi
     rm -rf "$_m4_dir"

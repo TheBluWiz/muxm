@@ -166,7 +166,8 @@ WORKDIR_BASE=""        # --workdir DIR: parent dir for the .muxm.tmp.* workdir.
 LOGFILE=""
 LOG_PERSIST_PATH=""   # Durable copy target for the run log under --keep-log; set once in Section 15
 DEBUG_BUNDLE_DIR=""   # Durable diagnostics-bundle dir kept on failure; set once in Section 15
-declare -i _OUT_LOCK_HELD=0   # M4: 1 once this run owns ${OUT}.lock; on_exit releases it only then
+declare -i _OUT_LOCK_HELD=0   # M4: 1 once this run owns the output lock; on_exit releases it only then
+OUT_LOCK_PATH=""      # Hidden lock path (…/.<basename>.lock) computed in _acquire_out_lock; released in on_exit
 _LOG_BUFFER=""        # In-memory capture of pre-§17 narrative (config/profile/conflict/validation),
                       # flushed into $LOGFILE the moment it is created in Section 17. Lets the log
                       # tell the WHOLE story, and stops log() leaking internal lines to the terminal.
@@ -6470,8 +6471,8 @@ on_exit() {
   # M4: release our output lock if (and only if) we acquired it. Gated on _OUT_LOCK_HELD so the
   # multi-profile parent (exits before acquiring) and a refused concurrent run never remove the
   # lock that another live run owns. Runs on every exit path, including SIGINT/SIGTERM.
-  if (( ${_OUT_LOCK_HELD:-0} )) && [[ -n "${OUT:-}" ]]; then
-    rm -rf "${OUT}.lock" 2>/dev/null || true
+  if (( ${_OUT_LOCK_HELD:-0} )) && [[ -n "${OUT_LOCK_PATH:-}" ]]; then
+    rm -rf "${OUT_LOCK_PATH}" 2>/dev/null || true
   fi
 
   local have_result=0 _persist_ok=1
@@ -6569,12 +6570,15 @@ on_exit() {
 }
 
 # _acquire_out_lock — refuse to start when another LIVE muxm run already targets this $OUT, and
-# reclaim a lock orphaned by a dead one (on_exit cannot run on SIGKILL). The lock is a directory
-# (${OUT}.lock) created atomically by mkdir — portable across macOS and Linux, where flock(1)
-# (util-linux) is unavailable. A pid file inside names the owner for the liveness check (mirrors
-# run_parallel.sh's stale-dir sweep). Released in on_exit, gated on _OUT_LOCK_HELD. (M4)
+# reclaim a lock orphaned by a dead one (on_exit cannot run on SIGKILL). The lock is a hidden
+# directory beside the output (…/.<basename>.lock — e.g. …/.Movie.mkv.lock) created atomically by
+# mkdir — portable across macOS and Linux, where flock(1) (util-linux) is unavailable. Keyed to the
+# OUTPUT (not the source) so two runs cannot clobber the same $OUT. A pid file inside names the owner
+# for the liveness check. The computed path is stored in OUT_LOCK_PATH so acquire and release (on_exit)
+# never drift. Released in on_exit, gated on _OUT_LOCK_HELD. (M4)
 _acquire_out_lock() {
-  local lock="${OUT}.lock" owner tries=0 empty_tries=0
+  OUT_LOCK_PATH="$(dirname "$OUT")/.$(basename "$OUT").lock"
+  local lock="$OUT_LOCK_PATH" owner tries=0 empty_tries=0
   while ! mkdir "$lock" 2>/dev/null; do
     owner=""; [[ -r "$lock/pid" ]] && read -r owner < "$lock/pid" 2>/dev/null
     if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
