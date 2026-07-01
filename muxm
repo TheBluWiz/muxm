@@ -6530,6 +6530,29 @@ on_exit() {
     (( _persist_ok )) && _cleanup_workdir 0
     exit 0
   else
+    # Phase 3 (Adjustments): decide up front whether this failure will KEEP artifacts (-k/-K/DEBUG).
+    # If so, we rename the hidden workdir to a visible sibling IN PLACE (below, after the tee drains)
+    # rather than copying a duplicate KB bundle out and leaving the multi-GB workdir hidden. The
+    # rename is a cheap same-fs op on the workdir's OWN volume — under --workdir it stays on the roomy
+    # volume and never drags GBs across to the output disk. Compute the target now so the "Diagnostics:"
+    # breadcrumb (printed pre-drain, into the log) points at the visible name it will land at.
+    # The keep condition mirrors _cleanup_workdir exactly (KEEP_TEMP || KEEP_TEMP_ALWAYS || DEBUG==1).
+    local _keep_failure_artifacts=0 VISIBLE_DEBUG_DIR="" _diag_dir="$DEBUG_BUNDLE_DIR"
+    if { (( KEEP_TEMP || KEEP_TEMP_ALWAYS )) || [[ "${DEBUG:-0}" == "1" ]]; } \
+       && [[ -n "${WORKDIR:-}" && -d "$WORKDIR" && "$WORKDIR" == *"/.muxm.tmp."* ]]; then
+      _keep_failure_artifacts=1
+      local _wd_parent _wd_suffix _vn=1
+      _wd_parent="$(dirname "$WORKDIR")"
+      _wd_suffix="$(basename "$WORKDIR")"; _wd_suffix="${_wd_suffix#.muxm.tmp.}"
+      VISIBLE_DEBUG_DIR="$_wd_parent/muxm-debug.$_wd_suffix"
+      # The mktemp suffix is unique per run, so a collision is essentially impossible; guard anyway
+      # (mv into an existing dir NESTS rather than replaces, which would bury the artifacts).
+      while [[ -e "$VISIBLE_DEBUG_DIR" ]]; do
+        VISIBLE_DEBUG_DIR="$_wd_parent/muxm-debug.$_wd_suffix.$_vn"; (( _vn++ ))
+      done
+      _diag_dir="$VISIBLE_DEBUG_DIR"
+    fi
+
     # Failure summary (D7): the detailed cause is printed ONCE — by die()/on_error() at the
     # failure site (_ERROR_PRINTED=1) — so this line stays terse and just folds in the exit code
     # and the durable diagnostics location. Only when no cause was printed (SIGINT/SIGTERM, or no
@@ -6537,10 +6560,10 @@ on_exit() {
     # captured in the copied log — the bundle then self-documents where it lives. The bundle is
     # kept on every failure, regardless of --keep-log.
     if (( ${_ERROR_PRINTED:-0} )); then
-      printf "%sBuild FAILED (exit %s). Diagnostics: %s/\n" "${_PFX_FAIL-❌ }" "${EXIT_CODE:-1}" "$DEBUG_BUNDLE_DIR"
+      printf "%sBuild FAILED (exit %s). Diagnostics: %s/\n" "${_PFX_FAIL-❌ }" "${EXIT_CODE:-1}" "$_diag_dir"
     else
       [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely an earlier parse/runtime error)."
-      printf "%sBuild FAILED (exit %s): %s — Diagnostics: %s/\n" "${_PFX_FAIL-❌ }" "${EXIT_CODE:-1}" "$FAIL_MSG" "$DEBUG_BUNDLE_DIR"
+      printf "%sBuild FAILED (exit %s): %s — Diagnostics: %s/\n" "${_PFX_FAIL-❌ }" "${EXIT_CODE:-1}" "$FAIL_MSG" "$_diag_dir"
     fi
 
     _print_completed_steps
@@ -6556,14 +6579,32 @@ on_exit() {
       _ACTIVE_FFMPEG_PID=""
     fi
 
-    # Drain the tee FIRST (log fully flushed + closed), THEN copy the bundle out, THEN
-    # remove the workdir. The copy may fail if the failure is itself "disk full on the
-    # output volume" — if so, keep the workdir so the real diagnostics survive there.
+    # Drain the tee FIRST (log fully flushed + closed) so the workdir — and the LOGFILE
+    # inside it — can be renamed/copied safely.
     _drain_tee
-    if _persist_failure_bundle; then
-      _cleanup_workdir 1
+    if (( _keep_failure_artifacts )); then
+      # Phase 3 keep path: rename the hidden workdir to its visible sibling IN PLACE and skip
+      # the separate copy-out. One user-visible set of artifacts (log + *.err + the intermediates),
+      # no KB duplication, no cross-volume copy — the rename needs no extra disk even when the
+      # failure was "output disk full". Guard on the same .muxm.tmp. pattern that gates the rm -rf.
+      if mv "$WORKDIR" "$VISIBLE_DEBUG_DIR" 2>/dev/null; then
+        note "Keeping failure artifacts at: $VISIBLE_DEBUG_DIR"
+        WORKDIR=""   # workdir is now the visible dir; stop _cleanup_workdir (unused here) double-handling it
+      else
+        # Same-fs rename failed (rare — usually means the volume itself vanished); the artifacts
+        # survive at the hidden path, so point there. The pre-drain "Diagnostics:" line predicted
+        # the visible name; this terminal note gives the real location.
+        note "Keeping failure artifacts at: $WORKDIR (could not rename to $VISIBLE_DEBUG_DIR)"
+      fi
     else
-      warn "Could not write diagnostics to $DEBUG_BUNDLE_DIR — preserving workdir: $WORKDIR"
+      # Non-keep path (unchanged): copy the small KB bundle beside OUT, THEN remove the workdir.
+      # The copy may fail if the failure is itself "disk full on the output volume" — if so, keep
+      # the workdir so the real diagnostics survive there.
+      if _persist_failure_bundle; then
+        _cleanup_workdir 1
+      else
+        warn "Could not write diagnostics to $DEBUG_BUNDLE_DIR — preserving workdir: $WORKDIR"
+      fi
     fi
     exit "${EXIT_CODE:-1}"
   fi

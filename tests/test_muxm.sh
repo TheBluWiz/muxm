@@ -12895,6 +12895,44 @@ FBDOVISCRIPT
     else
       fail "LOGPERSIST/persist-fail: expected workdir preserved + 'preserving workdir' message (exit $c4_code)"
     fi
+
+    # CASE 5 (Adjustments Phase 3 — failure + -k RENAMES, no duplication): a failure WITH -k must
+    # rename the hidden .muxm.tmp.XXXX workdir to a VISIBLE muxm-debug.XXXX in place (same volume,
+    # beside OUT since no --workdir) — NOT copy a KB bundle out and leave the hidden workdir behind.
+    # Assert: a single visible muxm-debug.* holding the log + encode.err; NO hidden .muxm.tmp.* left;
+    # NO duplicate <output>.muxm-debug/ bundle; and the "Diagnostics:" breadcrumb points at the
+    # visible dir. Uses -k (keep-on-failure) directly (lp_common has no keep flag).
+    local c5_dir="$lp_dir/c5"; mkdir -p "$c5_dir"; cp "$lp_dir/src.mkv" "$c5_dir/src.mkv"
+    local c5_out="$c5_dir/c5.mkv" c5_log c5_code=0
+    c5_log="$(cd "$c5_dir" && "$MUXM" -k "${lp_common[@]}" --x265-params "ctu=999" src.mkv "$c5_out" 2>&1)" || c5_code=$?
+    local c5_vis; c5_vis="$(find "$c5_dir" -maxdepth 1 -name 'muxm-debug.*' -type d 2>/dev/null | head -1)"
+    if (( c5_code != 0 )) && [[ -n "$c5_vis" ]] \
+       && ls "$c5_vis"/muxm.*.log >/dev/null 2>&1 && [[ -s "$c5_vis/encode.err" ]] \
+       && ! find "$c5_dir" -maxdepth 1 -name '.muxm.tmp.*' 2>/dev/null | grep -q . \
+       && [[ ! -e "$c5_dir/c5.muxm-debug" ]] \
+       && printf '%s' "$c5_log" | grep -qF "Diagnostics: $c5_vis/"; then
+      pass "LOGPERSIST/keep-rename: failure + -k renames workdir to a visible muxm-debug.* (no dup, no hidden dir)"
+    else
+      fail "LOGPERSIST/keep-rename: expected one visible muxm-debug.* (log+encode.err), no .muxm.tmp.*, no c5.muxm-debug, matching Diagnostics (exit $c5_code, vis='$c5_vis')"
+    fi
+
+    # CASE 6 (Adjustments Phase 3 — --workdir + -k lands on the workdir volume, not beside OUT): the
+    # rename is in-place on the workdir's own volume, so under --workdir the visible artifacts land
+    # THERE (roomy volume the user chose), never dragged across to the output disk. Can't stage two
+    # real volumes here, but the LANDING DIRECTORY proves the in-place logic: visible muxm-debug.*
+    # appears under the --workdir dir and nothing debug-shaped appears beside OUT.
+    local c6_wdir="$lp_dir/c6_work"; mkdir -p "$c6_wdir"
+    local c6_out="$lp_dir/c6.mkv" c6_code=0
+    ( cd "$lp_dir" && "$MUXM" -k --workdir "$c6_wdir" "${lp_common[@]}" --x265-params "ctu=999" src.mkv "$c6_out" >/dev/null 2>&1 ) || c6_code=$?
+    if (( c6_code != 0 )) \
+       && find "$c6_wdir" -maxdepth 1 -name 'muxm-debug.*' -type d 2>/dev/null | grep -q . \
+       && ! find "$c6_wdir" -maxdepth 1 -name '.muxm.tmp.*' 2>/dev/null | grep -q . \
+       && ! find "$lp_dir" -maxdepth 1 -name 'muxm-debug.*' 2>/dev/null | grep -q . \
+       && [[ ! -e "$lp_dir/c6.muxm-debug" ]]; then
+      pass "LOGPERSIST/keep-rename+workdir: visible muxm-debug.* lands under --workdir dir, not beside OUT"
+    else
+      fail "LOGPERSIST/keep-rename+workdir: expected visible muxm-debug.* under $c6_wdir and nothing beside OUT (exit $c6_code)"
+    fi
   fi
 
   # ---- LOGCONTENT: Phase 2 — the persisted log tells the whole story ----
