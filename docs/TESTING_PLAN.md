@@ -1,6 +1,6 @@
 # MuxMaster (muxm) Testing Plan
 
-**Version:** v1.5.0
+**Version:** v1.5.1
 **Date:** 2026-06-16
 **Scope:** Comprehensive feature coverage — automated test harness + manual testing checklist
 
