@@ -9768,8 +9768,13 @@ _sub_stream_info 0" -- "$_json" 2>/dev/null)"
 # `set -u` on bash < 4.4 when empty — and the documented floor is 4.3. muxm now uses the array-safe
 # ${arr[@]+"${arr[@]}"} form, which yields the elements when present and NOTHING (no spurious empty
 # argument) when empty. This test locks both the idiom's behavior AND that muxm's real call sites use
-# it. NOTE: on this host bash (>= 4.4) the OLD bare form would NOT error, so the true 4.3 failure can
-# only be reproduced on a 4.3 interpreter — run there too if $BASH_43 points to one, else skip.
+# it. NOTE: on a modern host bash (>= 4.4) the OLD bare form would NOT error, so the true pre-4.4
+# failure can only be reproduced on a genuinely old interpreter. Part (4) below prefers an explicit
+# $BASH_43 override (any old interpreter path, not literally version 4.3) and otherwise auto-detects
+# one: macOS ships a real pre-4.4 bash (3.2.x) at /bin/bash even when a modern bash is on PATH via
+# Homebrew, so that's tried automatically — confirmed empirically (does the bare form actually error
+# there?), not by parsing a version string (format varies across GNU/BSD bash builds). Skips only on
+# hosts with neither (e.g. a modern-only Linux box).
 _test_unit_rf9_empty_array_safe() {
   # (1) Idiom behavior: empty → 0 extra args (NOT one empty arg, as "${arr[@]:-}" would give).
   local n_empty n_full
@@ -9807,18 +9812,39 @@ _test_unit_rf9_empty_array_safe() {
   else
     fail "RF9: bare (4.3-unsafe) array expansion still present for: $unsafe"
   fi
-  # (4) True bash-4.3 coverage when an interpreter is available. Skip-first guard (not an else→skip)
-  # per the soft-skip ratchet: a genuine host/version skip belongs in `if [[ ! cond ]]; then skip`.
-  if [[ -z "${BASH_43:-}" || ! -x "${BASH_43:-}" ]]; then
-    skip "RF9: no bash-4.3 interpreter (\$BASH_43 unset) — host bash exercises the idiom; true 4.3 coverage needs a 4.3 binary"
+  # (4) True pre-4.4 coverage when an old interpreter is available. Skip-first guard (not an
+  # else→skip) per the soft-skip ratchet: a genuine host/version skip belongs in `if [[ ! cond ]]; then skip`.
+  # Interpreter selection: prefer an explicit $BASH_43 override (any old-bash path, not literally
+  # 4.3); otherwise auto-detect by trying /bin/bash and confirming — empirically, not by parsing a
+  # version string — that the BARE form actually still errors there (macOS's system /bin/bash is a
+  # real pre-4.4 build even when a modern bash is on PATH via Homebrew).
+  local old_bash=""
+  if [[ -n "${BASH_43:-}" && -x "${BASH_43:-}" ]]; then
+    old_bash="$BASH_43"
+  # shellcheck disable=SC2016  # the bare "${arr[@]}" form must reach /bin/bash literally, unexpanded
+  elif [[ -x /bin/bash ]] && ! /bin/bash -c 'set -u; arr=(); printf "%s" "${arr[@]}"' >/dev/null 2>&1; then
+    old_bash="/bin/bash"
+  fi
+  if [[ -z "$old_bash" ]]; then
+    skip "RF9: no pre-4.4 bash interpreter available (\$BASH_43 unset, /bin/bash doesn't reproduce the bug) — host bash exercises the idiom; true old-bash coverage needs one"
   else
-    local rc=0
-    # shellcheck disable=SC2016  # the ${arr[@]+…} idiom must reach $BASH_43 as a literal, unexpanded
-    "$BASH_43" -c 'set -u; arr=(); printf "%s" ${arr[@]+"${arr[@]}"}' >/dev/null 2>&1 || rc=$?
-    if (( rc == 0 )); then
-      pass "RF9: array-safe expansion works on bash 4.3 (\$BASH_43)"
+    local old_ver rc=0 bare_rc=0
+    old_ver="$("$old_bash" --version 2>&1 | head -1)" || true
+    # Positive control: the BARE form must still error here, or this isn't a valid repro host —
+    # guards against a misconfigured $BASH_43 (e.g. pointed at a modern bash) silently passing.
+    # shellcheck disable=SC2016  # the bare "${arr[@]}" form must reach $old_bash literally, unexpanded
+    "$old_bash" -c 'set -u; arr=(); printf "%s" "${arr[@]}"' >/dev/null 2>&1 || bare_rc=$?
+    if (( bare_rc != 0 )); then
+      pass "RF9: bare \"\${arr[@]}\" expansion still fails on $old_bash ($old_ver) — confirms a valid old-bash repro host"
     else
-      fail "RF9: \$BASH_43 errored on the array-safe expansion (rc=$rc)"
+      fail "RF9: bare expansion unexpectedly succeeded on $old_bash ($old_ver) — not actually pre-4.4?"
+    fi
+    # shellcheck disable=SC2016  # the ${arr[@]+…} idiom must reach $old_bash as a literal, unexpanded
+    "$old_bash" -c 'set -u; arr=(); printf "%s" ${arr[@]+"${arr[@]}"}' >/dev/null 2>&1 || rc=$?
+    if (( rc == 0 )); then
+      pass "RF9: array-safe expansion works on a genuinely old bash ($old_bash, $old_ver)"
+    else
+      fail "RF9: $old_bash ($old_ver) errored on the array-safe expansion (rc=$rc)"
     fi
   fi
 }
