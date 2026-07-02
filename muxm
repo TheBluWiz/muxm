@@ -1100,14 +1100,63 @@ write_checksum(){
   fi
 }
 
+# 5.1: compare the audio/subtitle stream counts ffmpeg was actually told to -map (the caller's
+# own count, derived from its ff_map array or equivalent — the single source of truth for what
+# was fed to ffmpeg) against what ffprobe reports landed in the muxed output. This is
+# defense-in-depth on top of the stronger PRE-encode guards (_check_multitrack_container_safety,
+# _emit_sub_tracks's own die-on-PGS-in-MP4 guard) — those already hard-stop the known failure
+# modes before any work starts, so a mismatch here would mean a rare, otherwise-uncaught partial
+# ffmpeg -map failure. Gated to --verbose/DEBUG (the extra ffprobe calls aren't worth paying on
+# every normal run for a belt-and-suspenders check) and WARNS rather than dies — this is a
+# diagnostic, not the primary correctness mechanism.
+# Args: $1 — file path; $2 — label; $3 — expected audio stream count (-1 = skip the check);
+#       $4 — expected subtitle stream count (-1 = skip the check)
+_check_mux_stream_counts(){
+  local _file="$1" _label="$2"
+  local -i _exp_a="$3" _exp_s="$4"
+  # NOTE: counts are via `awk 'END{print NR}'`, not a line-counting grep invocation — grep exits
+  # nonzero on zero matches (a legitimate "this container has no audio/subtitle streams"
+  # outcome, not an error), and
+  # under set -eEuo pipefail that nonzero pipeline status would abort this assignment entirely.
+  # awk's END block always runs and always exits 0, correctly reporting 0 for an empty stream.
+  if (( _exp_a >= 0 )); then
+    local -i _got_a
+    # pipefail can still surface ffprobe's own nonzero status even though awk always exits 0
+    # (pipefail reports the rightmost NONZERO status among all pipe stages, not just the last
+    # stage) — || true guards the assignment; a genuine ffprobe failure here just yields 0,
+    # which the count-mismatch branch below reports as a warning anyway.
+    _got_a="$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$_file" 2>/dev/null | awk 'END{print NR}')" || true
+    if (( _got_a != _exp_a )); then
+      warn "$_label: expected $_exp_a audio stream(s) to survive the mux, ffprobe found $_got_a in $(basename -- "$_file")"
+    else
+      log "[validate] $_label: audio stream count OK ($_got_a)"
+    fi
+  fi
+  if (( _exp_s >= 0 )); then
+    local -i _got_s
+    _got_s="$(ffprobe -v error -select_streams s -show_entries stream=index -of csv=p=0 "$_file" 2>/dev/null | awk 'END{print NR}')" || true
+    if (( _got_s != _exp_s )); then
+      warn "$_label: expected $_exp_s subtitle stream(s) to survive the mux, ffprobe found $_got_s in $(basename -- "$_file")"
+    else
+      log "[validate] $_label: subtitle stream count OK ($_got_s)"
+    fi
+  fi
+}
+
 # Validate that a media file exists, is non-empty, and is parseable by ffprobe.
 # Two-step approach:
 #   Step 1 — file must exist and have non-zero size (catches disk-full / write failure)
 #   Step 2 — ffprobe must confirm a valid video stream is present (catches corrupt mux)
-# Args: $1 — file path, $2 — context label for error message
-# Dies on failure.
+# 5.1: an optional Step 3 cross-checks audio/subtitle stream counts under --verbose/DEBUG — see
+# _check_mux_stream_counts.
+# Args: $1 — file path, $2 — context label for error message, $3 — (optional) expected audio
+#       stream count, $4 — (optional) expected subtitle stream count. Omit $3/$4 (or pass -1) to
+#       skip that cross-check — most callers (e.g. the mid-pipeline base-video-encode check,
+#       which has no audio/subtitle streams yet) don't have a meaningful count to compare.
+# Dies on failure (Steps 1-2); Step 3 only warns.
 _validate_media_file(){
   local file="$1" label="${2:-output}"
+  local -i _expected_audio="${3:--1}" _expected_subs="${4:--1}"
   # Step 1: file exists and has non-zero size
   if [[ ! -s "$file" ]]; then
     _check_disk_full "$file"
@@ -1120,6 +1169,12 @@ _validate_media_file(){
     || die 41 "$label produced unreadable file (ffprobe failed)"
   [[ -n "$_vcodec" ]] || die 41 "$label produced file with no video stream (ffprobe found: none)"
   log "[validate] $label: OK — video codec=${_vcodec}, size=$(filesize_pretty "$file")"
+
+  # Step 3 (5.1): optional audio/subtitle stream-count cross-check, verbose/DEBUG only.
+  if (( _expected_audio >= 0 || _expected_subs >= 0 )) \
+     && { [[ "${VERBOSITY:-}" == "verbose" ]] || [[ "${DEBUG:-0}" == "1" ]]; }; then
+    _check_mux_stream_counts "$file" "$label" "$_expected_audio" "$_expected_subs"
+  fi
 }
 
 # _check_disk_full — inspect an ffmpeg error log (or a file path on a volume)
@@ -2294,6 +2349,13 @@ channel count, surround bonus (\[>=]6ch), codec preference order, and bitrate
 (tie\-break). Tracks whose title contains "commentary", "descriptive", or
 similar keywords receive a penalty
 .RB ( AUDIO_SCORE_COMMENTARY_PENALTY ).
+Scoring is based on channel
+.I count
+only, not
+.IR channel_layout :
+a discrete 7.1 track and a 5.1.4 Atmos\-in\-TrueHD track with the same channel
+count score identically \(em object\-based/height channels are not
+distinguished from a same\-count surface layout.
 .PP
 Scoring weights are configurable via
 .IR .muxmrc :
@@ -4466,6 +4528,9 @@ apply_profile_archive() {
   OUTPUT_EXT="mkv"
   # Video: copy, don't re-encode
   VIDEO_COPY_IF_COMPLIANT=1
+  # 5.2: VIDEO_CODEC here is NOT the primary path — it's the re-encode FALLBACK used only if
+  # _video_is_copy_compliant rejects a stream-copy (e.g. source isn't already HEVC). With
+  # VIDEO_COPY_IF_COMPLIANT=1, a compliant source never reaches an encoder at all.
   VIDEO_CODEC="libx265"
   # Audio: multi-track, copy all matching tracks from source.
   # No scoring, no transcoding, no stereo fallback.
@@ -4896,6 +4961,13 @@ _create_config_prescan() {
         # End-of-options: a --create-config after -- is a positional, not the flag.
         break
         ;;
+      # 5.3: index layout relative to _cc_i (the position of this flag itself), so a future
+      # positional-like argument added here doesn't reintroduce an off-by-one:
+      #   _cc_i     = --create-config / --force-create-config (this flag)
+      #   _cc_i + 1 = scope (required: system|user|project)
+      #   _cc_i + 2 = profile (OPTIONAL — present only if it doesn't start with '-')
+      #   overrides start at _cc_i + 3 if a profile was consumed, else _cc_i + 2 — i.e.
+      #   immediately after wherever the (optional) profile slot would have been.
       --create-config|--force-create-config)
         _cc_found=1
         [[ "${_cc_args[$_cc_i]}" == "--force-create-config" ]] && _cc_force=1
@@ -8130,6 +8202,11 @@ declare -a AUDIO_MT_CODECS=()     # codec per kept track (e.g., truehd, ac3)
 declare -a AUDIO_MT_CHANNELS=()   # channel count per kept track
 declare -a AUDIO_MT_LANGS=()      # language tag per kept track
 declare -a AUDIO_MT_TITLES=()     # title tag per kept track (empty if unset)
+declare -a AUDIO_MT_COMMENTARY=() # 5.5: 1 if kept track is commentary/descriptive, else 0 —
+                                   # same predicate _build_audio_keep_list uses to filter (title
+                                   # keyword OR comment/visual_impaired/hearing_impaired
+                                   # disposition), populated in the same pass so it can never
+                                   # drift from the actual keep-list decision.
 
 # Multi-track subtitles: when SUB_MULTI_TRACK=1, subtitle streams are mapped
 # directly from source by the unified emitter (no extraction, OCR, or conversion).
@@ -9630,6 +9707,9 @@ _audio_stream_info(){
 #      Ensures preferred language wins over higher-channel foreign tracks.
 #   2. Channel count         — ch × AUDIO_SCORE_CHANNEL_MULTIPLIER (20)
 #      More channels = higher fidelity; 7.1 scores higher than 5.1.
+#      5.4: COUNT only, not channel_layout-aware — a discrete 7.1 track and a 5.1.4
+#      Atmos-in-TrueHD track with the same channel count score identically (accepted
+#      simplification; see README.md "Audio Pipeline" / man page "Audio Track Selection").
 #   3. Surround bonus        — +AUDIO_SCORE_SURROUND_BONUS (30) if ≥ 6ch
 #      Discrete jump to prefer surround over stereo.
 #   4. Codec preference      — (10 − rank) × 10 from AUDIO_CODEC_PREFERENCE list
@@ -10126,12 +10206,16 @@ run_audio_pipeline_multi(){
   AUDIO_MT_CHANNELS=()
   AUDIO_MT_LANGS=()
   AUDIO_MT_TITLES=()
+  AUDIO_MT_COMMENTARY=()
 
   local idx
   for idx in $keep_list; do
-    local info codec ch lang br title
+    local info codec ch lang br title comment vi hi
     info="$(_audio_stream_info "$idx")"
-    _split_tab "$info" codec ch lang br title _ _ _  # C2: non-collapsing — untagged lang/title into MT output metadata (RF3: sink disposition fields)
+    # 5.5: capture the three disposition flags (previously sunk) — same predicate
+    # _build_audio_keep_list uses to filter, reused here (not re-derived) so the commentary
+    # signal can never drift between "was this kept" and "is this commentary".
+    _split_tab "$info" codec ch lang br title comment vi hi  # C2: non-collapsing
     _normalize_codec_lang codec lang
 
     AUDIO_MT_INDICES+=("$idx")
@@ -10139,6 +10223,11 @@ run_audio_pipeline_multi(){
     AUDIO_MT_CHANNELS+=("$ch")
     AUDIO_MT_LANGS+=("$lang")
     AUDIO_MT_TITLES+=("${title:-}")
+    if _audio_is_commentary "$title" || (( comment )) || (( vi )) || (( hi )); then
+      AUDIO_MT_COMMENTARY+=(1)
+    else
+      AUDIO_MT_COMMENTARY+=(0)
+    fi
   done
 
   AUDIO_COPY_FROM_SOURCE=1
@@ -12047,12 +12136,19 @@ mux_final() {
       local _mt_codec="${AUDIO_MT_CODECS[$_mt_i]}"
       local _mt_ch="${AUDIO_MT_CHANNELS[$_mt_i]}"
       local _mt_title="${AUDIO_MT_TITLES[$_mt_i]}"
+      local _mt_commentary="${AUDIO_MT_COMMENTARY[$_mt_i]:-0}"
 
       [[ -n "$_mt_lang" ]] && ff_codec+=( "-metadata:s:a:${out_a_idx}" "language=$_mt_lang" )
 
       if (( INCLUDE_AUDIO_TITLES )); then
         local _mt_desc
         _mt_desc="$(_audio_descriptive_title "$_mt_codec" "$_mt_ch")"
+        # 5.5 (Option C, unconditional — no flag): append a "— Commentary" suffix instead of
+        # silently overwriting a commentary track's descriptive title with a bare codec/channel
+        # string indistinguishable from any other track. AUDIO_MT_COMMENTARY was populated
+        # alongside AUDIO_MT_TITLES in the same keep-list pass above, so this can't drift from
+        # the keep/drop decision itself.
+        (( _mt_commentary )) && _mt_desc="${_mt_desc} — Commentary"
         ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$_mt_desc" )
       elif [[ -n "$_mt_title" ]]; then
         ff_codec+=( "-metadata:s:a:${out_a_idx}" "title=$_mt_title" )
@@ -12167,8 +12263,22 @@ mux_final() {
     die 41 "ffmpeg final mux failed. See: $WORKDIR/mux.err"
   fi
 
+  # 5.1: expected audio/subtitle stream counts, derived from ff_map itself — the exact set of
+  # -map entries just fed to ffmpeg — rather than re-deriving them from AUDIO_MT_INDICES/
+  # SUB_TRACKS_*, so this can never drift from what was actually muxed.
+  local -i _exp_audio=0 _exp_subs=0
+  local _fm
+  for _fm in "${ff_map[@]}"; do
+    # Arithmetic-EXPANSION assignment (var=$((expr))), NOT the arithmetic COMMAND (( var++ )) —
+    # under set -e, a post-increment command's exit status reflects the PRE-increment value, so
+    # "$_fm" matching on the very first audio/subtitle entry (count going 0→1) would evaluate
+    # false and abort the whole run. Plain assignment is always exit-0 regardless of the value.
+    [[ "$_fm" == *:a:* ]] && _exp_audio=$(( _exp_audio + 1 ))
+    [[ "$_fm" == *:s:* ]] && _exp_subs=$(( _exp_subs + 1 ))
+  done
+
   # Validate muxed output
-  _validate_media_file "$TMP_OUT" "Final mux"
+  _validate_media_file "$TMP_OUT" "Final mux" "$_exp_audio" "$_exp_subs"
 
   mark_done "Mux final ${OUTPUT_EXT}"
 }
@@ -12421,7 +12531,9 @@ main() {
             _check_disk_full "$WORKDIR/skip_ideal_remux.err"
             die 41 "Skip-if-ideal metadata remux failed. See: $WORKDIR/skip_ideal_remux.err"
           fi
-          _validate_media_file "$TMP_OUT" "Skip-if-ideal remux"
+          # 5.1: SII_AUDIO_INDICES/SII_SUB_INDICES are the exact arrays this remux's -map
+          # entries were built from above — their counts are the expected survivor counts.
+          _validate_media_file "$TMP_OUT" "Skip-if-ideal remux" "${#SII_AUDIO_INDICES[@]}" "${#SII_SUB_INDICES[@]}"
 
           # Log stream counts if filtering occurred
           if (( ${#SII_AUDIO_INDICES[@]} < _sii_total_a )) || (( ${#SII_SUB_INDICES[@]} < _sii_total_s )); then

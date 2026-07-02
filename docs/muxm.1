@@ -413,6 +413,13 @@ channel count, surround bonus (\[>=]6ch), codec preference order, and bitrate
 (tie\-break). Tracks whose title contains "commentary", "descriptive", or
 similar keywords receive a penalty
 .RB ( AUDIO_SCORE_COMMENTARY_PENALTY ).
+Scoring is based on channel
+.I count
+only, not
+.IR channel_layout :
+a discrete 7.1 track and a 5.1.4 Atmos\-in\-TrueHD track with the same channel
+count score identically \(em object\-based/height channels are not
+distinguished from a same\-count surface layout.
 .PP
 Scoring weights are configurable via
 .IR .muxmrc :

@@ -5028,6 +5028,7 @@ EOF
   _test_audio_cr3_multitrack_disposition_commentary
   _test_audio_cr6_empty_langpref_no_crash
   _test_audio_cr7_native_stereo_en_eng_copy
+  _test_audio_5_5_commentary_title
 }
 
 # CR-6: `_audio_lang_matches` is the one of four call sites NOT gated on `[[ -n "$AUDIO_LANG_PREF" ]]`
@@ -5193,6 +5194,81 @@ _test_audio_cr3_multitrack_disposition_commentary() {
   fi
 
   rm -f "$src" "$TESTDIR/cr3_out.mkv" 2>/dev/null || true
+}
+
+# 5.5 (Option C): a kept multi-track commentary track's descriptive title gets a "— Commentary"
+# suffix appended instead of being silently indistinguishable from any other track. Three real
+# encodes (not --dry-run, since the title only lands in the actual muxed output):
+#   1. Positive — a titled commentary track (AUDIO_KEEP_COMMENTARY=1, INCLUDE_AUDIO_TITLES=1)
+#      gets both a codec/channel description AND the "— Commentary" suffix.
+#   2. Negative — a genuine alternate-language, non-commentary track in the SAME run gets the
+#      plain descriptive title with NO suffix (guards against the detection over-firing).
+#   3. --no-audio-titles regression — the original source title ("Commentary with Director")
+#      passes through verbatim; this code path is untouched by the 5.5 fix.
+_test_audio_5_5_commentary_title() {
+  local _dir="$TESTDIR/audio_5_5_commentary"; mkdir -p "$_dir"
+  local _src="$_dir/src.mkv"
+  # track0 = main (eng, untitled), track1 = commentary (eng, titled "Commentary with Director")
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=blue:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -f lavfi -i "sine=frequency=880:duration=1" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -map 0:v -map 1:a -map 2:a -c:a aac -b:a 128k \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:a:1 language=eng -metadata:s:a:1 title="Commentary with Director" \
+    "$_src" 2>/dev/null
+  if [[ ! -s "$_src" ]]; then
+    skip "5.5: could not build the commentary-title fixture"; rm -rf "$_dir"; return
+  fi
+
+  local _proj="$_dir/proj"; mkdir -p "$_proj"
+  printf 'AUDIO_MULTI_TRACK=1\nAUDIO_KEEP_COMMENTARY=1\nAUDIO_LANG_PREF=""\n' > "$_proj/.muxmrc"
+
+  # ---- 1. Positive: commentary track gets a descriptive title AND the "— Commentary" suffix ----
+  local _out1="$_dir/out_positive.mkv"
+  run_muxm_in "$_proj" "$_src" "$_out1" >/dev/null 2>&1 || true
+  local _title1
+  _title1="$(ffprobe -v error -select_streams a:1 -show_entries stream_tags=title -of csv=p=0 "$_out1" 2>/dev/null || true)"
+  if [[ "$_title1" == *"Commentary"* ]] && [[ "$_title1" =~ \([A-Za-z0-9-]+\) ]]; then
+    pass "5.5: commentary track title contains both a codec/channel description and 'Commentary' ('$_title1')"
+  else
+    fail "5.5: expected a codec/channel description + 'Commentary' suffix, got '${_title1:-<empty>}'"
+  fi
+
+  # ---- 2. Negative: a genuine alternate-language, non-commentary track gets NO suffix ----
+  local _src2="$_dir/src_altlang.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=blue:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -f lavfi -i "sine=frequency=880:duration=1" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -map 0:v -map 1:a -map 2:a -c:a aac -b:a 128k \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:a:1 language=spa -metadata:s:a:1 title="Spanish Dub" \
+    "$_src2" 2>/dev/null
+  local _out2="$_dir/out_negative.mkv"
+  run_muxm_in "$_proj" "$_src2" "$_out2" >/dev/null 2>&1 || true
+  local _title2
+  _title2="$(ffprobe -v error -select_streams a:1 -show_entries stream_tags=title -of csv=p=0 "$_out2" 2>/dev/null || true)"
+  if [[ -n "$_title2" ]] && [[ "$_title2" != *"Commentary"* ]]; then
+    pass "5.5: a genuine alternate-language (non-commentary) track's title has NO 'Commentary' suffix ('$_title2')"
+  else
+    fail "5.5: alternate-language track title unexpectedly missing or suffixed: '${_title2:-<empty>}'"
+  fi
+
+  # ---- 3. --no-audio-titles regression: original source title passes through unchanged ----
+  local _out3="$_dir/out_notitles.mkv"
+  run_muxm_in "$_proj" --no-audio-titles "$_src" "$_out3" >/dev/null 2>&1 || true
+  local _title3
+  _title3="$(ffprobe -v error -select_streams a:1 -show_entries stream_tags=title -of csv=p=0 "$_out3" 2>/dev/null || true)"
+  if [[ "$_title3" == "Commentary with Director" ]]; then
+    pass "5.5: --no-audio-titles still passes the original source title through unchanged (untouched code path)"
+  else
+    fail "5.5: --no-audio-titles expected 'Commentary with Director', got '${_title3:-<empty>}'"
+  fi
+
+  rm -rf "$_dir"
 }
 
 # RF3 (e2e): primary audio selection must demote a commentary track flagged by DISPOSITION even
@@ -7152,6 +7228,31 @@ test_output() {
       fi
     fi
     rm -rf "$_m1_dir"
+  fi
+
+  # 5.1: post-mux audio/subtitle stream-count cross-check (--verbose/DEBUG only). Sanity check —
+  # a normal encode must not false-positive (the check runs and reports the counts matching, not
+  # a spurious mismatch warning), and the check must NOT run without --verbose/DEBUG (avoiding
+  # the extra ffprobe calls on every ordinary run — this is an opt-in diagnostic, not the primary
+  # correctness mechanism).
+  local sc_out sc_outfile="$TESTDIR/out_streamcount.mkv"
+  sc_out="$(run_muxm --verbose --profile archive "$TESTDIR/basic_sdr_subs.mkv" "$sc_outfile")"
+  if [[ -f "$sc_outfile" && -s "$sc_outfile" ]]; then
+    pass "5.1: stream-count validation encode produced output"
+  else
+    fail "5.1: stream-count validation encode: no output"
+  fi
+  if grep -qF "audio stream count OK" <<<"$sc_out"; then
+    pass "5.1: --verbose surfaces the audio stream-count check and it matches (no false-positive)"
+  else
+    fail "5.1: expected 'audio stream count OK' in --verbose output, got: ${sc_out: -300}"
+  fi
+  local sc_out2 sc_outfile2="$TESTDIR/out_streamcount_quiet.mkv"
+  sc_out2="$(run_muxm --profile archive "$TESTDIR/basic_sdr_subs.mkv" "$sc_outfile2")"
+  if ! grep -qE 'stream count OK|stream\(s\) to survive the mux' <<<"$sc_out2"; then
+    pass "5.1: stream-count check is gated to --verbose/DEBUG (silent on a normal run)"
+  else
+    fail "5.1: stream-count check output appeared without --verbose/DEBUG: ${sc_out2: -300}"
   fi
 
   _test_output_m2_cleanup_on_checksum_fail
@@ -10348,6 +10449,7 @@ test_unit() {
   _test_unit_p3_ocr_lang_flags
   _test_unit_p3_run_ocr
   _test_unit_p4_audio_pretty_line
+  _test_unit_p5_check_mux_stream_counts
   _test_unit_mdry_loglevel_str
   _test_unit_l_disk_df_unavailable
   _test_unit_l_prepare_subtitle_workdir_gone
@@ -11013,6 +11115,41 @@ _test_unit_p4_audio_pretty_line() {
     pass "4.5: run_audio_pipeline_multi and run_audio_pipeline both delegate to _audio_pretty_line"
   else
     fail "4.5: expected 1 _audio_pretty_line call in each function, got multi=$multi_count single=$single_count"
+  fi
+}
+
+# 5.1: _check_mux_stream_counts must report a match (via log, no warning) and a mismatch (via
+# warn) independently for audio and subtitle counts, and must NOT abort under set -e when
+# ffprobe legitimately finds zero streams of a type (e.g. a video with no subtitles) — grep -c
+# exits 1 on zero matches, which is exactly the class of bug this function's own awk-based
+# counting was written to avoid; this test pins that behavior down.
+_test_unit_p5_check_mux_stream_counts() {
+  local body
+  body="$(_extract_muxm_fns _check_mux_stream_counts)" \
+    || { fail "5.1: _check_mux_stream_counts not found in muxm"; return; }
+
+  local script out
+  script='set -e'$'\n'"$body"$'\n''
+    warn(){ echo "WARN:$*"; }
+    log(){ echo "LOG:$*"; }
+    ffprobe(){
+      case "$*" in
+        *"-select_streams a"*) printf "0\n1\n" ;;   # 2 audio streams found
+        *"-select_streams s"*) ;;                    # 0 subtitle streams (legitimate, not an error)
+      esac
+    }
+    _check_mux_stream_counts /tmp/muxm_test_fake.mkv "Match test" 2 0
+    _check_mux_stream_counts /tmp/muxm_test_fake.mkv "Mismatch test" 3 -1
+    echo "SCRIPT_COMPLETED_OK"
+  '
+  out="$(bash -c "$script" 2>&1)"
+  if grep -qF "SCRIPT_COMPLETED_OK" <<<"$out" \
+     && grep -qF "LOG:[validate] Match test: audio stream count OK (2)" <<<"$out" \
+     && grep -qF "LOG:[validate] Match test: subtitle stream count OK (0)" <<<"$out" \
+     && grep -qF "WARN:Mismatch test: expected 3 audio stream(s)" <<<"$out"; then
+    pass "5.1: _check_mux_stream_counts reports match via log, mismatch via warn, and handles a zero-stream count without aborting under set -e"
+  else
+    fail "5.1: _check_mux_stream_counts behaved unexpectedly: ${out//$'\n'/ | }"
   fi
 }
 
