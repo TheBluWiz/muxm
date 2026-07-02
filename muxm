@@ -10587,6 +10587,45 @@ _pick_direct_text_sub_relidx(){
   echo ""
 }
 
+# 3.1: OCR language-flag selection — was triplicated verbatim across _prepare_subtitle (PGS
+# branch) and _prepare_ext_subtitle (.sup and .idx branches). pgsrip takes --language, sub2srt
+# takes no language flag at all, and any other configured OCR_TOOL is assumed to accept a short
+# -l flag (M14).
+# Args: $1 — nameref to the caller's array to fill; $2 — SUB_OCR_TOOL; $3 — SUB_OCR_LANG
+_ocr_lang_flags(){
+  local -n _olf_out=$1
+  local _tool="$2" _lang="$3"
+  _olf_out=()
+  case "$_tool" in
+    pgsrip)  [[ -n "$_lang" ]] && _olf_out=(--language "$_lang") ;;
+    sub2srt) ;;  # sub2srt does not support a language flag
+    *)       [[ -n "$_lang" ]] && _olf_out=(-l "$_lang") ;;
+  esac
+}
+
+# 3.1: shared "spawn $SUB_OCR_TOOL in the background, track/spinner/wait" sequence — was
+# duplicated (identical shape, differing only in input path/log file/label) across all four OCR
+# invocation sites in _prepare_subtitle and _prepare_ext_subtitle. The caller remains responsible
+# for relocating any stray output .srt and validating the result — that differs enough between
+# call sites (1 vs 2 candidate relocate paths, different diagnostics) to stay inline.
+# M3: _ACTIVE_FFMPEG_PID is registered on the line immediately after the background launch and
+# cleared only AFTER wait — a SIGINT before the wait must not orphan the OCR child.
+# Args: $1 — OCR input path; $2 — log file to capture OCR tool output; $3 — spinner label;
+#       $4 — nameref to the caller's already-populated _ocr_lang_flags array
+# Globals: SUB_OCR_TOOL (read), _ACTIVE_FFMPEG_PID (read/write)
+_run_ocr(){
+  local _input="$1" _log="$2" _label="$3"
+  local -n _ro_lang=$4
+  (
+    "$SUB_OCR_TOOL" ${_ro_lang[@]+"${_ro_lang[@]}"} "$_input" >"$_log" 2>&1 || true
+  ) &
+  local _ocr_pid=$!
+  _ACTIVE_FFMPEG_PID=$_ocr_pid
+  spinner "$_ocr_pid" "$_label"
+  wait "$_ocr_pid" 2>/dev/null || true
+  _ACTIVE_FFMPEG_PID=""
+}
+
 # Prepare subtitle for output (extract, convert, or OCR as needed).
 # When SUB_PRESERVE_TEXT_FORMAT=1 and the output container is MKV,
 # ASS/SSA subtitles are extracted in native format instead of converting to SRT.
@@ -10709,11 +10748,7 @@ _prepare_subtitle(){
 
       # Select language flag based on OCR tool (M14)
       local -a _ocr_lang=()
-      case "$SUB_OCR_TOOL" in
-        pgsrip)  [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(--language "$SUB_OCR_LANG") ;;
-        sub2srt) ;;  # sub2srt does not support a language flag
-        *)       [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(-l "$SUB_OCR_LANG") ;;
-      esac
+      _ocr_lang_flags _ocr_lang "$SUB_OCR_TOOL" "$SUB_OCR_LANG"
 
       # Try vobsub conversion if muxer is available
       if ffmpeg_has_muxer vobsub; then
@@ -10728,14 +10763,7 @@ _prepare_subtitle(){
         fi
 
         # Run OCR tool on VobSub .idx
-        (
-          "$SUB_OCR_TOOL" ${_ocr_lang[@]+"${_ocr_lang[@]}"} "${vob_base}.idx" >"$WORKDIR/sub_${idx}_ocr.log" 2>&1 || true
-        ) &
-        local ocr_pid=$!
-        _ACTIVE_FFMPEG_PID=$ocr_pid
-        spinner "$ocr_pid" "Running OCR on subtitle #${idx}"
-        wait "$ocr_pid" 2>/dev/null || true
-        _ACTIVE_FFMPEG_PID=""
+        _run_ocr "${vob_base}.idx" "$WORKDIR/sub_${idx}_ocr.log" "Running OCR on subtitle #${idx}" _ocr_lang
         if [[ -s "${vob_base}.srt" ]]; then
           mv -f "${vob_base}.srt" "$srt" || true
         fi
@@ -10749,13 +10777,7 @@ _prepare_subtitle(){
       fi
 
       # Fallback: try OCR tool directly on .sup
-      (
-        "$SUB_OCR_TOOL" ${_ocr_lang[@]+"${_ocr_lang[@]}"} "$sup" >"$WORKDIR/sub_${idx}_ocr_sup.log" 2>&1 || true
-      ) &
-      local ocr_sup_pid=$!
-      _ACTIVE_FFMPEG_PID=$ocr_sup_pid
-      spinner "$ocr_sup_pid" "Running OCR on subtitle #${idx} (SUP)"
-      wait "$ocr_sup_pid" 2>/dev/null || true; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait (a SIGINT before wait would otherwise orphan the OCR child and could hang the tee drain)
+      _run_ocr "$sup" "$WORKDIR/sub_${idx}_ocr_sup.log" "Running OCR on subtitle #${idx} (SUP)" _ocr_lang
       # Check common output locations for the SRT
       if [[ -s "${sup%.sup}.srt" ]]; then
         mv -f "${sup%.sup}.srt" "$srt" || true
@@ -10849,18 +10871,8 @@ _prepare_ext_subtitle(){
       fi
 
       local -a _ocr_lang=()
-      case "$SUB_OCR_TOOL" in
-        pgsrip)  [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(--language "$SUB_OCR_LANG") ;;
-        sub2srt) ;;
-        *)       [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(-l "$SUB_OCR_LANG") ;;
-      esac
-      (
-        "$SUB_OCR_TOOL" ${_ocr_lang[@]+"${_ocr_lang[@]}"} "$ext_path" >"$WORKDIR/ext_ocr_sup.log" 2>&1 || true
-      ) &
-      local ocr_pid=$!
-      _ACTIVE_FFMPEG_PID=$ocr_pid
-      spinner "$ocr_pid" "OCR external PGS: $basename_label"
-      wait "$ocr_pid" 2>/dev/null || true; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait (avoid orphaning the OCR child on SIGINT)
+      _ocr_lang_flags _ocr_lang "$SUB_OCR_TOOL" "$SUB_OCR_LANG"
+      _run_ocr "$ext_path" "$WORKDIR/ext_ocr_sup.log" "OCR external PGS: $basename_label" _ocr_lang
 
       # Some OCR tools write .srt next to source file; relocate to workdir
       local sup_srt="${ext_path%.sup}.srt"
@@ -10895,18 +10907,8 @@ _prepare_ext_subtitle(){
       fi
 
       local -a _ocr_lang=()
-      case "$SUB_OCR_TOOL" in
-        pgsrip)  [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(--language "$SUB_OCR_LANG") ;;
-        sub2srt) ;;
-        *)       [[ -n "$SUB_OCR_LANG" ]] && _ocr_lang=(-l "$SUB_OCR_LANG") ;;
-      esac
-      (
-        "$SUB_OCR_TOOL" ${_ocr_lang[@]+"${_ocr_lang[@]}"} "$ext_path" >"$WORKDIR/ext_ocr_vobsub.log" 2>&1 || true
-      ) &
-      local ocr_pid=$!
-      _ACTIVE_FFMPEG_PID=$ocr_pid
-      spinner "$ocr_pid" "OCR external VobSub: $basename_label"
-      wait "$ocr_pid" 2>/dev/null || true; _ACTIVE_FFMPEG_PID=""  # M3: clear AFTER wait (avoid orphaning the OCR child on SIGINT)
+      _ocr_lang_flags _ocr_lang "$SUB_OCR_TOOL" "$SUB_OCR_LANG"
+      _run_ocr "$ext_path" "$WORKDIR/ext_ocr_vobsub.log" "OCR external VobSub: $basename_label" _ocr_lang
 
       # RF7: some OCR tools write the .srt next to the source .idx, not into the workdir. Relocate
       # it before the existence check (mirrors the .sup branch above) — otherwise a SUCCESSFUL

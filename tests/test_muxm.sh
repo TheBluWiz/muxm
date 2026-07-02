@@ -10149,7 +10149,11 @@ _test_unit_ocr_dispatch() {
   local body
   # CR-10: _prepare_subtitle's extract/convert sites now await via _await_tracked_pid — pull the
   # helper in too (it calls the mocked spinner + the wait builtin), else the calls fail in isolation.
-  body="$(_extract_muxm_fns _prepare_subtitle _await_tracked_pid)" || { fail "3.2: could not extract _prepare_subtitle"; return; }
+  # 3.1: _prepare_subtitle's PGS OCR branch now delegates to _ocr_lang_flags/_run_ocr — pull both
+  # in too, else the OCR dispatch under test silently no-ops (the call sites are unresolved in
+  # the isolated subshell).
+  body="$(_extract_muxm_fns _prepare_subtitle _await_tracked_pid _ocr_lang_flags _run_ocr)" \
+    || { fail "3.2: could not extract _prepare_subtitle"; return; }
   local wd; wd="$(mktemp -d "${TMPDIR:-/tmp}/muxm-ocr.XXXXXX")" || { fail "3.2: mktemp failed"; return; }
   local sentinel="$wd/ocr_invoked"
   # Mock OCR tool: record the invocation, then emit a canned SRT beside the .sup (strip .sup→.srt),
@@ -10307,6 +10311,8 @@ test_unit() {
   _test_unit_p1_warn_if_not_on_manpath
   _test_unit_p2_dv_give_up_to_base
   _test_unit_p2_dv_mp4box_wrap
+  _test_unit_p3_ocr_lang_flags
+  _test_unit_p3_run_ocr
   _test_unit_mdry_loglevel_str
   _test_unit_l_disk_df_unavailable
   _test_unit_l_prepare_subtitle_workdir_gone
@@ -10828,6 +10834,94 @@ _test_unit_p2_dv_mp4box_wrap() {
     pass "2.2: verify_dv_container_record and run_video_pipeline both delegate to _dv_mp4box_wrap"
   else
     fail "2.2: a DV mp4box-wrap call site still inlines the block instead of calling _dv_mp4box_wrap"
+  fi
+}
+
+# 3.1: _ocr_lang_flags must select the correct language flag per OCR tool — behaviorally
+# verified in isolation (pgsrip → --language, sub2srt → none, anything else → -l, empty lang →
+# none), THEN structurally verified as the ONLY path all three former case-statement copies
+# (_prepare_subtitle's PGS branch, _prepare_ext_subtitle's .sup and .idx branches) use, so the
+# three copies can never silently drift apart again.
+_test_unit_p3_ocr_lang_flags() {
+  local body
+  body="$(_extract_muxm_fns _ocr_lang_flags)" || { fail "3.1: _ocr_lang_flags not found in muxm"; return; }
+
+  local out script
+  script="$body"$'\n''
+    declare -a o
+    _ocr_lang_flags o pgsrip eng;         echo "pgsrip:${o[*]}"
+    _ocr_lang_flags o sub2srt eng;        echo "sub2srt:${o[*]}"
+    _ocr_lang_flags o something-else eng; echo "other:${o[*]}"
+    _ocr_lang_flags o pgsrip "";          echo "pgsrip-empty:${o[*]}"
+  '
+  out="$(bash -c "$script" 2>&1)"
+  if grep -qF "pgsrip:--language eng" <<<"$out" \
+     && grep -qF "sub2srt:" <<<"$out" && ! grep -qF "sub2srt:-" <<<"$out" \
+     && grep -qF "other:-l eng" <<<"$out" \
+     && grep -qF "pgsrip-empty:" <<<"$out" && ! grep -qF "pgsrip-empty:-" <<<"$out"; then
+    pass "3.1: _ocr_lang_flags selects the correct flag per OCR tool (pgsrip/sub2srt/other, incl. empty lang)"
+  else
+    fail "3.1: _ocr_lang_flags returned unexpected flags: ${out//$'\n'/ | }"
+  fi
+
+  # Structural: all three former call sites must delegate, not inline the case statement.
+  local ps pes ps_count pes_count
+  ps="$(awk '/^_prepare_subtitle\(\)/,/^\}/' "$MUXM")"
+  pes="$(awk '/^_prepare_ext_subtitle\(\)/,/^\}/' "$MUXM")"
+  ps_count="$(grep -c '_ocr_lang_flags ' <<<"$ps")"
+  pes_count="$(grep -c '_ocr_lang_flags ' <<<"$pes")"
+  if [[ "$ps_count" -eq 1 && "$pes_count" -eq 2 ]]; then
+    pass "3.1: _prepare_subtitle (1x) and _prepare_ext_subtitle (2x) delegate to _ocr_lang_flags"
+  else
+    fail "3.1: expected 1 call in _prepare_subtitle and 2 in _prepare_ext_subtitle, got $ps_count and $pes_count"
+  fi
+  if ! grep -q 'case "\$SUB_OCR_TOOL" in' <<<"$ps$pes"; then
+    pass "3.1: no inlined SUB_OCR_TOOL case statement remains in either function"
+  else
+    fail "3.1: an inlined 'case \"\$SUB_OCR_TOOL\" in' block still exists — extraction incomplete"
+  fi
+}
+
+# 3.1: _run_ocr must spawn $SUB_OCR_TOOL with the resolved language flags, register/clear
+# _ACTIVE_FFMPEG_PID around the wait (M3), and block until it exits — verified behaviorally in
+# isolation, THEN structurally as the delegate for all four former spawn/wait call sites (PGS
+# vobsub + PGS .sup fallback in _prepare_subtitle; .sup + .idx branches in
+# _prepare_ext_subtitle).
+_test_unit_p3_run_ocr() {
+  local body
+  body="$(_extract_muxm_fns _run_ocr)" || { fail "3.1: _run_ocr not found in muxm"; return; }
+
+  local stub_bin; stub_bin="$(mktemp -d)"
+  printf '#!/bin/bash\nprintf "OCR_ARGS:%%s\\n" "$*" > "%s/args.txt"\n' "$stub_bin" > "$stub_bin/fake_ocr"
+  chmod +x "$stub_bin/fake_ocr"
+  local logfile; logfile="$(mktemp)"
+
+  local out script
+  script="spinner(){ :; }"$'\n'"SUB_OCR_TOOL=\"$stub_bin/fake_ocr\""$'\n'"$body"$'\n''
+    declare -a lang=(--language eng)
+    _run_ocr /tmp/muxm_test_ocr_input.sup "'"$logfile"'" "test label" lang
+    echo "ACTIVE_PID_AFTER=[$_ACTIVE_FFMPEG_PID]"
+  '
+  out="$(bash -c "$script" 2>&1)"
+  local args_out
+  args_out="$(cat "$stub_bin/args.txt" 2>/dev/null)"
+  rm -rf "$stub_bin" "$logfile"
+  if grep -qF "ACTIVE_PID_AFTER=[]" <<<"$out" \
+     && [[ "$args_out" == "OCR_ARGS:--language eng /tmp/muxm_test_ocr_input.sup" ]]; then
+    pass "3.1: _run_ocr invokes SUB_OCR_TOOL with the language flags and clears _ACTIVE_FFMPEG_PID after wait"
+  else
+    fail "3.1: _run_ocr did not behave as expected (out=${out:0:200}, args=$args_out)"
+  fi
+
+  local ps pes ps_count pes_count
+  ps="$(awk '/^_prepare_subtitle\(\)/,/^\}/' "$MUXM")"
+  pes="$(awk '/^_prepare_ext_subtitle\(\)/,/^\}/' "$MUXM")"
+  ps_count="$(grep -c '_run_ocr ' <<<"$ps")"
+  pes_count="$(grep -c '_run_ocr ' <<<"$pes")"
+  if [[ "$ps_count" -eq 2 && "$pes_count" -eq 2 ]]; then
+    pass "3.1: _prepare_subtitle (2x) and _prepare_ext_subtitle (2x) delegate to _run_ocr"
+  else
+    fail "3.1: expected 2 _run_ocr calls in each function, got $ps_count and $pes_count"
   fi
 }
 
@@ -12225,7 +12319,9 @@ _test_ext_subs_cr13_hi_is_hindi() {
 # function returns a non-empty workdir path (i.e. the result was relocated and kept).
 _test_ext_subs_rf7_idx_relocate() {
   local body
-  body="$(_extract_muxm_fns _prepare_ext_subtitle _container_supports_bitmap_subs)" \
+  # 3.1: _prepare_ext_subtitle's OCR branches now delegate to _ocr_lang_flags/_run_ocr — pull
+  # both in too, else the OCR dispatch under test silently no-ops (unresolved in the subshell).
+  body="$(_extract_muxm_fns _prepare_ext_subtitle _container_supports_bitmap_subs _ocr_lang_flags _run_ocr)" \
     || { fail "RF7: could not extract _prepare_ext_subtitle"; return; }
   local _dir; _dir="$(mktemp -d "$TESTDIR/rf7.XXXXXX")"
   local _work="$_dir/work"; mkdir -p "$_work"
