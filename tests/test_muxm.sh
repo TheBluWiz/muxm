@@ -1678,6 +1678,29 @@ _test_cli_l3_value_validation() {
   done
   pass "L4: all allow-listed --audio-force-codec encoders accepted at parse (incl. libfdk_aac, aac_at)"
 
+  # 4.1: --checksum-algo now validates at parse time via the same inline-validator shape as its
+  # siblings (_validate_checksum_algo_arg), instead of only being caught by a separate case
+  # statement after the whole CLI parse loop finished.
+  _l3_assert_rejected "4.1: --checksum-algo bogus rejected at parse" "Invalid --checksum-algo" --checksum-algo bogus
+  out="$(_l3_msg --checksum-algo sha256)"
+  if printf '%s\n' "$out" | grep -qiF "Invalid --checksum-algo"; then
+    fail "4.1: --checksum-algo sha256 wrongly rejected at parse"
+  else
+    pass "4.1: valid --checksum-algo values (sha256/blake2b/auto) accepted at parse"
+  fi
+  # Config-bypass: a sourced .muxmrc assigns CHECKSUM_ALGO directly, skipping the CLI arm. The
+  # post-config re-check (now delegating to the same _validate_checksum_algo_arg) must still
+  # reject it.
+  local _ck_dir; _ck_dir="$(mktemp -d "$TESTDIR/checksum_algo.XXXXXX")"
+  printf 'CHECKSUM_ALGO=bogus\n' > "$_ck_dir/.muxmrc"
+  : > "$_ck_dir/src.mkv"
+  local _ck_out; _ck_out="$(cd "$_ck_dir" && HOME="$_ck_dir" "$MUXM" --dry-run src.mkv out.mkv 2>&1)" || true
+  if printf '%s\n' "$_ck_out" | grep -qiF "Invalid CHECKSUM_ALGO"; then
+    pass "4.1: a sourced .muxmrc CHECKSUM_ALGO=bogus is still rejected (config-bypass closed)"
+  else
+    fail "4.1: config-bypass CHECKSUM_ALGO=bogus was not rejected: ${_ck_out:0:200}"
+  fi
+
   # Config-bypass: a sourced .muxmrc assigns the global directly. The post-config re-check must
   # still reject it. Use AV1_MAXRATE (no profile overrides it; the re-check fires before source
   # validation, so the dummy source is fine). Isolated HOME so no stray ~/.muxmrc interferes.
@@ -9304,7 +9327,10 @@ _test_unit_decide_color_and_pixfmt() {
   # This asserts the decision function's output VARS (not an encoded file's tags), so unlike the
   # 1.2 HDR-tag path there is no ffmpeg auto-copy to make a branch mutation un-catchable.
   local body
-  body="$(_extract_muxm_fns decide_color_and_pixfmt _lower)" \
+  # 4.2: decide_color_and_pixfmt now delegates its 4 color-field probes to
+  # _probe_video_color_fields (which itself uses _split_tab) instead of calling _probe_field
+  # directly 4 times — pull both in too, else the extracted function can't resolve the call.
+  body="$(_extract_muxm_fns decide_color_and_pixfmt _lower _probe_video_color_fields _split_tab)" \
     || { fail "2.3: could not extract decide_color_and_pixfmt + _lower"; return; }
   # $1=pix $2=prim $3=trc $4=cspace $5=optional flags ("SDR_FORCE_10BIT=1" etc.). Emits PROF|PIXFMT.
   _dcp(){
@@ -9380,8 +9406,11 @@ select_best_audio | cut -f1" -- "$tracks" "$override"
 #        through to downmixing the preferred-language track instead.
 _test_unit_rf3_rf4_audio_disposition() {
   local body defaults
-  body="$(_extract_muxm_fns select_best_audio _score_audio_stream _audio_stream_info _audio_stream_count \
-                            _split_tab _normalize_codec_lang _audio_codec_rank _audio_lang_matches \
+  # 4.4: _audio_stream_info now delegates to _audio_stream_info_uncached (memoization cache
+  # miss/fallback path) instead of doing the jq fork itself — pull it in too, else the REAL
+  # (non-mocked) _audio_stream_info this test drives can't resolve the call.
+  body="$(_extract_muxm_fns select_best_audio _score_audio_stream _audio_stream_info _audio_stream_info_uncached \
+                            _audio_stream_count _split_tab _normalize_codec_lang _audio_codec_rank _audio_lang_matches \
                             _norm_lang_code audio_is_lossless _audio_is_commentary _jq_cache)" \
     || { fail "RF3/RF4: could not extract audio-selection fns"; return; }
   defaults="$(grep -E '^(declare -i )?(AUDIO_SCORE_[A-Z_]+|AUDIO_CODEC_PREFERENCE|AUDIO_LANG_PREF|TAG_LANGUAGE_DEFAULT|_AUDIO_CODEC_RANK_PREF)=' "$MUXM")"
@@ -9589,7 +9618,8 @@ printf '%s\n' \"\$SRT_FULL\"" -- "$1" "$2"
 # must replace each with a space.
 _test_unit_rf8_metadata_sanitize() {
   local body_a body_s
-  body_a="$(_extract_muxm_fns _audio_stream_info _jq_cache)" || { fail "RF8: could not extract _audio_stream_info"; return; }
+  # 4.4: _audio_stream_info now delegates to _audio_stream_info_uncached — pull it in too.
+  body_a="$(_extract_muxm_fns _audio_stream_info _audio_stream_info_uncached _jq_cache)" || { fail "RF8: could not extract _audio_stream_info"; return; }
   body_s="$(_extract_muxm_fns _sub_stream_info _jq_cache)"   || { fail "RF8: could not extract _sub_stream_info"; return; }
   # JSON \u escapes for ESC (27), BEL (7), DEL (127) — generated, not typed, so no raw control byte
   # ever lands in this file.
@@ -9904,7 +9934,10 @@ _test_unit_video_copy_compliant() {
   local body
   # CR-2: the DV gate now delegates to _is_atv_directplay_profile (shared Direct-Play predicate) —
   # extract it too, else the gate's `if` references an undefined function and never fires here.
-  body="$(_extract_muxm_fns _video_is_copy_compliant _lower _output_pixfmt_is_10bit _is_atv_directplay_profile)" \
+  # 4.2: _output_pixfmt_is_10bit now delegates its 4 color-field probes to
+  # _probe_video_color_fields (which itself uses _split_tab) — pull both in too.
+  body="$(_extract_muxm_fns _video_is_copy_compliant _lower _output_pixfmt_is_10bit _is_atv_directplay_profile \
+                            _probe_video_color_fields _split_tab)" \
     || { fail "3.5: could not extract _video_is_copy_compliant + _lower + _output_pixfmt_is_10bit + _is_atv_directplay_profile"; return; }
   # $1=src_codec $2=src_pix $3=src_prim $4=src_trc $5=src_bitrate(bps) $6=extra global overrides.
   # Emits "<rc>|<reject reason>". Bitrate is always a real number so the size/duration stat
@@ -10013,7 +10046,8 @@ _test_unit_c1_gate_helpers() {
 
   # ---- _output_pixfmt_is_10bit ----
   local body10
-  body10="$(_extract_muxm_fns _output_pixfmt_is_10bit _lower)" \
+  # 4.2: _output_pixfmt_is_10bit now delegates to _probe_video_color_fields (+ _split_tab).
+  body10="$(_extract_muxm_fns _output_pixfmt_is_10bit _lower _probe_video_color_fields _split_tab)" \
     || { fail "3.5b: could not extract _output_pixfmt_is_10bit + _lower"; return; }
   # $1=pix $2=prim $3=trc $4=cspace $5=extra flags. Emits "10" if 10-bit output else "8".
   _o10(){
@@ -10313,6 +10347,7 @@ test_unit() {
   _test_unit_p2_dv_mp4box_wrap
   _test_unit_p3_ocr_lang_flags
   _test_unit_p3_run_ocr
+  _test_unit_p4_audio_pretty_line
   _test_unit_mdry_loglevel_str
   _test_unit_l_disk_df_unavailable
   _test_unit_l_prepare_subtitle_workdir_gone
@@ -10847,21 +10882,30 @@ _test_unit_p3_ocr_lang_flags() {
   body="$(_extract_muxm_fns _ocr_lang_flags)" || { fail "3.1: _ocr_lang_flags not found in muxm"; return; }
 
   local out script
-  script="$body"$'\n''
+  # set -e (matching muxm's own set -eEuo pipefail): a bare `cond && action` as a function's
+  # LAST statement propagates a false `cond` as the function's own exit status, which aborts the
+  # whole script when the function is called as a plain statement — exactly how every real call
+  # site invokes _ocr_lang_flags. Without set -e here, a regression of that class would go
+  # undetected even though it crashes every real pgsrip/custom-tool run with no language set.
+  script='set -e'$'\n'"$body"$'\n''
     declare -a o
     _ocr_lang_flags o pgsrip eng;         echo "pgsrip:${o[*]}"
     _ocr_lang_flags o sub2srt eng;        echo "sub2srt:${o[*]}"
     _ocr_lang_flags o something-else eng; echo "other:${o[*]}"
     _ocr_lang_flags o pgsrip "";          echo "pgsrip-empty:${o[*]}"
+    _ocr_lang_flags o something-else "";  echo "other-empty:${o[*]}"
+    echo "SCRIPT_COMPLETED_OK"
   '
   out="$(bash -c "$script" 2>&1)"
-  if grep -qF "pgsrip:--language eng" <<<"$out" \
+  if grep -qF "SCRIPT_COMPLETED_OK" <<<"$out" \
+     && grep -qF "pgsrip:--language eng" <<<"$out" \
      && grep -qF "sub2srt:" <<<"$out" && ! grep -qF "sub2srt:-" <<<"$out" \
      && grep -qF "other:-l eng" <<<"$out" \
-     && grep -qF "pgsrip-empty:" <<<"$out" && ! grep -qF "pgsrip-empty:-" <<<"$out"; then
-    pass "3.1: _ocr_lang_flags selects the correct flag per OCR tool (pgsrip/sub2srt/other, incl. empty lang)"
+     && grep -qF "pgsrip-empty:" <<<"$out" && ! grep -qF "pgsrip-empty:-" <<<"$out" \
+     && grep -qF "other-empty:" <<<"$out" && ! grep -qF "other-empty:-" <<<"$out"; then
+    pass "3.1: _ocr_lang_flags selects the correct flag per OCR tool under set -e (pgsrip/sub2srt/other, incl. empty lang — does not abort the script)"
   else
-    fail "3.1: _ocr_lang_flags returned unexpected flags: ${out//$'\n'/ | }"
+    fail "3.1: _ocr_lang_flags returned unexpected flags or aborted under set -e: ${out//$'\n'/ | }"
   fi
 
   # Structural: all three former call sites must delegate, not inline the case statement.
@@ -10922,6 +10966,53 @@ _test_unit_p3_run_ocr() {
     pass "3.1: _prepare_subtitle (2x) and _prepare_ext_subtitle (2x) delegate to _run_ocr"
   else
     fail "3.1: expected 2 _run_ocr calls in each function, got $ps_count and $pes_count"
+  fi
+}
+
+# 4.5: _audio_pretty_line must format a display line identically to the pre-refactor inline
+# construction — behaviorally verified (title suffix, [commentary] tag, bitrate suffix
+# including the "0 bitrate omits the suffix" edge case), THEN structurally verified as the ONLY
+# path both run_audio_pipeline_multi and run_audio_pipeline's display loops use (M-DRY-b
+# pattern) — the SYNC comment that used to warn editors to keep the two copies in step is gone
+# because there's only one copy now.
+_test_unit_p4_audio_pretty_line() {
+  local body
+  body="$(_extract_muxm_fns _audio_pretty_line _audio_is_commentary)" \
+    || { fail "4.5: _audio_pretty_line not found in muxm"; return; }
+
+  local script out
+  # set -e (matching muxm's own set -eEuo pipefail): a bare `cond && action` as a function's
+  # LAST statement propagates a false `cond` as the function's own exit status, which aborts the
+  # whole script when the function is called as a plain statement — exactly how both real call
+  # sites invoke _audio_pretty_line. Without set -e here, a regression of that class would go
+  # undetected even though it crashes every real run on a 0-bitrate/untitled track (the C
+  # scenario below — a very common case, not an edge case).
+  script='set -e'$'\n'"$body"$'\n''
+    declare out
+    _audio_pretty_line out 0 eac3 6 eng "" 384000;          echo "A:$out"
+    _audio_pretty_line out 1 aac 2 eng Commentary 128000;   echo "B:$out"
+    _audio_pretty_line out 2 ac3 2 und "" 0;                echo "C:$out"
+    echo "SCRIPT_COMPLETED_OK"
+  '
+  out="$(bash -c "$script" 2>&1)"
+  if grep -qF "SCRIPT_COMPLETED_OK" <<<"$out" \
+     && grep -qF 'A:#0: eac3 6ch [eng], 384kbps' <<<"$out" \
+     && grep -qF 'B:#1: aac 2ch [eng] — Commentary [commentary], 128kbps' <<<"$out" \
+     && grep -qF 'C:#2: ac3 2ch [und]' <<<"$out" && ! grep -qF 'C:#2: ac3 2ch [und],' <<<"$out"; then
+    pass "4.5: _audio_pretty_line formats title/commentary/bitrate exactly like the pre-refactor inline construction, and does not abort under set -e on a 0-bitrate track"
+  else
+    fail "4.5: _audio_pretty_line output mismatch or aborted under set -e: ${out//$'\n'/ | }"
+  fi
+
+  local multi single multi_count single_count
+  multi="$(awk '/^run_audio_pipeline_multi\(\)/,/^\}/' "$MUXM")"
+  single="$(awk '/^run_audio_pipeline\(\)/,/^\}/' "$MUXM")"
+  multi_count="$(grep -c '_audio_pretty_line ' <<<"$multi")"
+  single_count="$(grep -c '_audio_pretty_line ' <<<"$single")"
+  if [[ "$multi_count" -eq 1 && "$single_count" -eq 1 ]]; then
+    pass "4.5: run_audio_pipeline_multi and run_audio_pipeline both delegate to _audio_pretty_line"
+  else
+    fail "4.5: expected 1 _audio_pretty_line call in each function, got multi=$multi_count single=$single_count"
   fi
 }
 

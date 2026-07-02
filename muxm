@@ -3449,9 +3449,9 @@ _uninstall_completions(){
     [[ -f "$rc" ]] || continue
     local rc_base="${rc##*/}"
     if grep -qF 'muxm-completion.bash' "$rc" 2>/dev/null; then
-      # Remove the marker comment and source line
-      _sed_inplace '/# muxm tab completion/d' "$rc"
-      _sed_inplace '/muxm-completion\.bash/d' "$rc"
+      # 4.3: remove the marker comment and source line in one _sed_inplace pass (two -e
+      # expressions) instead of two separate passes — halves the file I/O.
+      _sed_inplace -e '/# muxm tab completion/d' -e '/muxm-completion\.bash/d' "$rc"
       printf '  ✅ Cleaned %s\n' "$rc_base"
     fi
   done
@@ -5187,6 +5187,18 @@ _validate_force_codec_arg(){
     *) die 11 "Invalid $1 '$2': unknown audio encoder. Valid: libopus, libmp3lame, libvorbis, aac, libfdk_aac, aac_at, ac3, eac3, flac." ;;
   esac
 }
+# 4.1: --checksum-algo validated via the same inline-validator shape as its siblings above,
+# instead of a structurally separate case statement that only ran after the whole CLI parse loop
+# finished. Called both at the CLI parse site (immediate parse-time failure, matching every
+# other _validate_*_arg flag) and again below as the sourced-.muxmrc bypass check (a config file
+# assigns CHECKSUM_ALGO directly, skipping the CLI arm) — one function, two call sites, instead
+# of duplicating the enum list.
+_validate_checksum_algo_arg(){
+  case "$2" in
+    sha256|blake2b|auto) return 0 ;;
+    *) die 11 "Invalid $1 '$2': expected one of sha256, blake2b, auto." ;;
+  esac
+}
 
 POSITIONALS=()
 while [[ $# -gt 0 ]]; do
@@ -5206,7 +5218,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --checksum) CHECKSUM=1; shift ;;
     --no-checksum) CHECKSUM=0; shift ;;
-    --checksum-algo) _require_val "$1" "$#" "${2:-}"; CHECKSUM_ALGO="$2"; CHECKSUM=1; shift 2 ;;
+    --checksum-algo) _require_val "$1" "$#" "${2:-}"; _validate_checksum_algo_arg "$1" "$2"; CHECKSUM_ALGO="$2"; CHECKSUM=1; shift 2 ;;
     --disk-check) DISK_CHECK=1; shift ;;
     --no-disk-check) DISK_CHECK=0; shift ;;
 
@@ -5358,11 +5370,8 @@ done
 # the rest of the run (covers the config-only case, where no --quiet/--verbose flag ran).
 _resolve_verbosity
 
-# Validate CHECKSUM_ALGO
-case "${CHECKSUM_ALGO:-sha256}" in
-  sha256|blake2b|auto) ;;
-  *) die 11 "Invalid CHECKSUM_ALGO: \"$CHECKSUM_ALGO\". Valid values: sha256, blake2b, auto" ;;
-esac
+# Validate CHECKSUM_ALGO (catches a sourced .muxmrc bypassing the --checksum-algo CLI arm above)
+_validate_checksum_algo_arg "CHECKSUM_ALGO" "${CHECKSUM_ALGO:-sha256}"
 
 # ===== Section 13: Profile + flag conflict warnings ==========================================
 # These are warnings, not errors — the user's explicit CLI flags always win.
@@ -7270,6 +7279,32 @@ _probe_field(){
   fi
 }
 
+# 4.2: batch the 4 color-decision fields (pix_fmt, color_primaries, color_transfer,
+# color_space) into ONE jq call instead of the 4 separate _probe_field forks that
+# decide_color_and_pixfmt and _output_pixfmt_is_10bit each ran independently. Behavior-preserving:
+# same values, same "" default for an absent/null field (matching _probe_field's own `// empty`).
+# Uses _split_tab, NOT a plain `IFS=$'\t' read`, since any of these fields can legitimately be
+# empty and a plain read would collapse/shift the remaining fields (tab is IFS-whitespace — see
+# _split_tab's own C2 note).
+# Args: $1-$4 — namerefs to fill, in order: pix_fmt, color_primaries, color_transfer, color_space
+#       $5 — (optional) source file path, only used in the pre-cache ffprobe fallback
+# Globals: METADATA_CACHE (read), FFPROBE_FLAGS (read)
+_probe_video_color_fields(){
+  local -n _pvcf_pix=$1 _pvcf_prim=$2 _pvcf_trc=$3 _pvcf_cspace=$4
+  local _pvcf_rec
+  if [[ -n "${METADATA_CACHE:-}" ]]; then
+    _pvcf_rec="$(_jq_cache -r \
+      "[.streams[] | select(.codec_type==\"video\")] | .[0] |
+       \"\(.pix_fmt // \"\")\t\(.color_primaries // \"\")\t\(.color_transfer // \"\")\t\(.color_space // \"\")\"" \
+      | head -n1)" || true
+  else
+    # Pre-cache fallback (should only occur if called before cache_stream_metadata) — matches
+    # _probe_field's own pre-cache path, one ffprobe call per field.
+    _pvcf_rec="$(_probe_field pix_fmt "${5:-}")"$'\t'"$(_probe_field color_primaries "${5:-}")"$'\t'"$(_probe_field color_transfer "${5:-}")"$'\t'"$(_probe_field color_space "${5:-}")"
+  fi
+  _split_tab "$_pvcf_rec" _pvcf_pix _pvcf_prim _pvcf_trc _pvcf_cspace
+}
+
 # Check if METADATA_CACHE contains at least one stream of the given type.
 # Args: $1 — stream type (e.g., "audio", "video", "subtitle")
 # Globals: METADATA_CACHE (read)
@@ -7336,10 +7371,7 @@ COLOR_ARGS=()
 #                FORCE_CHROMA_420, SDR_USE_10BIT_IF_SRC_10BIT, SDR_FORCE_10BIT
 decide_color_and_pixfmt() {
   local pix prim trc cspace
-  pix="$(_probe_field pix_fmt)"
-  prim="$(_probe_field color_primaries)"
-  trc="$(_probe_field color_transfer)"
-  cspace="$(_probe_field color_space)"
+  _probe_video_color_fields pix prim trc cspace
 
   prim="$(_lower "$prim")"
   trc="$(_lower "$trc")"
@@ -8373,10 +8405,8 @@ declare -a ALL_SUB_TITLES=()      # title tag per entry (empty for external file
 # Returns: 0 (true) if the output would be 10-bit, 1 (false) otherwise.
 _output_pixfmt_is_10bit() {
   local prim trc cspace pix src_is_hdr=0 src_is_10bit=0
-  prim="$(_lower "$(_probe_field color_primaries)")"
-  trc="$(_lower "$(_probe_field color_transfer)")"
-  cspace="$(_lower "$(_probe_field color_space)")"
-  pix="$(_lower "$(_probe_field pix_fmt)")"
+  _probe_video_color_fields pix prim trc cspace
+  prim="$(_lower "$prim")"; trc="$(_lower "$trc")"; cspace="$(_lower "$cspace")"; pix="$(_lower "$pix")"
 
   # Classify the source exactly as decide_color_and_pixfmt does (same predicates).
   [[ "$prim" == "bt2020" || "$cspace" == "bt2020nc" || "$trc" == "smpte2084" \
@@ -9550,10 +9580,47 @@ _audio_is_commentary(){
 # earlier \t\n\r-only strip on title.)
 # Args: $1 — audio stream index (0-based, relative to audio streams)
 # Globals: METADATA_CACHE (read)
-_audio_stream_info(){
+_audio_stream_info_uncached(){
   local idx="$1"
   _jq_cache -r "[.streams[] | select(.codec_type==\"audio\")] | .[$idx] |
     \"\(.codec_name // \"unknown\")\t\(.channels // 0)\t\(.tags.language // \"\" | gsub(\"[\\u0000-\\u001f\\u007f]\";\" \"))\t\(.bit_rate // \"0\")\t\(.tags.title // \"\" | gsub(\"[\\u0000-\\u001f\\u007f]\";\" \"))\t\(.disposition.comment // 0)\t\(.disposition.visual_impaired // 0)\t\(.disposition.hearing_impaired // 0)\"" | head -n1 || printf 'unknown\t0\t\t0\t\t0\t0\t0\n'
+}
+
+# 4.4: per-index memoization cache for _audio_stream_info, populated once by
+# _prefetch_audio_stream_info. Cuts what was O(tracks × ~3 passes) redundant jq forks —
+# _build_audio_keep_list, the stereo-fallback scan, select_best_audio, and the multi-/
+# single-track display loops each independently called _audio_stream_info per track — down to
+# one jq fork per stream, done once per run.
+declare -gA _AUDIO_STREAM_INFO_CACHE=()
+
+# Populate _AUDIO_STREAM_INFO_CACHE for every audio stream in ONE pass. MUST be called as a
+# plain statement, never inside command substitution: _audio_stream_info's callers all invoke it
+# via `info="$(_audio_stream_info "$i")"`, which forks a subshell — a cache write from inside
+# that subshell would vanish the instant it exits, silently defeating the memoization. Read
+# access from a subshell is fine (the array is already fully populated by the time any consumer
+# runs), so this prefetch is the only place that needs to avoid the subshell trap. Called once
+# from main(), immediately after cache_stream_metadata.
+# Args: none. Globals: METADATA_CACHE (read), _AUDIO_STREAM_INFO_CACHE (write)
+_prefetch_audio_stream_info(){
+  _AUDIO_STREAM_INFO_CACHE=()
+  local -i _pasi_n _pasi_i
+  _pasi_n="$(_audio_stream_count)"
+  for (( _pasi_i=0; _pasi_i<_pasi_n; _pasi_i++ )); do
+    _AUDIO_STREAM_INFO_CACHE[$_pasi_i]="$(_audio_stream_info_uncached "$_pasi_i")"
+  done
+}
+
+# Args: $1 — audio stream index (0-based, relative to audio streams)
+# Globals: METADATA_CACHE (read), _AUDIO_STREAM_INFO_CACHE (read)
+_audio_stream_info(){
+  local idx="$1"
+  if [[ -n "${_AUDIO_STREAM_INFO_CACHE[$idx]+x}" ]]; then
+    printf '%s\n' "${_AUDIO_STREAM_INFO_CACHE[$idx]}"
+    return 0
+  fi
+  # Fallback for any call before the prefetch has run (or an index outside the prefetched
+  # range) — same jq fork the un-memoized version always did, just not the common path anymore.
+  _audio_stream_info_uncached "$idx"
 }
 
 # Audio stream scoring algorithm for automatic track selection.
@@ -9996,6 +10063,26 @@ _build_audio_keep_list(){
   echo "${kept[*]}"
 }
 
+# 4.5: shared per-stream display-line construction — was duplicated verbatim between
+# run_audio_pipeline_multi and run_audio_pipeline's "Scanning/Detected audio streams" display
+# loops (the surrounding select/keep logic around each loop differs by design and stays
+# separate; only this line-formatting step was identical).
+# Args: $1 — nameref to fill; $2 — stream index; $3 — codec; $4 — channels; $5 — language;
+#       $6 — title; $7 — bitrate (bps)
+_audio_pretty_line(){
+  local -n _apl_out=$1
+  local _i="$2" _c="$3" _ch="$4" _l="$5" _t="$6" _br="$7"
+  _apl_out="#$_i: $_c ${_ch}ch [$_l]"
+  [[ -n "$_t" ]] && _apl_out="$_apl_out — $_t"
+  _audio_is_commentary "$_t" && _apl_out="$_apl_out [commentary]"
+  (( _br > 0 )) && _apl_out="$_apl_out, $((_br/1000))kbps"
+  # A bare `cond && action` as a function's LAST statement propagates a false `cond` as the
+  # function's own exit status — under set -e (active throughout muxm), calling this function as
+  # a plain statement (as both callers do) would then abort the whole run whenever the bitrate is
+  # 0/absent (a common case for untitled or bitrate-less tracks). Force success explicitly.
+  return 0
+}
+
 # run_audio_pipeline_multi — Multi-track audio: filter and defer to mux_final.
 #
 # Called instead of the single-track pipeline when AUDIO_MULTI_TRACK=1.
@@ -10063,8 +10150,6 @@ run_audio_pipeline_multi(){
   n_kept="${#AUDIO_MT_INDICES[@]}"
   n_dropped=$(( n_total - n_kept ))
 
-  # SYNC: only the per-stream `pretty=` line construction must stay in sync with the display loop in
-  # run_audio_pipeline (the surrounding filter/keep logic differs by design). (RF12: narrowed.)
   say "→ Scanning audio streams (multi-track mode):"
   local i
   for (( i=0; i<n_total; i++ )); do
@@ -10080,10 +10165,7 @@ run_audio_pipeline_multi(){
       (( idx == i )) && { _is_kept=1; break; }
     done
 
-    pretty="#$i: $_c ${_ch_i}ch [$_l]"
-    [[ -n "$_t" ]] && pretty="$pretty — $_t"
-    _audio_is_commentary "$_t" && pretty="$pretty [commentary]"
-    (( _br_i > 0 )) && pretty="$pretty, $((_br_i/1000))kbps"
+    _audio_pretty_line pretty "$i" "$_c" "$_ch_i" "$_l" "$_t" "$_br_i"
 
     if (( _is_kept )); then
       marker=" ✓"
@@ -10171,8 +10253,6 @@ run_audio_pipeline(){
   _parse_audio_record "$_best_record"
   idx="$_AREC_IDX"; codec="$_AREC_CODEC"; ch="$_AREC_CH"; lang="$_AREC_LANG"; title="$_AREC_TITLE"; br="$_AREC_BR"
 
-  # SYNC: only the per-stream `pretty=` line construction must stay in sync with the display loop in
-  # run_audio_pipeline_multi (the surrounding select/keep logic differs by design). (RF12: narrowed.)
   log "• Detected audio streams:"
   local i
   for (( i=0; i<n; i++ )); do
@@ -10182,10 +10262,7 @@ run_audio_pipeline(){
     _normalize_codec_lang _c _l
     [[ -z "$_br_i" || ! "$_br_i" =~ ^[0-9]+$ ]] && _br_i=0
 
-    pretty="#$i: $_c ${_ch_i}ch [$_l]"
-    [[ -n "$_t" ]] && pretty="$pretty — $_t"
-    _audio_is_commentary "$_t" && pretty="$pretty [commentary]"
-    (( _br_i > 0 )) && pretty="$pretty, $((_br_i/1000))kbps"
+    _audio_pretty_line pretty "$i" "$_c" "$_ch_i" "$_l" "$_t" "$_br_i"
     log "  $pretty"
   done
 
@@ -10601,6 +10678,11 @@ _ocr_lang_flags(){
     sub2srt) ;;  # sub2srt does not support a language flag
     *)       [[ -n "$_lang" ]] && _olf_out=(-l "$_lang") ;;
   esac
+  # A bare `cond && action` as a function's LAST statement propagates a false `cond` as the
+  # function's own exit status — under set -e (active throughout muxm), calling this function as
+  # a plain statement (as every caller does) would then abort the whole run whenever $_lang is
+  # empty with pgsrip/a custom tool. Force success explicitly; this function never fails.
+  return 0
 }
 
 # 3.1: shared "spawn $SUB_OCR_TOOL in the background, track/spinner/wait" sequence — was
@@ -12225,6 +12307,11 @@ main() {
 
   # Cache metadata once for all operations
   cache_stream_metadata
+
+  # 4.4: pre-populate the per-track _audio_stream_info cache in one pass, before any of its many
+  # consumers (keep-list filtering, scoring, stereo-fallback scan, display loops) run. Must be a
+  # plain statement, not a command substitution — see _prefetch_audio_stream_info.
+  _prefetch_audio_stream_info
 
   # Capture the source frame rate so the DV raw-ES wrap steps (mp4box / ffmpeg)
   # stamp the correct rate instead of mp4box's 25fps default for headerless ES.
