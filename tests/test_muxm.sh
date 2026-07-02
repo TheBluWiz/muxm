@@ -10305,6 +10305,8 @@ test_unit() {
   _test_unit_mdry_refresh_mandb
   _test_unit_p1_require_sudo_for
   _test_unit_p1_warn_if_not_on_manpath
+  _test_unit_p2_dv_give_up_to_base
+  _test_unit_p2_dv_mp4box_wrap
   _test_unit_mdry_loglevel_str
   _test_unit_l_disk_df_unavailable
   _test_unit_l_prepare_subtitle_workdir_gone
@@ -10760,6 +10762,72 @@ _test_unit_p1_warn_if_not_on_manpath() {
     pass "1.7: stays silent (does not guess) when neither manpath nor \$MANPATH can be resolved"
   else
     fail "1.7: unexpectedly printed something with no resolvable search path: ${out:0:200}"
+  fi
+}
+
+# 2.1: _dv_give_up_to_base must always alias V_MIXED to V_BASE and reset OUTPUT_HAS_DV=0 —
+# verified behaviorally in isolation (DRY_RUN=1 short-circuits _dv_fallback_timestamp_wrap's
+# ffmpeg call), THEN structurally as the ONLY path any give-up branch in run_video_pipeline
+# uses. An audit while extracting this helper found 3 of the 5 original give-up branches
+# omitted the explicit OUTPUT_HAS_DV=0 reset (harmless at the time — OUTPUT_HAS_DV was still 0
+# at every one of those points in the pre-refactor control flow — but a latent trap for any
+# future change reaching them with it already 1). Routing all 5 through one helper makes that
+# whole class of omission structurally impossible, which is what the second half of this test
+# guards: it doesn't matter whether a future edit adds a 6th give-up branch that forgets to
+# reset the flag directly, as long as it still goes through _dv_give_up_to_base.
+_test_unit_p2_dv_give_up_to_base() {
+  local body wrap
+  body="$(_extract_muxm_fns _dv_give_up_to_base)" || { fail "2.1: _dv_give_up_to_base not found in muxm"; return; }
+  wrap="$(awk '/^_dv_fallback_timestamp_wrap\(\)/,/^\}/' "$MUXM")"
+
+  local out
+  out="$(bash -c '
+    warn(){ :; }
+    mark_done(){ echo "MARK_DONE:$*"; }
+    DRY_RUN=1
+    V_BASE=/tmp/muxm_test_dv_base.hevc
+    V_MIXED=/tmp/muxm_test_dv_mixed.hevc
+    OUTPUT_HAS_DV=1
+    '"$wrap"'
+    '"$body"'
+    _dv_give_up_to_base "unit test reason"
+    echo "V_MIXED=$V_MIXED"
+    echo "OUTPUT_HAS_DV=$OUTPUT_HAS_DV"
+  ' 2>&1)"
+  if grep -qF "V_MIXED=/tmp/muxm_test_dv_base.hevc" <<<"$out" \
+     && grep -qF "OUTPUT_HAS_DV=0" <<<"$out" \
+     && grep -qF "MARK_DONE:Use base video (unit test reason)" <<<"$out"; then
+    pass "2.1: _dv_give_up_to_base aliases V_MIXED to V_BASE and resets OUTPUT_HAS_DV=0"
+  else
+    fail "2.1: _dv_give_up_to_base did not behave as expected: ${out:0:300}"
+  fi
+
+  # Structural: run_video_pipeline must route EVERY give-up branch through this one helper —
+  # exactly 5 call sites (RPU validation, inject failure, inject-empty, convert failure, frame
+  # mismatch) — so none can silently omit the OUTPUT_HAS_DV reset again.
+  local rvp_body call_count
+  rvp_body="$(awk '/^run_video_pipeline\(\)/,/^\}/' "$MUXM")"
+  call_count="$(grep -c '_dv_give_up_to_base ' <<<"$rvp_body")"
+  if [[ "$call_count" -eq 5 ]]; then
+    pass "2.1: run_video_pipeline routes all 5 DV give-up branches through _dv_give_up_to_base"
+  else
+    fail "2.1: expected 5 _dv_give_up_to_base call sites in run_video_pipeline, found $call_count"
+  fi
+}
+
+# 2.2: structural — verify_dv_container_record's mp4box fallback and run_video_pipeline's
+# pre-wrap Method 1 must both delegate the mp4box dvp_hint/fps-argument/invocation construction
+# to the shared _dv_mp4box_wrap helper (no inline duplicate block). Same M-DRY-b-style guard as
+# _test_unit_mdry_refresh_mandb; a behavioral test isn't meaningful here since the real work
+# (argument construction) is already covered by exercising the two call sites in dv_vt/dv_sw.
+_test_unit_p2_dv_mp4box_wrap() {
+  local vdcr rvp
+  vdcr="$(awk '/^verify_dv_container_record\(\)/,/^\}/' "$MUXM")"
+  rvp="$(awk '/^run_video_pipeline\(\)/,/^\}/' "$MUXM")"
+  if grep -q '_dv_mp4box_wrap ' <<<"$vdcr" && grep -q '_dv_mp4box_wrap ' <<<"$rvp"; then
+    pass "2.2: verify_dv_container_record and run_video_pipeline both delegate to _dv_mp4box_wrap"
+  else
+    fail "2.2: a DV mp4box-wrap call site still inlines the block instead of calling _dv_mp4box_wrap"
   fi
 }
 

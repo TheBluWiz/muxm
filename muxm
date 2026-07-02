@@ -7850,6 +7850,39 @@ _dv_probe_has_config_record() {
   printf '%s\n' "$_probe" | grep -qiE "$DV_CONTAINER_PATTERN"
 }
 
+# 2.2: shared "mux a raw HEVC ES into an MP4 with mp4box, signaling dvcC/dvvC" invocation —
+# collapses the duplicated dvp_hint/fps-argument/invocation block that used to be near-verbatim
+# (including comments) across verify_dv_container_record's mp4box fallback and
+# run_video_pipeline's pre-wrap Method 1. Only the identical construct-and-run portion lives
+# here; the two call sites still each check the exit status, validate the resulting dvcC/dvvC
+# box (_dv_probe_has_config_record), and take their own success/failure actions afterward — those
+# differ enough (different state vars, different follow-up steps) to stay at the call site.
+# Args: $1 — source video (raw HEVC ES, typically $V_MIXED); $2 — destination MP4 path;
+#       $3 — log file to capture mp4box's output; $4 — progress label for _await_tracked_pid
+# Returns: mp4box's exit status (via _await_tracked_pid)
+# Globals: MP4BOX_CMD, DV_OUT_PROFILE, DV_OUT_COMPAT_ID, SRC_FPS (read)
+_dv_mp4box_wrap(){
+  local _src="$1" _dest="$2" _log="$3" _label="$4"
+  local dvp_hint=""
+  # Defense-in-depth: require BOTH values to be plain integers before feeding them into the
+  # mp4box `:dvp=PROFILE.COMPAT_ID` hint. Safe in practice (DOVI-box integers can't carry : or =),
+  # but a numeric guard keeps a malformed probe value from ever reaching the mp4box arg string.
+  # CR-1: consume the OUTPUT profile (8.1 after a P7/P5 convert; otherwise the source value) so
+  # the dvcC box never mis-signals a converted single-layer stream.
+  if [[ "${DV_OUT_PROFILE:-}" =~ ^[0-9]+$ && "${DV_OUT_COMPAT_ID:-}" =~ ^[0-9]+$ ]]; then
+    dvp_hint=":dvp=${DV_OUT_PROFILE}.${DV_OUT_COMPAT_ID}"
+  fi
+  # Force the source frame rate: mp4box defaults headerless raw ES to 25fps (corrupting timing
+  # on 23.976/24/30 content). Skipped only when SRC_FPS is undeterminable.
+  local -a fps_arg=()
+  [[ -n "$SRC_FPS" ]] && fps_arg=(-fps "$SRC_FPS")
+  "$MP4BOX_CMD" ${fps_arg[@]+"${fps_arg[@]}"} -add "${_src}${dvp_hint}" \
+       -new "$_dest" >"$_log" 2>&1 &
+  local _pid=$!
+  local _rc=0; _await_tracked_pid "$_pid" "$_label" || _rc=$?
+  return "$_rc"
+}
+
 # Verify DOVI configuration record (dvcC/dvvC box) is present in muxed output.
 # For MP4/MOV containers, the dvcC box is required for players to activate DV rendering.
 # If missing, attempts a fallback remux. If still missing, warns clearly.
@@ -7914,24 +7947,9 @@ verify_dv_container_record() {
 
     # mp4box fallback: natively parses RPU NALs and writes dvcC box.
     if (( ! fallback_ok )) && [[ -n "${MP4BOX_CMD:-}" && -n "${V_MIXED:-}" && -s "$V_MIXED" ]]; then
-      local dvp_hint=""
-      # Defense-in-depth: require BOTH values to be plain integers before feeding them into the
-      # mp4box `:dvp=PROFILE.COMPAT_ID` hint. Safe in practice (DOVI-box integers can't carry : or =),
-      # but a numeric guard keeps a malformed probe value from ever reaching the mp4box arg string.
-      # CR-1: consume the OUTPUT profile (8.1 after a P7/P5 convert; otherwise the
-      # source value) so the dvcC box never mis-signals a converted single-layer stream.
-      if [[ "${DV_OUT_PROFILE:-}" =~ ^[0-9]+$ && "${DV_OUT_COMPAT_ID:-}" =~ ^[0-9]+$ ]]; then
-        dvp_hint=":dvp=${DV_OUT_PROFILE}.${DV_OUT_COMPAT_ID}"
-      fi
-
-      # Force source frame rate (mp4box defaults headerless ES to 25fps). See the
-      # pre-wrap path for the full rationale.
-      local -a fps_arg=()
-      [[ -n "$SRC_FPS" ]] && fps_arg=(-fps "$SRC_FPS")
-      "$MP4BOX_CMD" ${fps_arg[@]+"${fps_arg[@]}"} -add "${V_MIXED}${dvp_hint}" \
-           -new "$dv_video_mp4" >"$WORKDIR/dovi_mux_mp4box.log" 2>&1 &
-      local mp4box_fb_pid=$!
-      local _mp4box_fb_rc=0; _await_tracked_pid "$mp4box_fb_pid" "DV fallback: muxing with mp4box" || _mp4box_fb_rc=$?
+      local _mp4box_fb_rc=0
+      _dv_mp4box_wrap "$V_MIXED" "$dv_video_mp4" "$WORKDIR/dovi_mux_mp4box.log" \
+        "DV fallback: muxing with mp4box" || _mp4box_fb_rc=$?
       if (( _mp4box_fb_rc == 0 )) && [[ -s "$dv_video_mp4" ]]; then
         if _dv_probe_has_config_record "$dv_video_mp4"; then  # M-DRY-a
           fallback_ok=1
@@ -8583,6 +8601,33 @@ _dv_fallback_timestamp_wrap() {
   fi
 }
 
+# 2.1: shared tail for every "give up on DV, fall back to base video" branch inside
+# run_video_pipeline. Collapses five near-identical blocks (RPU validation failure, inject
+# failure, inject-empty, dovi_tool convert failure, RPU/frame-count mismatch) that each
+# repeated: warn → alias V_MIXED to V_BASE → clear DV state → _dv_fallback_timestamp_wrap →
+# mark_done → return 0. Since all five call sites now go through this single path, it also
+# structurally guarantees OUTPUT_HAS_DV is reset on every give-up — an audit while extracting
+# this found the reset was already present at only two of the five original call sites
+# (convert failure, frame mismatch); harmless today since OUTPUT_HAS_DV is still 0 at every
+# give-up point in the current control flow (see the comment on _dv_fallback_timestamp_wrap),
+# but a latent trap for any future refactor that could reach these branches with it already 1.
+# Any call-site step that ISN'T common to all five (the pre-give-up _reclaim of a completed
+# V_INJECTED/V_MIXED on the convert-failure/frame-mismatch branches, which only apply once a
+# real intermediate file exists) stays inline at the call site, run BEFORE this helper.
+# The caller must still `return 0` itself right after calling this — a `return` in here only
+# returns from this helper, not from run_video_pipeline.
+# Args: $1 — short reason, used in both the warn and the mark_done label
+# Sets: V_MIXED (aliased to V_BASE), OUTPUT_HAS_DV=0
+# Globals: V_BASE, V_MIXED, OUTPUT_HAS_DV (read/write)
+_dv_give_up_to_base(){
+  local _reason="$1"
+  warn "Falling back to base video without Dolby Vision ($_reason)."
+  V_MIXED="$V_BASE"
+  OUTPUT_HAS_DV=0
+  _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
+  mark_done "Use base video ($_reason)"
+}
+
 run_video_pipeline() {
   # Check copy-if-compliant first
   if (( VIDEO_COPY_IF_COMPLIANT )); then
@@ -9047,10 +9092,7 @@ run_video_pipeline() {
   if ! _validate_dv_rpu "$RPU_FINAL"; then
     warn "RPU validation failed — RPU may be corrupt or incompatible."
     if (( ALLOW_DV_FALLBACK )); then
-      warn "Falling back to base video without DV."
-      V_MIXED="$V_BASE"
-      _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
-      mark_done "Use base video (RPU validation failed)"
+      _dv_give_up_to_base "RPU validation failed"
       return 0
     fi
     die 40 "DV RPU validation failed and fallback is disabled"
@@ -9070,10 +9112,7 @@ run_video_pipeline() {
   if (( _inject_rc != 0 )); then
     warn "DV RPU injection failed. See: $WORKDIR/rpu_inject.log"
     if (( ALLOW_DV_FALLBACK )); then
-      warn "Falling back to base video without DV."
-      V_MIXED="$V_BASE"
-      _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
-      mark_done "Use base video (DV inject failed)"
+      _dv_give_up_to_base "DV inject failed"
       return 0
     fi
     die 41 "Dolby Vision RPU injection failed and fallback is disabled"
@@ -9083,10 +9122,7 @@ run_video_pipeline() {
   if [[ ! -s "$inject_target" ]]; then
     warn "DV injection produced empty file."
     if (( ALLOW_DV_FALLBACK )); then
-      warn "Falling back to base video without DV."
-      V_MIXED="$V_BASE"
-      _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
-      mark_done "Use base video (DV inject empty)"
+      _dv_give_up_to_base "DV inject empty"
       return 0
     fi
     die 41 "DV injection produced empty output and fallback is disabled"
@@ -9112,12 +9148,8 @@ run_video_pipeline() {
       warn "dovi_tool convert failed (P${DV_SRC_PROFILE} → P8.1). See: $WORKDIR/rpu_convert.log"
       report_add "dv_rpu_action" "convert failed — P${DV_SRC_PROFILE} RPU cannot be used for single-layer output"
       if (( ALLOW_DV_FALLBACK )); then
-        warn "  Falling back to base video without Dolby Vision (DV fallback is allowed)."
-        V_MIXED="$V_BASE"
-        OUTPUT_HAS_DV=0
         _reclaim "$V_INJECTED" "convert failed — using base"
-        _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
-        mark_done "Use base video (DV convert failed)"
+        _dv_give_up_to_base "DV convert failed"
         return 0
       fi
       die 44 "dovi_tool convert failed (P${DV_SRC_PROFILE} → P8.1) and ALLOW_DV_FALLBACK=0 — refusing to ship invalid Dolby Vision"
@@ -9152,21 +9184,17 @@ run_video_pipeline() {
         if (( ! ALLOW_DV_FALLBACK )); then
           die 44 "DV RPU/frame mismatch — refusing to ship desynced Dolby Vision (ALLOW_DV_FALLBACK=0)"
         fi
-        warn "  Falling back to base video without Dolby Vision (DV fallback is allowed)."
         # The fully injected/converted DV video (the current V_MIXED, e.g.
         # video_mixed.hevc — full-size on a real title) is dead now that we're reverting
-        # to the base encode. Reclaim it BEFORE aliasing V_MIXED to V_BASE, so we don't
-        # carry an orphaned multi-GB intermediate to end-of-run (same _reclaim convention;
-        # only this give-up branch holds a *completed* injected video — the earlier
-        # branches fail during/before injection, leaving at most a partial/empty file).
+        # to the base encode. Reclaim it BEFORE aliasing V_MIXED to V_BASE (inside the
+        # helper below), so we don't carry an orphaned multi-GB intermediate to end-of-run
+        # (same _reclaim convention; only this give-up branch holds a *completed* injected
+        # video — the earlier branches fail during/before injection, leaving at most a
+        # partial/empty file).
         _reclaim "$V_MIXED" "DV abandoned on frame mismatch — injected video superseded by base"
-        V_MIXED="$V_BASE"
-        OUTPUT_HAS_DV=0
-        _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
-        mark_done "Use base video (DV frame mismatch)"
-        # Give up like the three sibling fallback branches above (RPU validation,
-        # inject failure, convert failure): return now so we do NOT pre-wrap the
-        # base video with dvcC/dvh1 signaling and re-set OUTPUT_HAS_DV=1 below.
+        _dv_give_up_to_base "DV frame mismatch"
+        # Give up like the sibling fallback branches above: return now so we do NOT
+        # pre-wrap the base video with dvcC/dvh1 signaling and re-set OUTPUT_HAS_DV=1 below.
         return 0
       else
         note "RPU frame count verified: video=$v_frames, rpu=$rpu_frames (within tolerance)."
@@ -9222,30 +9250,9 @@ run_video_pipeline() {
     # Constructs the dvcC box from RPU data; dvp=PROFILE.COMPAT_ID ensures
     # correct signaling even if auto-detection is ambiguous.
     if (( ! prewrap_ok )) && [[ -n "${MP4BOX_CMD:-}" ]]; then
-      local dvp_hint=""
-      # Defense-in-depth: require BOTH values to be plain integers before feeding them into the
-      # mp4box `:dvp=PROFILE.COMPAT_ID` hint. Safe in practice (DOVI-box integers can't carry : or =),
-      # but a numeric guard keeps a malformed probe value from ever reaching the mp4box arg string.
-      # CR-1: consume the OUTPUT profile (8.1 after a P7/P5 convert; otherwise the
-      # source value) so the dvcC box never mis-signals a converted single-layer stream.
-      if [[ "${DV_OUT_PROFILE:-}" =~ ^[0-9]+$ && "${DV_OUT_COMPAT_ID:-}" =~ ^[0-9]+$ ]]; then
-        dvp_hint=":dvp=${DV_OUT_PROFILE}.${DV_OUT_COMPAT_ID}"
-      fi
-
-      # Force the source frame rate: raw HEVC ES carries no container timing, and
-      # mp4box defaults headerless ES (e.g. from hevc_videotoolbox, which omits VUI
-      # timing) to 25fps — corrupting timing on 23.976/24/30 content. Skipped only
-      # when SRC_FPS is undeterminable.
-      # RF9: expand with the array-safe ${fps_arg[@]+"${fps_arg[@]}"} form below — a bare
-      # "${fps_arg[@]}" raises `unbound variable` under `set -u` on bash < 4.4 (the documented
-      # floor is 4.3) when the array is empty. The alternate-value form yields the elements when
-      # present and NOTHING when empty (no spurious empty argument, unlike "${fps_arg[@]:-}").
-      local -a fps_arg=()
-      [[ -n "$SRC_FPS" ]] && fps_arg=(-fps "$SRC_FPS")
-      "$MP4BOX_CMD" ${fps_arg[@]+"${fps_arg[@]}"} -add "${V_MIXED}${dvp_hint}" \
-           -new "$dv_prewrap" >"$WORKDIR/dv_prewrap_mp4box.log" 2>&1 &
-      local pw_mp4box_pid=$!
-      local _pw_mp4box_rc=0; _await_tracked_pid "$pw_mp4box_pid" "Pre-wrapping DV video (mp4box)" || _pw_mp4box_rc=$?
+      local _pw_mp4box_rc=0
+      _dv_mp4box_wrap "$V_MIXED" "$dv_prewrap" "$WORKDIR/dv_prewrap_mp4box.log" \
+        "Pre-wrapping DV video (mp4box)" || _pw_mp4box_rc=$?
       if (( _pw_mp4box_rc == 0 )) && [[ -s "$dv_prewrap" ]]; then
         if _dv_probe_has_config_record "$dv_prewrap"; then  # M-DRY-a
           V_DV_MP4="$dv_prewrap"
