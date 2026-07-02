@@ -1491,6 +1491,7 @@ test_cli() {
   _test_cli_m1_dashdash
   _test_cli_m5_config_missing_val
   _test_cli_m6_replace_source_eof
+  _test_cli_p1_create_config
 
   # F6: no advisory may emit the invalid muxm flag value `--video-codec libsvtav1`. muxm's flag
   # value is `libsvt-av1` (hyphenated); `libsvtav1` is the ffmpeg ENCODER name, not a valid
@@ -1578,6 +1579,55 @@ _test_cli_m6_replace_source_eof() {
     fail "M6: REPLACE_SOURCE + EOF stdin → expected die 11, got exit $rc (ERR-trap crash?)"
   fi
   rm -rf "$_dir"
+}
+
+# 1.3/1.4/1.6: --create-config writes atomically (no stray temp file; a refused overwrite leaves
+# the original untouched), writes .muxmrc as mode 644 regardless of the invoking umask, and gives
+# a muxm-specific diagnostic (not bash's raw "unbound variable") when $HOME is unset.
+_test_cli_p1_create_config() {
+  # ---- 1.3: atomic write ----
+  local cfg_atomic_dir="$TESTDIR/config_create_atomic"
+  mkdir -p "$cfg_atomic_dir"
+  rm -f "$cfg_atomic_dir/.muxmrc"
+  run_muxm_in "$cfg_atomic_dir" --create-config project atv-directplay-hq >/dev/null 2>&1
+  if [[ -f "$cfg_atomic_dir/.muxmrc" ]] && ! ls "$cfg_atomic_dir"/.muxmrc.?????? >/dev/null 2>&1; then
+    pass "1.3: --create-config leaves no stray .muxmrc.XXXXXX temp file behind"
+  else
+    fail "1.3: --create-config left a stray temp file or did not create .muxmrc"
+  fi
+  local _atomic_before _atomic_after
+  _atomic_before="$(cksum < "$cfg_atomic_dir/.muxmrc")"
+  run_muxm_in "$cfg_atomic_dir" --create-config project archive >/dev/null 2>&1
+  _atomic_after="$(cksum < "$cfg_atomic_dir/.muxmrc")"
+  if [[ "$_atomic_before" == "$_atomic_after" ]]; then
+    pass "1.3: a refused --create-config (existing file, no --force) leaves the original untouched"
+  else
+    fail "1.3: the existing .muxmrc changed despite the overwrite being refused"
+  fi
+  rm -f "$cfg_atomic_dir/.muxmrc"
+
+  # ---- 1.4: mode 644 regardless of umask ----
+  local cfg_perm_dir="$TESTDIR/config_create_perm"
+  mkdir -p "$cfg_perm_dir"
+  rm -f "$cfg_perm_dir/.muxmrc"
+  ( umask 077; run_muxm_in "$cfg_perm_dir" --create-config project atv-directplay-hq >/dev/null 2>&1 )
+  local _perm
+  _perm="$(stat -c '%a' "$cfg_perm_dir/.muxmrc" 2>/dev/null || stat -f '%Lp' "$cfg_perm_dir/.muxmrc" 2>/dev/null)"
+  if [[ "$_perm" == "644" ]]; then
+    pass "1.4: --create-config writes .muxmrc as mode 644 regardless of umask"
+  else
+    fail "1.4: --create-config .muxmrc has mode '$_perm', expected 644"
+  fi
+  rm -f "$cfg_perm_dir/.muxmrc"
+
+  # ---- 1.6: $HOME unset gives a muxm-specific diagnostic, not a raw bash "unbound variable" ----
+  local cfg_home_out cfg_home_rc
+  cfg_home_out="$(cd "$TESTDIR" && env -u HOME "$MUXM" --create-config user atv-directplay-hq 2>&1)" && cfg_home_rc=$? || cfg_home_rc=$?
+  if [[ "$cfg_home_rc" -ne 0 ]] && grep -qiF '$HOME is not set' <<<"$cfg_home_out" && ! grep -qiF 'unbound variable' <<<"$cfg_home_out"; then
+    pass "1.6: --create-config user with \$HOME unset gives a muxm-specific diagnostic"
+  else
+    fail "1.6: --create-config user with \$HOME unset: ${cfg_home_out:0:200}"
+  fi
 }
 
 # L3: --level and the rate flags (--av1-maxrate/--av1-bufsize/--stereo-bitrate) are validated at
@@ -10253,6 +10303,8 @@ test_unit() {
   _test_unit_m8_pipx_bin_dir
   _test_unit_mdry_dv_probe
   _test_unit_mdry_refresh_mandb
+  _test_unit_p1_require_sudo_for
+  _test_unit_p1_warn_if_not_on_manpath
   _test_unit_mdry_loglevel_str
   _test_unit_l_disk_df_unavailable
   _test_unit_l_prepare_subtitle_workdir_gone
@@ -10639,6 +10691,75 @@ _test_unit_mdry_refresh_mandb() {
     pass "M-DRY-b: _install_man and _uninstall_man both delegate to _refresh_mandb"
   else
     fail "M-DRY-b: a man function still inlines the mandb-refresh block instead of calling _refresh_mandb"
+  fi
+}
+
+# 1.1: _require_sudo_for must die with an actionable message (not a raw "command not found" or a
+# hang) when `sudo` isn't on PATH, and must be a silent no-op when it is. Tested in isolation via
+# a controlled PATH (not real-system PATH surgery, which would be fragile across platforms) with
+# `die` stubbed to a plain printf+exit — same idiom the rest of this suite already uses for
+# functions that call die (e.g. the VMF/disk-preflight unit tests).
+_test_unit_p1_require_sudo_for() {
+  local body
+  body="$(_extract_muxm_fns _require_sudo_for)" || { fail "1.1: _require_sudo_for not found in muxm"; return; }
+  local die_stub='die(){ printf "DIE|%s|%s\n" "$1" "$2"; exit "$1"; }'
+
+  # NOTE: PATH must be reassigned as the FIRST statement INSIDE the bash -c script body, not as
+  # an env-prefix on the `bash -c` invocation itself — an env-prefixed `PATH=X bash -c ...`
+  # resolves the `bash` command NAME using the reassigned PATH too, so a restrictive value
+  # there makes bash itself "command not found" rather than restricting what the script sees.
+  local out rc script
+  script='PATH="/nonexistent_dir_for_muxm_test"'$'\n'"$die_stub"$'\n'"$body"$'\n''_require_sudo_for "/some/dir"'
+  out="$(bash -c "$script" 2>&1)" && rc=$? || rc=$?
+  if [[ "$rc" -eq 10 ]] && grep -qiF "sudo" <<<"$out" && grep -qiF "not available" <<<"$out"; then
+    pass "1.1: _require_sudo_for dies (exit 10) with an actionable message when sudo is absent"
+  else
+    fail "1.1: _require_sudo_for did not die correctly when sudo absent (rc=$rc, out=${out:0:200})"
+  fi
+
+  local stub_bin; stub_bin="$(mktemp -d)"
+  printf '#!/bin/sh\nexit 0\n' > "$stub_bin/sudo"; chmod +x "$stub_bin/sudo"
+  script="PATH=\"$stub_bin\""$'\n'"$die_stub"$'\n'"$body"$'\n''_require_sudo_for "/some/dir"; echo "RC=$?"'
+  out="$(bash -c "$script" 2>&1)"
+  rm -rf "$stub_bin"
+  if grep -qF "RC=0" <<<"$out" && ! grep -qF "DIE|" <<<"$out"; then
+    pass "1.1: _require_sudo_for does not die when sudo is present"
+  else
+    fail "1.1: _require_sudo_for unexpectedly died when sudo was present (out=${out:0:200})"
+  fi
+}
+
+# 1.7: _warn_if_not_on_manpath must warn when the install target isn't on the resolved search
+# path, stay silent when it is, and stay silent (not guess) when neither `manpath`(1) nor
+# $MANPATH can resolve anything. Isolated via a controlled PATH/MANPATH, same rationale as 1.1
+# (PATH is reassigned inside the script body, not as an env-prefix on `bash -c` itself).
+_test_unit_p1_warn_if_not_on_manpath() {
+  local body
+  body="$(_extract_muxm_fns _warn_if_not_on_manpath)" || { fail "1.7: _warn_if_not_on_manpath not found in muxm"; return; }
+
+  local out script
+  script='PATH="/nonexistent_dir_for_muxm_test"; MANPATH="/some/other/dir"; CLI_NAME=muxm'$'\n'"$body"$'\n''_warn_if_not_on_manpath "/tmp/muxm_test_mandir"'
+  out="$(bash -c "$script" 2>&1)"
+  if grep -qiF "not on your man search path" <<<"$out"; then
+    pass "1.7: warns when the install target is not on the resolved man search path"
+  else
+    fail "1.7: expected a MANPATH warning, got: ${out:0:200}"
+  fi
+
+  script='PATH="/nonexistent_dir_for_muxm_test"; MANPATH="/tmp/muxm_test_mandir:/usr/share/man"; CLI_NAME=muxm'$'\n'"$body"$'\n''_warn_if_not_on_manpath "/tmp/muxm_test_mandir"'
+  out="$(bash -c "$script" 2>&1)"
+  if [[ -z "$out" ]]; then
+    pass "1.7: no warning when the install target is already on the search path"
+  else
+    fail "1.7: unexpectedly warned when target was already on the search path: ${out:0:200}"
+  fi
+
+  script='PATH="/nonexistent_dir_for_muxm_test"; unset MANPATH; CLI_NAME=muxm'$'\n'"$body"$'\n''_warn_if_not_on_manpath "/tmp/muxm_test_mandir"'
+  out="$(bash -c "$script" 2>&1)"
+  if [[ -z "$out" ]]; then
+    pass "1.7: stays silent (does not guess) when neither manpath nor \$MANPATH can be resolved"
+  else
+    fail "1.7: unexpectedly printed something with no resolvable search path: ${out:0:200}"
   fi
 }
 
@@ -11251,6 +11372,45 @@ test_completions() {
   # ---- --uninstall-completions is safe when nothing is installed ----
   out="$(HOME="$fake_home" "$MUXM" --uninstall-completions 2>&1)" || true
   assert_contains "not found" "--uninstall-completions safe when already removed" "$out"
+
+  # ---- 1.5: a commented-out source line is NOT mistaken for "already configured" ----
+  local fake_home2="$TESTDIR/fake_home_1_5"
+  mkdir -p "$fake_home2"
+  printf '# source ~/.muxm/muxm-completion.bash\n' > "$fake_home2/.bashrc"
+  out="$(HOME="$fake_home2" "$MUXM" --install-completions 2>&1)" || true
+  if grep -qF "added source line" <<<"$out"; then
+    pass "1.5: a commented-out source line does not block re-activation"
+  else
+    fail "1.5: --install-completions treated a commented-out line as already configured: ${out:0:200}"
+  fi
+  if grep -vE '^[[:space:]]*#' "$fake_home2/.bashrc" | grep -qF 'muxm-completion.bash'; then
+    pass "1.5: .bashrc has an active (uncommented) source line after install"
+  else
+    fail "1.5: .bashrc has no active source line after install"
+  fi
+  # Running it again now IS idempotent — the newly-added ACTIVE line is correctly recognized.
+  out="$(HOME="$fake_home2" "$MUXM" --install-completions 2>&1)" || true
+  if grep -qF "already configured" <<<"$out"; then
+    pass "1.5: a genuinely active source line is still recognized as already configured"
+  else
+    fail "1.5: idempotency regressed for a real (uncommented) source line: ${out:0:200}"
+  fi
+  rm -rf "$fake_home2"
+
+  # ---- 1.6: $HOME unset gives a muxm-specific diagnostic, not a raw bash "unbound variable" ----
+  local out16 rc16
+  out16="$(cd "$TESTDIR" && env -u HOME "$MUXM" --install-completions 2>&1)" && rc16=$? || rc16=$?
+  if [[ "$rc16" -ne 0 ]] && grep -qiF '$HOME is not set' <<<"$out16" && ! grep -qiF 'unbound variable' <<<"$out16"; then
+    pass "1.6: --install-completions with \$HOME unset gives a muxm-specific diagnostic"
+  else
+    fail "1.6: --install-completions with \$HOME unset: ${out16:0:200}"
+  fi
+  out16="$(cd "$TESTDIR" && env -u HOME "$MUXM" --uninstall-completions 2>&1)" && rc16=$? || rc16=$?
+  if [[ "$rc16" -ne 0 ]] && grep -qiF '$HOME is not set' <<<"$out16" && ! grep -qiF 'unbound variable' <<<"$out16"; then
+    pass "1.6: --uninstall-completions with \$HOME unset gives a muxm-specific diagnostic"
+  else
+    fail "1.6: --uninstall-completions with \$HOME unset: ${out16:0:200}"
+  fi
 }
 
 # ===== --setup (combined installer) ===========================================================
@@ -11448,6 +11608,69 @@ test_setup() {
   else
     skip "L4: filesystem did not create a dangling symlink as expected"
   fi
+
+  # ---- 1.2: --install-man reports FAILURE (not "✅ Installed") when the write itself fails ----
+  # Point _man_target_dir at an UNWRITABLE stubbed prefix (forcing the sudo branch) and shadow
+  # `sudo` with a stub that always fails — a failed write must surface as a real error, never a
+  # false "✅ Installed". Guarded with a precondition check since chmod-based unwritability is
+  # meaningless when the suite runs as root.
+  local m12_prefix="$fake_home/m12_prefix" m12_bin="$fake_home/m12_bin"
+  mkdir -p "$m12_prefix/share/man/man1" "$m12_bin"
+  chmod 555 "$m12_prefix/share/man/man1"
+  # shellcheck disable=SC2016
+  printf '#!/bin/bash\n[[ "$1" == "--prefix" ]] && { printf "%%s\\n" "%s"; exit 0; }\nexit 0\n' "$m12_prefix" > "$m12_bin/brew"
+  chmod +x "$m12_bin/brew"
+  printf '#!/bin/bash\nexit 1\n' > "$m12_bin/sudo"
+  chmod +x "$m12_bin/sudo"
+  if [[ -w "$m12_prefix/share/man/man1" ]]; then
+    skip "1.2: cannot make the man dir unwritable in this environment (running as root?)"
+  else
+    local m12_out m12_rc
+    m12_out="$(PATH="$m12_bin:$PATH" "$MUXM" --install-man 2>&1)" && m12_rc=$? || m12_rc=$?
+    if [[ "$m12_rc" -ne 0 ]] && ! grep -q '✅ Installed' <<<"$m12_out"; then
+      pass "1.2: --install-man reports failure (not '✅ Installed') when the write fails"
+    else
+      fail "1.2: --install-man reported success despite a failing write (rc=$m12_rc): ${m12_out:0:200}"
+    fi
+  fi
+  chmod 755 "$m12_prefix/share/man/man1"  # restore so the final rm -rf "$fake_home" can clean up
+
+  # ---- 1.2: --uninstall-man reports FAILURE (not "✅ Removed") when the remove itself fails ----
+  local m12u_prefix="$fake_home/m12u_prefix" m12u_bin="$fake_home/m12u_bin"
+  mkdir -p "$m12u_prefix/share/man/man1" "$m12u_bin"
+  echo "content" > "$m12u_prefix/share/man/man1/muxm.1"
+  chmod 555 "$m12u_prefix/share/man/man1"
+  # shellcheck disable=SC2016
+  printf '#!/bin/bash\n[[ "$1" == "--prefix" ]] && { printf "%%s\\n" "%s"; exit 0; }\nexit 0\n' "$m12u_prefix" > "$m12u_bin/brew"
+  chmod +x "$m12u_bin/brew"
+  printf '#!/bin/bash\nexit 1\n' > "$m12u_bin/sudo"
+  chmod +x "$m12u_bin/sudo"
+  if [[ -w "$m12u_prefix/share/man/man1" ]]; then
+    skip "1.2: cannot make the man dir unwritable in this environment (running as root?)"
+  else
+    local m12u_out m12u_rc
+    m12u_out="$(PATH="$m12u_bin:$PATH" "$MUXM" --uninstall-man 2>&1)" && m12u_rc=$? || m12u_rc=$?
+    if [[ "$m12u_rc" -ne 0 ]] && ! grep -q '✅ Removed' <<<"$m12u_out"; then
+      pass "1.2: --uninstall-man reports failure (not '✅ Removed') when the remove fails"
+    else
+      fail "1.2: --uninstall-man reported success despite a failing remove (rc=$m12u_rc): ${m12u_out:0:200}"
+    fi
+  fi
+  chmod 755 "$m12u_prefix/share/man/man1"
+
+  # ---- 1.7: --install-man warns when the target dir is not on the resolved man search path ----
+  local m17_prefix="$fake_home/m17_prefix" m17_bin="$fake_home/m17_bin"
+  mkdir -p "$m17_prefix/share/man/man1" "$m17_bin"
+  # shellcheck disable=SC2016
+  printf '#!/bin/bash\n[[ "$1" == "--prefix" ]] && { printf "%%s\\n" "%s"; exit 0; }\nexit 0\n' "$m17_prefix" > "$m17_bin/brew"
+  chmod +x "$m17_bin/brew"
+  local m17_out
+  m17_out="$(PATH="$m17_bin:$PATH" env -u MANPATH "$MUXM" --install-man 2>&1)" || true
+  assert_contains "not on your man search path" "1.7: --install-man warns when target isn't on MANPATH" "$m17_out"
+
+  # 1.8 (mp4box/gpac install-check dedup) needs no new test — it's a pure internal refactor
+  # already protected by the existing --install-dependencies (R26/R27) and _detect_mp4box
+  # unit coverage exercised elsewhere in this suite.
 
   # ---- Cleanup ----
   rm -rf "$fake_home"

@@ -1438,7 +1438,12 @@ done
 unset _pcd_v
 
 _muxm_try_source /etc/.muxmrc
-_muxm_try_source "$HOME/.muxmrc"
+# 1.6: guard against $HOME being unset — under `set -u`, an unguarded "$HOME/.muxmrc" here
+# crashes EVERY invocation (including --help) with bash's raw "HOME: unbound variable" instead
+# of a muxm-specific diagnostic. An unset $HOME has no meaningful user-config path, so this tier
+# of the chain is simply skipped; user-scope actions that specifically require $HOME (e.g.
+# --create-config user, --install-completions) still surface their own actionable die message.
+[[ -n "${HOME:-}" ]] && _muxm_try_source "$HOME/.muxmrc"
 _muxm_try_source "./.muxmrc"   # Sources from $PWD — intentional project-level override (see section header)
 
 # Deprecation bridge: AUDIO_SCORE_LANG_BONUS_ENG → AUDIO_SCORE_LANG_BONUS (v1.1)
@@ -1591,18 +1596,33 @@ _dep_install_dependencies(){
 
   local -i total=0 installed=0 skipped=0 failed=0
 
-  # Helper: check + brew install
+  # Helper: check + brew install. Optional $3 is a detection-function override for tools whose
+  # binary name varies by platform (e.g. mp4box/MP4Box — see _detect_mp4box); defaults to
+  # `command -v "$_tool"`. 1.8: this override collapses what used to be a hand-duplicated copy
+  # of this function's whole shape (for the mp4box/gpac case) into this single path.
   _brew_ensure(){
-    local _tool="$1" formula="${2:-$1}"
+    local _tool="$1" formula="${2:-$1}" _detect="${3:-}"
+    local -i _found=0 _postinstall_ok=0
     total=$(( total + 1 ))
     printf "  %-14s" "$_tool"
-    if command -v "$_tool" >/dev/null 2>&1; then
-      printf "✅ already installed (%s)\n" "$(command -v "$_tool")"
+    if [[ -n "$_detect" ]]; then "$_detect" && _found=1; else command -v "$_tool" >/dev/null 2>&1 && _found=1; fi
+    if (( _found )); then
+      # Only the detect-override path (mp4box) needs the resolved-binary-name indirection;
+      # $MP4BOX_CMD is a global set as a SIDE EFFECT of _detect_mp4box and must not leak into
+      # the path shown for any other tool's "already installed" line.
+      local _found_path
+      if [[ -n "$_detect" ]]; then
+        _found_path="$(command -v "${MP4BOX_CMD:-$_tool}" 2>/dev/null)"
+      else
+        _found_path="$(command -v "$_tool" 2>/dev/null)"
+      fi
+      printf "✅ already installed (%s)\n" "${_found_path:-found}"
       skipped=$(( skipped + 1 ))
     else
       printf "⏳ installing via brew (%s)...\n" "$formula"
       if brew install "$formula" 2>&1 | sed 's/^/    /'; then
-        if command -v "$_tool" >/dev/null 2>&1; then
+        if [[ -n "$_detect" ]]; then "$_detect" && _postinstall_ok=1; else command -v "$_tool" >/dev/null 2>&1 && _postinstall_ok=1; fi
+        if (( _postinstall_ok )); then
           printf "  %-14s✅ installed successfully\n" "$_tool"
           installed=$(( installed + 1 ))
         else
@@ -1767,27 +1787,9 @@ _dep_install_dependencies(){
 
   say "Dolby Vision pipeline (recommended):"
   _brew_ensure dovi_tool dovi_tool
-  # mp4box: binary name varies by platform (MP4Box vs mp4box)
-  total=$(( total + 1 ))
-  printf "  %-14s" "mp4box"
-  if _detect_mp4box; then
-    printf "✅ already installed (%s)\n" "$(command -v "$MP4BOX_CMD")"
-    skipped=$(( skipped + 1 ))
-  else
-    printf "⏳ installing via brew (gpac)...\n"
-    if brew install gpac 2>&1 | sed 's/^/    /'; then
-      if _detect_mp4box; then
-        printf "  %-14s✅ installed successfully\n" "mp4box"
-        installed=$(( installed + 1 ))
-      else
-        printf "  %-14s⚠️  brew install succeeded but mp4box/MP4Box not found in PATH\n" "mp4box"
-        failed=$(( failed + 1 ))
-      fi
-    else
-      printf "  %-14s❌ brew install gpac failed\n" "mp4box"
-      failed=$(( failed + 1 ))
-    fi
-  fi
+  # mp4box: binary name varies by platform (MP4Box vs mp4box) — handled via the _detect_mp4box
+  # override (1.8) instead of a hand-duplicated copy of _brew_ensure's shape.
+  _brew_ensure mp4box gpac _detect_mp4box
   printf '\n'
 
   say "Subtitle OCR pipeline (recommended for PGS/Blu-ray subtitles):"
@@ -3041,6 +3043,38 @@ MANPAGE_EOF
 # _refresh_mandb DIR — refresh the man database so the just-installed/removed page appears in /
 # drops out of `man -k`/whatis. M-DRY: byte-identical block in _install_man / _uninstall_man.
 # No-op when mandb is absent; uses sudo only when DIR is not writable by the current user.
+# 1.1: verify `sudo` is actually on PATH before any of _install_man/_uninstall_man/_refresh_mandb
+# rely on it. Without this, a missing `sudo` (common on locked-down containers/minimal images)
+# surfaced as a raw "sudo: command not found" — or, on some systems, a hang waiting on a
+# password prompt that could never resolve — instead of an actionable muxm diagnostic.
+# Args: $1 — the path that needs elevated permissions (used only for the error message)
+_require_sudo_for(){
+  command -v sudo >/dev/null 2>&1 || die 10 "No write permission to '$1' and 'sudo' is not available on this system. Re-run with sufficient permissions, or as the owner of that directory."
+}
+
+# 1.7: after a successful --install-man, warn (don't silently assume success) if the target
+# directory isn't on the resolved man search path — `man muxm` would otherwise find nothing
+# despite the install having worked. Prefers `manpath`(1), which resolves the EFFECTIVE search
+# path (config-file defaults + $MANPATH), over the raw $MANPATH env var alone. If neither is
+# available, there's nothing reliable to check against, so this stays silent rather than guess.
+# Args: $1 — the installed man directory
+_warn_if_not_on_manpath(){
+  local _mandir="$1" _resolved
+  if command -v manpath >/dev/null 2>&1; then
+    _resolved="$(manpath 2>/dev/null)"
+  else
+    _resolved="${MANPATH:-}"
+  fi
+  [[ -n "$_resolved" ]] || return 0
+  case ":$_resolved:" in
+    *":$_mandir:"*) ;;  # already on the search path — nothing to warn about
+    *)
+      printf '  ⚠️  %s is not on your man search path — `man %s` may not find it.\n' "$_mandir" "$CLI_NAME"
+      printf '     Add it with: export MANPATH="%s:$MANPATH"\n' "$_mandir"
+      ;;
+  esac
+}
+
 _refresh_mandb(){
   local _mandir="$1"
   if command -v mandb >/dev/null 2>&1; then
@@ -3048,6 +3082,7 @@ _refresh_mandb(){
     if [[ -w "$_mandir" ]]; then
       mandb -q 2>/dev/null || true
     else
+      _require_sudo_for "$_mandir"
       sudo mandb -q 2>/dev/null || true
     fi
   fi
@@ -3068,20 +3103,26 @@ _install_man(){
     if [[ -w "$(dirname "$mandir")" ]]; then
       mkdir -p "$mandir"
     else
+      _require_sudo_for "$mandir"
       sudo mkdir -p "$mandir"
     fi
   fi
 
-  # Write the man page
+  # Write the man page. 1.2: check the write actually succeeded before reporting success —
+  # a false-positive -w check, a filled quota, or a failing `sudo tee` must not be reported
+  # as "✅ Installed".
   if [[ -w "$mandir" ]]; then
-    _man_emit > "$target"
+    _man_emit > "$target" || die 1 "Failed to write man page to $target"
   else
     printf '  🔐 Requires elevated permissions.\n'
-    _man_emit | sudo tee "$target" > /dev/null
+    _require_sudo_for "$mandir"
+    _man_emit | sudo tee "$target" > /dev/null || die 1 "Failed to write man page to $target (sudo tee failed)"
   fi
 
   printf '  ✅ Installed %s\n' "$target"
   printf '\n'
+
+  _warn_if_not_on_manpath "$mandir"  # 1.7
 
   # Update man database if mandb/makewhatis available
   _refresh_mandb "$mandir"  # M-DRY-b
@@ -3106,11 +3147,14 @@ _uninstall_man(){
   fi
 
   printf '  Target: %s\n' "$target"
+  # 1.2: check the remove actually succeeded (rm -f suppresses "missing file" errors, but not
+  # permission errors) before reporting "✅ Removed".
   if [[ -w "$mandir" ]]; then
-    rm -f "$target"
+    rm -f "$target" || die 1 "Failed to remove man page at $target"
   else
     printf '  🔐 Requires elevated permissions.\n'
-    sudo rm -f "$target"
+    _require_sudo_for "$mandir"
+    sudo rm -f "$target" || die 1 "Failed to remove man page at $target (sudo rm failed)"
   fi
 
   printf '  ✅ Removed %s\n' "$target"
@@ -3310,6 +3354,9 @@ _completions_source_line='source "$HOME/.muxm/muxm-completion.bash"'
 _completions_marker='# muxm tab completion'
 
 _install_completions(){
+  # 1.6: $HOME unset is a broken environment, but under `set -u` it would otherwise surface as
+  # bash's raw "unbound variable" instead of a muxm-specific diagnostic.
+  [[ -n "${HOME:-}" ]] || die 1 "\$HOME is not set — cannot determine where to install completions (expected ~/.muxm). Set HOME and try again."
   local comp_dir="$HOME/.muxm"
   local comp_file="$comp_dir/muxm-completion.bash"
 
@@ -3353,7 +3400,10 @@ _install_completions(){
     for rc in "${rc_files[@]}"; do
       local rc_base="${rc##*/}"
       printf '  %-20s' "$rc_base"
-      if grep -qF 'muxm-completion.bash' "$rc" 2>/dev/null; then
+      # 1.5: exclude commented-out lines from the idempotency check (grep -v the comment lines
+      # first) — otherwise a user who comments out the source line to temporarily disable
+      # completions has this installer treat it as "already configured" and never re-enable it.
+      if grep -vE '^[[:space:]]*#' "$rc" 2>/dev/null | grep -qF 'muxm-completion.bash'; then
         printf '✅ already configured\n'
       else
         # Ensure file ends with a newline before appending
@@ -3377,6 +3427,8 @@ _install_completions(){
 }
 
 _uninstall_completions(){
+  # 1.6: same $HOME guard as _install_completions, for consistency.
+  [[ -n "${HOME:-}" ]] || die 1 "\$HOME is not set — cannot determine where completions were installed (expected ~/.muxm). Set HOME and try again."
   local comp_dir="$HOME/.muxm"
   local comp_file="$comp_dir/muxm-completion.bash"
 
@@ -4207,7 +4259,12 @@ _create_config() {
   local target_path
   case "$scope" in
     system)  target_path="/etc/.muxmrc" ;;
-    user)    target_path="$HOME/.muxmrc" ;;
+    user)
+      # 1.6: $HOME unset is a broken environment, but under `set -u` it would otherwise surface
+      # as bash's raw "unbound variable" instead of a muxm-specific diagnostic.
+      [[ -n "${HOME:-}" ]] || die 1 "\$HOME is not set — cannot determine where to write the user config (expected ~/.muxmrc). Set HOME and try again."
+      target_path="$HOME/.muxmrc"
+      ;;
     project) target_path="$PWD/.muxmrc" ;;
     *)
       die 11 "Invalid scope: $scope
@@ -4260,12 +4317,23 @@ _create_config() {
     die 1 "$_np_msg"
   fi
 
-  # Generate the config file
+  # Generate the config file. 1.3: write to a temp file in the SAME directory, then atomically
+  # rename into place (mirrors _install_completions's existing pattern) — a crash or disk-full
+  # event mid-write must not leave a partially-written .muxmrc, since this file is `.`-sourced
+  # on every subsequent muxm invocation (including --create-config system's /etc/.muxmrc,
+  # sourced by every user on the box).
+  local _cc_tmp
+  _cc_tmp="$(mktemp "${target_path}.XXXXXX")" || die 1 "Failed to create a temp file for $target_path"
   if (( _cc_is_multi )); then
-    _create_config_emit_multi "$profile" > "$target_path"
+    _create_config_emit_multi "$profile" > "$_cc_tmp" || { rm -f "$_cc_tmp"; die 1 "Failed to generate config content for $target_path"; }
   else
-    _create_config_emit "$profile" > "$target_path"
+    _create_config_emit "$profile" > "$_cc_tmp" || { rm -f "$_cc_tmp"; die 1 "Failed to generate config content for $target_path"; }
   fi
+  # 1.4: explicit chmod rather than relying on the invoking process's umask — matters most for
+  # `--create-config system` (/etc/.muxmrc, sourced by every user on the box under the accepted
+  # H1 trust model): a permissive umask could otherwise leave it group/world-writable.
+  chmod 644 "$_cc_tmp" || { rm -f "$_cc_tmp"; die 1 "Failed to set permissions on $_cc_tmp"; }
+  mv -f "$_cc_tmp" "$target_path" || { rm -f "$_cc_tmp"; die 1 "Failed to move generated config into place at $target_path"; }
 
   printf '✅ Created %s config → %s\n' "$profile" "$target_path"
   if (( ${#_CC_OVERRIDES[@]} > 0 )); then
