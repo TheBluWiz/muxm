@@ -7244,7 +7244,14 @@ check_skip_if_ideal() {
   elif (( ideal )) && (( ! AUDIO_LOSSLESS_PASSTHROUGH )); then
     local n_audio a_codec
     n_audio="$(_audio_stream_count)"
-    if (( n_audio > 0 )); then
+    # RV3-02: single-track mode keeps only the ONE track select_best_audio picks. A skip ships
+    # every source audio track, so >1 stream means the skip would exceed the real pipeline (the
+    # live bug: skip shipped a duplicate 2nd audio track). Not ideal — force the pipeline to
+    # select. With exactly one stream, index 0 IS the selected track, so the codec checks below
+    # are exact (no "primary track ≈ index 0" approximation).
+    if (( n_audio > 1 )); then
+      ideal=0; reason="source has $n_audio audio tracks; single-track mode keeps only the selected one"
+    elif (( n_audio == 1 )); then
       a_codec="$(_audio_codec 0)"
       if [[ -n "${AUDIO_FORCE_CODEC:-}" && "$a_codec" != "$(_encoder_to_codec "$AUDIO_FORCE_CODEC")" ]]; then
         ideal=0; reason="audio codec is $a_codec (need $(_encoder_to_codec "$AUDIO_FORCE_CODEC"))"
@@ -7261,7 +7268,11 @@ check_skip_if_ideal() {
     # pipeline instead, which transcodes/handles the lossless track rather than dropping it.
     local _sii_lp_n _sii_lp_codec
     _sii_lp_n="$(_audio_stream_count)"
-    if (( _sii_lp_n > 0 )); then
+    # RV3-02: as above, >1 audio track can't be "ideal" for single-track mode — the skip would
+    # ship all of them while the pipeline keeps one.
+    if (( _sii_lp_n > 1 )); then
+      ideal=0; reason="source has $_sii_lp_n audio tracks; single-track mode keeps only the selected one"
+    elif (( _sii_lp_n == 1 )); then
       _sii_lp_codec="$(_audio_codec 0)"
       if ! _sii_audio_is_container_safe "$_sii_lp_codec"; then
         ideal=0; reason="lossless audio codec $_sii_lp_codec not muxable into .$OUTPUT_EXT (would be silently dropped on skip)"
@@ -7285,6 +7296,50 @@ check_skip_if_ideal() {
     # Multi-track: source is ideal only if every subtitle track survives the filter.
     # If any track would be dropped (wrong language, excluded type, cap), we need to remux.
     _check_filter_ideality "subtitle" "_build_subtitle_keep_list" "_sub_count" ideal reason
+  elif (( ideal )); then
+    # RV3-02: single-track subtitle ideality (previously there was NO else arm — subtitles never
+    # disqualified a single-track skip, so the shortcut shipped every embedded subtitle unchanged
+    # while the real pipeline selects ONE by language/type. That is the live bug: 3 subs shipped
+    # vs 2 kept, including a wrong-language track the profile was supposed to filter). Ideal only
+    # if the embedded subtitles can't exceed or diverge from what the pipeline would keep. Every
+    # branch here only ADDS disqualifiers (strictly safer than the prior no-check state).
+    local _sii_sub_n
+    _sii_sub_n="$(_sub_count)"
+    if (( SKIP_SUBS )); then
+      # Subtitles disabled: the pipeline keeps none, so any embedded subtitle would be shipped
+      # in excess by a skip.
+      (( _sii_sub_n > 0 )) && { ideal=0; reason="$_sii_sub_n subtitle track(s) present but subtitles are disabled (--skip-subs)"; }
+    elif (( SUB_MAX_TRACKS <= 0 )); then
+      # SUB_MAX_TRACKS=0 keeps no subtitles; an embedded track present means a skip would exceed it.
+      (( _sii_sub_n > 0 )) && { ideal=0; reason="$_sii_sub_n subtitle track(s) present but SUB_MAX_TRACKS=0"; }
+    elif (( _sii_sub_n > 1 )); then
+      # >1 embedded subtitle: single-track selection keeps one; a skip would ship them all.
+      ideal=0; reason="source has $_sii_sub_n subtitle tracks; single-track mode keeps only the selected one"
+    elif (( _sii_sub_n == 1 )); then
+      # Exactly one embedded subtitle — ideal only if the real single-track filter would KEEP it
+      # (matching language and included type); otherwise a skip ships a subtitle the pipeline drops.
+      local _sii_s0_info _sii_s0_codec _sii_s0_lang _sii_s0_title _sii_s0_forced _sii_s0_hi
+      _sii_s0_info="$(_sub_stream_info 0)"
+      _split_tab "$_sii_s0_info" _sii_s0_codec _sii_s0_lang _sii_s0_title _sii_s0_forced _sii_s0_hi
+      [[ -z "$_sii_s0_lang" ]] && _sii_s0_lang="$TAG_LANGUAGE_DEFAULT"
+      if [[ -n "${SUB_LANG_PREF:-}" ]] && ! _sub_lang_matches "$_sii_s0_lang"; then
+        ideal=0; reason="subtitle language [$_sii_s0_lang] not in SUB_LANG_PREF ($SUB_LANG_PREF)"
+      else
+        # Classify by disposition OR title heuristic (mirrors _build_subtitle_keep_list's type
+        # source), then reject if that type is excluded by the SUB_INCLUDE_* flags.
+        local _sii_s0_type="full"
+        if (( _sii_s0_forced )) || _is_forced_title "$_sii_s0_title"; then
+          _sii_s0_type="forced"
+        elif (( _sii_s0_hi )) || _is_sdh_title "$_sii_s0_title"; then
+          _sii_s0_type="sdh"
+        fi
+        case "$_sii_s0_type" in
+          forced) (( ! SUB_INCLUDE_FORCED )) && { ideal=0; reason="forced subtitle present but SUB_INCLUDE_FORCED=0"; } ;;
+          sdh)    (( ! SUB_INCLUDE_SDH ))    && { ideal=0; reason="SDH subtitle present but SUB_INCLUDE_SDH=0"; } ;;
+          full)   (( ! SUB_INCLUDE_FULL ))   && { ideal=0; reason="full subtitle present but SUB_INCLUDE_FULL=0"; } ;;
+        esac
+      fi
+    fi
   fi
 
   # ---- External subtitle check ----
@@ -7320,14 +7375,24 @@ check_skip_if_ideal() {
       # shellcheck disable=SC2206  # intentional word-splitting of index list
       SII_AUDIO_INDICES=( $_sii_alist )
     else
-      local _sii_a_n _sii_a_i _sii_a_codec
+      local _sii_a_n _sii_a_i _sii_a_codec _sii_a_ok
       _sii_a_n="$(_audio_stream_count)"
       for (( _sii_a_i=0; _sii_a_i<_sii_a_n; _sii_a_i++ )); do
         _sii_a_codec="$(_audio_codec "$_sii_a_i")"
-        if _sii_audio_is_container_safe "$_sii_a_codec"; then
+        # RV3-02: gate the keep-list through the REAL Direct-Play predicate
+        # (audio_is_direct_play_copyable) — not the MKV-permissive _sii_audio_is_container_safe,
+        # which returns true for ANY codec on a matroska target and would let an MKV skip silently
+        # keep a non-Direct-Play track. Under lossless passthrough the container-muxable set is the
+        # intended one, so keep _sii_audio_is_container_safe there.
+        if (( AUDIO_LOSSLESS_PASSTHROUGH )); then
+          _sii_audio_is_container_safe "$_sii_a_codec" && _sii_a_ok=1 || _sii_a_ok=0
+        else
+          audio_is_direct_play_copyable "$_sii_a_codec" && _sii_a_ok=1 || _sii_a_ok=0
+        fi
+        if (( _sii_a_ok )); then
           SII_AUDIO_INDICES+=("$_sii_a_i")
         else
-          log "  [skip-if-ideal] Excluding audio #$_sii_a_i ($_sii_a_codec) — incompatible with $OUTPUT_EXT container"
+          log "  [skip-if-ideal] Excluding audio #$_sii_a_i ($_sii_a_codec) — not Direct-Play copyable into $OUTPUT_EXT"
         fi
       done
     fi

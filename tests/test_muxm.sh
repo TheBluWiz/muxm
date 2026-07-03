@@ -5154,6 +5154,7 @@ EOF
   _test_audio_verify_display
   _test_audio_forceaac_stereo_bitrate
   _test_audio_lossless_skip_drop
+  _test_sii_single_track_extra_audio
   _test_audio_disposition_commentary
   _test_audio_multitrack_disposition_commentary
   _test_audio_empty_langpref_no_crash
@@ -5482,6 +5483,31 @@ _test_audio_lossless_skip_drop() {
     fail "audio-lossless-passthrough-no-skip-drop: expected the audio non-ideal reason; got: $(printf '%s' "$_l1_out" | grep -iE 'does not match ideal|already matches' | head -1)"
   fi
   rm -f "$_l1_src" "$TESTDIR/l1_out.mp4" 2>/dev/null || true
+}
+
+# RV3-02: for a single-track profile, check_skip_if_ideal must NOT call a source "ideal" when a
+# second audio stream is present that the real selector (select_best_audio) would drop. Before the
+# fix the single-track audio arm inspected only stream index 0 and the keep-list kept every
+# container-safe track, so the default skip path shipped ALL source audio tracks (a duplicate/bonus
+# track) while the real pipeline keeps one. Reuses hevc_multi_audio.mkv (HEVC Main10 →
+# atv-directplay-hq video-compliant; 3 audio: eng main, eng commentary, spa). The discriminating
+# signal is the audio-count non-ideal reason. Skip-first guard (not an else-skip) per the ratchet.
+_test_sii_single_track_extra_audio() {
+  if ! ffmpeg_has_encoder libx265; then
+    skip "sii-single-track-extra-audio: ffmpeg lacks libx265 — cannot video-compliance-check the fixture"
+    return
+  fi
+  local out
+  out="$(run_muxm --profile atv-directplay-hq --output-ext mkv --skip-if-ideal --dry-run \
+    "$TESTDIR/hevc_multi_audio.mkv" "$TESTDIR/sii_xa_out.mkv")"
+  if printf '%s' "$out" | grep -qiE 'already matches profile'; then
+    fail "sii-single-track-extra-audio: 3-audio source treated as ideal — skip would ship every audio track vs the pipeline's one"
+  elif printf '%s' "$out" | grep -qiE 'does not match ideal:.*audio tracks'; then
+    pass "sii-single-track-extra-audio: multi-audio source is not ideal for a single-track profile (skip won't over-ship audio)"
+  else
+    fail "sii-single-track-extra-audio: expected the audio-count non-ideal reason; got: $(printf '%s' "$out" | grep -iE 'does not match ideal|already matches' | head -1)"
+  fi
+  rm -f "$TESTDIR/sii_xa_out.mkv" 2>/dev/null || true
 }
 
 # L: force-AAC must honor STEREO_BITRATE, not a hardcoded 256k. Force-transcode an ac3
@@ -6705,6 +6731,60 @@ SRT
   _test_subs_untagged_forced
   _test_subs_no_reembed
   _test_subs_forced_copy_gate
+  _test_sii_single_track_subs_ideality
+}
+
+# RV3-02: for a single-track profile, check_skip_if_ideal previously had NO subtitle-ideality arm
+# for the non-SUB_MULTI_TRACK case — subtitles never disqualified a skip, so the shortcut shipped
+# every embedded subtitle unchanged while the real single-track pipeline selects ONE by
+# language/type. Two arms:
+#  (a) multiple subtitle tracks (incl. a non-preferred language) → count > 1 disqualifies. Reuses
+#      hevc_multi_subs.mkv (HEVC Main10 → atv-directplay-hq video-compliant; 1 audio + 5 subs:
+#      eng/spa/fra).
+#  (b) a lone non-preferred-language subtitle (fra with SUB_LANG_PREF=eng) → the pipeline would
+#      drop it, so a skip that ships it diverges. Builds a focused fixture.
+# Skip-first guard (not an else-skip) per the soft-skip ratchet.
+_test_sii_single_track_subs_ideality() {
+  if ! ffmpeg_has_encoder libx265; then
+    skip "sii-single-track-subs-ideality: ffmpeg lacks libx265 — cannot build/compliance-check the fixtures"
+    return
+  fi
+  local out
+
+  # (a) multi-count / multi-language subtitles must disqualify single-track ideality.
+  out="$(run_muxm --profile atv-directplay-hq --output-ext mkv --skip-if-ideal --dry-run \
+    "$TESTDIR/hevc_multi_subs.mkv" "$TESTDIR/sii_xs_out.mkv")"
+  if printf '%s' "$out" | grep -qiE 'already matches profile'; then
+    fail "sii-single-track-subs-ideality: multi-subtitle source treated as ideal — skip would over-ship subtitles vs the pipeline's one"
+  elif printf '%s' "$out" | grep -qiE 'does not match ideal:.*subtitle tracks'; then
+    pass "sii-single-track-subs-ideality: multi-subtitle source is not ideal for a single-track profile (skip won't over-ship subs)"
+  else
+    fail "sii-single-track-subs-ideality: expected the subtitle-count non-ideal reason; got: $(printf '%s' "$out" | grep -iE 'does not match ideal|already matches' | head -1)"
+  fi
+  rm -f "$TESTDIR/sii_xs_out.mkv" 2>/dev/null || true
+
+  # (b) a lone non-preferred-language subtitle (fra, SUB_LANG_PREF=eng) must also disqualify.
+  local _fra_src="$TESTDIR/sii_1frasub.mkv"
+  printf '1\n00:00:00,000 --> 00:00:01,000\nx\n' > "$TESTDIR/sii_fra.srt"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=red:s=320x240:r=24:d=1" -f lavfi -i "sine=d=1" -i "$TESTDIR/sii_fra.srt" \
+    -c:v libx265 -preset ultrafast -x265-params log-level=none -pix_fmt yuv420p10le \
+    -c:a aac -b:a 128k -ac 2 -c:s srt -map 0:v -map 1:a -map 2 \
+    -metadata:s:a:0 language=eng -metadata:s:s:0 language=fra \
+    "$_fra_src" 2>/dev/null || true
+  if [[ ! -s "$_fra_src" ]]; then
+    skip "sii-single-track-subs-ideality: could not build the single-fra-sub fixture"
+  else
+    out="$(run_muxm --profile atv-directplay-hq --output-ext mkv --skip-if-ideal --dry-run \
+      "$_fra_src" "$TESTDIR/sii_xs2_out.mkv")"
+    if printf '%s' "$out" | grep -qiE 'does not match ideal:.*(language|SUB_LANG_PREF)'; then
+      pass "sii-single-track-subs-ideality: a lone non-preferred-language subtitle disqualifies single-track ideality"
+    else
+      fail "sii-single-track-subs-ideality: single fra sub (SUB_LANG_PREF=eng) should be non-ideal on language; got: $(printf '%s' "$out" | grep -iE 'does not match ideal|already matches' | head -1)"
+    fi
+    rm -f "$TESTDIR/sii_xs2_out.mkv" 2>/dev/null || true
+  fi
+  rm -f "$_fra_src" "$TESTDIR/sii_fra.srt" 2>/dev/null || true
 }
 
 # RF2 (e2e): with --sub-burn-forced and a video stream eligible for stream-copy (a
@@ -7398,6 +7478,52 @@ test_output() {
   fi
 
   _test_output_cleanup_on_checksum_fail
+  _test_sii_single_track_no_overship
+}
+
+# RV3-02 (headline regression): a single-track profile (atv-directplay-hq) fed a video-compliant
+# source that carries 2 same-language audio tracks + 3 subtitle tracks (2 langs, one forced) must
+# NOT take the skip-if-ideal shortcut. The shortcut used to ship every source track (2 audio + 3
+# subs) while the real pipeline keeps one audio + a filtered subtitle set — live-reproduced in the
+# review. Reporting the source as non-ideal makes skip-if-ideal fall through to the identical
+# pipeline as --no-skip-if-ideal, so it can never ship MORE tracks than the pipeline (convergence).
+# Skip-first guard (not an else-skip) per the soft-skip ratchet.
+_test_sii_single_track_no_overship() {
+  if ! ffmpeg_has_encoder libx265; then
+    skip "sii-single-track-no-overship: ffmpeg lacks libx265 — cannot build the compliant fixture"
+    return
+  fi
+  local _src="$TESTDIR/sii_multi_ax_sx.mkv"
+  printf '1\n00:00:00,000 --> 00:00:01,000\nfull\n'    > "$TESTDIR/sii_full.srt"
+  printf '1\n00:00:00,000 --> 00:00:01,000\n[signs]\n' > "$TESTDIR/sii_forced.srt"
+  printf '1\n00:00:00,000 --> 00:00:01,000\nfra\n'     > "$TESTDIR/sii_fra2.srt"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=red:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -f lavfi -i "sine=frequency=550:duration=1" \
+    -i "$TESTDIR/sii_full.srt" -i "$TESTDIR/sii_forced.srt" -i "$TESTDIR/sii_fra2.srt" \
+    -c:v libx265 -preset ultrafast -x265-params log-level=none -pix_fmt yuv420p10le \
+    -map 0:v -map 1:a -map 2:a -map 3 -map 4 -map 5 \
+    -c:a aac -b:a 128k -ac 2 -c:s srt \
+    -metadata:s:a:0 language=eng -metadata:s:a:1 language=eng \
+    -metadata:s:s:0 language=eng -metadata:s:s:1 language=eng -metadata:s:s:2 language=fra \
+    -disposition:s:1 forced \
+    "$_src" 2>/dev/null || true
+  if [[ ! -s "$_src" ]]; then
+    skip "sii-single-track-no-overship: could not build the 2-audio/3-sub fixture"
+    rm -f "$TESTDIR/sii_full.srt" "$TESTDIR/sii_forced.srt" "$TESTDIR/sii_fra2.srt" 2>/dev/null || true
+    return
+  fi
+  local out
+  out="$(run_muxm --profile atv-directplay-hq --output-ext mkv --skip-if-ideal --dry-run "$_src" "$TESTDIR/sii_os_out.mkv")"
+  if printf '%s' "$out" | grep -qiE 'already matches profile'; then
+    fail "sii-single-track-no-overship: 2-audio/3-sub source treated as ideal — skip-if-ideal would over-ship tracks vs the real pipeline"
+  elif printf '%s' "$out" | grep -qiE 'does not match ideal'; then
+    pass "sii-single-track-no-overship: multi-track source is not ideal for a single-track profile — skip-if-ideal falls through to the real pipeline (no over-ship)"
+  else
+    fail "sii-single-track-no-overship: expected a non-ideal verdict; got: $(printf '%s' "$out" | grep -iE 'does not match ideal|already matches' | head -1)"
+  fi
+  rm -f "$_src" "$TESTDIR/sii_os_out.mkv" "$TESTDIR/sii_full.srt" "$TESTDIR/sii_forced.srt" "$TESTDIR/sii_fra2.srt" 2>/dev/null || true
 }
 
 # M2: a failed final mv/checksum must not abort on_exit's cleanup and leak the workdir. Under
