@@ -1437,12 +1437,40 @@ _check_filter_ideality() {
 # arbitrary commands. This is the same trust model as .envrc (direnv), Makefile,
 # etc. — standard for developer tooling. See README.md (Config Chain section)
 # and docs/config_profile.md for profile behavior details.
+# _muxm_tier_is_trusted FILE — return 0 if FILE is safe to source as a SYSTEM (/etc) or USER ($HOME)
+# config tier: it must not be group- or world-writable, mirroring ssh/sudo's own config-file trust
+# checks, so another user can't inject shell that runs as this user (RV3-04). Emits a warning and
+# returns 1 on rejection. Best-effort: if the mode can't be determined, don't block (the -r gate
+# already applied). This gate is NOT applied to the CWD ./.muxmrc tier — that same-privilege,
+# project-level override is the accepted H1 trust model and keeps no gate.
+_muxm_tier_is_trusted(){
+  local f="$1" mode
+  mode="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f" 2>/dev/null || echo '')"
+  [[ "$mode" =~ ^[0-7]+$ ]] || return 0            # no usable stat → best-effort, don't block
+  if (( (8#$mode & 8#22) != 0 )); then             # 0o22 = group-write (0o20) | other-write (0o2)
+    warn "Ignoring ${f} — it is group- or world-writable (mode ${mode}); refusing to source it as a config tier (another user could inject shell that runs as you). Fix with: chmod go-w '${f}'"
+    return 1
+  fi
+  return 0
+}
+
+# _muxm_user_tier_is_elevation_risk EUID — return 0 (⇒ skip the $HOME/.muxmrc tier) when running as
+# root (euid 0) VIA sudo/su with the invoking user's $HOME preserved (SUDO_USER/SUDO_UID present),
+# so root doesn't execute an unprivileged user's config (RV3-04, Finding #3). A genuine root login
+# (no SUDO_*) returns 1 → root's own ~/.muxmrc is still sourced. Taking euid as an ARG (the call
+# site passes the read-only $EUID) keeps the real privilege check un-spoofable AND unit-testable.
+_muxm_user_tier_is_elevation_risk(){
+  (( ${1:-1} == 0 )) && [[ -n "${SUDO_USER:-}${SUDO_UID:-}" ]]
+}
+
 # Source a config file if it exists and is readable. Tracks loaded files for diagnostics.
-# Args: $1 — file path
+# Args: $1 — file path; $2 (optional) — "trusted" to apply the group/world-writable trust gate
+#       (RV3-04) before sourcing. The CWD ./.muxmrc tier calls WITHOUT it (accepted H1 model).
 # Globals: MUXM_CONFIG_LOADED (modified)
 _muxm_try_source(){
-  local f="$1"
+  local f="$1" tier="${2:-}"
   [[ -r "$f" ]] || return 0
+  [[ "$tier" == "trusted" ]] && ! _muxm_tier_is_trusted "$f" && return 0  # rejected (warned) → skip
   # shellcheck disable=SC1090
   . "$f"
   MUXM_CONFIG_LOADED+=("$f")
@@ -1497,14 +1525,27 @@ for _pcd_v in "${CONFIG_TRACKED_VARS[@]}"; do
 done
 unset _pcd_v
 
-_muxm_try_source /etc/.muxmrc
+_muxm_try_source /etc/.muxmrc trusted
 # 1.6: guard against $HOME being unset — under `set -u`, an unguarded "$HOME/.muxmrc" here
 # crashes EVERY invocation (including --help) with bash's raw "HOME: unbound variable" instead
 # of a muxm-specific diagnostic. An unset $HOME has no meaningful user-config path, so this tier
 # of the chain is simply skipped; user-scope actions that specifically require $HOME (e.g.
 # --create-config user, --install-completions) still surface their own actionable die message.
-[[ -n "${HOME:-}" ]] && _muxm_try_source "$HOME/.muxmrc"
-_muxm_try_source "./.muxmrc"   # Sources from $PWD — intentional project-level override (see section header)
+#
+# RV3-04 (Finding #3) — privilege-ELEVATION guard, distinct from the accepted same-privilege H1
+# CWD tier below. When running as root VIA sudo/su with the invoking user's $HOME preserved
+# (`sudo -E`, `env_keep += HOME`, or `su` without `-`), $HOME points at the UNPRIVILEGED user's
+# home, so sourcing $HOME/.muxmrc would execute that user's shell as root. Skip the user tier in
+# that case (a genuine root login — no SUDO_USER/SUDO_UID — still sources root's own ~/.muxmrc).
+# The /etc tier above is unaffected (it is the system-owned config, meant to be read by everyone).
+if [[ -n "${HOME:-}" ]]; then
+  if _muxm_user_tier_is_elevation_risk "$EUID"; then
+    [[ -r "$HOME/.muxmrc" ]] && warn "Skipping ${HOME}/.muxmrc — running as root via sudo/su with the invoking user's \$HOME preserved; sourcing it would execute that user's config as root. Use 'sudo muxm --create-config system <profile>' for a root-owned config."
+  else
+    _muxm_try_source "$HOME/.muxmrc" trusted
+  fi
+fi
+_muxm_try_source "./.muxmrc"   # Sources from $PWD — intentional project-level override (see section header; H1 WONTFIX — no trust gate)
 
 # Deprecation bridge: AUDIO_SCORE_LANG_BONUS_ENG → AUDIO_SCORE_LANG_BONUS (v1.1)
 # Apply the legacy alias ONLY when the new var was not explicitly set in config — i.e. it still
@@ -1942,7 +1983,15 @@ unset _arg
 _man_target_dir(){
   # Prefer Homebrew man path if brew is installed
   if command -v brew >/dev/null 2>&1; then
-    echo "$(brew --prefix 2>/dev/null)/share/man/man1"  # Suppress stderr to match the other brew --prefix call sites
+    local _brew_prefix
+    _brew_prefix="$(brew --prefix 2>/dev/null)"   # Suppress stderr to match the other brew --prefix call sites
+    # RV3-04: validate `brew --prefix` produced a sane ABSOLUTE, existing directory before building
+    # a (possibly sudo'd) install target from it — a broken/wrapped/empty brew would otherwise yield
+    # a root-level path like "/share/man/man1". die cleanly instead of silently mis-targeting.
+    if [[ -z "$_brew_prefix" || "$_brew_prefix" != /* || ! -d "$_brew_prefix" ]]; then
+      die 1 "Could not determine a valid Homebrew prefix (\`brew --prefix\` returned '${_brew_prefix:-<empty>}'). Fix your Homebrew install, or install the man page manually into a directory on your MANPATH."
+    fi
+    echo "$_brew_prefix/share/man/man1"
   else
     echo "/usr/local/share/man/man1"
   fi
@@ -3186,15 +3235,27 @@ _install_man(){
     fi
   fi
 
-  # Write the man page. 1.2: check the write actually succeeded before reporting success —
-  # a false-positive -w check, a filled quota, or a failing `sudo tee` must not be reported
-  # as "✅ Installed".
+  # Write the man page ATOMICALLY (temp + mv -f), never a direct `>`/`tee` redirect into the final
+  # path. RV3-04: on a shared, user-writable Homebrew man dir another local user could pre-place a
+  # SYMLINK at $target; a `>` redirect (and `tee`) FOLLOWS it and writes through to the link's
+  # target — an arbitrary-file overwrite — whereas `mv -f` replaces the link NAME with the real
+  # file. Mirrors _install_completions / _create_config (RV2-01). Mode 644 (read/parsed by man(1),
+  # never executed). 1.2: check every step so a partial/failed write is never reported "✅ Installed".
+  local _man_tmp
   if [[ -w "$mandir" ]]; then
-    _man_emit > "$target" || die 1 "Failed to write man page to $target"
+    _man_tmp="$(mktemp "${mandir}/.muxm-man.XXXXXX")" || die 1 "Cannot create a temp file in $mandir"
+    _man_emit > "$_man_tmp"       || { rm -f "$_man_tmp"; die 1 "Failed to write man page content for $target"; }
+    chmod 644 "$_man_tmp"         || { rm -f "$_man_tmp"; die 1 "Failed to set permissions on the temp man page"; }
+    mv -f "$_man_tmp" "$target"   || { rm -f "$_man_tmp"; die 1 "Failed to install man page to $target"; }
   else
     printf '  🔐 Requires elevated permissions.\n'
     _require_sudo_for "$mandir"
-    _man_emit | sudo tee "$target" > /dev/null || die 1 "Failed to write man page to $target (sudo tee failed)"
+    # $mandir isn't user-writable, so stage the temp in a user-writable dir and sudo-mv it into
+    # place (still replacing the target NAME, so a pre-placed symlink is not followed).
+    _man_tmp="$(mktemp "${TMPDIR:-/tmp}/.muxm-man.XXXXXX")" || die 1 "Cannot create a temp file for the man page"
+    _man_emit > "$_man_tmp"          || { rm -f "$_man_tmp"; die 1 "Failed to write man page content for $target"; }
+    chmod 644 "$_man_tmp"            || { rm -f "$_man_tmp"; die 1 "Failed to set permissions on the temp man page"; }
+    sudo mv -f "$_man_tmp" "$target" || { rm -f "$_man_tmp"; die 1 "Failed to install man page to $target (sudo mv failed)"; }
   fi
 
   printf '  ✅ Installed %s\n' "$target"

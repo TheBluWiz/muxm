@@ -2401,6 +2401,48 @@ _test_config_crf_octal() {
   rm -rf "$h" "$TESTDIR/crf_cfg_out.mp4"
 }
 
+# RV3-04 (Finding #3 + the tier-permission medium): the /etc and $HOME config tiers are now trust-
+# gated. Two independent checks:
+#  (a) Privilege elevation — when root runs muxm via sudo/su with the invoking user's $HOME
+#      preserved, $HOME/.muxmrc is skipped (root must not execute an unprivileged user's config).
+#      $EUID is read-only, so unit-test the extracted predicate directly (the call site passes the
+#      real $EUID). This does NOT touch the accepted same-privilege H1 CWD ./.muxmrc tier.
+#  (b) Group/world-writable tier files are rejected with a warning (not silently sourced).
+_test_config_tier_trust() {
+  # (a) elevation predicate truth table.
+  local body
+  body="$(_extract_muxm_fns _muxm_user_tier_is_elevation_risk)" \
+    || { fail "config-tier-trust: could not extract _muxm_user_tier_is_elevation_risk"; return; }
+  _elev(){ bash -c "$body"$'\n'"SUDO_USER='$2'; SUDO_UID='$3'"$'\n''_muxm_user_tier_is_elevation_risk "$1" && echo SKIP || echo SOURCE' -- "$1"; }
+  local g
+  g="$(_elev 0 alice '')";   [[ "$g" == SKIP   ]] && pass "config-tier-trust: root via sudo (euid 0 + SUDO_USER) skips \$HOME/.muxmrc"                    || fail "config-tier-trust: euid0+SUDO_USER expected SKIP, got '$g'"
+  g="$(_elev 0 '' 42)";      [[ "$g" == SKIP   ]] && pass "config-tier-trust: root via sudo (euid 0 + SUDO_UID) skips \$HOME/.muxmrc"                     || fail "config-tier-trust: euid0+SUDO_UID expected SKIP, got '$g'"
+  g="$(_elev 0 '' '')";      [[ "$g" == SOURCE ]] && pass "config-tier-trust: genuine root login (euid 0, no SUDO_*) still sources \$HOME/.muxmrc"        || fail "config-tier-trust: euid0 no-SUDO expected SOURCE, got '$g'"
+  g="$(_elev 1000 alice '')";[[ "$g" == SOURCE ]] && pass "config-tier-trust: non-root sudo -u (euid 1000) sources \$HOME/.muxmrc (same privilege)"      || fail "config-tier-trust: euid1000 expected SOURCE, got '$g'"
+
+  # (b) a group/world-writable $HOME/.muxmrc is rejected (warn), a 0644 one is sourced. Run from a
+  # clean CWD (no ./.muxmrc) so only the $HOME tier is under test.
+  local _tt_home _tt_cwd _tt_out
+  _tt_home="$(mktemp -d "$TESTDIR/tiertrust_home.XXXXXX")"
+  _tt_cwd="$(mktemp -d "$TESTDIR/tiertrust_cwd.XXXXXX")"
+  printf 'CRF_VALUE=33\n' > "$_tt_home/.muxmrc"
+  chmod 664 "$_tt_home/.muxmrc"    # group-writable → must be rejected
+  _tt_out="$(cd "$_tt_cwd" && HOME="$_tt_home" "$MUXM" --print-effective-config 2>&1)"
+  if printf '%s\n' "$_tt_out" | grep -qiF "group- or world-writable" && printf '%s\n' "$_tt_out" | grep -qE 'CRF_VALUE += 18$'; then
+    pass "config-tier-trust: a group-writable ~/.muxmrc is rejected with a warning (not silently sourced)"
+  else
+    fail "config-tier-trust: group-writable ~/.muxmrc — expected a warning + default CRF_VALUE=18, got: $(printf '%s\n' "$_tt_out" | grep -iE 'writable|CRF_VALUE ' | head -2 | tr '\n' ' ')"
+  fi
+  chmod 644 "$_tt_home/.muxmrc"    # control: same file, safe perms → sourced
+  _tt_out="$(cd "$_tt_cwd" && HOME="$_tt_home" "$MUXM" --print-effective-config 2>&1)"
+  if printf '%s\n' "$_tt_out" | grep -qE 'CRF_VALUE += 33$' && ! printf '%s\n' "$_tt_out" | grep -qiF "group- or world-writable"; then
+    pass "config-tier-trust: a 0644 ~/.muxmrc is sourced normally (the gate is permission-driven, not a blanket skip)"
+  else
+    fail "config-tier-trust: 0644 ~/.muxmrc should be sourced (CRF_VALUE=33), got: $(printf '%s\n' "$_tt_out" | grep -iE 'writable|CRF_VALUE ' | head -2 | tr '\n' ' ')"
+  fi
+  rm -rf "$_tt_home" "$_tt_cwd"
+}
+
 _test_config_create_overrides() {
   # --create-config with CLI overrides should produce a .muxmrc where the
   # overridden values are uncommented and set to the supplied values.
@@ -2843,6 +2885,7 @@ test_config() {
   _test_config_layering
   _test_config_validation
   _test_config_crf_octal
+  _test_config_tier_trust
   _test_config_create_overrides
   _test_config_deprecation_bridge
   _test_config_create_escape
@@ -12522,6 +12565,42 @@ test_setup() {
   # 1.8 (mp4box/gpac install-check dedup) needs no new test — it's a pure internal refactor
   # already protected by the existing --install-dependencies (R26/R27) and _detect_mp4box
   # unit coverage exercised elsewhere in this suite.
+
+  # ---- RV3-04: --install-man writes ATOMICALLY (temp + mv -f), so a pre-placed symlink at the
+  #      target is REPLACED, not followed (no write-through/arbitrary-file overwrite), and no
+  #      temp file is left behind. On a shared, user-writable Homebrew man dir this closes a
+  #      symlink-follow overwrite. ----
+  local atm_prefix="$fake_home/atomic_prefix" atm_bin="$fake_home/atomic_bin"
+  mkdir -p "$atm_prefix/share/man/man1" "$atm_bin"
+  # shellcheck disable=SC2016
+  printf '#!/bin/bash\n[[ "$1" == "--prefix" ]] && { printf "%%s\\n" "%s"; exit 0; }\nexit 0\n' "$atm_prefix" > "$atm_bin/brew"
+  chmod +x "$atm_bin/brew"
+  local atm_victim="$atm_prefix/victim.txt"; printf 'ORIGINAL\n' > "$atm_victim"
+  local atm_target="$atm_prefix/share/man/man1/muxm.1"
+  ln -sf "$atm_victim" "$atm_target"    # hostile pre-placed symlink at the install target
+  ( PATH="$atm_bin:$PATH" env -u MANPATH "$MUXM" --install-man >/dev/null 2>&1 ) || true
+  if [[ "$(cat "$atm_victim" 2>/dev/null)" == "ORIGINAL" ]] && [[ -f "$atm_target" && ! -L "$atm_target" ]] && grep -q '\.TH' "$atm_target" 2>/dev/null; then
+    pass "setup-install-man-atomic: a pre-placed symlink at the target is replaced (not followed); the victim file is untouched"
+  else
+    fail "setup-install-man-atomic: symlink followed or man page not installed (victim='$(cat "$atm_victim" 2>/dev/null)', target-is-symlink=$([[ -L "$atm_target" ]] && echo yes || echo no))"
+  fi
+  if ls "$atm_prefix/share/man/man1"/.muxm-man.?????? >/dev/null 2>&1; then
+    fail "setup-install-man-atomic: a stray .muxm-man.XXXXXX temp file was left in the man dir"
+  else
+    pass "setup-install-man-atomic: no stray temp file left after a successful install"
+  fi
+
+  # ---- RV3-04: _man_target_dir dies CLEANLY on a broken/empty `brew --prefix` instead of silently
+  #      building a root-level "/share/man/man1" target. ----
+  local bad_bin="$fake_home/badbrew_bin"; mkdir -p "$bad_bin"
+  printf '#!/bin/sh\necho ""\n' > "$bad_bin/brew"; chmod +x "$bad_bin/brew"   # --prefix → empty
+  local bad_out bad_rc
+  bad_out="$(PATH="$bad_bin:$PATH" "$MUXM" --install-man 2>&1)" && bad_rc=$? || bad_rc=$?
+  if [[ "$bad_rc" -ne 0 ]] && printf '%s\n' "$bad_out" | grep -qiF "valid Homebrew prefix"; then
+    pass "setup-man-target-dir-broken-brew: a broken 'brew --prefix' dies cleanly (no silent root-level install path)"
+  else
+    fail "setup-man-target-dir-broken-brew: expected a clean die on empty brew --prefix (rc=$bad_rc): ${bad_out:0:200}"
+  fi
 
   # ---- Cleanup ----
   rm -rf "$fake_home"
