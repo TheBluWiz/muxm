@@ -10249,18 +10249,22 @@ _test_unit_empty_array_safe() {
   else
     fail "unit-empty-array-safe-set-u: set -u empty-array expansion errored: $err"
   fi
-  # (3) Static: muxm's known empty-prone command-arg arrays use the safe form, never bare "${x[@]}".
-  # A "bare" expansion is "${arr[@]}" NOT preceded by '+' (the safe form is ${arr[@]+"${arr[@]}"}).
-  # Grep the file directly (matching LINES), then keep only NON-comment matches so the RF9
-  # explanatory comment (which quotes the unsafe form) doesn't false-positive.
+  # (3) Static: muxm's known empty-prone command-arg AND keep-list/iteration arrays use the safe
+  # form, never bare "${x[@]}". A "bare" expansion is "${arr[@]}" NOT preceded by '+' (the safe form
+  # is ${arr[@]+"${arr[@]}"}). Grep the file directly (matching LINES), then keep only NON-comment
+  # matches so the RF9 explanatory comment (which quotes the unsafe form) doesn't false-positive.
+  # RV3-05 extended this to the four arrays Finding #4 named (COMPLETED_STEPS, _MULTI_PROFILES,
+  # _ORIG_FILTERED_ARGS, SII_AUDIO_INDICES) plus the two same-class siblings the whole-file sweep
+  # surfaced (SII_SUB_INDICES beside SII_AUDIO_INDICES; AUDIO_MT_INDICES, the multi-track keep-list).
   local arr unsafe=""
-  for arr in fps_arg _ts_fps fps_in fps_in2 _ocr_lang thread_args _child_flags _cc_override_args; do
+  for arr in fps_arg _ts_fps fps_in fps_in2 _ocr_lang thread_args _child_flags _cc_override_args \
+             COMPLETED_STEPS _MULTI_PROFILES _ORIG_FILTERED_ARGS SII_AUDIO_INDICES SII_SUB_INDICES AUDIO_MT_INDICES; do
     if grep -E "[^+]\"\\\$\{${arr}\[@\]\}\"" "$MUXM" | grep -qvE '^[[:space:]]*#'; then
       unsafe+="$arr "
     fi
   done
   if [[ -z "$unsafe" ]]; then
-    pass "unit-empty-array-safe-set-u: no bare \"\${arr[@]}\" expansion remains for the empty-prone command-arg arrays"
+    pass "unit-empty-array-safe-set-u: no bare \"\${arr[@]}\" expansion remains for the empty-prone command-arg / keep-list arrays"
   else
     fail "unit-empty-array-safe-set-u: bare (4.3-unsafe) array expansion still present for: $unsafe"
   fi
