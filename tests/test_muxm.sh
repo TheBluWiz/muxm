@@ -368,9 +368,14 @@ assert_no_file() {
 # muxm routes its internal log() lines to the logfile instead of leaking them to the
 # terminal, so tests that need to observe those decisions read the kept workdir log (same pattern
 # the H9 x265-params test uses).
+# `|| true` on the pipeline assignment: under set -o pipefail, a `grep` miss (no "Keeping
+# workdir:" line — e.g. -K wasn't honored) propagates through the trailing `head`/`awk` even
+# though they individually succeed on empty input; without the guard, a bare assignment here
+# trips `set -e` and silently kills the whole harness instead of falling through to `return 1`
+# below (Test_Review.md Tier A #1).
 _keepworkdir_logfile() {
   local wd
-  wd="$(printf '%s\n' "$1" | grep 'Keeping workdir:' | head -1 | awk '{print $NF}')"
+  wd="$(printf '%s\n' "$1" | grep 'Keeping workdir:' | head -1 | awk '{print $NF}')" || true
   [[ -n "$wd" && -d "$wd" ]] || return 1
   find "$wd" -maxdepth 1 -name 'muxm.*.log' 2>/dev/null | head -1
 }
@@ -378,51 +383,68 @@ _keepworkdir_logfile() {
 # Probe a video field from output file (returns value via stdout).
 # head -1: ffprobe may return multiple lines for multi-segment files.
 # tr -d ',': ffprobe's csv output can include trailing commas in multi-value fields.
+# `|| true`: under set -o pipefail, ffprobe failing (missing/corrupt file) propagates through
+# `head`/`tr` even though those stages individually succeed on empty input; without the guard,
+# callers doing a bare `actual="$(probe_video ...)"` assignment would trip `set -e` and abort
+# the entire suite instead of receiving an empty string to compare/fail on (Test_Review.md
+# Tier A #1 — same failure mode `ffmpeg_has_encoder` below already guards against).
 probe_video() {
   local file="$1" field="$2"
-  ffprobe -v error -select_streams v:0 -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ','
+  ffprobe -v error -select_streams v:0 -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ',' || true
 }
 
 # Probe an audio field from output file (stream index defaults to a:0).
-# Same head -1 | tr -d ',' rationale as probe_video above.
+# Same head -1 | tr -d ',' rationale as probe_video above; same `|| true` set -e guard.
 probe_audio() {
   local file="$1" field="$2" idx="${3:-0}"
-  ffprobe -v error -select_streams "a:$idx" -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ','
+  ffprobe -v error -select_streams "a:$idx" -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ',' || true
 }
 
 # Probe a subtitle field from output file (stream index defaults to s:0).
+# Same `|| true` set -e guard as probe_video above.
 probe_sub() {
   local file="$1" field="$2" idx="${3:-0}"
-  ffprobe -v error -select_streams "s:$idx" -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ','
+  ffprobe -v error -select_streams "s:$idx" -show_entries "stream=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 | tr -d ',' || true
 }
 
 # Probe a format-level tag (title, comment, encoder, language, etc.).
 # Usage: probe_format_tag FILE TAG
+# Same `|| true` set -e guard as probe_video above.
 probe_format_tag() {
   local file="$1" tag="$2"
-  ffprobe -v error -show_entries "format_tags=$tag" -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | head -1
+  ffprobe -v error -show_entries "format_tags=$tag" -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | head -1 || true
 }
 
 # Probe a stream-level tag (language, title, etc.).
 # Usage: probe_stream_tag FILE STREAM_SPEC TAG
 #   STREAM_SPEC — ffprobe stream selector (a:0, s:0, v:0, etc.)
+# Same `|| true` set -e guard as probe_video above.
 probe_stream_tag() {
   local file="$1" stream="$2" tag="$3"
-  ffprobe -v error -select_streams "$stream" -show_entries "stream_tags=$tag" -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | head -1
+  ffprobe -v error -select_streams "$stream" -show_entries "stream_tags=$tag" -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | head -1 || true
 }
 
 # Probe a format-level field (format_name, duration, etc.).
 # Usage: probe_format FILE FIELD
+# Same `|| true` set -e guard as probe_video above.
 probe_format() {
   local file="$1" field="$2"
-  ffprobe -v error -show_entries "format=$field" -of csv=p=0 "$file" 2>/dev/null | head -1
+  ffprobe -v error -show_entries "format=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 || true
 }
 
-# Count streams of a given type
-# Note: tr -d ' ' strips padding from BSD wc (macOS compat)
+# Count streams of a given type. Echoes "-1" (and returns 1) when ffprobe itself fails
+# (missing/corrupt file) — distinct from a genuine zero-stream count — so callers can tell
+# "no streams of this type" apart from "couldn't probe the file at all" instead of both
+# collapsing to "0" (Test_Review.md Tier A #2). Note: 'wc -l' strips padding from BSD wc
+# (macOS compat) via tr -d ' '.
 count_streams() {
-  local file="$1" type="$2"
-  ffprobe -v error -select_streams "$type" -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null | wc -l | tr -d ' '
+  local file="$1" type="$2" out
+  out="$(ffprobe -v error -select_streams "$type" -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null)" || { printf '%s' "-1"; return 1; }
+  if [[ -z "$out" ]]; then
+    printf '%s' "0"
+  else
+    printf '%s\n' "$out" | wc -l | tr -d ' '
+  fi
 }
 
 # True if the current ffmpeg build lists ENCODER. Collects the encoder list into
@@ -475,7 +497,12 @@ assert_stream_count() {
   local label="$1" file="$2" type="$3" min="$4" max="${5:-999}"
   local count
   count="$(count_streams "$file" "$type")"
-  if [[ "$count" -ge "$min" && "$count" -le "$max" ]]; then
+  # count_streams signals "couldn't probe the file at all" with -1, distinct from a genuine
+  # zero-stream count — treat it as a hard fail rather than silently comparing -1 against
+  # min/max (which could otherwise accidentally satisfy a "0-0 streams expected" assertion).
+  if [[ "$count" == "-1" ]]; then
+    fail "$label — could not probe '$file' (missing, empty, or corrupt)"
+  elif [[ "$count" -ge "$min" && "$count" -le "$max" ]]; then
     pass "$label ($count streams)"
   else
     fail "$label — expected ${min}-${max} streams, got $count"
@@ -994,6 +1021,7 @@ External subtitle test line
 SRT
 
   # Sidecar files covering every naming convention and parser code-path
+  local _stem_sfx _ext_n _ext_bad _f
   for _stem_sfx in \
     "" \
     ".en" \
@@ -1549,7 +1577,7 @@ _test_cli_dashdash() {
 # → non-11 exit → red.
 _test_cli_config_missing_val() {
   local _h="$TESTDIR/m5_home"; mkdir -p "$_h"
-  assert_exit 11 "cli-config-missing-value: --create-config with a trailing --crf (missing value) → clean die 11" \
+  assert_exit "$EXIT_VALIDATION" "cli-config-missing-value: --create-config with a trailing --crf (missing value) → clean die 11" \
     --create-config user atv-directplay-hq --crf
   # Sanity: a present value still parses (no false die).
   local rc=0
@@ -1573,7 +1601,7 @@ _test_cli_replace_source_eof() {
   local out rc=0
   # SRC == OUT triggers the replace-source confirm prompt; </dev/null makes read hit EOF.
   out="$(cd "$_dir" && HOME="$_dir/h" "$MUXM" clip.mkv clip.mkv </dev/null 2>&1)" || rc=$?
-  if (( rc == 11 )) && grep -qiE "declined|Aborted" <<<"$out"; then
+  if (( rc == EXIT_VALIDATION )) && grep -qiE "declined|Aborted" <<<"$out"; then
     pass "cli-replace-source-eof: REPLACE_SOURCE + non-interactive stdin → clean die 11 (EOF treated as decline)"
   else
     fail "cli-replace-source-eof: REPLACE_SOURCE + EOF stdin → expected die 11, got exit $rc (ERR-trap crash?)"
@@ -1669,14 +1697,19 @@ _test_cli_value_validation() {
 
   # L4: every allow-listed encoder (incl. the newly-mapped libfdk_aac/aac_at) must pass the parse
   # guard — the run fails later only for the missing source, never with "Invalid --audio-force-codec".
-  local _afc
+  # _afc_all_ok tracks whether every iteration passed; the closing pass() only fires if it
+  # survives the loop, so a single rejected codec can't be masked by an unconditional pass
+  # (Test_Review.md Tier A #4 — previously fail() could fire inside the loop and pass() would
+  # still fire right after it, claiming "all accepted" regardless).
+  local _afc _afc_all_ok=1
   for _afc in libopus libmp3lame libvorbis aac libfdk_aac aac_at ac3 eac3 flac; do
     out="$(_l3_msg --audio-force-codec "$_afc")"
     if printf '%s\n' "$out" | grep -qiF "Invalid --audio-force-codec"; then
       fail "cli-audio-force-codec-allowlist: --audio-force-codec $_afc wrongly rejected at parse"
+      _afc_all_ok=0
     fi
   done
-  pass "cli-audio-force-codec-allowlist: all allow-listed --audio-force-codec encoders accepted at parse (incl. libfdk_aac, aac_at)"
+  (( _afc_all_ok )) && pass "cli-audio-force-codec-allowlist: all allow-listed --audio-force-codec encoders accepted at parse (incl. libfdk_aac, aac_at)"
 
   # 4.1: --checksum-algo now validates at parse time via the same inline-validator shape as its
   # siblings (_validate_checksum_algo_arg), instead of only being caught by a separate case
@@ -1728,7 +1761,7 @@ _test_cli_value_flag_no_value() {
                --level --x265-params --ocr-tool --max-copy-bitrate --workdir --checksum-algo; do
     # set -e-safe capture: the flag-with-no-value exits 11, which would otherwise abort.
     _out="$(cd "$TESTDIR" && "$MUXM" "$_flag" 2>&1)" && _code=$? || _code=$?
-    if [[ "$_code" -eq 11 ]] && printf '%s' "$_out" | grep -qiE 'requires a value'; then
+    if [[ "$_code" -eq "$EXIT_VALIDATION" ]] && printf '%s' "$_out" | grep -qiE 'requires a value'; then
       pass "cli-value-flag-requires-value: '$_flag' as final token → exit 11 'requires a value'"
     else
       fail "cli-value-flag-requires-value: '$_flag' as final token → expected exit 11 'requires a value', got exit $_code"
@@ -1741,7 +1774,7 @@ _test_cli_value_flag_no_value() {
   done
   # A value-flag followed by another flag is still rejected (not silently consumed).
   _out="$(cd "$TESTDIR" && "$MUXM" --threads --crf 20 2>&1)" && _code=$? || _code=$?
-  if [[ "$_code" -eq 11 ]] && printf '%s' "$_out" | grep -qiE 'requires a value, not a flag'; then
+  if [[ "$_code" -eq "$EXIT_VALIDATION" ]] && printf '%s' "$_out" | grep -qiE 'requires a value, not a flag'; then
     pass "cli-value-flag-requires-value: '--threads --crf' rejects the following flag as the value"
   else
     fail "cli-value-flag-requires-value: '--threads --crf' → expected exit 11 'not a flag', got exit $_code"
@@ -1751,7 +1784,7 @@ _test_cli_value_flag_no_value() {
   # values exit 11 cleanly (zero/fractional would be meaningless as a core cap).
   for _bad in abc 0 2.5 ""; do
     _out="$(cd "$TESTDIR" && "$MUXM" --threads "$_bad" 2>&1)" && _code=$? || _code=$?
-    if [[ "$_code" -eq 11 ]] && printf '%s' "$_out" | grep -qiE 'Invalid --threads|requires a value'; then
+    if [[ "$_code" -eq "$EXIT_VALIDATION" ]] && printf '%s' "$_out" | grep -qiE 'Invalid --threads|requires a value'; then
       pass "cli-value-flag-requires-value: '--threads ${_bad:-<empty>}' rejected (positive integer required)"
     else
       fail "cli-value-flag-requires-value: '--threads ${_bad:-<empty>}' → expected exit 11, got exit $_code"
@@ -1869,7 +1902,7 @@ test_toggles() {
     "--no-sub-preserve-bitmap|SUB_PRESERVE_BITMAP       = 0"
   )
 
-  local out flag expected
+  local out flag expected tc
   for tc in "${TOGGLE_CASES[@]}"; do
     IFS='|' read -r flag expected <<< "$tc"
     out="$(run_muxm "$flag" --print-effective-config)"
@@ -2066,7 +2099,7 @@ _test_config_create() {
   assert_contains "Invalid scope" "--create-config rejects invalid scope" "$out"
 
   # --create-config with all remaining profiles (#50)
-  local profiles_to_test=("archive" "hdr10-hq" "atv-directplay-hq" "universal")
+  local profiles_to_test=("archive" "hdr10-hq" "atv-directplay-hq" "universal") p
   for p in "${profiles_to_test[@]}"; do
     local cfg_p_dir="$TESTDIR/config_create_$p"
     mkdir -p "$cfg_p_dir"
@@ -2736,7 +2769,7 @@ _test_config_create_injection() {
   local _rc=0
   ( cd "$_d" && HOME="$_d/h" "$MUXM" --create-config project atv-directplay-hq \
       --crf '20; echo INJECTED' >/dev/null 2>&1 ) || _rc=$?
-  if (( _rc == 11 )) && [[ ! -f "$_d/.muxmrc" ]]; then
+  if (( _rc == EXIT_VALIDATION )) && [[ ! -f "$_d/.muxmrc" ]]; then
     pass "config-create-config-injection inject: non-numeric --crf override rejected with exit 11 (no file written)"
   else
     fail "config-create-config-injection inject: expected exit 11 + no file for non-numeric --crf, got rc=$_rc, file-exists=$([[ -f "$_d/.muxmrc" ]] && echo yes || echo no)"
@@ -2856,7 +2889,7 @@ test_profiles() {
   section "Profile Variable Assignment"
 
   local profiles=("archive" "hdr10-hq" "atv-directplay-hq" "atv-directplay-animation" "av1-hq" "streaming-hevc" "streaming-av1" "animation" "universal" "youtube-upload")
-  local out
+  local out p
 
   for p in "${profiles[@]}"; do
     out="$(run_muxm --profile "$p" --print-effective-config)"
@@ -4001,9 +4034,13 @@ EOF
   fi
 
   # Without an explicit --crf, skip-if-ideal should still recognize the compliant source.
+  # Regex matches the same specific skip-if-ideal phrase asserted (as a negative) two blocks
+  # above, not a generic word list — the source file is literally named "compliant.mp4", so a
+  # loose alternative like a bare "compliant" would match the echoed source path even if
+  # skip-if-ideal detection were completely broken (Test_Review.md Tier A #5).
   out="$(run_muxm --dry-run --skip-if-ideal \
     "$TESTDIR/compliant.mp4" 2>&1)"
-  if echo "$out" | grep -qiE "ideal|skip|already|compliant|no.?processing"; then
+  if echo "$out" | grep -qiE "already matches|source already ideal|no.?processing.?needed"; then
     pass "skip-if-ideal (no explicit --crf): compliant source still recognized as ideal"
   else
     # May have encoded if compliance check is strict; either way no crash.
@@ -5903,6 +5940,13 @@ _test_audio_native_stereo() {
   local nf_src="$TESTDIR/native_stereo_flac.mkv"
   local nf_out="$TESTDIR/native_stereo_flac_out.mkv"
   log "Testing native FLAC stereo stream-copied into MKV (regression)..."
+  # Skip-first guard (not an else-skip): a minimal ffmpeg build without a FLAC encoder can't
+  # build this fixture at all, and feeding run_muxm a source that silently failed to encode
+  # would previously produce a confusing hard fail unrelated to the feature under test
+  # (Test_Review.md Tier B).
+  if ! ffmpeg_has_encoder flac; then
+    skip "audio-native-stereo-flac: ffmpeg lacks a FLAC encoder — cannot build the regression fixture"
+  else
   ffmpeg -hide_banner -loglevel error -y \
     -f lavfi -i "color=c=teal:s=320x240:r=24:d=1" \
     -f lavfi -i "sine=frequency=440:duration=1" \
@@ -5914,6 +5958,9 @@ _test_audio_native_stereo() {
     -metadata:s:a:0 language=eng \
     -metadata:s:a:1 language=eng \
     "$nf_src"
+  if [[ ! -s "$nf_src" ]]; then
+    skip "audio-native-stereo-flac: fixture failed to encode"
+  else
   out="$(run_muxm --crf 51 --preset ultrafast --output-ext mkv --stereo-fallback "$nf_src" "$nf_out")"
   assert_contains "Native stereo track found" \
     "FLAC native stereo: preference path taken" "$out"
@@ -5935,6 +5982,8 @@ _test_audio_native_stereo() {
     fi
   else
     fail "FLAC native stereo: no output produced"
+  fi
+  fi
   fi
 
   # Test 5 (regression): the MP4/MOV copy branch also copies AC3/EAC3 verbatim,
@@ -7449,7 +7498,7 @@ test_containers() {
     local _m1a_log _m1a_code=0
     _m1a_log="$(cd "$TESTDIR" && "$MUXM" --profile archive --output-ext mp4 \
       --preset ultrafast --crf 30 "$_m1_thd" 2>&1)" || _m1a_code=$?
-    if [[ "$_m1a_code" -eq 11 ]] && printf '%s' "$_m1a_log" | grep -qiE "can't preserve|--output-ext mkv"; then
+    if [[ "$_m1a_code" -eq "$EXIT_VALIDATION" ]] && printf '%s' "$_m1a_log" | grep -qiE "can't preserve|--output-ext mkv"; then
       pass "containers-multitrack-hard-stop: TrueHD + archive→mp4 multi-track → pre-encode hard stop (exit 11, recommend MKV)"
     else
       fail "containers-multitrack-hard-stop: TrueHD + archive→mp4 → expected exit 11 hard stop, got exit $_m1a_code"
@@ -7480,7 +7529,7 @@ test_containers() {
     local _m1b_log _m1b_code=0
     _m1b_log="$(cd "$TESTDIR" && "$MUXM" --profile atv-directplay-animation --output-ext mp4 \
       --preset ultrafast --crf 30 "$TESTDIR/ass_subs.mkv" 2>&1)" || _m1b_code=$?
-    if [[ "$_m1b_code" -eq 11 ]] && printf '%s' "$_m1b_log" | grep -qiE "styled|flatten|--output-ext mkv"; then
+    if [[ "$_m1b_code" -eq "$EXIT_VALIDATION" ]] && printf '%s' "$_m1b_log" | grep -qiE "styled|flatten|--output-ext mkv"; then
       pass "containers-multitrack-hard-stop: ASS + atv-directplay-animation→mp4 → pre-encode hard stop (would flatten)"
     else
       fail "containers-multitrack-hard-stop: ASS + atv-anim→mp4 → expected exit 11 hard stop, got exit $_m1b_code"
@@ -7749,6 +7798,9 @@ test_collision() {
   gen_media "$coll_src" blue \
     -c:v libx264 -preset ultrafast -crf 28 \
     -c:a aac -b:a 128k -ac 2
+  # Checksum the source once so every "should not touch the source" assertion below can prove
+  # byte-for-byte non-modification, not just "a file still happens to be at this path".
+  local coll_src_sum; coll_src_sum="$(cksum "$coll_src" 2>/dev/null)"
 
   # ---- Auto-version: movie.mp4 → movie(1).mp4 ----
   log "Testing auto-versioning: movie.mp4 → movie(1).mp4"
@@ -7761,6 +7813,13 @@ test_collision() {
   else
     fail "Auto-version: movie(1).mp4 not found"
   fi
+  # Auto-versioning must never touch the original source (Test_Review.md Tier A #6 — the
+  # collision suite previously never verified the wrong file wasn't modified).
+  if [[ -f "$coll_src" && "$(cksum "$coll_src" 2>/dev/null)" == "$coll_src_sum" ]]; then
+    pass "Auto-version: original source movie.mp4 byte-for-byte untouched"
+  else
+    fail "Auto-version: original source movie.mp4 missing or modified after a supposedly non-destructive run"
+  fi
 
   # ---- Increment: movie(1).mp4 exists → movie(2).mp4 ----
   log "Testing auto-versioning increment: movie(1) exists → movie(2).mp4"
@@ -7771,6 +7830,11 @@ test_collision() {
   else
     fail "Auto-version increment: movie(2).mp4 not found"
   fi
+  if [[ -f "$coll_src" && "$(cksum "$coll_src" 2>/dev/null)" == "$coll_src_sum" ]]; then
+    pass "Auto-version increment: original source movie.mp4 still byte-for-byte untouched"
+  else
+    fail "Auto-version increment: original source movie.mp4 missing or modified"
+  fi
 
   # ---- Further increment: movie(1) and movie(2) exist → movie(3).mp4 ----
   log "Testing auto-versioning further increment: → movie(3).mp4"
@@ -7780,6 +7844,11 @@ test_collision() {
     pass "Auto-version further: movie(3).mp4 created"
   else
     fail "Auto-version further: movie(3).mp4 not found"
+  fi
+  if [[ -f "$coll_src" && "$(cksum "$coll_src" 2>/dev/null)" == "$coll_src_sum" ]]; then
+    pass "Auto-version further: original source movie.mp4 still byte-for-byte untouched"
+  else
+    fail "Auto-version further: original source movie.mp4 missing or modified"
   fi
 
   # ---- No collision when source ext != output ext (e.g., .mkv → .mp4) ----
@@ -7810,6 +7879,13 @@ test_collision() {
   fi
   assert_contains "not a TTY" "--replace-source: error mentions TTY" "$rs_out"
   assert_contains "force-replace-source" "--replace-source: error suggests --force-replace-source" "$rs_out"
+  # A rejected --replace-source attempt must leave the source exactly as it was
+  # (Test_Review.md Tier A #6).
+  if [[ -f "$coll_src" && "$(cksum "$coll_src" 2>/dev/null)" == "$coll_src_sum" ]]; then
+    pass "--replace-source (rejected): source movie.mp4 byte-for-byte untouched"
+  else
+    fail "--replace-source (rejected): source movie.mp4 missing or modified despite the rejection"
+  fi
 
   # ---- --force-replace-source: replaces the original file ----
   log "Testing --force-replace-source replaces original"
@@ -7826,13 +7902,18 @@ test_collision() {
   if [[ -f "$frs_src" && -s "$frs_src" ]]; then
     local new_size
     new_size="$(stat -c%s "$frs_src" 2>/dev/null || stat -f%z "$frs_src" 2>/dev/null || echo 0)"
-    # The re-encoded file should exist; size will differ from original
     local frs_codec
     frs_codec="$(probe_video "$frs_src" codec_name)"
-    if [[ -n "$frs_codec" ]]; then
+    # Since the source is re-encoded with the SAME codec/crf/preset it started with, a
+    # decodable-video check alone can't tell "replaced" from "left untouched" — the untouched
+    # file would still be valid libx264 (Test_Review.md Tier A #6). Requiring the byte size to
+    # have actually changed proves a real re-encode happened, not just a no-op.
+    if [[ -n "$frs_codec" && "$new_size" != "$original_size" ]]; then
       pass "--force-replace-source: source replaced with valid video ($frs_codec, ${original_size} → ${new_size} bytes)"
-    else
+    elif [[ -z "$frs_codec" ]]; then
       fail "--force-replace-source: replaced file is not a decodable video (size: $original_size → $new_size)"
+    else
+      fail "--force-replace-source: file size unchanged ($original_size bytes) — no evidence the source was actually re-encoded"
     fi
   else
     fail "--force-replace-source: source file missing after encode"
@@ -7879,10 +7960,13 @@ test_collision() {
       mkdir "$_m4_lock"; printf '%s\n' "$_m4_live" > "$_m4_lock/pid"
       local _m4_code
       (cd "$_m4_dir" && "$MUXM" --output-ext mkv "$_m4_src" "$_m4_out" >/dev/null 2>&1) && _m4_code=$? || _m4_code=$?
-      if [[ "$_m4_code" == 11 ]]; then
-        pass "collision-concurrent-run-lock: a live concurrent-run lock refuses the second run (exit 11)"
+      # The fail-message wording ("output clobbered?") long implied this was checked; it wasn't
+      # (Test_Review.md Tier A #6) — a muxm bug that returns 11 *after* partially writing the
+      # output would previously still pass here.
+      if [[ "$_m4_code" == "$EXIT_VALIDATION" && ! -e "$_m4_out" ]]; then
+        pass "collision-concurrent-run-lock: a live concurrent-run lock refuses the second run (exit 11, no output written)"
       else
-        fail "collision-concurrent-run-lock: expected exit 11 against a live lock, got $_m4_code (output clobbered?)"
+        fail "collision-concurrent-run-lock: expected exit 11 with no output against a live lock, got exit $_m4_code, output present: $([[ -e "$_m4_out" ]] && echo yes || echo no)"
       fi
       kill "$_m4_live" 2>/dev/null || true; wait "$_m4_live" 2>/dev/null || true; rm -rf "$_m4_lock"
 
@@ -8575,21 +8659,25 @@ _test_unit_filesize() {
   result="$(muxm_fn filesize_pretty "$fsz_dir/small")"
   if [[ "$result" == "512 bytes" ]]; then pass "filesize_pretty(512 bytes)"; else fail "filesize_pretty(512 bytes) expected '512 bytes', got '$result'"; fi
 
-  # 1024 bytes (KB path)
+  # 1024 bytes (KB path). Exact value asserted, not just the "KB" unit suffix — a math
+  # regression that corrupts the numerator while keeping the right unit label would otherwise
+  # pass undetected (Test_Review.md Tier B).
   dd if=/dev/zero of="$fsz_dir/onekb" bs=1024 count=1 2>/dev/null
   result="$(muxm_fn filesize_pretty "$fsz_dir/onekb")"
-  if [[ "$result" == *"KB"* ]]; then pass "filesize_pretty(1 KB)"; else fail "filesize_pretty(1 KB) expected 'KB', got '$result'"; fi
+  if [[ "$result" == "1 KB" ]]; then pass "filesize_pretty(1 KB)"; else fail "filesize_pretty(1 KB) expected '1 KB', got '$result'"; fi
 
-  # ~1.5 MB (MB path)
+  # 1536 KiB = 1572864 bytes (MB path). Exact value asserted per the Tier B rationale above.
   dd if=/dev/zero of="$fsz_dir/onemb" bs=1024 count=1536 2>/dev/null
   result="$(muxm_fn filesize_pretty "$fsz_dir/onemb")"
-  if [[ "$result" == *"MB"* ]]; then pass "filesize_pretty(~1.5 MB)"; else fail "filesize_pretty(~1.5 MB) expected 'MB', got '$result'"; fi
+  if [[ "$result" == "1.5 MB (1572864 bytes)" ]]; then pass "filesize_pretty(~1.5 MB)"; else fail "filesize_pretty(~1.5 MB) expected '1.5 MB (1572864 bytes)', got '$result'"; fi
 
-  # >1 GiB (GB path) — use a sparse file so no real disk space is consumed
+  # >1 GiB (GB path) — use a sparse file so no real disk space is consumed. Exact value
+  # asserted per the Tier B rationale above (bc's scale=2 truncates 1073741825/1073741824
+  # to 1.00, not rounds — verified against the real bc build this suite requires).
   if command -v truncate &>/dev/null; then
     truncate -s 1073741825 "$fsz_dir/onegb"
     result="$(muxm_fn filesize_pretty "$fsz_dir/onegb")"
-    if [[ "$result" == *"GB"* ]]; then pass "filesize_pretty(>1 GiB sparse)=GB path"; else fail "filesize_pretty(>1 GiB sparse) expected 'GB', got '$result'"; fi
+    if [[ "$result" == "1.00 GB (1073741825 bytes)" ]]; then pass "filesize_pretty(>1 GiB sparse)=GB path"; else fail "filesize_pretty(>1 GiB sparse) expected '1.00 GB (1073741825 bytes)', got '$result'"; fi
     rm -f "$fsz_dir/onegb"
   else
     skip "filesize_pretty(GB path) — truncate not available"
@@ -8839,7 +8927,7 @@ _test_unit_disk_output_volume() {
 
   rc=0
   out="$(bash -c "$common"$'\n'"$dfmock_diff"$'\n'"SRC_ABS='$srcfile'"$'\n'"$body"$'\n''disk_free_warn' 2>&1)" || rc=$?
-  if [[ "$rc" -eq 11 ]] && printf '%s\n' "$out" | grep -qiE 'output volume|output file'; then
+  if [[ "$rc" -eq "$EXIT_VALIDATION" ]] && printf '%s\n' "$out" | grep -qiE 'output volume|output file'; then
     pass "unit-disk-output-volume disk output-volume: full output volume on a different device → die 11"
   else
     fail "unit-disk-output-volume disk output-volume: expected die 11 on a full different output volume, got rc=$rc out='${out:0:120}'"
@@ -9032,31 +9120,38 @@ _test_unit_realpath_fallback() {
   local body
   body="$(awk '/^realpath_fallback\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
 
-  # Absolute path input → returned unchanged (or resolved if exists)
+  # Absolute path input → returned unchanged (or resolved if exists). Asserts the exact
+  # resolved value, not just a leading slash — a bug that resolves against the wrong base
+  # directory (still producing *some* absolute path) would otherwise pass undetected
+  # (Test_Review.md Tier B). /tmp exists on every host this suite targets, so the function
+  # takes its "-d $dir" branch: `cd /tmp && pwd` — a plain `cd`/`pwd` here reports the logical
+  # path bash tracks in $PWD (it does not resolve /tmp -> /private/tmp on macOS).
   local abs
   abs="$(bash -c "$body"$'\n'"realpath_fallback /tmp/muxm_test_abs.mkv")"
-  if [[ "$abs" == /* ]]; then
-    pass "realpath_fallback: absolute input returns absolute path"
+  if [[ "$abs" == "/tmp/muxm_test_abs.mkv" ]]; then
+    pass "realpath_fallback: absolute input resolves to itself"
   else
-    fail "realpath_fallback: absolute input expected absolute, got '$abs'"
+    fail "realpath_fallback: absolute input expected '/tmp/muxm_test_abs.mkv', got '$abs'"
   fi
 
-  # Relative path input → prefixed with a directory component
+  # Relative path input → resolved against the actual current directory.
   local rel
   rel="$(cd "$TESTDIR" && bash -c "$body"$'\n'"realpath_fallback some_movie.mkv")"
-  if [[ "$rel" == /* ]]; then
-    pass "realpath_fallback: relative input returns absolute path"
+  if [[ "$rel" == "$TESTDIR/some_movie.mkv" ]]; then
+    pass "realpath_fallback: relative input resolves against \$TESTDIR"
   else
-    fail "realpath_fallback: relative input expected absolute, got '$rel'"
+    fail "realpath_fallback: relative input expected '$TESTDIR/some_movie.mkv', got '$rel'"
   fi
 
-  # Non-existent file → path is still absolute (no existence check)
+  # Non-existent file → path is still absolute (no existence check), unchanged since it was
+  # already absolute (the dirname doesn't exist, so the function falls through to the
+  # already-absolute branch and echoes it verbatim).
   local noexist
   noexist="$(bash -c "$body"$'\n'"realpath_fallback /no/such/path/file.mkv")"
-  if [[ "$noexist" == /* ]]; then
-    pass "realpath_fallback: non-existent file returns absolute path"
+  if [[ "$noexist" == "/no/such/path/file.mkv" ]]; then
+    pass "realpath_fallback: non-existent file returns the unchanged absolute path"
   else
-    fail "realpath_fallback: non-existent file expected absolute, got '$noexist'"
+    fail "realpath_fallback: non-existent file expected '/no/such/path/file.mkv', got '$noexist'"
   fi
 }
 
@@ -11356,7 +11451,7 @@ test_profile_e2e() {
   )
 
   local profile source output ext codec extra_flags
-  local outfile actual_ext pix_fmt
+  local outfile actual_ext pix_fmt entry
   for entry in "${E2E_PROFILES[@]}"; do
     IFS='|' read -r profile source output ext codec extra_flags <<< "$entry"
     outfile="$TESTDIR/$output"
@@ -13409,12 +13504,12 @@ FBDOVISCRIPT
     printf 'DISK_FREE_WARN_GB=900000\n' > "$ds_home/.muxmrc"
     local ds_out="$TESTDIR/diskstop_out.mkv" ds_log ds_code=0
     ds_log="$(cd "$TESTDIR" && HOME="$ds_home" "$MUXM" -K --crf 28 --preset ultrafast "hevc_sdr_51.mkv" "$ds_out" 2>&1)" || ds_code=$?
-    if (( ds_code == 11 )) && printf '%s' "$ds_log" | grep -qiE 'disk space'; then
+    if (( ds_code == EXIT_VALIDATION )) && printf '%s' "$ds_log" | grep -qiE 'disk space'; then
       pass "DISKSTOP: insufficient space is a hard stop (exit 11)"
     else
       fail "DISKSTOP: expected hard stop exit 11 with disk message, got exit $ds_code"
     fi
-    assert_no_file "DISKSTOP: no output produced when the space check fails" "$ds_out"
+    assert_no_file "$ds_out" "DISKSTOP: no output produced when the space check fails"
     # Override: --no-disk-check must bypass the guard and let the encode proceed.
     local ds_out2="$TESTDIR/diskstop_override.mkv" ds_code2=0
     (cd "$TESTDIR" && HOME="$ds_home" "$MUXM" -K --no-disk-check --crf 28 --preset ultrafast "hevc_sdr_51.mkv" "$ds_out2" >/dev/null 2>&1) || ds_code2=$?
@@ -13447,7 +13542,7 @@ FBDOVISCRIPT
     # A nonexistent --workdir must hard-fail (exit 11), not silently fall back.
     local wd_bad_code=0
     (cd "$TESTDIR" && "$MUXM" -K --workdir "$TESTDIR/nonexistent_workdir_xyz" --crf 28 "hevc_sdr_51.mkv" "$TESTDIR/wd_bad.mkv" >/dev/null 2>&1) || wd_bad_code=$?
-    if (( wd_bad_code == 11 )); then
+    if (( wd_bad_code == EXIT_VALIDATION )); then
       pass "WORKDIR: nonexistent --workdir is rejected (exit 11)"
     else
       fail "WORKDIR: nonexistent --workdir should exit 11, got $wd_bad_code"
@@ -14540,14 +14635,33 @@ _test_docs_prose_drift() {
 #    catches creep in the config/CLI suites.
 _test_meta_soft_skip() {
   local self="${BASH_SOURCE[0]}"
-  local -i baseline=60   # History: 80→65 (converted 15 soft-skips to fail); 65→62 (replaced the R28/R29 tonemap dry-run skips with a real encode and converted the avi-fixture else-skip to a positive guard); 62→61 (replaced the host-gated NVENC-stub else-skip with a host-independent unit test); 61→60 (converted the _codec_max_channels else-skip to fail — a committed function's absence is drift, not host-optionality). LOWER as more convert; never raise.
+  local -i baseline=62   # History: 80→65 (converted 15 soft-skips to fail); 65→62 (replaced the R28/R29 tonemap dry-run skips with a real encode and converted the avi-fixture else-skip to a positive guard); 62→61 (replaced the host-gated NVENC-stub else-skip with a host-independent unit test); 61→60 (converted the _codec_max_channels else-skip to fail — a committed function's absence is drift, not host-optionality); 60→62 (Test_Review.md Tier A #7: widened detection to also catch a one-line if/then/else compound whose else-branch is a bare soft-skip call, and a multiline else-branch whose soft-skip call is followed by one more statement before fi — 2 pre-existing soft-skips the old anchored/adjacent-fi-only regex missed are now correctly counted; this bump reflects corrected detection, not new soft-skips). LOWER as more convert; never raise.
   local -i found
   found="$(awk '
     function trim(s){ gsub(/^[ \t]+|[ \t]+$/,"",s); return s }
-    { t=trim($0)
-      if (t ~ /^else[ \t]+skip[ \t]/) { c++; next }                 # inline:  else skip "..."
+    {
+      t=trim($0)
+      # Inline soft-skip, at the start of a line OR appearing mid-line right after a `;` — the
+      # latter is a one-line if/then/else compound whose else-branch is a bare soft-skip call;
+      # such a line never starts with the "else" keyword, so it was previously invisible to an
+      # anchored-only match (Test_Review.md Tier A #7).
+      if (t ~ /(^|;)[ \t]*else[ \t]+skip[ \t]/) { c++; next }
       if (t=="else") { ie=1; next }                                  # multiline: else \n skip \n fi
-      if (ie){ if(t==""||t~/^#/)next; if(ss){ if(t=="fi")c++; ie=0;ss=0;next } if(t~/^skip[ \t]/){ss=1;next} ie=0 } }
+      if (ie) {
+        if (t=="" || t~/^#/) next
+        if (ss) {
+          if (t=="fi") { c++; ie=0; ss=0; next }
+          # Tolerate a trailing statement between `skip` and `fi` (e.g. `return 0`) — still the
+          # same soft-skip shape the ratchet exists to catch. Bail (do not count) only if a new
+          # control-flow construct starts, since that means the else-body is no longer a
+          # trivial skip-and-fall-through block.
+          if (t ~ /^(if|elif|else|case|for|while|until|esac|done)([ \t;]|$)/ || t ~ /^[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*\{?$/) { ie=0; ss=0; next }
+          next
+        }
+        if (t ~ /^skip[ \t]/) { ss=1; next }
+        ie=0
+      }
+    }
     END{print c+0}' "$self")"
   if (( found <= baseline )); then
     pass "soft-skip ratchet: $found else-only-skip blocks ≤ baseline $baseline (no new soft-skips)"
