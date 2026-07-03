@@ -79,8 +79,8 @@ The test harness (`test_muxm.sh`) generates synthetic test media — short 2-sec
 | 17b | VALID_PROFILES ↔ completions | Every profile in VALID_PROFILES appears in installed completion script | ✅ |
 | 18 | `DEBUG=1` dry-run | Exits 0 with tracing on; `set -x` trace lands on stderr (not stdout) | ✅ |
 | 19 | bash 4.3+ version guard | Under macOS `/bin/bash` (3.2): "requires bash 4.3+", nonzero exit (skips if only modern bash present) | ✅ |
-| 20 | Value-flag as final token (M2) | A value-flag with no value (`muxm --threads`, `--crf`, `--output-ext`, …) → exit 11 "requires a value"; never crashes with "$2: unbound variable"; a following flag is rejected ("not a flag") | ✅ |
-| 21 | `--` end-of-options into action pre-scans (L5) | `muxm -- --install-man <file>` treats `--install-man` as a positional (man installer not run); without `--` it still runs | ✅ |
+| 20 | Value-flag as final token (cli-value-flag-requires-value) | A value-flag with no value (`muxm --threads`, `--crf`, `--output-ext`, …) → exit 11 "requires a value"; never crashes with "$2: unbound variable"; a following flag is rejected ("not a flag") | ✅ |
+| 21 | `--` end-of-options into action pre-scans (cli-install-man-honors-dashdash) | `muxm -- --install-man <file>` treats `--install-man` as a positional (man installer not run); without `--` it still runs | ✅ |
 
 ### 1.2 Toggle Flag Coverage (suite: `toggles`)
 
@@ -159,7 +159,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 48 | `--setup` installs completions | Completion file created | ✅ |
 | 49 | `--install-dependencies` standalone | Shows banner, lists ffmpeg/ffprobe/jq | ✅ |
 | 50 | `--uninstall-man` standalone | Shows banner, safe when man page not installed | ✅ |
-| 51 | `--uninstall-man` removes a dangling symlink (L4) | A broken `muxm.1` symlink (target gone) is detected via `[[ -L ]]` and removed, not reported "not found" | ✅ |
+| 51 | `--uninstall-man` removes a dangling symlink (setup-uninstall-man-dangling-symlink) | A broken `muxm.1` symlink (target gone) is detected via `[[ -L ]]` and removed, not reported "not found" | ✅ |
 
 ### 1.5 Configuration Precedence (suite: `config`)
 
@@ -188,8 +188,8 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 71 | `--ocr-tool` sets config | `--ocr-tool pgsrip` → SUB_OCR_TOOL = pgsrip in effective config | ✅ |
 | 71a | `--create-config user av1-hq` | `SVT_AV1_PARAMS_BASE` line uncommented in generated `.muxmrc` | ✅ |
 | 71b | `--create-config user streaming-av1` | Creates valid `.muxmrc` with `streaming-av1` profile name | ✅ |
-| 71c | `--create-config` does not leak local `.muxmrc` (H1) | User `~/.muxmrc` `MAX_AUDIO_CHANNELS=4` + `--create-config project streaming-hevc` → profile-untouched var stays commented at script default (`#MAX_AUDIO_CHANNELS=8`), profile-owned `EAC3_BITRATE_5_1=448k` stays uncommented | ✅ |
-| 71d | Config template emits live defaults, not stale literals (L3) | Change a Section-4 default in a copy of the script (`DISK_FREE_WARN_GB`) → generated config shows the new value (emitted via `_V`, not a hardcoded `printf`); `TONEMAP_FILTER` round-trips quoted | ✅ |
+| 71c | `--create-config` does not leak local `.muxmrc` (config-create-config-no-user-leak) | User `~/.muxmrc` `MAX_AUDIO_CHANNELS=4` + `--create-config project streaming-hevc` → profile-untouched var stays commented at script default (`#MAX_AUDIO_CHANNELS=8`), profile-owned `EAC3_BITRATE_5_1=448k` stays uncommented | ✅ |
+| 71d | Config template emits live defaults, not stale literals (config-template-live-defaults) | Change a Section-4 default in a copy of the script (`DISK_FREE_WARN_GB`) → generated config shows the new value (emitted via `_V`, not a hardcoded `printf`); `TONEMAP_FILTER` round-trips quoted | ✅ |
 
 ### 1.6 Profile Variable Assignment (suite: `profiles`)
 
@@ -252,7 +252,7 @@ Validates `--setup` runs all three sub-installers and standalone installer/unins
 | 101p2 | `av1-hq` + DV source | Informational note: DV auto-disabled for AV1 pipeline | ✅ |
 | 101p3 | `av1-hq` profile sets DISABLE_DV | DISABLE_DV = 1 in effective config | ✅ |
 | 101p4 | `--video-codec libsvt-av1` + DV source | Note emitted that DV is auto-disabled | ✅ |
-| 101q | archive CRF warning gates on `_CLI_CRF_EXPLICIT` (L2) | CRF set via `.muxmrc` (no `--crf`) → no copy-only warning; explicit `--crf 18` → warns | ✅ |
+| 101q | archive CRF warning gates on `_CLI_CRF_EXPLICIT` (conflicts-archive-crf-warn-gating) | CRF set via `.muxmrc` (no `--crf`) → no copy-only warning; explicit `--crf 18` → warns | ✅ |
 
 ### 1.8 Collision Handling (suite: `collision`)
 
@@ -330,7 +330,7 @@ Validates filename collision auto-versioning and source replacement flags. Uses 
 | 135 | Commentary stereo skipped | 5.1 + commentary-titled 2.0 → downmix used, not the commentary track | ✅ |
 | 136 | Native FLAC stereo stream-copied into MKV (regression) | EAC3 5.1 + FLAC 2.0 → output keeps 2 audio streams; stereo is 2ch, `codec_name=flac` (stream-copied, not dropped). Guards the hardcoded-`.aac` muxer bug that silently dropped non-AAC native stereo tracks. | ✅ |
 | 137 | Native AC3 stereo stream-copied into MP4 (regression) | EAC3 5.1 + AC3 2.0 → output keeps 2 audio streams; stereo is 2ch, `codec_name=ac3`. Covers the MP4/MOV copy branch of the same bug. | ✅ |
-| 138 | Encoder↔codec normalization in the audio copy decision (L6) | Opus source + `streaming-av1` (`AUDIO_FORCE_CODEC=libopus`) → audio stream-copied (not transcoded), title `… (Opus)` not `(libopus)` | ✅ |
+| 138 | Encoder↔codec normalization in the audio copy decision (audio-descriptive-title-codec) | Opus source + `streaming-av1` (`AUDIO_FORCE_CODEC=libopus`) → audio stream-copied (not transcoded), title `… (Opus)` not `(libopus)` | ✅ |
 
 ### 1.13 Subtitle Pipeline (suite: `subs`)
 
@@ -346,7 +346,7 @@ Validates filename collision auto-versioning and source replacement flags. Uses 
 | 140 | `--ocr-lang jpn` | SUB_OCR_LANG = jpn in effective config | ✅ |
 | 141 | `SUB_MAX_TRACKS=1` via config file | Output limited to ≤1 subtitle track | ✅ |
 | 142 | `--sub-lang-pref spa` with multilang source | Output subtitle track is Spanish | ✅ |
-| 143 | Forced-sub burn into apostrophe path (M4) | `--sub-burn-forced` into an output dir named `It's A Test/` → filtergraph parses (relative `burn.srt`, encode runs from WORKDIR), encode completes | ✅ |
+| 143 | Forced-sub burn into apostrophe path (subs-forced-burn-apostrophe-path) | `--sub-burn-forced` into an output dir named `It's A Test/` → filtergraph parses (relative `burn.srt`, encode runs from WORKDIR), encode completes | ✅ |
 
 ### 1.14 Output Features (suite: `output`)
 
@@ -418,10 +418,10 @@ Validates filename collision auto-versioning and source replacement flags. Uses 
 | 178d | `--replace-source` non-interactive | `echo n | muxm --replace-source ...` → exits 11 (stdin not TTY) | ❌ |
 | 178e | `--max-copy-bitrate` with non-k format | Edge: empty string, missing k suffix, "0k" | ❌ |
 | 178f | Source collision auto-version loop | Source = output with existing `(1)` file → output becomes `(2)` | ❌ |
-| 179a | Multi-track container safety: lossless audio (M1) | TrueHD source + `archive --output-ext mp4` → pre-encode hard stop (exit 11, recommend MKV), before any encode | ✅ |
-| 179b | Multi-track container safety: styled subs (M1) | ASS source + `atv-directplay-animation --output-ext mp4` → pre-encode hard stop (would flatten to mov_text) | ✅ |
-| 179c | Multi-track container safety: proceed path (M1) | subrip source + `archive --output-ext mp4` → proceeds; subtitle converted to `mov_text` (not a failed `-c copy`), mux succeeds | ✅ |
-| 179d | Multi-track to MKV copies all (M1) | TrueHD source + `archive` (MKV) → stream-copied losslessly | ✅ |
+| 179a | Multi-track container safety: lossless audio (containers-multitrack-hard-stop) | TrueHD source + `archive --output-ext mp4` → pre-encode hard stop (exit 11, recommend MKV), before any encode | ✅ |
+| 179b | Multi-track container safety: styled subs (containers-multitrack-hard-stop) | ASS source + `atv-directplay-animation --output-ext mp4` → pre-encode hard stop (would flatten to mov_text) | ✅ |
+| 179c | Multi-track container safety: proceed path (containers-multitrack-hard-stop) | subrip source + `archive --output-ext mp4` → proceeds; subtitle converted to `mov_text` (not a failed `-c copy`), mux succeeds | ✅ |
+| 179d | Multi-track to MKV copies all (containers-multitrack-hard-stop) | TrueHD source + `archive` (MKV) → stream-copied losslessly | ✅ |
 
 ### 1.18 Profile End-to-End Encodes (suite: `e2e`)
 

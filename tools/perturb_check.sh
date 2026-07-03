@@ -2,7 +2,7 @@
 # =============================================================================
 #  perturb_check.sh — perturbation catalog / acceptance gate for the hardened test suite
 #
-#  The "spine" of the test-remediation plan: it proves each hardened test can actually
+#  The acceptance gate for the hardened test suite: it proves each hardened test can actually
 #  FAIL when the feature it covers is broken. For every ENFORCED mutation it
 #    1. copies muxm to a throwaway file,
 #    2. applies ONE content-anchored mutation, asserting exactly one line changed (so a
@@ -21,7 +21,7 @@
 #  Exit:  0 = every enforced mutation behaved; 1 = a gate failed; 2 = usage/setup error.
 #
 #  Run it locally after the suite passes — it's the acceptance gate that signs off each
-#  remediation item.
+#  test in the hardened suite.
 # =============================================================================
 set -uo pipefail
 
@@ -112,14 +112,14 @@ enforce MUT-AUD-INV-audio audio \
   'Lossless-vs-lossy: expected track #0' \
   'M-AUD-2: codec-rank inversion caught by FLAC-vs-AC3 selection'
 
-# M-HDR-1 (Phase 1.2) is DEFERRED to Phase 3.1 — no working mutation exists within 1.2's
-# "assertion-only, no new fixtures" scope. Empirically (verified during Phase 1.2) muxm's output
-# color tags track the SOURCE via ffmpeg's auto-copy; the COLOR_ARGS the plan targets do NOT
-# observably override them — dropping, overriding-to-bt709, and force-HDR-detect ALL leave the
-# probed output tags unchanged. A non-tautological HDR-metadata test needs Phase 3.1's
-# master-display/MaxCLL fixture + frame_side_data probe, which is where M-HDR-2 already lives.
+# M-HDR-1 is deferred: no working assertion-only mutation exists (no new fixtures). muxm's output
+# color tags track the SOURCE via ffmpeg's auto-copy; the COLOR_ARGS do NOT observably override
+# them — dropping, overriding-to-bt709, and force-HDR-detect ALL leave the probed output tags
+# unchanged. A non-tautological HDR-metadata test needs a master-display/MaxCLL fixture +
+# frame_side_data probe, which is where M-HDR-2 already lives.
+#
 
-# M-SUB-1 (Phase 1.4): make _parse_ext_sub_filename treat the `.forced.` infix as a full sub, so
+# M-SUB-1: make _parse_ext_sub_filename treat the `.forced.` infix as a full sub, so
 # the forced sidecar no longer gets disposition.forced=1. The rebuilt ext_forced test probes the
 # actual forced disposition (not just "a sub exists"), so it goes red.
 enforce MUT-SUB-1 ext_subs \
@@ -127,7 +127,7 @@ enforce MUT-SUB-1 ext_subs \
   'ext_forced: expected ≥1 sub with disposition.forced=1' \
   'M-SUB-1: external forced-sidecar disposition probe'
 
-# M-SII-1 (Phase 1.6): force check_skip_if_ideal's final `if (( ideal ))` decision always-true
+# M-SII-1: force check_skip_if_ideal's final `if (( ideal ))` decision always-true
 # (anchored on the unique "Build validated stream keep-lists" comment so only that arm changes,
 # not the identical line earlier in the function). The non-compliant source is then wrongly
 # skipped/copied (stays H.264) instead of re-encoded → the non-compliant re-encode probe fails.
@@ -136,7 +136,7 @@ enforce MUT-SII-1 output \
   'skip-if-ideal non-compliant: re-encoded H.264 → HEVC' \
   'M-SII-1: check_skip_if_ideal always-ideal → non-compliant must-re-encode probe'
 
-# MUT-SII-MOV (C1, Phase 1): invert the mov) arm's source-container guard (!= → ==) in
+# MUT-SII-MOV (C1): invert the mov) arm's source-container guard (!= → ==) in
 # check_skip_if_ideal, so a copy-compliant non-.mov source requested as .mov is again judged
 # ideal and false-skipped (the C1 defect). Anchored on the unique `!= "mov"` (the mp4/m4v/mkv
 # arms test their own extensions), so exactly the mov) guard changes. The new skip-if-ideal+.mov
@@ -148,7 +148,7 @@ enforce MUT-SII-MOV output \
   'skip-if-ideal mov: compliant .mkv was wrongly skipped' \
   'M-SII-MOV: check_skip_if_ideal mov) container arm → false-skip mislabel probe'
 
-# MUT-C2-MTLANG (C2, Phase 1): revert the multi-track audio populate site in
+# MUT-C2-MTLANG (C2): revert the multi-track audio populate site in
 # run_audio_pipeline_multi from the non-collapsing _split_tab back to the collapsing
 # `IFS=$'\t' read`. For an untagged-language track the empty middle field then collapses and the
 # bitrate shifts into `lang`, so AUDIO_MT_LANGS carries the bitrate and mux_final stamps a bogus
@@ -158,8 +158,8 @@ enforce MUT-SII-MOV output \
 # untagged-track probe asserts a:1 is NOT a numeric language → under the mutation it is → red.
 # shellcheck disable=SC2016  # $info / $'\t' are literal sed text — they must NOT expand in this shell.
 enforce MUT-C2-MTLANG audio \
-  's|_split_tab "$info" codec ch lang br title  # C2: non-collapsing — untagged lang/title into MT output metadata|IFS=$'"'"'\t'"'"' read -r codec ch lang br title <<< "$info"|' \
-  'C2 multi-track: untagged track a:1 has garbage numeric language' \
+  's|_split_tab "$info" codec ch lang br title  # Non-collapsing split — untagged lang/title into MT output metadata|IFS=$'"'"'\t'"'"' read -r codec ch lang br title <<< "$info"|' \
+  'audio-untagged-lang multi-track: untagged track a:1 has garbage numeric language' \
   'M-C2-MTLANG: run_audio_pipeline_multi non-collapsing split → untagged-language output-metadata probe'
 
 # MUT-C2-CSAFETY (C2 follow-up): revert the audio-record split in _check_multitrack_container_safety
@@ -169,8 +169,8 @@ enforce MUT-C2-MTLANG audio \
 # comment. The container-safety probe (untagged TrueHD commentary → MP4 must succeed) goes red.
 # shellcheck disable=SC2016  # $_info / $'\t' are literal sed text — they must NOT expand here.
 enforce MUT-C2-CSAFETY audio \
-  's|_split_tab "$_info" _codec _ch _lang _br _title  # C2: non-collapsing — keep-filter mirrors _build_audio_keep_list|IFS=$'"'"'\t'"'"' read -r _codec _ch _lang _br _title <<< "$_info"|' \
-  'C2 container-safety: MP4 encode wrongly blocked' \
+  's|_split_tab "$_info" _codec _ch _lang _br _title  # Non-collapsing split — keep-filter mirrors _build_audio_keep_list|IFS=$'"'"'\t'"'"' read -r _codec _ch _lang _br _title <<< "$_info"|' \
+  'audio-container-safety container-safety: MP4 encode wrongly blocked' \
   'M-C2-CSAFETY: _check_multitrack_container_safety non-collapsing split → untagged-commentary keep-filter probe'
 
 # MUT-C2-VERIFY (C2 follow-up): revert the per-record split in mux_final's post-encode "Audio :"
@@ -180,7 +180,7 @@ enforce MUT-C2-CSAFETY audio \
 # shellcheck disable=SC2016  # $_a_rec / $'\t' are literal sed text — they must NOT expand here.
 enforce MUT-C2-VERIFY audio \
   's|_split_tab "$_a_rec" a_codec a_ch a_lang a_br a_title a_layout|IFS=$'"'"'\t'"'"' read -r a_codec a_ch a_lang a_br a_title a_layout <<< "$_a_rec"|' \
-  'C2 verify-display: verify Audio line lost the title' \
+  'audio-verify-display verify-display: verify Audio line lost the title' \
   'M-C2-VERIFY: mux_final verify-summary non-collapsing split → empty-bitrate title-shift probe'
 
 # MUT-C2-SUBCLASS (C2 follow-up): revert the subtitle-record split in merge_subtitle_sources to the
@@ -192,11 +192,11 @@ enforce MUT-C2-VERIFY audio \
 # untagged-forced scan probe goes red.
 # shellcheck disable=SC2016  # $info / $'\t' are literal sed text — they must NOT expand here.
 enforce MUT-C2-SUBCLASS subs \
-  's|_split_tab "$info" codec lang title forced hi  # C2: non-collapsing — empty lang/title must not shift forced/hi (sub classification)|IFS=$'"'"'\t'"'"' read -r codec lang title forced hi <<< "$info"|' \
-  'C2 sub-classify: untagged forced subtitle misclassified' \
+  's|_split_tab "$info" codec lang title forced hi  # Non-collapsing split — empty lang/title must not shift forced/hi (sub classification)|IFS=$'"'"'\t'"'"' read -r codec lang title forced hi <<< "$info"|' \
+  'subs-untagged-forced-classification sub-classify: untagged forced subtitle misclassified' \
   'M-C2-SUBCLASS: merge_subtitle_sources non-collapsing split → untagged-forced classification probe'
 
-# MUT-H2-REEMBED (Phase 2, H2): revert build_subtitle_plan's direct-map fallback guard to its old
+# MUT-H2-REEMBED (H2): revert build_subtitle_plan's direct-map fallback guard to its old
 # "nothing EMBEDDED" form by neutering the two added "nothing PREPARED" clauses (collapse them to
 # `true`). On the universal profile (burn + export) the embed vars are empty even though subs were
 # prepared, so the reverted guard fires the fallback and re-embeds a contradictory soft mov_text
@@ -205,178 +205,178 @@ enforce MUT-C2-SUBCLASS subs \
 # shellcheck disable=SC2016  # $SRT_FORCED_BURN_PATH / ${#EXTERNAL_SRT_PATHS[@]} are literal sed text.
 enforce MUT-H2-REEMBED subs \
   's|\[\[ -z "$SRT_FORCED_BURN_PATH" \]\] && (( ${#EXTERNAL_SRT_PATHS\[@\]} == 0 ))|true|' \
-  'H2: universal re-embedded a soft subtitle' \
+  'subs-universal-no-reembed: universal re-embedded a soft subtitle' \
   'M-H2-REEMBED: build_subtitle_plan fallback gates on "nothing prepared" → universal no-reembed probe'
 
-# MUT-H3-SORTZ (Phase 2, H3): flip discover_external_subtitles' portable-sort FALLBACK from `cat`
+# MUT-H3-SORTZ (H3): flip discover_external_subtitles' portable-sort FALLBACK from `cat`
 # back to GNU-only `sort -z`. On a sort without -z (the test shims a BSD sort on PATH) the probe
 # fails, the else-branch is taken, and `find … | sort -z` then errors → empty → every sidecar is
 # silently dropped. The BSD-sort discovery probe goes red.
 # shellcheck disable=SC2016  # literal sed text.
 enforce MUT-H3-SORTZ ext_subs \
   's|_sub_sort=( cat )|_sub_sort=( sort -z )|' \
-  'H3: external sidecar NOT discovered under BSD sort' \
+  'extsub-bsd-sort-discovery: external sidecar NOT discovered under BSD sort' \
   'M-H3-SORTZ: discover_external_subtitles portable-sort fallback → BSD-sort sidecar-discovery probe'
 
-# MUT-M1-DASHDASH (Phase 3, M1): revert the `--` end-of-options handler to the old drop-positionals
+# MUT-M1-DASHDASH (M1): revert the `--` end-of-options handler to the old drop-positionals
 # form. `muxm -- <src>` then loses its source and falls through to usage/help instead of a plan.
 # shellcheck disable=SC2016  # $@ is literal sed text.
 enforce MUT-M1-DASHDASH cli \
   's/    --) shift; POSITIONALS+=("$@"); break ;;.*/    --) shift; break ;;/' \
-  "M1: '--' dropped the source positional" \
+  "cli-dashdash-source-resolution: '--' dropped the source positional" \
   'M-M1-DASHDASH: `--` folds remaining args into POSITIONALS → end-of-options source-resolution probe'
 
-# MUT-M2-CLEANUP (Phase 3, M2): revert the guarded checksum call to a bare `&& write_checksum`.
+# MUT-M2-CLEANUP (M2): revert the guarded checksum call to a bare `&& write_checksum`.
 # A failed checksum (last cmd of the && list) then trips `set -e` and aborts on_exit mid-way,
 # skipping the workdir cleanup → the workdir leaks. (The ERR-disarm alone does NOT prevent this —
 # set -e exits regardless; the guard is the real fix.) The leak probe goes red.
 # shellcheck disable=SC2016  # $OUT is literal sed text.
 enforce MUT-M2-CLEANUP output \
   's#{ write_checksum "$OUT" || warn "Could not write the checksum file for $OUT."; }#write_checksum "$OUT"#' \
-  'M2: failed checksum leaked the workdir' \
+  'output-cleanup-on-checksum-fail: failed checksum leaked the workdir' \
   'M-M2-CLEANUP: guarded final checksum keeps set -e from aborting on_exit → no-workdir-leak probe'
 
-# MUT-M3-REGISTER (Phase 3, M3): drop one DV child registration (inject_pid) so it is launched but
+# MUT-M3-REGISTER (M3): drop one DV child registration (inject_pid) so it is launched but
 # never recorded in _ACTIVE_FFMPEG_PID — on Ctrl-C on_exit cannot SIGKILL it (orphan). The
 # structural registration invariant goes red.
 # shellcheck disable=SC2016  # $inject_pid is literal sed text.
 enforce MUT-M3-REGISTER unit \
   's/_ACTIVE_FFMPEG_PID=\$inject_pid.*/: # mutated/' \
-  'M3: backgrounded heavy child(ren) not registered' \
+  'unit-ffmpeg-pid-lifecycle: backgrounded heavy child(ren) not registered' \
   'M-M3-REGISTER: every backgrounded heavy child registers _ACTIVE_FFMPEG_PID → orphan-on-Ctrl-C probe'
 
-# MUT-M3-CLEARWAIT (Phase 3, M3): reorder one OCR site to clear _ACTIVE_FFMPEG_PID BEFORE its wait.
+# MUT-M3-CLEARWAIT (M3): reorder one OCR site to clear _ACTIVE_FFMPEG_PID BEFORE its wait.
 # A SIGINT in that window orphans the OCR child (which may hold the tee write-end and hang the
 # drain). The structural clear-after-wait invariant goes red.
 # shellcheck disable=SC2016  # $ocr_sup_pid is literal sed text.
 enforce MUT-M3-CLEARWAIT unit \
   's@wait "$ocr_sup_pid" 2>/dev/null || true; _ACTIVE_FFMPEG_PID=""@_ACTIVE_FFMPEG_PID=""; wait "$ocr_sup_pid" 2>/dev/null || true@' \
-  'M3: clear-before-wait at:' \
+  'unit-ffmpeg-pid-lifecycle: clear-before-wait at:' \
   'M-M3-CLEARWAIT: _ACTIVE_FFMPEG_PID cleared only AFTER wait → orphan-during-wait-window probe'
 
-# MUT-M4-SUMMARY (Phase 3, M4): revert the guarded _ensure_ffmpeg_full call to bare. Its return-1
+# MUT-M4-SUMMARY (M4): revert the guarded _ensure_ffmpeg_full call to bare. Its return-1
 # (failed ffmpeg-full install) then aborts the installer under set -e before the summary prints.
 enforce MUT-M4-SUMMARY setup \
   's/_ensure_ffmpeg_full || true/_ensure_ffmpeg_full/' \
-  'M4: installer aborted before the summary' \
+  'setup-install-deps-summary-on-failure: installer aborted before the summary' \
   'M-M4-SUMMARY: guarded _ensure_ffmpeg_full call → installer-summary-still-prints probe'
 
-# MUT-M5-UNBOUND (Phase 3, M5): revert the --crf config-override arm to the raw unchecked index
+# MUT-M5-UNBOUND (M5): revert the --crf config-override arm to the raw unchecked index
 # read. A trailing `--crf` (no value) then crashes under set -u (unbound variable) instead of a
 # clean die 11. Anchored on the --crf arm so only it reverts.
 # shellcheck disable=SC2016  # ${_cc_override_argv[...]} is literal sed text.
 enforce MUT-M5-UNBOUND cli \
   's#--crf)\(  *\)_cc_need_val;#--crf)\1_cc_val="${_cc_override_argv[$((_cc_oi+1))]}";#' \
-  'M5: --create-config with a trailing --crf (missing value)' \
+  'cli-config-missing-value: --create-config with a trailing --crf (missing value)' \
   'M-M5-UNBOUND: _cc_need_val bounds-checks config-override values → clean-die-11 probe'
 
-# MUT-M6-EOF (Phase 3, M6): drop the `|| _confirm=""` EOF guard on the replace-source prompt. A
+# MUT-M6-EOF (M6): drop the `|| _confirm=""` EOF guard on the replace-source prompt. A
 # non-interactive stdin (EOF) then makes `read` fail and crash under set -e instead of a clean
 # die 11 decline.
 # shellcheck disable=SC2016  # _confirm is literal sed text.
 enforce MUT-M6-EOF cli \
   's/  read -r _confirm || _confirm="".*/  read -r _confirm/' \
-  'M6: REPLACE_SOURCE + EOF stdin → expected die 11' \
+  'cli-replace-source-eof: REPLACE_SOURCE + EOF stdin → expected die 11' \
   'M-M6-EOF: read EOF treated as decline → clean-die-11-not-crash probe'
 
-# MUT-M7-BRIDGE (Phase 4, M7): make the deprecation bridge's guard always-true (compare the new var
+# MUT-M7-BRIDGE (M7): make the deprecation bridge's guard always-true (compare the new var
 # to itself), reverting to the unconditional overwrite. With BOTH set in config the legacy value
 # then wins over the explicitly-set new value → the M7 both-set probe goes red.
 # shellcheck disable=SC2016  # the variable refs are literal sed text.
 enforce MUT-M7-BRIDGE config \
   's#== "${_MUXM_PRE_CONFIG\[AUDIO_SCORE_LANG_BONUS\]}"#== "$AUDIO_SCORE_LANG_BONUS"#' \
-  'M7: both set → expected AUDIO_SCORE_LANG_BONUS=200' \
+  'config-deprecation-bridge: both set → expected AUDIO_SCORE_LANG_BONUS=200' \
   'M-M7-BRIDGE: deprecation bridge applies legacy only when new is unset → new-wins probe'
 
-# MUT-M8-FALLBACK (Phase 4, M8): drop the pipx <1.0 fallback line in _pipx_resolve_bin_dir. Under
+# MUT-M8-FALLBACK (M8): drop the pipx <1.0 fallback line in _pipx_resolve_bin_dir. Under
 # the old-pipx shim (no `environment --value`) the helper then returns empty → the M8 unit probe red.
 # shellcheck disable=SC2016  # $_d / pipx text is literal sed text.
 enforce MUT-M8-FALLBACK unit \
   's@  \[\[ -z "$_d" \]\] && _d="$(pipx environment.*@  :@' \
-  'M8: _pipx_resolve_bin_dir returned' \
+  'unit-pipx-bin-dir-fallback: _pipx_resolve_bin_dir returned' \
   'M-M8-FALLBACK: pipx <1.0 environment-dump fallback → bin-dir-resolution probe'
 
-# MUT-MDRYA-PROBE (Phase 4, M-DRY-a): break _dv_probe_has_config_record's grep (always false).
+# MUT-MDRYA-PROBE (M-DRY-a): break _dv_probe_has_config_record's grep (always false).
 # Anchored on the helper's "$_probe" so only the helper changes (verify_dv_container_record's
 # "$out_probe" grep is untouched). The DV-probe unit positive case goes red.
 # shellcheck disable=SC2016  # $_probe / $DV_CONTAINER_PATTERN are literal sed text.
 enforce MUT-MDRYA-PROBE unit \
   's/printf .*"$_probe" | grep -qiE "$DV_CONTAINER_PATTERN"/false/' \
-  'M-DRY-a: helper failed to detect a present DOVI configuration record' \
+  'unit-dv-config-record-probe: helper failed to detect a present DOVI configuration record' \
   'M-MDRYA-PROBE: _dv_probe_has_config_record probe+grep → DV-record-detection probe'
 
-# MUT-MDRYC-DRIFT (Phase 4, M-DRY-c): inject a bogus value into _VALID_LOGLEVEL_STR so it diverges
+# MUT-MDRYC-DRIFT (M-DRY-c): inject a bogus value into _VALID_LOGLEVEL_STR so it diverges
 # from is_valid_loglevel's case set (invalid entry + count mismatch). The loglevel drift guard red.
 enforce MUT-MDRYC-DRIFT unit \
   's/, trace"/, bogus, trace"/' \
-  'M-DRY-c: _VALID_LOGLEVEL_STR drifted from is_valid_loglevel' \
+  'unit-loglevel-drift-guard: _VALID_LOGLEVEL_STR drifted from is_valid_loglevel' \
   'M-MDRYC-DRIFT: _VALID_LOGLEVEL_STR ↔ is_valid_loglevel sync → loglevel drift-guard probe'
 
-# MUT-L-FORCEAAC (Phase 5): revert the force-AAC bitrate to a hardcoded 256k, ignoring
+# MUT-L-FORCEAAC: revert the force-AAC bitrate to a hardcoded 256k, ignoring
 # STEREO_BITRATE. The forced-AAC probe (STEREO_BITRATE=96k) then logs bitrate=256k → red.
 # shellcheck disable=SC2016  # $STEREO_BITRATE is literal sed text.
 enforce MUT-L-FORCEAAC audio \
   's/tgt_br="$STEREO_BITRATE"/tgt_br="256k"/' \
-  'L force-aac: forced-AAC bitrate ignored STEREO_BITRATE' \
+  'audio-forceaac-stereo-bitrate: forced-AAC bitrate ignored STEREO_BITRATE' \
   'M-L-FORCEAAC: force-AAC honors STEREO_BITRATE → no-hardcoded-256k probe'
 
-# MUT-L-DISKNOTE (Phase 5): drop the disk-preflight "df unavailable" else-note so the preflight
+# MUT-L-DISKNOTE: drop the disk-preflight "df unavailable" else-note so the preflight
 # fails open silently again when df yields nothing. The df-unavailable note probe goes red.
 enforce MUT-L-DISKNOTE unit \
   's/note "Disk preflight skipped.*/: # mutated/' \
-  "L disk-df: no 'preflight skipped' note" \
+  "unit-disk-preflight-note: no 'preflight skipped' note" \
   'M-L-DISKNOTE: df-unavailable emits an explicit skipped-note → no-silent-fail-open probe'
 
-# MUT-L-SUBWD (Phase 5): revert _prepare_subtitle's vanished-workdir path to `return 1`, which trips
+# MUT-L-SUBWD: revert _prepare_subtitle's vanished-workdir path to `return 1`, which trips
 # set -e at the `sub_path="$(...)"` callers. The unit probe expects rc0+empty → rc1 → red. Anchored
 # two lines below the unique "Workdir disappeared" warn.
 enforce MUT-L-SUBWD unit \
   '/Workdir disappeared/{n;n;s/    return 0/    return 1/;}' \
-  'L sub-workdir: vanished-workdir path returned' \
+  'unit-prepare-subtitle-workdir-gone: vanished-workdir path returned' \
   'M-L-SUBWD: _prepare_subtitle workdir-gone returns ""+rc0 → no-set-e-abort probe'
 
-# MUT-L-CCESCAPE (Phase 5): neuter the _V quoted-value escaping so an embedded " in a --create-config
+# MUT-L-CCESCAPE: neuter the _V quoted-value escaping so an embedded " in a --create-config
 # override corrupts the generated .muxmrc on round-trip. The cc-escape round-trip probe goes red.
 # shellcheck disable=SC2016  # ${qval//…} is literal sed text.
 enforce MUT-L-CCESCAPE config \
   's#qval="${qval//.*#:#' \
-  'L cc-escape: override value corrupted on round-trip' \
+  'config-create-config-escaping: override value corrupted on round-trip' \
   'M-L-CCESCAPE: --create-config %q-escapes emitted values → faithful-round-trip probe'
 
-# M-AUD-1 (Phase 2.1 — was pending): the same '(10 - rank)' inversion, now caught by the new
+# M-AUD-1: the same '(10 - rank)' inversion, now caught by the new
 # direct _score_audio_stream unit test. The ch<6 scenario keeps this signature distinct from
 # M-AUD-3 (surround only applies at ≥6ch).
 enforce MUT-AUD-INV-unit unit \
   's/(10 - rank)/rank/' \
-  '2.1 score: eac3 2ch eng 448k' \
+  'unit-score-audio-stream score: eac3 2ch eng 448k' \
   'M-AUD-1: codec-rank inversion caught by the _score_audio_stream oracle'
 
-# M-AUD-3 (Phase 2.1 — was pending): zero the surround-bonus default. The unit test SOURCES the
-# muxm default (not an injected value — see its plan-vs-code note), so the surround-isolation
+# M-AUD-3: zero the surround-bonus default. The unit test SOURCES the
+# muxm default (not an injected value), so the surround-isolation
 # assertion (6ch−5ch) diverges. The rank cancels in that difference, so M-AUD-1 does NOT flip it.
 enforce MUT-AUD-SURROUND unit \
   's/AUDIO_SCORE_SURROUND_BONUS=30/AUDIO_SCORE_SURROUND_BONUS=0/' \
-  '2.1 surround: bonus at >=6ch' \
+  'unit-score-audio-stream surround: bonus at >=6ch' \
   'M-AUD-3: surround-bonus default caught by the surround-isolation assertion'
 
-# 2.2 (Phase 2.2): make the --audio-track override unconditional by widening the range check, so
+# 2.2: make the --audio-track override unconditional by widening the range check, so
 # an out-of-range override is wrongly honored instead of falling back to auto-selection. The new
 # select_best_audio unit test asserts the invalid-override case auto-selects (idx 1), so it goes red.
 enforce MUT-AUD-OVERRIDE unit \
   's/AUDIO_TRACK_OVERRIDE < n/AUDIO_TRACK_OVERRIDE < 9999/' \
-  '2.2 select: invalid --audio-track 5 → auto-selection fallback' \
+  'unit-select-best-audio select: invalid --audio-track 5 → auto-selection fallback' \
   '2.2: override range-guard widened → invalid override no longer falls back'
 
-# M-TM-1 (Phase 2.3): collapse the tonemap arm's PROFILE from "SDR-TONEMAP" to "SDR". The new
+# M-TM-1: collapse the tonemap arm's PROFILE from "SDR-TONEMAP" to "SDR". The new
 # decide_color_and_pixfmt unit test asserts PROFILE_DESC=SDR-TONEMAP for the tonemap scenario,
 # so that one scenario diverges (the others, which never set SDR-TONEMAP, stay green).
 enforce MUT-TM-1 unit \
   's/profile="SDR-TONEMAP"/profile="SDR"/' \
-  '2.3 color: tonemap HDR→SDR' \
+  'unit-decide-color-and-pixfmt color: tonemap HDR→SDR' \
   'M-TM-1: tonemap PROFILE label caught by decide_color_and_pixfmt unit test'
 
-# M-TM-2 (Phase 4.1) — the catalog's single "M-TM-1" row covers BOTH the Phase 2.3 unit label and
-# the Phase 4.1 real-encode color probe, which need DIFFERENT mutations. MUT-TM-1 above flips only
+# M-TM-2 — the tonemap arm needs two DIFFERENT mutations: one for the unit label and one for the
+# real-encode color probe. MUT-TM-1 above flips only
 # the PROFILE_DESC *label* (`SDR-TONEMAP`→`SDR`); the bt709 COLOR_ARGS on the next line still run,
 # so a real encode's output is still bt709-TAGGED (the tag probe can't catch the label mutation —
 # the unit test does). MUT-TM-2 instead disables the SDR-tonemap arm's entry condition so it falls
@@ -388,17 +388,17 @@ enforce MUT-TM-2 hdr \
   'tonemap real encode:' \
   'M-TM-2: SDR-tonemap arm output color tags caught by the real --tonemap encode probe'
 
-# M-CHROMA-1 (Phase 4.2): flip the SDR-path 4:2:2-preserve branch of decide_color_and_pixfmt to
+# M-CHROMA-1: flip the SDR-path 4:2:2-preserve branch of decide_color_and_pixfmt to
 # 4:2:0 (tgt_pix yuv422 → yuv420p), so a FORCE_CHROMA_420=0 encode wrongly downsamples. The
 # real-encode chroma test asserts the FORCE_CHROMA_420=0 output is yuv422p (and the default arm is
 # yuv420p, unaffected by this branch) → only the preserve assertion goes red.
 # shellcheck disable=SC2016  # ${_cbit} is literal sed text — it must NOT expand in this shell.
 enforce MUT-CHROMA-1 regression_p5 \
   's/422) tgt_pix="yuv422${_cbit}"/422) tgt_pix="yuv420p"/' \
-  'H8 real encode: FORCE_CHROMA_420=0' \
+  'regression-chroma-420-downsample real encode: FORCE_CHROMA_420=0' \
   'M-CHROMA-1: 4:2:2 chroma preserve decision caught by the real-encode pix_fmt probe'
 
-# M-AVIFB-1 (Phase 4.3): break the container-passthrough fallback default for unsupported source
+# M-AVIFB-1: break the container-passthrough fallback default for unsupported source
 # extensions (the `*) OUTPUT_EXT="mkv"` arm → "mp4"). Anchored on the unique adjacent "not supported
 # for output" notice (the N pulls it into the pattern space) so only the fallback arm changes, not
 # the many profile `OUTPUT_EXT="mkv"` assignments. The real .avi passthrough encode then derives a
@@ -409,16 +409,16 @@ enforce MUT-AVIFB-1 containers \
   'passthrough fallback:' \
   'M-AVIFB-1: .avi→mkv container fallback caught by the real-encode format_name probe'
 
-# M-VTPARAMS-1 (Phase 5.3): change the hevc_videotoolbox container tag from hvc1 to hev1 in
+# M-VTPARAMS-1: change the hevc_videotoolbox container tag from hvc1 to hev1 in
 # build_videotoolbox_params. The VT-params unit test asserts the 10-bit mp4 arg string carries
 # `-tag:v hvc1`; under the mutation it carries hev1 → that assertion goes red (the 8-bit-mkv arm,
 # which adds no tag, is unaffected). Pure param-builder check — no VT host needed.
 enforce MUT-VTPARAMS-1 hw_accel \
   's/VIDEOTOOLBOX_ARGS+=( -tag:v hvc1 )/VIDEOTOOLBOX_ARGS+=( -tag:v hev1 )/' \
-  '5.3 VT params: hevc_videotoolbox mp4 10-bit' \
+  'hw-vt-params VT params: hevc_videotoolbox mp4 10-bit' \
   'M-VTPARAMS-1: hevc_videotoolbox hvc1 tag caught by the build_videotoolbox_params unit test'
 
-# M-NVENC-1 (Phase 5.2): strip "NVENC" from resolve_video_encoder's software-fallback reason
+# M-NVENC-1: strip "NVENC" from resolve_video_encoder's software-fallback reason
 # string. The NVENC-fallback unit test asserts the recorded reason names NVENC (so the user is
 # told WHY hardware accel was disabled); under the mutation it no longer does → that assertion goes
 # red (the companion "stays software libx265" assertion is unaffected). QSV/VAAPI rejection rides
@@ -426,10 +426,10 @@ enforce MUT-VTPARAMS-1 hw_accel \
 # Anchored on the unique nvenc-case reason string ("NVENC is not supported in this build; …").
 enforce MUT-NVENC-1 hw_accel \
   's/NVENC is not supported in this build/Hardware acceleration is not supported in this build/' \
-  '5.2 NVENC: software-fallback reason' \
+  'hw-accel-backend NVENC: software-fallback reason' \
   'M-NVENC-1: NVENC software-fallback contract caught by the resolve_video_encoder unit test'
 
-# M-DVSW-1 (Phase 5.1): corrupt the dovi_tool inject-rpu subcommand so RPU injection fails. With
+# M-DVSW-1: corrupt the dovi_tool inject-rpu subcommand so RPU injection fails. With
 # ALLOW_DV_FALLBACK=1 (default) muxm falls back to a non-DV encode (exit 0, output produced — NOT a
 # die), so the failure mode is clean: the software DV round-trip's output carries no DOVI record →
 # the dv_sw DV-record assertion goes red. The --crf re-encode forces the extract→inject path (a
@@ -441,7 +441,7 @@ enforce MUT-DVSW-1 dv_sw \
   'dv_sw: no Dolby Vision configuration record' \
   'M-DVSW-1: software DV RPU round-trip caught by the dv_sw DOVI-record probe'
 
-# MUT-DVSW-CONVERT (Phase 6): break the `dovi_tool convert` subcommand so the P7→P8.1 conversion
+# MUT-DVSW-CONVERT: break the `dovi_tool convert` subcommand so the P7→P8.1 conversion
 # fails. With ALLOW_DV_FALLBACK=1 (default) the run falls back to non-DV base (exit 0, no die), so
 # the convert-SUCCESS marker ("DV profile converted") never fires → the new P7→P8.1 convert-success
 # probe goes red. Anchored on the unique `dovi_tool convert -i "$V_INJECTED"` invocation.
@@ -451,25 +451,25 @@ enforce MUT-DVSW-CONVERT dv_sw \
   'dv_sw convert: convert-success marker missing' \
   'M-DVSW-CONVERT: real P7→P8.1 dovi_tool convert success path caught by the dv_sw convert probe'
 
-# 2.4a (Phase 2.4): off-by-one the relidx returned by _pick_direct_text_sub_relidx (echo i+1 on
+# 2.4a: off-by-one the relidx returned by _pick_direct_text_sub_relidx (echo i+1 on
 # the text-codec match). Anchored on the positive `if _is_text_sub_codec` (the keep-list uses the
 # negated `! _is_text_sub_codec`), the `n` advances to the unique echo line. The picker test
 # asserts idx 2; the empty-case scenario never reaches the inner echo, so only the picker flips.
 # shellcheck disable=SC2016  # $codec/$i are literal sed text — they must NOT expand in this shell.
 enforce MUT-SUB-RELIDX unit \
   '/if _is_text_sub_codec "$codec"; then/{n;s/echo "$i"/echo "$(( i + 1 ))"/;}' \
-  '2.4 direct: picks first text sub matching lang' \
+  'unit-build-subtitle-lists direct: picks first text sub matching lang' \
   '2.4a: direct-text-sub relidx off-by-one caught by _pick_direct_text_sub_relidx test'
 
-# 2.4b (Phase 2.4): neuter the SUB_MAX_TRACKS cap by widening its threshold, so the keep list is
+# 2.4b: neuter the SUB_MAX_TRACKS cap by widening its threshold, so the keep list is
 # never truncated. The new _build_subtitle_keep_list test caps 4→2; under the mutation it returns
 # all four, so the cap scenario goes red (the under-cap scenarios are unaffected).
 enforce MUT-SUB-MAXTRACKS unit \
   's/> SUB_MAX_TRACKS/> 9999/' \
-  '2.4 keep: SUB_MAX_TRACKS caps 4→2' \
+  'unit-build-subtitle-lists keep: SUB_MAX_TRACKS caps 4→2' \
   '2.4b: SUB_MAX_TRACKS cap caught by _build_subtitle_keep_list test'
 
-# M-REP-1 (Phase 2.5): drop the _json_escape wrapper around the report_add VALUE ($2) so the raw
+# M-REP-1: drop the _json_escape wrapper around the report_add VALUE ($2) so the raw
 # argument is pushed into the JSON entry — a value containing a quote/backslash/newline then
 # produces invalid JSON. The report_add escaping test feeds exactly such a value and asserts jq
 # parses + round-trips, so it goes red. Anchored on the unique `_json_escape "$2"` (the key uses
@@ -477,10 +477,10 @@ enforce MUT-SUB-MAXTRACKS unit \
 # shellcheck disable=SC2016  # $(_json_escape "$2")/$2 are literal sed text — they must NOT expand here.
 enforce MUT-REP-1 unit \
   's/$(_json_escape "$2")/$2/' \
-  '2.5 report_add escaping' \
+  'unit-report-add-escaping report_add escaping' \
   'M-REP-1: report_add JSON-escaping caught by the jq round-trip test'
 
-# M-DUR-1 (Phase 3.4): break the tier-3 Matroska-DURATION parse in _get_source_duration_secs by
+# M-DUR-1: break the tier-3 Matroska-DURATION parse in _get_source_duration_secs by
 # collapsing the hours multiplier (10#$h * 3600 → * 60). The duration-tier-3 unit test asserts
 # 01:02:03 → 3723s, which then diverges to 183s. The octal-safe (00:09:09, hours=0) and tier-1
 # scenarios are unaffected — 0*anything is unchanged — so the signature stays isolated to the
@@ -488,10 +488,10 @@ enforce MUT-REP-1 unit \
 # shellcheck disable=SC2016  # $h is literal sed text — it must NOT expand in this shell.
 enforce MUT-DUR-1 unit \
   's/10#$h \* 3600/10#$h \* 60/' \
-  '3.4 duration tier-3: Matroska tag 01:02:03' \
+  'unit-duration-tier3 duration tier-3: Matroska tag 01:02:03' \
   'M-DUR-1: tier-3 HH:MM:SS parse caught by the _get_source_duration_secs unit test'
 
-# M-VCC-1 (Phase 3.5): neuter the 10-bit-pixfmt copy-reject in _video_is_copy_compliant by
+# M-VCC-1: neuter the 10-bit-pixfmt copy-reject in _video_is_copy_compliant by
 # inverting its source-pixfmt test — drop the negation in `[[ ! "$src_pix" =~ (p010le|p10|p12) ]]`
 # so an 8-bit source is wrongly judged copyable for a 10-bit target. The copy-compliant unit test
 # asserts that exact case (sdr-force 10-bit out vs 8-bit src) returns re-encode (rc 1, "need 10-bit"
@@ -501,75 +501,75 @@ enforce MUT-DUR-1 unit \
 # shellcheck disable=SC2016  # $src_pix is literal sed text — it must NOT expand in this shell.
 enforce MUT-VCC-1 unit \
   's/\[\[ ! "$src_pix" =~/[[ "$src_pix" =~/' \
-  '3.5 copy-compliant: 10-bit out (sdr-force) vs 8-bit src' \
+  'unit-video-copy-compliant copy-compliant: 10-bit out (sdr-force) vs 8-bit src' \
   'M-VCC-1: 10-bit-pixfmt copy-reject caught by the _video_is_copy_compliant unit test'
 
-# M-HDR-2 (Phase 3.1) — RE-POINTED off the catalog's original "drop master-display/max-cll x265
-# params" framing. Verified during Phase 3.1: muxm sets NO master-display/max-cll params; ffmpeg
-# auto-forwards the source frame side-data to libx265 irrespective of the x265-params string (even
-# with none, even with color stripped), so an output-survival probe is tautological with no muxm
-# lever — exactly the reason M-HDR-1 was deferred. The genuinely-mutable, previously-untested
-# surface is the warning path: neuter the "missing HDR10 static metadata" gate in
+# M-HDR-2 targets the warning path, not the output color params. muxm sets NO
+# master-display/max-cll params; ffmpeg auto-forwards the source frame side-data to libx265
+# irrespective of the x265-params string (even with none, even with color stripped), so an
+# output-survival probe is tautological with no muxm lever — the same reason M-HDR-1 was deferred.
+# The genuinely-mutable, previously-untested surface is the warning path: neuter the
+# "missing HDR10 static metadata" gate in
 # _check_hdr10_static_metadata (anchored on the unique "Source has DV but NO HDR10" warn line so
 # only the warning arm — not the identical fallback gate — changes). The hdr10-static-metadata
 # unit test's missing-source scenario then reports "partial", not "missing" → it goes red.
 enforce MUT-HDR-2 unit \
   '/if (( ! has_mastering && ! has_cll )); then/{N;/Source has DV but NO HDR10/s/if (( ! has_mastering && ! has_cll )); then/if (( 0 )); then/;}' \
-  '3.1 hdr10-meta: neither present' \
+  'unit-hdr10-static-metadata hdr10-meta: neither present' \
   'M-HDR-2: HDR10 missing-static-metadata warning caught by the _check_hdr10_static_metadata unit test'
 
-# M-OCR-1 (Phase 3.2): make _prepare_subtitle's PGS branch skip OCR by forcing its
+# M-OCR-1: make _prepare_subtitle's PGS branch skip OCR by forcing its
 # `if (( ! SUB_ENABLE_OCR ))` gate always-true. Anchored on the unique "PGS subtitle #" warn line
 # (the N pulls the following warn into the pattern space) so only the embedded-PGS gate flips, not
 # the two identical external-PGS/VobSub gates later in the file. The OCR-dispatch unit test then
 # sees neither a tool invocation nor a produced SRT track → both its assertions go red.
 enforce MUT-OCR-1 unit \
   '/if (( ! SUB_ENABLE_OCR )); then/{N;/PGS subtitle #/s/if (( ! SUB_ENABLE_OCR )); then/if (( 1 )); then/;}' \
-  '3.2 OCR dispatch:' \
+  'unit-ocr-dispatch OCR dispatch:' \
   'M-OCR-1: PGS OCR dispatch caught by the _prepare_subtitle unit test'
 
-# M-BURN-1 (Phase 3.3): turn the forced-subtitle burn filter into a no-op passthrough
+# M-BURN-1: turn the forced-subtitle burn filter into a no-op passthrough
 # (subtitles=filename=burn.srt → null). The encode still succeeds and still produces output — it
 # just stops burning text into the video — so the burn-in pixel test's two encodes become
 # bit-identical in the subtitle band (y-PSNR jumps from ~21 dB to inf) and it goes red. `null` (not
 # a broken filtergraph) is chosen so the failure mode is "no pixels changed", not "no output".
 enforce MUT-BURN-1 subs \
   's/subtitles=filename=burn.srt/null/' \
-  '3.3 burn-in:' \
+  'subs-forced-burn-in burn-in:' \
   'M-BURN-1: forced-subtitle burn-in pixels caught by the band-PSNR test'
 
-# ---- Phase 3.6: previously-unreached die/guard branches -------------------------------------
+# ---- previously-unreached die/guard branches ------------------------------------------------
 # (Already covered elsewhere, deliberately NOT re-added: --replace-source non-interactive die and
 # the collision auto-version loop live in the collision suite; the catalog's "DISK_FREE_WARN_GB
 # warning path" is stale — that code now die 11s, exercised by M-DISK-1 below.)
 
-# M-DISK-1 (Phase 3.6): invert disk_free_warn's cross-volume guard (`od_dev != wd_dev` → `==`) so
-# the output-volume hard stop is skipped when WORKDIR and OUT_DIR are on different volumes — the
-# branch the review found no e2e test ever reaches. The disk-output-volume unit test mocks a full
+# M-DISK-1: invert disk_free_warn's cross-volume guard (`od_dev != wd_dev` → `==`) so
+# the output-volume hard stop is skipped when WORKDIR and OUT_DIR are on different volumes — a
+# branch no e2e test reaches. The disk-output-volume unit test mocks a full
 # output volume on a separate device and asserts die 11; under the mutation no die fires → red.
 # shellcheck disable=SC2016  # $od_dev/$wd_dev are literal sed text — they must NOT expand here.
 enforce MUT-DISK-1 unit \
   's/"$od_dev" != "$wd_dev"/"$od_dev" == "$wd_dev"/' \
-  '3.6 disk output-volume:' \
+  'unit-disk-output-volume disk output-volume:' \
   'M-DISK-1: disk_free_warn output-volume die branch caught by the disk-output-volume unit test'
 
-# M-CTRL-1 (Phase 3.6): neuter the OUTPUT-filename control-char guard (its [[:cntrl:]] regex → a
+# M-CTRL-1: neuter the OUTPUT-filename control-char guard (its [[:cntrl:]] regex → a
 # never-matching literal) so a tabbed output path is no longer rejected. Anchored on $OUT_ABS so
 # the identical $SRC_ABS source-filename check (already tested) is untouched. The edge test then
 # sees neither exit 11 nor the output-specific message → red.
 # shellcheck disable=SC2016  # $OUT_ABS is literal sed text — it must NOT expand here.
 enforce MUT-CTRL-1 edge \
   's/\$OUT_ABS" =~ \[\[:cntrl:\]\]/$OUT_ABS" =~ ZZZNEVER/' \
-  '3.6 output control-char:' \
+  'edge-output-control-char output control-char:' \
   'M-CTRL-1: output-filename control-char die caught by the edge-suite output-path test'
 
-# M-VCC-2 (Phase 3.6): neuter the MAX_COPY_BITRATE ceiling reject in _video_is_copy_compliant
+# M-VCC-2: neuter the MAX_COPY_BITRATE ceiling reject in _video_is_copy_compliant
 # (`if (( src_br_bps > max_br_bps ))` → always-false) so an over-ceiling source is wrongly judged
 # copyable. The copy-compliant unit test's bitrate-ceiling-exceeded scenarios then return copyable
 # (rc 0) instead of re-encode → red. Distinct from M-VCC-1 (which targets the 10-bit-pixfmt reject).
 enforce MUT-VCC-2 unit \
   's/if (( src_br_bps > max_br_bps )); then/if (( 0 )); then/' \
-  '3.5 copy-compliant: bitrate ceiling exceeded' \
+  'unit-video-copy-compliant copy-compliant: bitrate ceiling exceeded' \
   'M-VCC-2: MAX_COPY_BITRATE ceiling reject caught by the _video_is_copy_compliant unit test'
 
 printf '\n%sEnforced: %d passed, %d failed.%s\n' "$BOLD" "$PASS" "$FAIL" "$NC"

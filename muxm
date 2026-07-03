@@ -75,10 +75,10 @@ shopt -s inherit_errexit 2>/dev/null || true
 #   - All =~ [0-9] ranges are POSIX-safe regardless of locale
 #   - The [a-zA-Z0-9] range in OCR tool sanitization is a security reject-list
 #     (conservative direction under exotic locales)
-#   - LC_NUMERIC=C guards all printf %.Nf calls that receive bc decimal output (M3)
+#   - LC_NUMERIC=C guards all printf %.Nf calls that receive bc decimal output
 #   Validated by: LANG=C LC_ALL=C tests/test_muxm.sh --suite all
 
-# Naming convention (L9): a leading underscore marks an internal/"private" helper not meant to be
+# Naming convention: a leading underscore marks an internal/"private" helper not meant to be
 # called from outside its subsystem; unprefixed names are the public-ish entry points (main, the
 # pipeline stages, profile appliers). The convention is applied loosely — a few long-standing
 # internal helpers predate it and are intentionally left unprefixed to avoid churn/test-rename risk
@@ -99,7 +99,7 @@ fi
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
 readonly VERSION="1.5.1"
-# RF11: release date for the man-page .TH line, co-located with VERSION so a release bump updates
+# Release date for the man-page .TH line, co-located with VERSION so a release bump updates
 # both together. _man_emit substitutes it for the __DATE__ token (like __VERSION__) — the date is no
 # longer a hidden literal buried mid-heredoc that the docs-parity guard can't see drifting.
 readonly RELEASE_DATE="2026-07-03"
@@ -116,7 +116,7 @@ _valid_profiles_display(){ echo "${VALID_PROFILES// /, }"; }
 # Also accepts deprecated aliases: 'dv-archival' (maps to 'archive'), 'streaming' (maps to 'streaming-hevc').
 _is_valid_profile(){ [[ " $VALID_PROFILES " == *" $1 "* ]] || [[ "$1" == "dv-archival" ]] || [[ "$1" == "streaming" ]]; }
 
-# L4: single source of truth for deprecated profile aliases.
+# Single source of truth for deprecated profile aliases.
 # All normalisation call sites must go through _normalize_profile instead of
 # maintaining their own warn+rename blocks.
 declare -A PROFILE_ALIASES=( [dv-archival]=archive [streaming]=streaming-hevc )
@@ -136,7 +136,7 @@ _normalize_profile(){
 
 # ===== Section 3: Globals =====================================================================
 
-# L7: single source of truth for the numeric-value validation patterns. These were inlined ~3×
+# Single source of truth for the numeric-value validation patterns. These were inlined ~3×
 # each across the CLI-parse validators and the post-config re-validation block; hoisting them keeps
 # the two sites from drifting. Used unquoted in [[ $x =~ $_RE_… ]] tests (quoting forces a literal
 # match). _RE_BITRATE: a bitrate like 20000k / 5M / a plain integer. _RE_LEVEL: a numeric H.26x level
@@ -145,13 +145,13 @@ _normalize_profile(){
 readonly _RE_BITRATE='^[0-9]+(\.[0-9]+)?[kKmMgG]?$'
 readonly _RE_LEVEL='^[0-9]+(\.[0-9]+)?$'
 
-# CR-15: single source of truth for the binary size units. Both filesize_pretty and _gb open-coded
+# Single source of truth for the binary size units. Both filesize_pretty and _gb open-coded
 # 1 GiB / 1 MiB as the bare literal (1073741824 / 1048576) AND the factored expression
 # (1024*1024*1024 / 1024*1024). Name them once so the two spellings can't drift.
 readonly BYTES_PER_GIB=1073741824   # 1024^3
 readonly BYTES_PER_MIB=1048576      # 1024^2
 
-# L8: canonical membership test for "is $1 one of the software AV1 encoders". Replaces the
+# Canonical membership test for "is $1 one of the software AV1 encoders". Replaces the
 # `[[ $VIDEO_CODEC == libsvt-av1 || $VIDEO_CODEC == libaom-av1 ]]` idiom that was repeated across
 # many sites, so adding/renaming an AV1 encoder is a one-line change. NOTE: `case` pattern arms
 # (e.g. `libsvt-av1|libaom-av1)`) cannot call a function and are intentionally left inline.
@@ -166,7 +166,7 @@ WORKDIR_BASE=""        # --workdir DIR: parent dir for the .muxm.tmp.* workdir.
 LOGFILE=""
 LOG_PERSIST_PATH=""   # Durable copy target for the run log under --keep-log; set once in Section 15
 DEBUG_BUNDLE_DIR=""   # Durable diagnostics-bundle dir kept on failure; set once in Section 15
-declare -i _OUT_LOCK_HELD=0   # M4: 1 once this run owns the output lock; on_exit releases it only then
+declare -i _OUT_LOCK_HELD=0   # 1 once this run owns the output lock; on_exit releases it only then
 OUT_LOCK_PATH=""      # Hidden lock path (…/.<basename>.lock) computed in _acquire_out_lock; released in on_exit
 _LOG_BUFFER=""        # In-memory capture of pre-§17 narrative (config/profile/conflict/validation),
                       # flushed into $LOGFILE the moment it is created in Section 17. Lets the log
@@ -179,7 +179,7 @@ _BURN_SRT_FILTER=""   # temp file for subtitle burn-in (inside WORKDIR; cleaned 
 FAILED=0
 FAIL_MSG=""
 _ERROR_PRINTED=0      # set by die()/on_error() once the cause is on screen, so on_exit's failure
-                      # summary stays terse and never re-prints the cause (D7). SIGINT/SIGTERM and
+                      # summary stays terse and never re-prints the cause. SIGINT/SIGTERM and
                       # the no-output fallback leave it 0, so on_exit surfaces their cause itself.
 EXIT_CODE=1
 PRINT_EFFCONF=0
@@ -243,7 +243,7 @@ LEVEL_VALUE=""                 # e.g., 5.1 (blank = encoder decides)
 # Explicit-tracking for the advanced encode-param flags (mirrors _CLI_CRF_EXPLICIT):
 # 1 when the user typed the flag on the CLI, 0 when the value came from a profile/config
 # default. Set at parse time and READ by the Section-13 ignored-knob conflict warnings
-# (WI-1b/Section 13b) — e.g. --x265-params with a non-x265 codec, --level on AV1, --threads
+# (Section 13b) — e.g. --x265-params with a non-x265 codec, --level on AV1, --threads
 # under HW/copy. The advisories are warn-only, so these still drive no encode behavior.
 declare -i _CLI_X265_PARAMS_EXPLICIT=0   # --x265-params
 declare -i _CLI_X264_PARAMS_EXPLICIT=0   # --x264-params
@@ -311,7 +311,7 @@ declare -i VT_QUALITY_DEFAULT=65
 # (or VT_QUALITY_DEFAULT if profile not in the map).
 HW_ACCEL_QUALITY=""
 # Records whether --hw-accel-quality was typed explicitly. Set at parse and READ by the Section-13
-# C5 advisory (warns when --hw-accel-quality is given but the resolved backend isn't VideoToolbox).
+# advisory (warns when --hw-accel-quality is given but the resolved backend isn't VideoToolbox).
 # Warn-only — it still feeds no encode behavior. (Distinct from _CLI_HW_ACCEL_EXPLICIT above, which
 # remains genuinely reserved for the future backend-precedence decision.)
 declare -i _CLI_HW_ACCEL_QUALITY_EXPLICIT=0
@@ -381,7 +381,7 @@ declare -i SUB_PRESERVE_BITMAP=1
 # Explicit-tracking for the sub-preserve flags (mirrors _CLI_CRF_EXPLICIT): 1 when the user
 # typed --sub-preserve-format/--no-sub-preserve-format or --sub-preserve-bitmap/--no-…-bitmap
 # on the CLI. Gates the ATV MKV subtitle adjustment (_resolve_output_and_sub_policy) so an
-# explicit --no-… is not clobbered by the profile (D1). Surfaced in print_effective_config.
+# explicit --no-… is not clobbered by the profile. Surfaced in print_effective_config.
 declare -i _CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT=0
 declare -i _CLI_SUB_PRESERVE_BITMAP_EXPLICIT=0
 
@@ -407,7 +407,7 @@ OUTPUT_EXT="mp4"               # supports mp4|m4v|mov
 TAG_LANGUAGE_DEFAULT="und"
 declare -i INCLUDE_AUDIO_TITLES=1  # Generate descriptive titles for audio streams (e.g., "5.1 Surround (E-AC-3)")
 
-# ---- Terminal verbosity & color (Phase 6; Phase 7 made VERBOSITY a .muxmrc knob) ----
+# ---- Terminal verbosity & color (VERBOSITY is a .muxmrc knob) ----
 # VERBOSITY gates what muxm's OWN narration prints to the TERMINAL — the LOG always stays complete
 # (quiet routes suppressed lines to the log only). It is the human-facing enum quiet|normal|verbose
 # (the tracked .muxmrc knob, default normal); the hot-path helpers gate on the derived numeric
@@ -496,14 +496,14 @@ declare -i TONEMAP_HDR_TO_SDR=0
 TONEMAP_FILTER='zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p'
 # Force all audio to a specific codec (e.g., "aac" for universal; "" = auto)
 AUDIO_FORCE_CODEC=""
-AUDIO_FORCE_BITRATE=""    # Override the bitrate for any transcoded non-lossless audio output (D3)
+AUDIO_FORCE_BITRATE=""    # Override the bitrate for any transcoded non-lossless audio output
 # Allow lossless audio codecs (TrueHD, DTS-HD MA, FLAC) to pass through untouched
 declare -i AUDIO_LOSSLESS_PASSTHROUGH=0
 # Burn forced subtitles into the video stream
 declare -i SUB_BURN_FORCED=0
 # Export non-forced subtitles as external .srt files alongside output
 declare -i SUB_EXPORT_EXTERNAL=0
-declare -i _EXPORT_MKV_ADVISORY_SHOWN=0   # CR-14: one-shot guard for _warn_export_external_mkv
+declare -i _EXPORT_MKV_ADVISORY_SHOWN=0   # One-shot guard for _warn_export_external_mkv
 # Keep chapter markers in output
 declare -i KEEP_CHAPTERS=1
 # Strip non-essential metadata from output
@@ -708,11 +708,11 @@ ffmpeg_progress_bar() {
   while IFS='=' read -r key val 2>/dev/null; do
     case "$key" in
       out_time_us|out_time_ms)
-        # L5: handle both progress fields. Older ffmpeg emits only out_time_ms; modern builds emit
+        # Handle both progress fields. Older ffmpeg emits only out_time_ms; modern builds emit
         # both. NOTE: ffmpeg's out_time_ms is a long-standing misnomer — it carries MICROSECONDS, the
         # same value as out_time_us (verified: both print e.g. 3000000 for a 3s clip), so both route
-        # to the identical microseconds math below. (The review's "*1000" suggestion assumed true
-        # milliseconds and would run the bar 1000× fast; it is intentionally not applied.)
+        # to the identical microseconds math below. (A "*1000" scaling here would assume true
+        # milliseconds and run the bar 1000× fast, so it is intentionally not applied.)
         elapsed_us="${val:-0}"
         # Guard against non-numeric values
         [[ "$elapsed_us" =~ ^-?[0-9]+$ ]] || continue
@@ -755,7 +755,7 @@ _ffmpeg_run_with_ui() {
                                # forced-sub burn-in, whose -vf references burn.srt
                                # relatively so no user path needs filtergraph escaping).
   local _ffui_pipe="$WORKDIR/_ffui.$$.pipe"
-  local _ffui_t0=$SECONDS      # for log-only per-op timing (D8: where did the run hang?)
+  local _ffui_t0=$SECONDS      # for log-only per-op timing (where did the run hang?)
 
   # When a cwd is requested, launch ffmpeg inside a subshell that cd's first. `exec`
   # replaces the subshell with ffmpeg, so $! is ffmpeg's own PID (not the subshell's) —
@@ -792,7 +792,7 @@ _ffmpeg_run_with_ui() {
   fi
 }
 
-# _await_tracked_pid PID MSG — CR-10: the shared tail for the ~20 "backgrounded child → register
+# _await_tracked_pid PID MSG — the shared tail for the ~20 "backgrounded child → register
 # _ACTIVE_FFMPEG_PID → spinner → wait → clear PID" sites. Enforces the SIGINT-safety contract in ONE
 # place: register the pid BEFORE wait (so on_exit can SIGKILL the child on Ctrl-C) and clear it AFTER
 # (so a stale pid can't be killed later). Returns the child's exit code, so callers keep their exact
@@ -913,7 +913,7 @@ _jq_cache() {
 die()  {
   local code=1
   if [[ $# -gt 1 && "$1" =~ ^[0-9]+$ ]]; then code="$1"; shift; fi
-  # FAIL_MSG carries no "Fatal:" prefix (D7): the "❌ ERROR:" / "❌ Build FAILED" prefixes
+  # FAIL_MSG carries no "Fatal:" prefix: the "❌ ERROR:" / "❌ Build FAILED" prefixes
   # already convey severity, and on_exit must not echo the cause a second time (see _ERROR_PRINTED).
   FAILED=1; EXIT_CODE="$code"; FAIL_MSG="$*"
   printf "${_PFX_ERR-❌ ERROR: }%s\n" "$FAIL_MSG" >&2
@@ -928,7 +928,7 @@ on_error(){
   EXIT_CODE="$status"
   FAIL_MSG="Command failed at line $lineno: $cmd (exit $status)"
   printf "${_PFX_ERR-❌ ERROR: }%s\n" "$FAIL_MSG" >&2
-  _ERROR_PRINTED=1   # cause printed here; on_exit will not echo it again (D7)
+  _ERROR_PRINTED=1   # cause printed here; on_exit will not echo it again
   # Note: This trap does not call exit directly. Under set -e, the shell
   # exits after the ERR trap returns, which triggers the EXIT trap (on_exit)
   # where FAILED/EXIT_CODE/FAIL_MSG are used for cleanup and reporting.
@@ -936,7 +936,7 @@ on_error(){
 
 mark_done(){
   COMPLETED_STEPS+=("$1")
-  # Log-only per-step timing (D8): elapsed since the previous completed step (or the §17
+  # Log-only per-step timing: elapsed since the previous completed step (or the §17
   # baseline) so the log shows where time went / where it hung. Cheap ($SECONDS, no fork).
   log "step \"$1\" done in $(( SECONDS - ${_STEP_T0:-0} ))s"
   _STEP_T0=$SECONDS
@@ -963,7 +963,7 @@ need(){
 #   - date:      all calls use POSIX-compatible format strings (+%Y%m%d, etc.)
 #   - mktemp:    template-argument form used (POSIX-compatible on BSD and GNU)
 #   - grep:      only -i, -E, -o, -q, -v, -x, -F flags used (all POSIX-compatible)
-#                RF10: -m is NON-POSIX and was redundant with -q, so it was removed; the grep
+#                -m is NON-POSIX and was redundant with -q, so it was removed; the grep
 #                flag allow-list above is enforced by the unit suite (_test_unit_rf10_grep_flags).
 #   - readlink:  not used; path resolution handled via realpath_fallback
 #   - seq:       eliminated; replaced with _repeat_char (pure bash, fully portable)
@@ -984,7 +984,7 @@ _detect_mp4box(){
 }
 
 # Improved realpath that handles non-existent files on all platforms.
-# L9 note (left as-is, functionally inert): the BSD/no-realpath fallback below resolves the
+# Note: the BSD/no-realpath fallback below resolves the
 # *directory* to canonical via `cd … && pwd` but does NOT canonicalize symlinks or `..` in the
 # basename the way GNU `realpath -m` does for the whole path. Both call sites (SRC_ABS, OUT_ABS)
 # operate on an existing file whose directory is cd-resolved, so the difference never surfaces;
@@ -994,7 +994,7 @@ realpath_fallback(){
   
   # Try GNU realpath with -m (allows missing files). Skip on macOS/BSD ($OSTYPE=darwin*), whose
   # realpath has no -m: the call always fails there, so probing it every time is pure overhead —
-  # it just falls through to the portable resolver below. (Phase 5; perf only.)
+  # it just falls through to the portable resolver below. (Perf only.)
   if [[ "$OSTYPE" != darwin* ]] && command -v realpath >/dev/null 2>&1; then
     if realpath -m "$p" 2>/dev/null; then
       return 0
@@ -1258,7 +1258,7 @@ ffmpeg_has_encoder(){
 # libx265/libx264 and no hardware backend resolved), verify ffmpeg actually has it and die 10 with
 # an install hint — the same fail-fast treatment the AV1 and hardware encoders already get above.
 # Without this, a stripped ffmpeg build lacking libx265 proceeds all the way to the encode and
-# fails mid-stream at die 40 instead of cleanly at preflight (M5). No-op for AV1/hardware paths.
+# fails mid-stream at die 40 instead of cleanly at preflight. No-op for AV1/hardware paths.
 # Reads: VIDEO_CODEC, HW_ACCEL_RESOLVED.
 _preflight_sw_video_encoder() {
   [[ "$VIDEO_CODEC" == "libx265" || "$VIDEO_CODEC" == "libx264" ]] || return 0
@@ -1474,7 +1474,7 @@ readonly CONFIG_TRACKED_VARS=(
   OUTPUT_EXT KEEP_CHAPTERS STRIP_METADATA INCLUDE_AUDIO_TITLES
   CHECKSUM CHECKSUM_ALGO SKIP_IF_IDEAL REPORT_JSON
   FFMPEG_LOGLEVEL
-  # L3: vars previously emitted as hardcoded literals in the config template — tracked here
+  # Vars previously emitted as hardcoded literals in the config template — tracked here
   # so _create_config_emit emits their live defaults (no drift from the Section-4 values).
   AUDIO_SCORE_CHANNEL_MULTIPLIER AUDIO_SCORE_SURROUND_BONUS AUDIO_SCORE_LANG_BONUS AUDIO_SCORE_COMMENTARY_PENALTY
   TAG_LANGUAGE_DEFAULT DISK_FREE_WARN_GB TONEMAP_FILTER
@@ -1502,7 +1502,7 @@ _muxm_try_source /etc/.muxmrc
 _muxm_try_source "./.muxmrc"   # Sources from $PWD — intentional project-level override (see section header)
 
 # Deprecation bridge: AUDIO_SCORE_LANG_BONUS_ENG → AUDIO_SCORE_LANG_BONUS (v1.1)
-# M7: apply the legacy alias ONLY when the new var was not explicitly set in config — i.e. it still
+# Apply the legacy alias ONLY when the new var was not explicitly set in config — i.e. it still
 # equals its pre-config default (_MUXM_PRE_CONFIG snapshot, taken before the .muxmrc chain). If a
 # .muxmrc sets BOTH, the new var wins; the legacy value must never silently overwrite it. The
 # rename warning always fires while the legacy alias is present.
@@ -1522,7 +1522,7 @@ fi
 # Validate HW_ACCEL set via .muxmrc (CLI validation happens in the parser).
 [[ -n "${HW_ACCEL:-}" ]] && ! is_valid_hw_accel "$HW_ACCEL" && \
   die 11 "Invalid HW_ACCEL=\"$HW_ACCEL\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: none, auto, videotoolbox, nvenc"
-# Validate VERBOSITY set via .muxmrc (Phase 7); the numeric _VERBOSITY_N is derived after the CLI
+# Validate VERBOSITY set via .muxmrc; the numeric _VERBOSITY_N is derived after the CLI
 # parse so an explicit --quiet/--verbose still wins. Catches config typos early, like the loglevels.
 [[ -n "${VERBOSITY:-}" ]] && ! is_valid_verbosity "$VERBOSITY" && \
   die 11 "Invalid VERBOSITY=\"$VERBOSITY\" in config (${MUXM_CONFIG_LOADED[*]:-environment}). Valid values: quiet, normal, verbose"
@@ -1613,13 +1613,13 @@ _dep_check_only(){
     printf "  %-14s %-24s %-24s %s\n" "tesseract"  "apt install tesseract-ocr" "dnf install tesseract" "brew install tesseract"
     printf "  %-14s %-24s %-24s %s\n" "pgsrip"     "pipx install pgsrip"    "pipx install pgsrip"    "pipx install pgsrip"
     printf '\n'
-    # Phase 5: cover Arch (pacman) and openSUSE (zypper) without widening the table to 5 columns —
+    # Cover Arch (pacman) and openSUSE (zypper) without widening the table to 5 columns —
     # their package names match the dnf/apt column (gpac for mp4box; ffmpeg/jq/bc as-is).
     printf "  %s\n" "Arch:     pacman -S <pkg>          openSUSE: zypper install <pkg>   (package names match the dnf/apt column above; pgsrip via pipx)"
     printf '\n'
     say "After installing, re-run: ${CLI_NAME} --install-dependencies"
     note "Advisory check — $missing tool(s) missing. No automatic install available on this platform."
-    exit 0  # Advisory: report only, not a failure (M8)
+    exit 0  # Advisory: report only, not a failure
   fi
 
   say "✅ All tools found."
@@ -1627,7 +1627,7 @@ _dep_check_only(){
 }
 
 # _pipx_resolve_bin_dir — echo pipx's bin directory (PIPX_BIN_DIR), or "" if undeterminable.
-# M8: `pipx environment --value PIPX_BIN_DIR` exists only on pipx ≥1.0; on older pipx (e.g. some
+# `pipx environment --value PIPX_BIN_DIR` exists only on pipx ≥1.0; on older pipx (e.g. some
 # Ubuntu LTS) it fails silently, leaving only the hardcoded $HOME/.local/bin guess — so a
 # non-standard pipx install made pgsrip look missing right after installing it. Fall back to
 # parsing the full `pipx environment` dump. Top-level (not nested in _dep_install_dependencies) so
@@ -1711,7 +1711,7 @@ _dep_install_dependencies(){
           pipx ensurepath 2>/dev/null || true
           # Add pipx bin dir to current PATH (without eval of arbitrary output)
           local _pipx_bin
-          _pipx_bin="$(_pipx_resolve_bin_dir)"  # M8: pipx <1.0-safe (falls back to parsing `pipx environment`)
+          _pipx_bin="$(_pipx_resolve_bin_dir)"  # pipx <1.0-safe (falls back to parsing `pipx environment`)
           if [[ -n "$_pipx_bin" && -d "$_pipx_bin" ]]; then
             export PATH="$_pipx_bin:$PATH"
           fi
@@ -1820,7 +1820,7 @@ _dep_install_dependencies(){
   }
 
   say "Core tools (required):"
-  # M4: guard the call so a return-1 (install failed / incomplete build) does not abort the whole
+  # Guard the call so a return-1 (install failed / incomplete build) does not abort the whole
   # installer under `set -e` before its summary. _ensure_ffmpeg_full already does its own failed++
   # on every failure path, so `|| true` (NOT `|| (( failed++ ))`, which would double-count) just
   # neutralizes the abort; the failure is still recorded and the summary prints. Mirrors the
@@ -1929,7 +1929,7 @@ unset _arg
 _man_target_dir(){
   # Prefer Homebrew man path if brew is installed
   if command -v brew >/dev/null 2>&1; then
-    echo "$(brew --prefix 2>/dev/null)/share/man/man1"  # Phase 5: suppress stderr to match the other brew --prefix call sites
+    echo "$(brew --prefix 2>/dev/null)/share/man/man1"  # Suppress stderr to match the other brew --prefix call sites
   else
     echo "/usr/local/share/man/man1"
   fi
@@ -1937,7 +1937,7 @@ _man_target_dir(){
 
 # <<< embedded man page >>>
 _man_emit(){
-  # RF11: substitute __DATE__ (release date) alongside __VERSION__, so the .TH date is generated
+  # Substitute __DATE__ (release date) alongside __VERSION__, so the .TH date is generated
   # from the RELEASE_DATE variable (next to VERSION) rather than hardcoded inside this heredoc.
   sed "s/__VERSION__/$VERSION/; s/__DATE__/$RELEASE_DATE/" <<'MANPAGE_EOF'
 .TH MUXM 1 "__DATE__" "MuxMaster v__VERSION__" "User Commands"
@@ -3436,7 +3436,7 @@ _install_completions(){
   fi
 
   # Write completion script atomically (temp + mv) so a shell never `source`s a half-written file;
-  # mode 644 (not +x) — the file is sourced, never executed. (Phase 5)
+  # mode 644 (not +x) — the file is sourced, never executed.
   local _comp_tmp
   _comp_tmp="$(mktemp "${comp_dir}/.muxm-completion.XXXXXX")" || die 11 "Cannot create temp file in $comp_dir"
   _completions_emit > "$_comp_tmp"
@@ -3624,12 +3624,11 @@ unset _arg
 # Profile:       defaults to atv-directplay-hq if omitted.
 # --force-create-config: overwrite if file already exists.
 
-# RF1 (HIGH-1): single shared escape for values emitted into a double-quoted shell
+# Single shared escape for values emitted into a double-quoted shell
 # word in a generated .muxmrc. Escapes the four characters special inside "…" ( \ " $ ` )
 # so a crafted override value cannot inject shell that would execute on every later
 # `. .muxmrc` source. Both config emitters route every override through this one helper,
-# so the escape logic has a single definition (the prior duplication is what let
-# _create_config_emit_multi keep the pre-M1 unescaped form — see RF1 in CHANGELOG).
+# so the escape logic has a single definition.
 _cc_shell_escape() {
   local v="$1"
   v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//\$/\\\$}"; v="${v//\`/\\\`}"
@@ -3650,7 +3649,7 @@ _create_config_emit() {
   # Derive from CONFIG_TRACKED_VARS so this list never diverges from _MUXM_PRE_CONFIG (Structural).
   local _sv
 
-  # H1: reset every tracked variable to its script-builtin default (_MUXM_PRE_CONFIG)
+  # Reset every tracked variable to its script-builtin default (_MUXM_PRE_CONFIG)
   # BEFORE applying the profile. At this point the live values still carry whatever the
   # user/system/project .muxmrc layers set at startup (sourced in Section 6). Without
   # this reset, the diff below would flag a profile-UNTOUCHED variable that a .muxmrc
@@ -3698,22 +3697,22 @@ _create_config_emit() {
   # Usage: _V VARNAME [quoted]
   # "quoted" wraps the value in double quotes (for strings with special chars).
   # The optional second argument (historically "quoted") is now vestigial: every value is
-  # quoted unconditionally (see M1 below). It is still accepted so existing `_V VAR quoted`
+  # quoted unconditionally (see below). It is still accepted so existing `_V VAR quoted`
   # call sites keep working without change.
   _V() {
     local var="$1"
     local val="${!var}"
     local suffix=""
     [[ "$_manually_adjusted" == *" ${var} "* ]] && suffix=" # Manually adjusted"
-    # M1 (Phase 1): ALWAYS escape the characters special inside a double-quoted shell word
+    # ALWAYS escape the characters special inside a double-quoted shell word
     # ( \ " $ ` ) and ALWAYS emit the quoted VAR="value" form — for every variable, not just
     # those a call site marked "quoted". Override values arrive from the CLI unvalidated, so the
     # old unquoted branch let a value like  mp4; echo INJECTED  emit a bare
     # OUTPUT_EXT=mp4; echo INJECTED  line that executes on every later `. .muxmrc` source.
     # VAR=value and VAR="value" are identical when sourced, so no existing config changes meaning.
-    # (This also subsumes the earlier Phase-5 fix for embedded quotes in string values, e.g.
+    # (This also handles embedded quotes in string values, e.g.
     # X265_PARAMS_BASE='aq-mode=3:foo="bar"' now round-trips faithfully.)
-    local qval; qval="$(_cc_shell_escape "$val")"   # RF1: shared escape (was inline; see _cc_shell_escape)
+    local qval; qval="$(_cc_shell_escape "$val")"   # Shared escape (see _cc_shell_escape)
     if [[ "$_active" == *" ${var} "* ]]; then
       printf '%s="%s"%s\n' "$var" "$qval" "$suffix"
     else
@@ -4181,19 +4180,19 @@ HEADER
   if (( ${#_CC_OVERRIDES[@]} > 0 )); then
     printf '\n'
     local _ovr_var
-    # RF1 (HIGH-1): ALWAYS emit the escaped, double-quoted form for every override — drop the
+    # ALWAYS emit the escaped, double-quoted form for every override — drop the
     # old numeric/string branch entirely. The string branch did `printf '%s="%s"'` with NO
     # escaping, so a crafted value (e.g. --x265-params '$(touch /tmp/pwn)') emitted a line that
     # executed on every later `. .muxmrc` source. VAR="20" sources identically to VAR=20, so the
     # unconditional quoted form is safe for numeric values too. Same _cc_shell_escape as _V, so
-    # the two emitters can no longer drift (which is what re-opened M1 on this path).
+    # the two emitters can no longer drift.
     for _ovr_var in "${!_CC_OVERRIDES[@]}"; do
-      printf '%s="%s"\n' "$_ovr_var" "$(_cc_shell_escape "${_CC_OVERRIDES[$_ovr_var]}")"   # RF1
+      printf '%s="%s"\n' "$_ovr_var" "$(_cc_shell_escape "${_CC_OVERRIDES[$_ovr_var]}")"
     done
   fi
 }
 
-# M5: fetch the value following a value-taking --create-config override flag, dying cleanly (11)
+# Fetch the value following a value-taking --create-config override flag, dying cleanly (11)
 # instead of crashing under `set -u` when it is missing (e.g. a trailing `--crf` with no value).
 # Mirrors the main parser's _require_val. Sets _cc_val as a SIDE EFFECT (not via stdout: a `die`
 # inside `$(...)` would only exit the subshell, not abort) and must be called bare from
@@ -4300,7 +4299,7 @@ _create_config() {
     esac
   done
 
-  # M1 (Phase 1): validate numeric-only overrides at parse time. These variables only ever hold a
+  # Validate numeric-only overrides at parse time. These variables only ever hold a
   # bare number (optionally with a k/M/G suffix), so anything else is a typo or an injection attempt
   # — reject it with die 11 rather than quoting garbage into the generated config. Same pattern as
   # the main CLI's _validate_rate_arg. Complements the unconditional quoting in _V above.
@@ -4314,7 +4313,7 @@ _create_config() {
     fi
   done
 
-  # Normalize deprecated aliases (L4: single call site via _normalize_profile).
+  # Normalize deprecated aliases (single call site via _normalize_profile).
   _normalize_profile profile
 
   # Validate scope → target path
@@ -4345,7 +4344,7 @@ _create_config() {
     IFS=',' read -ra _cc_mp_list <<< "$profile"
     for _cc_mp in "${_cc_mp_list[@]}"; do
       [[ -z "$_cc_mp" ]] && die 11 "Empty profile name in list: $profile"
-      # Normalize deprecated aliases per element (L4: single call site via _normalize_profile).
+      # Normalize deprecated aliases per element (single call site via _normalize_profile).
       _normalize_profile _cc_mp
       if ! _is_valid_profile "$_cc_mp"; then
         die 11 "Unknown profile: $_cc_mp
@@ -4393,7 +4392,7 @@ _create_config() {
   fi
   # 1.4: explicit chmod rather than relying on the invoking process's umask — matters most for
   # `--create-config system` (/etc/.muxmrc, sourced by every user on the box under the accepted
-  # H1 trust model): a permissive umask could otherwise leave it group/world-writable.
+  # accepted trust model): a permissive umask could otherwise leave it group/world-writable.
   chmod 644 "$_cc_tmp" || { rm -f "$_cc_tmp"; die 1 "Failed to set permissions on $_cc_tmp"; }
   mv -f "$_cc_tmp" "$target_path" || { rm -f "$_cc_tmp"; die 1 "Failed to move generated config into place at $target_path"; }
 
@@ -4458,7 +4457,7 @@ _filtered_args=()
 _i=0
 while (( _i < ${#_prescan_args[@]} )); do
   if [[ "${_prescan_args[$_i]}" == "--" ]]; then
-    # L10: end-of-options. A --profile after -- is a positional, not the flag — stop interpreting
+    # End-of-options: a --profile after -- is a positional, not the flag — stop interpreting
     # --profile and pass -- plus everything after it through untouched (the main parser's `--` arm
     # folds them into POSITIONALS). Mirrors _create_config_prescan's `--` handling. A plain `break`
     # here would DROP -- and the trailing source/target, so slice the remainder in verbatim.
@@ -4497,7 +4496,7 @@ if [[ "${PROFILE_NAME:-}" == *,* ]]; then
     _mp="${_MULTI_PROFILES[$_mp_i]}"
     [[ -z "$_mp" ]] && die 11 "--profile: empty profile name in list '$PROFILE_NAME'"
     _is_valid_profile "$_mp" || die 11 "Unknown profile '${_mp}' in --profile list. Valid: $(_valid_profiles_display)"
-    # M2 (Phase 1): resolve deprecated aliases (e.g. dv-archival → archive) IN the array, before
+    # Resolve deprecated aliases (e.g. dv-archival → archive) IN the array, before
     # anything reads it. _MULTI_PROFILES feeds _probe_profile_ext (which dispatches to
     # apply_profile_<name>), the per-profile output filename, and the child's --profile flag.
     # Without this, _probe_profile_ext("dv-archival") would call the non-existent
@@ -4909,7 +4908,7 @@ _profile_comment() {
     hdr10-hq)                   echo "All the nits, none of the drama." ;;
     atv-directplay-hq)          echo "Shaped to please the most demanding rectangle in your living room." ;;
     atv-directplay-animation)   echo "Studio Ghibli didn't suffer for mov_text." ;;
-    streaming-hevc)             echo "Lean, mean, streaming machine." ;;   # RF12: dropped unreachable 'streaming' alias arm (apply_profile normalizes PROFILE_NAME first)
+    streaming-hevc)             echo "Lean, mean, streaming machine." ;;   # No 'streaming' alias arm — apply_profile normalizes PROFILE_NAME first
     av1-hq)                     echo "Fewer bits, same nits." ;;
     streaming-av1)              echo "Stream smarter, not larger." ;;
     animation)                  echo "psy-rd turned down, sakuga turned up." ;;
@@ -4922,7 +4921,7 @@ _profile_comment() {
 # Dispatcher
 apply_profile() {
   [[ -z "${PROFILE_NAME:-}" ]] && return 0
-  # Resolve deprecated aliases before dispatch (L4: single normalisation path).
+  # Resolve deprecated aliases before dispatch (single normalisation path).
   _normalize_profile PROFILE_NAME
   case "$PROFILE_NAME" in
     archive)                     apply_profile_archive ;;
@@ -5011,7 +5010,7 @@ apply_profile
 # _probe_profile_ext PROFILE — return the OUTPUT_EXT that apply_profile_PROFILE sets.
 # `local OUTPUT_EXT="mp4"` only gives a clean default to read back — apply_profile_* also mutates
 # many OTHER globals (CRF_VALUE, VIDEO_CODEC, …). The real isolation is the command-substitution
-# SUBSHELL at the call site ("$(_probe_profile_ext …)"); callers must invoke it that way. (Phase 5)
+# SUBSHELL at the call site ("$(_probe_profile_ext …)"); callers must invoke it that way.
 _probe_profile_ext() {
   local OUTPUT_EXT="mp4"
   "apply_profile_${1//-/_}" 2>/dev/null || true
@@ -5065,7 +5064,7 @@ _run_multi_profiles() {
   local _ofa _ppi _dropped
   local -i _skip_next=0
   for _ofa in "${_ORIG_FILTERED_ARGS[@]}"; do
-    # RF5: strip the user's --output-ext (and its value) here — the per-profile --output-ext is
+    # Strip the user's --output-ext (and its value) here — the per-profile --output-ext is
     # injected at the child invocation below, and it comes BEFORE _child_flags, so a retained user
     # value would re-override it in the child parser (last --output-ext wins) and mislabel the
     # container (file named .archive.mkv but actually MP4). The user's intent is instead honored by
@@ -5090,7 +5089,7 @@ _run_multi_profiles() {
   local _mp _prof_ext
   for _mp in "${_MULTI_PROFILES[@]}"; do
     if (( _OUTPUT_EXT_EXPLICIT )); then
-      # RF5: an explicit CLI --output-ext applies to EVERY profile, so the per-profile filename
+      # An explicit CLI --output-ext applies to EVERY profile, so the per-profile filename
       # and the child's actual container always agree. This mirrors single-profile behavior, where
       # an explicit --output-ext overrides the profile's natural container. (In multi-profile mode
       # _resolve_output_and_sub_policy is skipped, so OUTPUT_EXT here is exactly the user's CLI
@@ -5225,7 +5224,7 @@ is_valid_preset(){
   esac
 }
 
-# L10: die clearly when a value-taking flag receives another flag as its value.
+# Die clearly when a value-taking flag receives another flag as its value.
 # Empty-string values are allowed (some flags use "" as "no filter").
 _require_val(){
   # Args: $1 = flag name, $2 = remaining arg count ($# at the call site), $3 = value.
@@ -5238,7 +5237,7 @@ _require_val(){
   return 0
 }
 
-# Parse-time validators for the numeric/rate value flags (L3). These reject obvious garbage at
+# Parse-time validators for the numeric/rate value flags. These reject obvious garbage at
 # parse time — the same robustness the CLI already gives CRF — instead of letting it slip through
 # to a mid-encode ffmpeg failure (die 40). Framing is validation-consistency, not security: the
 # user owns their own command line. A sourced .muxmrc bypasses these (it assigns the globals
@@ -5246,7 +5245,7 @@ _require_val(){
 # Args: $1 = flag name (for the message), $2 = the value.
 _validate_level_arg(){ [[ "$2" =~ $_RE_LEVEL ]]   || die 11 "Invalid $1 '$2': expected a numeric H.265/H.264 level like 5.1 or 4.0."; }
 _validate_rate_arg(){  [[ "$2" =~ $_RE_BITRATE ]] || die 11 "Invalid $1 '$2': expected a bitrate like 20000k, 5M, or a plain integer (bits/s)."; }
-# L4: reject an unknown --audio-force-codec encoder at parse time (die 11) instead of letting an
+# Reject an unknown --audio-force-codec encoder at parse time (die 11) instead of letting an
 # encoder muxm can't name an intermediate for surface as a cryptic late die 43 after track scanning.
 # SYNC: this allow-list must stay in step with the real (non-fallback) arms of _audio_codec_ext —
 # every accepted encoder must resolve to a valid intermediate extension there. `alac` is deliberately
@@ -5426,12 +5425,12 @@ while [[ $# -gt 0 ]]; do
       REPLACE_SOURCE=1; shift ;;
     --force-replace-source) FORCE_REPLACE_SOURCE=1; shift ;;
 
-    # L10/cleanup: no `--profile)` arm here — the pre-scan strips every `--profile <val>` before
+    # No `--profile)` arm here — the pre-scan strips every `--profile <val>` before
     # this parser runs, and a post-`--` `--profile` is folded into POSITIONALS by the `--)` arm
     # below, so the token can never reach this case. (The old arm's `shift 2` would also over-shift
     # a lone trailing `--profile`.) A stray `--profile` now correctly hits the unknown-option guard.
 
-    --) shift; POSITIONALS+=("$@"); break ;;  # M1: fold remaining args back in (the `--` end-of-options idiom, e.g. `muxm -- -dashname.mkv`); the arity check below still guards
+    --) shift; POSITIONALS+=("$@"); break ;;  # Fold remaining args back in (the `--` end-of-options idiom, e.g. `muxm -- -dashname.mkv`); the arity check below still guards
     -*) die 11 "Unknown option: $1. $USAGE_SHORT" ;;
     *) POSITIONALS+=("$1"); shift ;;
   esac
@@ -5454,7 +5453,7 @@ _warn_conflict() {
   warn "Profile '$profile' + $flag: $reason"
 }
 
-# L5: shared helpers for near-verbatim Section 13 patterns.
+# Shared helpers for near-verbatim Section 13 patterns.
 
 # Warn when SUB_MULTI_TRACK clashes with flags that force single-track behaviour.
 _warn_multitrack_sub_conflicts(){
@@ -5469,7 +5468,7 @@ _warn_multitrack_sub_conflicts(){
   return 0
 }
 
-# CR-14: --sub-export-external + MKV advisory. Idempotent (one-shot via _EXPORT_MKV_ADVISORY_SHOWN)
+# --sub-export-external + MKV advisory. Idempotent (one-shot via _EXPORT_MKV_ADVISORY_SHOWN)
 # so it can be safely called from BOTH the Section-13 conflict block (where it catches an explicit
 # --output-ext mkv / mkv-setting profile, the only state known pre-resolution — and the only state
 # available in `--print-effective-config` with no source) AND the tail of
@@ -5500,7 +5499,7 @@ _warn_h264_hdr(){
   return 0
 }
 
-# Deferred warning (C6): H.264 cannot carry Dolby Vision. The libx264 path silently drops
+# Deferred warning: H.264 cannot carry Dolby Vision. The libx264 path silently drops
 # the source RPU — the DV RPU-injection gate excludes libx264 (only libx265/hevc_videotoolbox
 # produce a raw HEVC ES suitable for dovi_tool). AV1 + DV already warns and auto-disables DV
 # upstream; this surfaces the previously-silent H.264 case. Must be called POST-PROBE (IS_DV
@@ -5514,13 +5513,13 @@ _warn_h264_drops_dv() {
   return 0
 }
 
-# WI-1b: warn when an explicitly-typed CLI flag is silently ignored by the resolved
+# Warn when an explicitly-typed CLI flag is silently ignored by the resolved
 # backend/codec. Every check is gated on a _CLI_*_EXPLICIT tracker (or, for AV1 rate
 # control, on a non-empty value that no profile sets), so a value supplied by a profile or
 # config never warns. Must be called AFTER detect_hw_accel so HW_ACCEL_RESOLVED and
 # VIDEO_CODEC are known, and before print_effective_config so the warnings are visible
 # (and unit-testable) there.
-# Phrasing note (C1–C4): VideoToolbox can fall back to its software path per-frame
+# Phrasing note: VideoToolbox can fall back to its software path per-frame
 # (allow_sw), in which case the software knobs *would* apply — hence "When the VideoToolbox
 # backend is used". The config-time emission is correct for the overwhelmingly common case.
 _warn_ignored_knobs() {
@@ -5528,7 +5527,7 @@ _warn_ignored_knobs() {
   local _is_x26x=0; [[ "$VIDEO_CODEC" == "libx265" || "$VIDEO_CODEC" == "libx264" ]] && _is_x26x=1
   local _is_av1=0;  _is_av1_codec "$VIDEO_CODEC" && _is_av1=1
 
-  # C1–C4: VideoToolbox ignores the x265/x264 software encode knobs.
+  # VideoToolbox ignores the x265/x264 software encode knobs.
   if (( _vt && _is_x26x )); then
     (( _CLI_CRF_EXPLICIT )) && \
       warn "When the VideoToolbox backend is used it controls quality via -q:v; --crf $CRF_VALUE is ignored. Use --hw-accel-quality to set VideoToolbox quality."
@@ -5542,13 +5541,13 @@ _warn_ignored_knobs() {
     fi
   fi
 
-  # C5: --hw-accel-quality only affects hardware encoders.
+  # --hw-accel-quality only affects hardware encoders.
   if (( _CLI_HW_ACCEL_QUALITY_EXPLICIT )) \
      && [[ "$HW_ACCEL_RESOLVED" != "videotoolbox" && "$HW_ACCEL_RESOLVED" != "nvenc" ]]; then
     warn "--hw-accel-quality has no effect without a hardware backend (current backend: ${HW_ACCEL_RESOLVED:-none})."
   fi
 
-  # C10: --threads caps the software encoder's thread pool (pools= for libx265,
+  # --threads caps the software encoder's thread pool (pools= for libx265,
   # lp= for libsvtav1). A VideoToolbox encode is fixed-function hardware with no
   # software pool to size, so the flag does nothing there. (AV1 + videotoolbox
   # falls back to software libsvtav1, where --threads *does* apply — so this only
@@ -5557,14 +5556,14 @@ _warn_ignored_knobs() {
     warn "--threads has no effect on a VideoToolbox hardware encode (fixed-function; no software thread pool to cap)."
   fi
 
-  # C7: --av1-params / --av1-maxrate / --av1-bufsize apply only to AV1 encodes.
+  # --av1-params / --av1-maxrate / --av1-bufsize apply only to AV1 encodes.
   if (( ! _is_av1 )); then
     if (( _CLI_AV1_PARAMS_EXPLICIT )) || [[ -n "$AV1_MAXRATE" || -n "$AV1_BUFSIZE" ]]; then
       warn "--av1-params/--av1-maxrate/--av1-bufsize apply only to AV1 encodes; ignored for $VIDEO_CODEC."
     fi
   fi
 
-  # C8: --x265-params / --x264-params apply only to their own codec.
+  # --x265-params / --x264-params apply only to their own codec.
   if (( _CLI_X265_PARAMS_EXPLICIT )) && [[ "$VIDEO_CODEC" != "libx265" ]]; then
     warn "--x265-params applies only to the libx265 encoder; ignored for $VIDEO_CODEC."
   fi
@@ -5572,7 +5571,7 @@ _warn_ignored_knobs() {
     warn "--x264-params applies only to the libx264 encoder; ignored for $VIDEO_CODEC."
   fi
 
-  # C9: --level has no effect on AV1 encodes.
+  # --level has no effect on AV1 encodes.
   if (( _CLI_LEVEL_EXPLICIT )) && (( _is_av1 )); then
     warn "--level has no effect on AV1 encodes."
   fi
@@ -5651,7 +5650,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       # There is no conflict check here for it because OUTPUT_EXT is not yet resolved at this point.
 
       # No MKV warning: MKV Direct Plays on Apple TV via Plex/Infuse (the native TV.app
-      # requires MP4, but that is not a footgun worth a conflict warning). See WI-5.
+      # requires MP4, but that is not a footgun worth a conflict warning).
       # MOV is unusual but works
       _warn_container_unusual "$PROFILE_NAME" "mov" \
         "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play."
@@ -5669,7 +5668,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
 
     atv-directplay-animation)
       # No MKV warning: MKV Direct Plays on Apple TV via Plex/Infuse (passthrough may also
-      # produce MKV — that is intentional and supported). See WI-5.
+      # produce MKV — that is intentional and supported).
       # MOV is unusual
       _warn_container_unusual "$PROFILE_NAME" "mov" \
         "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play."
@@ -5814,7 +5813,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
   if (( SUB_BURN_FORCED )) && (( ! SUB_INCLUDE_FORCED )); then
     warn "[Subs] Forced-subtitle burn-in is enabled, but forced subtitles are excluded — there is nothing to burn."
   fi
-  # CR-14: fires here for an explicit --output-ext mkv / mkv-setting profile (the only state known
+  # Fires here for an explicit --output-ext mkv / mkv-setting profile (the only state known
   # pre-resolution, and the only state available under --print-effective-config with no source).
   # Passthrough profiles whose OUTPUT_EXT resolves to mkv only later are caught by the twin call at
   # the tail of _resolve_output_and_sub_policy; the one-shot guard makes whichever runs first win.
@@ -5868,15 +5867,15 @@ if [[ -n "${PROFILE_NAME:-}" ]] && [[ "$HW_ACCEL_RESOLVED" != "none" ]]; then
   esac
 fi
 
-# WI-1b: surface explicitly-typed CLI flags that the resolved backend/codec silently
-# ignores (C1–C5, C7–C9). Runs after detect_hw_accel (HW_ACCEL_RESOLVED known) and before
+# Surface explicitly-typed CLI flags that the resolved backend/codec silently
+# ignores. Runs after detect_hw_accel (HW_ACCEL_RESOLVED known) and before
 # print_effective_config so the warnings appear there. Gated on _CLI_*_EXPLICIT.
 _warn_ignored_knobs
 
 
 # True (rc 0) iff $1 is one of the Apple TV Direct-Play profiles. These share the same Direct-Play
 # contract (single-layer DV P8.1, copy-if-compliant, ≤50 Mbps) and must be gated together
-# everywhere; a single literal `== atv-directplay-hq` silently excludes the animation sibling (CR-2).
+# everywhere; a single literal `== atv-directplay-hq` silently excludes the animation sibling.
 # Route Direct-Play-intent checks through here so a future Direct-Play profile inherits the gate by
 # being added in one place. MUST be defined BEFORE _resolve_output_and_sub_policy (its first caller),
 # which runs at top level on the print-effective-config path well before Section 26 — defining it in
@@ -5888,7 +5887,7 @@ _is_atv_directplay_profile() {
 # _resolve_output_and_sub_policy — resolve the final output container and the ATV subtitle
 # policy from the source/output filenames and the active profile. Extracted from Section 15
 # so --print-effective-config (Section 13) can resolve the same way and report the RESOLVED
-# config (D4) instead of pre-resolution globals. Called exactly once per run (the diagnostic
+# config instead of pre-resolution globals. Called exactly once per run (the diagnostic
 # path exits before Section 15; the normal path skips the diagnostic block), but each sub-block
 # is self-gating so a repeat call would be a no-op.
 # Reads/writes globals: OUTPUT_EXT, _OUTPUT_EXT_EXPLICIT, SUB_PRESERVE_TEXT_FORMAT,
@@ -5932,7 +5931,7 @@ _resolve_output_and_sub_policy(){
   # ---- atv-directplay-hq / atv-directplay-animation: MKV-output subtitle adjustment ----
   # When either ATV profile produces MKV output (via passthrough or explicit --output-ext mkv),
   # enable native ASS/SSA format and PGS bitmap preservation — UNLESS the user explicitly asked
-  # otherwise on the CLI (D1: gate on _CLI_SUB_PRESERVE_*_EXPLICIT so --no-… is not clobbered).
+  # otherwise on the CLI (gate on _CLI_SUB_PRESERVE_*_EXPLICIT so --no-… is not clobbered).
   if _is_atv_directplay_profile "${PROFILE_NAME:-}" && [[ "$OUTPUT_EXT" == "mkv" ]]; then
     if (( ! _CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT )); then
       SUB_PRESERVE_TEXT_FORMAT=1
@@ -5944,7 +5943,7 @@ _resolve_output_and_sub_policy(){
     fi
   fi
 
-  # CR-14: now that OUTPUT_EXT is fully resolved, fire the export-external+MKV advisory for the
+  # Now that OUTPUT_EXT is fully resolved, fire the export-external+MKV advisory for the
   # passthrough case the Section-13 conflict block could not see (OUTPUT_EXT was "" there). One-shot
   # guarded, so if the conflict block already warned (explicit mkv) this is a no-op — no double-warn.
   _warn_export_external_mkv
@@ -6078,9 +6077,9 @@ EOF
   exit 0
 }
 
-# D4: when --print-effective-config is requested, resolve the output container + ATV subtitle
+# When --print-effective-config is requested, resolve the output container + ATV subtitle
 # policy FIRST (mirroring Section 15) so the diagnostic reports what the encode will actually do
-# — not pre-resolution globals (which mis-reported OUTPUT_EXT and masked the D1 SUB_PRESERVE_*
+# — not pre-resolution globals (which mis-reported OUTPUT_EXT and masked the SUB_PRESERVE_*
 # clobber). Resolution needs a source path to derive passthrough/inferred containers; with no
 # source we leave OUTPUT_EXT empty and print_effective_config shows "<pending: needs source>".
 # Multi-profile mode prints per child downstream, so skip resolution there (each child resolves
@@ -6098,7 +6097,7 @@ if (( PRINT_EFFCONF )); then
 fi
 
 # ===== Section 14: Tool validation ============================================================
-# F5: if a complete ffmpeg (libass + AV1) is installed as the keg-only `ffmpeg-full` but the one
+# If a complete ffmpeg (libass + AV1) is installed as the keg-only `ffmpeg-full` but the one
 # on PATH is incomplete, prefer the keg so all features work (it emits a note when it switches).
 _prefer_complete_ffmpeg
 need ffmpeg
@@ -6139,7 +6138,7 @@ if _is_av1_codec "$VIDEO_CODEC"; then
   fi
 fi
 
-# Same fail-fast preflight for the software x26x encoders (M5) — runs after detect_hw_accel so
+# Same fail-fast preflight for the software x26x encoders — runs after detect_hw_accel so
 # HW_ACCEL_RESOLVED is known (the HW path uses hevc_videotoolbox/hevc_nvenc, not libx265/libx264).
 _preflight_sw_video_encoder
 
@@ -6185,12 +6184,12 @@ case "$OUTPUT_EXT" in
 esac
 
 # Re-validate CRF_VALUE after config load: a sourced config can assign directly to the
-# declare -i variable, bypassing the CLI parser guard (C1).
+# declare -i variable, bypassing the CLI parser guard.
 if [[ ! "$CRF_VALUE" =~ ^[0-9]+$ ]] || (( CRF_VALUE > 51 )); then
   die 11 "Invalid CRF_VALUE from config: integer 0–51 expected (got: ${CRF_VALUE})"
 fi
 
-# Re-validate the level/rate value flags after config load, mirroring the CRF re-check (L3): a
+# Re-validate the level/rate value flags after config load, mirroring the CRF re-check: a
 # sourced .muxmrc assigns these directly, bypassing the parse-time guards above. LEVEL_VALUE,
 # AV1_MAXRATE, and AV1_BUFSIZE are optional (blank = let the encoder decide), so gate on -n;
 # STEREO_BITRATE always has a value (default 192k).
@@ -6226,7 +6225,7 @@ fi
 # ---- Resolve output container + ATV subtitle policy -----------------------------------------
 # Output-filename inference, container passthrough, and the ATV MKV subtitle adjustment all live
 # in _resolve_output_and_sub_policy (Section 13) so --print-effective-config can resolve the same
-# way and report the post-resolution config (D4). Only runs in single-profile mode (multi-profile
+# way and report the post-resolution config. Only runs in single-profile mode (multi-profile
 # dispatched and exited above); SRC_ABS is validated, OUT is set.
 _resolve_output_and_sub_policy
 # ---- End output container + subtitle policy resolution --------------------------------------
@@ -6262,7 +6261,7 @@ if [[ "$SRC_ABS" -ef "$OUT_ABS" ]]; then
     note "Source will be replaced (--force-replace-source): $SRC_ABS"
   elif (( REPLACE_SOURCE )); then
     printf '⚠️  Are you sure you want the original file replaced? (y/n) '
-    read -r _confirm || _confirm=""  # M6: REPLACE_SOURCE via .muxmrc bypasses the --replace-source TTY guard; treat a non-interactive EOF as a decline (clean die 11 below) instead of an ERR-trap crash
+    read -r _confirm || _confirm=""  # REPLACE_SOURCE via .muxmrc bypasses the --replace-source TTY guard; treat a non-interactive EOF as a decline (clean die 11 below) instead of an ERR-trap crash
     if [[ "$_confirm" == [Yy]* ]]; then
       _REPLACING_SOURCE=1
       note "Source will be replaced (confirmed): $SRC_ABS"
@@ -6290,7 +6289,7 @@ if (( ! FFMPEG_OVERWRITE )) && [[ -f "$OUT_ABS" ]]; then
   die 11 "Output file already exists (--no-overwrite): $OUT_ABS — remove --no-overwrite to overwrite, or choose a different output path."
 fi
 
-# Temp output file name (L1): mktemp creates a 0600 file, then we delete it and re-add the
+# Temp output file name: mktemp creates a 0600 file, then we delete it and re-add the
 # extension so the muxer writes to a name with the right suffix. NOTE on the TOCTOU window — the
 # mktemp name is NOT a secret: an attacker with write access to OUT_DIR can read it from a
 # directory listing and, in the gap between the rm below and ffmpeg's open, plant a symlink at
@@ -6298,7 +6297,7 @@ fi
 # writable OUT_DIR (an attacker with write access there already controls the output location);
 # the random name only thwarts blind pre-creation, not an attacker who observes the listing.
 # Honest severity is Low (it needs a hostile OUT_DIR). mktemp --suffix would avoid the rm→reuse
-# but is not portable to BSD/macOS. CR-8: the same observe-then-symlink class — and the same Low
+# but is not portable to BSD/macOS. The same observe-then-symlink class — and the same Low
 # severity and hostile-OUT_DIR precondition — covers ALL the predictable post-run artifacts written
 # into OUT_DIR with a deterministic name via `>` / `cp -f` / `mkdir -p` (which follow a pre-planted
 # symlink): write_checksum's ${OUT}.${algo}, write_json_report's ${OUT%.ext}.report.json, _persist_log's
@@ -6362,7 +6361,7 @@ WORKDIR="$(
 [[ -n "$WORKDIR_BASE" ]] && note "Workdir relocated to: $WORKDIR (intermediates kept off the output volume)"
 LOGFILE="$WORKDIR/muxm.$(date +%Y%m%d-%H%M%S).log"
 
-# RF12: arm the EXIT trap NOW — immediately after the workdir exists — instead of later (before the
+# Arm the EXIT trap NOW — immediately after the workdir exists — instead of later (before the
 # output-lock acquisition). This closes the sub-second window in which a SIGINT/SIGTERM between
 # workdir creation and the old arm point would leak the (possibly multi-GB) workdir. on_exit is safe
 # to run with the still-partial state here: _drain_tee no-ops while TEE_PID/TERM_FD are empty (the tee
@@ -6384,7 +6383,7 @@ trap 'on_exit' EXIT
 # After this section:
 #   stdout/stderr → tee → log file + terminal
 #   FD 3          → raw terminal (bypasses tee)
-# The tee block now runs UNCONDITIONALLY — including under DEBUG=1 (Phase 6 decouple). Previously
+# The tee block now runs UNCONDITIONALLY — including under DEBUG=1. Previously
 # DEBUG skipped it entirely so `set -x` xtrace wouldn't flood the logfile through the tee, which
 # left the one mode you most want a persistent log producing none. Instead we keep the tee and
 # siphon xtrace to the raw terminal FD (see BASH_XTRACEFD below), so the logfile stays clean.
@@ -6402,7 +6401,7 @@ _STEP_T0=$SECONDS   # baseline for per-step timing (mark_done)
 # FD 3 bypasses tee so \r-based progress UI doesn't pollute the log file.
 exec 3>&2
 TERM_FD=3
-# DEBUG decouple (Phase 6, option a): point `set -x` xtrace at the raw terminal (FD 3) so the trace
+# DEBUG decouple: point `set -x` xtrace at the raw terminal (FD 3) so the trace
 # stays on screen as before, but does NOT flow through the tee into the logfile. Must be set before
 # the tee redirect below; on_exit runs `set +x` before closing FD 3 so no traced command writes to
 # a closing descriptor.
@@ -6419,7 +6418,7 @@ _LOG_READY=1   # tee is live: note/warn/say now reach the log via the tee; log()
 note "Logging to $(realpath_fallback "$LOGFILE")"
 # Self-describing log: dump the resolved effective config (log-only, captured via $() so it
 # never reaches the terminal) so "why did it do X" is answerable from the file alone.
-# NOTE: as of Phase 2 print_effective_config runs on EVERY normal run (not just under
+# NOTE: print_effective_config runs on EVERY normal run (not just under
 # --print-effective-config), so it is on the hot path — every variable it references must stay
 # ${x:-}-guarded (set -u-safe), or an unguarded addition would crash every run, not just the
 # diagnostic flag. Keep it side-effect-free.
@@ -6475,7 +6474,7 @@ _reclaim() {
   local f="${1:-}" reason="${2:-}"
   (( DRY_RUN )) && return 0
   [[ -n "$f" && -e "$f" ]] || return 0
-  # CR-12: require a non-empty WORKDIR before the prefix guard. If WORKDIR were ever empty the
+  # Require a non-empty WORKDIR before the prefix guard. If WORKDIR were ever empty the
   # `"$WORKDIR"/*` pattern degenerates to `/*`, matching any absolute path and defeating the
   # containment check. Not reachable today (WORKDIR is set before any _reclaim), but mirrors the
   # `-n "$WORKDIR"` precondition in _cleanup_workdir — defense-in-depth for a deletion path.
@@ -6605,7 +6604,7 @@ _persist_failure_bundle() {
 }
 
 on_exit() {
-  # M2: disarm ERR alongside INT/TERM/EXIT. This does NOT by itself keep cleanup running — `trap ''
+  # Disarm ERR alongside INT/TERM/EXIT. This does NOT by itself keep cleanup running — `trap ''
   # ERR` only suppresses the on_error handler; `set -e` still exits on a failing command regardless.
   # What actually prevents the leak is GUARDING the failure-prone final steps below (the `if ! mv`
   # and `write_checksum || warn`) so a failed mv/checksum never trips set -e and aborts on_exit
@@ -6617,7 +6616,7 @@ on_exit() {
   # Clean up subtitle burn-in temp file (lives inside WORKDIR; explicit removal before workdir cleanup)
   [[ -n "${_BURN_SRT_FILTER:-}" && -f "$_BURN_SRT_FILTER" ]] && rm -f "$_BURN_SRT_FILTER"
 
-  # M4: release our output lock if (and only if) we acquired it. Gated on _OUT_LOCK_HELD so the
+  # Release our output lock if (and only if) we acquired it. Gated on _OUT_LOCK_HELD so the
   # multi-profile parent (exits before acquiring) and a refused concurrent run never remove the
   # lock that another live run owns. Runs on every exit path, including SIGINT/SIGTERM.
   if (( ${_OUT_LOCK_HELD:-0} )) && [[ -n "${OUT_LOCK_PATH:-}" ]]; then
@@ -6635,14 +6634,14 @@ on_exit() {
   fi
 
   # Note: fd 3 (TERM_FD) is intentionally kept open here so the drain can restore
-  # stdout/stderr to it before waiting on the tee process (H6).
+  # stdout/stderr to it before waiting on the tee process.
 
   if (( FAILED == 0 && have_result == 1 )); then
     if (( DRY_RUN )); then
       [[ -f "$TMP_OUT" ]] && rm -f "$TMP_OUT"
       note "DRY-RUN complete — no real files were created."
     else
-      # M2: surface a failed final mv/checksum cleanly (the ERR trap is disarmed above, so these no
+      # Surface a failed final mv/checksum cleanly (the ERR trap is disarmed above, so these no
       # longer abort cleanup) — warn and skip the success banner rather than claiming success.
       local _mv_ok=1
       if [[ -f "$TMP_OUT" ]] && ! mv -f "$TMP_OUT" "$OUT"; then
@@ -6679,7 +6678,7 @@ on_exit() {
     (( _persist_ok )) && _cleanup_workdir 0
     exit 0
   else
-    # Phase 3 (Adjustments): decide up front whether this failure will KEEP artifacts (-k/-K/DEBUG).
+    # Decide up front whether this failure will KEEP artifacts (-k/-K/DEBUG).
     # If so, we rename the hidden workdir to a visible sibling IN PLACE (below, after the tee drains)
     # rather than copying a duplicate KB bundle out and leaving the multi-GB workdir hidden. The
     # rename is a cheap same-fs op on the workdir's OWN volume — under --workdir it stays on the roomy
@@ -6702,7 +6701,7 @@ on_exit() {
       _diag_dir="$VISIBLE_DEBUG_DIR"
     fi
 
-    # Failure summary (D7): the detailed cause is printed ONCE — by die()/on_error() at the
+    # Failure summary: the detailed cause is printed ONCE — by die()/on_error() at the
     # failure site (_ERROR_PRINTED=1) — so this line stays terse and just folds in the exit code
     # and the durable diagnostics location. Only when no cause was printed (SIGINT/SIGTERM, or no
     # output produced) do we surface the reason here. Printed BEFORE the tee drains so it is
@@ -6732,7 +6731,7 @@ on_exit() {
     # inside it — can be renamed/copied safely.
     _drain_tee
     if (( _keep_failure_artifacts )); then
-      # Phase 3 keep path: rename the hidden workdir to its visible sibling IN PLACE and skip
+      # Keep path: rename the hidden workdir to its visible sibling IN PLACE and skip
       # the separate copy-out. One user-visible set of artifacts (log + *.err + the intermediates),
       # no KB duplication, no cross-volume copy — the rename needs no extra disk even when the
       # failure was "output disk full". Guard on the same .muxm.tmp. pattern that gates the rm -rf.
@@ -6765,7 +6764,7 @@ on_exit() {
 # mkdir — portable across macOS and Linux, where flock(1) (util-linux) is unavailable. Keyed to the
 # OUTPUT (not the source) so two runs cannot clobber the same $OUT. A pid file inside names the owner
 # for the liveness check. The computed path is stored in OUT_LOCK_PATH so acquire and release (on_exit)
-# never drift. Released in on_exit, gated on _OUT_LOCK_HELD. (M4)
+# never drift. Released in on_exit, gated on _OUT_LOCK_HELD.
 _acquire_out_lock() {
   OUT_LOCK_PATH="$(dirname "$OUT")/.$(basename "$OUT").lock"
   local lock="$OUT_LOCK_PATH" owner tries=0 empty_tries=0
@@ -6774,7 +6773,7 @@ _acquire_out_lock() {
     if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
       die 11 "Another muxm run (PID $owner) is already writing to this output: $OUT — wait for it to finish, choose a different output path, or remove the stale lock with: rm -rf '$lock'"
     fi
-    # L2: an empty/unreadable pid file may simply mean the holder just won the mkdir race but has
+    # An empty/unreadable pid file may simply mean the holder just won the mkdir race but has
     # not yet written its pid (the write happens immediately AFTER mkdir succeeds — see below). Do
     # not treat that sub-millisecond window as a stale lock to reclaim: give the holder a brief moment
     # to populate the pid and re-check, and only fall through to reclaim if it stays empty. A present
@@ -6792,7 +6791,7 @@ _acquire_out_lock() {
   _OUT_LOCK_HELD=1
 }
 
-# M4: the EXIT trap is already armed (just after workdir creation, RF12) so the lock is guaranteed to
+# The EXIT trap is already armed (just after workdir creation) so the lock is guaranteed to
 # be released, and the print-config / multi-profile early exits are already behind us — take an
 # advisory lock on $OUT so two concurrent runs can't clobber each other's output, report, or log.
 # Dry runs write nothing — skip.
@@ -6941,7 +6940,7 @@ disk_free_warn() {
         libsvt-av1|libaom-av1) preset_mult="$(_av1_preset_multiplier "$PRESET_VALUE")" ;;
         *)                     preset_mult="$(_preset_multiplier "$PRESET_VALUE")" ;;
       esac
-      # shellcheck disable=SC2017 # Early division order is intentional: prevents signed-64-bit overflow on long 4K sources (H5).
+      # shellcheck disable=SC2017 # Early division order is intentional: prevents signed-64-bit overflow on long 4K sources.
       est_video_bytes=$(( vbr / 8 * dur / 1000 * ratio / 1000 * preset_mult ))
       # Floor a degenerate (collapsed-to-zero) re-encode estimate against a
       # source-derived estimate, so a stale/odd bit_rate tag can't defeat the guard.
@@ -6965,7 +6964,7 @@ disk_free_warn() {
     for (( i=0; i<max_tracks; i++ )); do
       local a_info a_codec a_channels _a_lang a_bitrate _a_title
       a_info="$(_audio_stream_info "$i")"
-      _split_tab "$a_info" a_codec a_channels _a_lang a_bitrate _a_title _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
+      _split_tab "$a_info" a_codec a_channels _a_lang a_bitrate _a_title _ _ _  # Non-collapsing split: sink the trailing disposition fields
 
       local -i ch=0
       [[ "$a_channels" =~ ^[0-9]+$ ]] && ch="$a_channels"
@@ -7063,7 +7062,7 @@ disk_free_warn() {
 
   # D15: confirm the preflight passed (a note → suppressed by --quiet, shown otherwise). The
   # workdir volume holds the multi-GB intermediates, so its free space is the meaningful figure.
-  # L (Phase 5): if df produced nothing (unavailable / unusual mount), say so explicitly instead
+  # If df produced nothing (unavailable / unusual mount), say so explicitly instead
   # of failing open silently — the user should know the free-space guard did not actually run.
   if [[ -n "${wd_avail_kb:-}" ]]; then
     note "Disk OK — ~$(_gb "$(( wd_avail_kb * 1024 ))")GB free on the working volume."
@@ -7100,7 +7099,7 @@ cache_stream_metadata() {
 # double quote, then the common control characters as their short forms (\n \r \t), then EVERY
 # remaining ASCII control byte (< 0x20) as \uXXXX. That last pass is what makes a crafted path or
 # track title (a `"` in a filename, a BEL/0x07 in a tag) unable to break the report's key/line
-# structure or emit a control byte that violates the JSON grammar (M1). NUL (0x00) can't occur —
+# structure or emit a control byte that violates the JSON grammar. NUL (0x00) can't occur —
 # a bash string cannot hold it.
 _json_escape() {
   local s="${1//\\/\\\\}"
@@ -7149,7 +7148,7 @@ write_json_report() {
     fi
     printf '}\n'
   } > "$report_path" 2>/dev/null; then
-    note "JSON report written → $report_path"   # L (Phase 5): only claim "written" on success
+    note "JSON report written → $report_path"   # Only claim "written" on success
   else
     warn "Failed to write JSON report to $report_path"
   fi
@@ -7191,7 +7190,7 @@ check_skip_if_ideal() {
         fi
         ;;
       mov)
-        # C1: without this arm a non-.mov source requested as .mov fell through with
+        # Without this arm a non-.mov source requested as .mov fell through with
         # ideal=1 and was hardlinked into a .mov name — a Matroska/MP4 byte stream in a
         # mislabeled container. Require an actual .mov source to skip into a .mov output.
         if [[ "$src_ext" != "mov" ]]; then
@@ -7199,7 +7198,7 @@ check_skip_if_ideal() {
         fi
         ;;
       *)
-        # C1: defensive default — any future/unknown OUTPUT_EXT must never silently
+        # Defensive default — any future/unknown OUTPUT_EXT must never silently
         # false-skip into a mislabeled container. Force a remux instead.
         ideal=0; reason="container .$OUTPUT_EXT has no skip-if-ideal rule"
         ;;
@@ -7223,7 +7222,7 @@ check_skip_if_ideal() {
       fi
     fi
   elif (( ideal )) && (( AUDIO_LOSSLESS_PASSTHROUGH )); then
-    # L1: single-track WITH lossless passthrough. The two arms above both skip this case, so
+    # Single-track WITH lossless passthrough. The two arms above both skip this case, so
     # `ideal` would otherwise rest on video+container alone. But the single-track keep-list loop
     # below filters audio through _sii_audio_is_container_safe and SILENTLY excludes a
     # container-unsafe codec (e.g. FLAC/DTS-HD MA in an .mp4 — the MP4/MOV whitelist is
@@ -7312,7 +7311,7 @@ check_skip_if_ideal() {
       _sii_s_n="$(_sub_count)"
       for (( _sii_s_i=0; _sii_s_i<_sii_s_n; _sii_s_i++ )); do
         _sii_s_info="$(_sub_stream_info "$_sii_s_i")"
-        _sii_s_codec="${_sii_s_info%%$'\t'*}"  # C2: codec is the first field — non-collapsing by construction
+        _sii_s_codec="${_sii_s_info%%$'\t'*}"  # Codec is the first field — non-collapsing by construction
         _sii_s_codec="${_sii_s_codec,,}"
         if [[ "$MUX_FORMAT" == "matroska" ]] || _is_text_sub_codec "$_sii_s_codec"; then
           SII_SUB_INDICES+=("$_sii_s_i")
@@ -7357,7 +7356,7 @@ _probe_field(){
 # same values, same "" default for an absent/null field (matching _probe_field's own `// empty`).
 # Uses _split_tab, NOT a plain `IFS=$'\t' read`, since any of these fields can legitimately be
 # empty and a plain read would collapse/shift the remaining fields (tab is IFS-whitespace — see
-# _split_tab's own C2 note).
+# _split_tab's own note about non-collapsing splits).
 # Args: $1-$4 — namerefs to fill, in order: pix_fmt, color_primaries, color_transfer, color_space
 #       $5 — (optional) source file path, only used in the pre-cache ffprobe fallback
 # Globals: METADATA_CACHE (read), FFPROBE_FLAGS (read)
@@ -7495,7 +7494,7 @@ decide_color_and_pixfmt() {
     else
       tgt_pix="yuv420p"
     fi
-    # Honor FORCE_CHROMA_420=0 by preserving source chroma on the SDR path (H8).
+    # Honor FORCE_CHROMA_420=0 by preserving source chroma on the SDR path.
     if (( ! FORCE_CHROMA_420 )) && [[ "$chroma" != "420" ]]; then
       local _cbit="p"
       (( is_10bit )) && _cbit="p10le"
@@ -7526,7 +7525,7 @@ decide_color_and_pixfmt() {
 build_x265_params() {
   X265_PARAMS="$X265_PARAMS_BASE"
 
-  # Strip all baked HDR10/PQ color keys from X265_PARAMS_BASE up front (H9, L7): some profiles bake
+  # Strip all baked HDR10/PQ color keys from X265_PARAMS_BASE up front: some profiles bake
   # hdr10=1/transfer=smpte2084/colorprim=bt2020/etc. in, which must NOT signal PQ on non-PQ (HLG/SDR)
   # content and must be de-duplicated before the HDR10 path re-appends them. Both color paths start
   # from this clean slate, so the strip — previously duplicated verbatim in both branches — is hoisted
@@ -7543,7 +7542,7 @@ build_x265_params() {
   if [[ "$PROFILE_DESC" == "HDR10" ]]; then
     X265_PARAMS="${X265_PARAMS}:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited"
   elif [[ "$PROFILE_DESC" == "HLG" ]]; then
-    # HLG: inject the correct HLG color signaling (H9).
+    # HLG: inject the correct HLG color signaling.
     X265_PARAMS="${X265_PARAMS}:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc"
   fi
   # (SDR / SDR-TONEMAP and anything else: stripped, nothing appended.)
@@ -7589,7 +7588,7 @@ build_av1_params() {
 # master_display / max_cll flags — ffmpeg 6.0+ carries input side data
 # forward to the muxer, which writes the correct MP4 atoms (colr/mdcv/clli)
 # or MKV Colour/MasteringMetadata elements automatically (verified in the
-# Phase 2 HDR10 and DV spikes).
+# HDR10 and DV spikes).
 #
 # Reads:  VIDEO_ENCODER_FFMPEG, VIDEO_CODEC, HW_ACCEL_QUALITY, VT_QUALITY_MAP,
 #         VT_QUALITY_DEFAULT, PROFILE_NAME, HW_ACCEL_ALLOW_SW, OUTPUT_EXT,
@@ -7618,7 +7617,7 @@ build_videotoolbox_params() {
   # Encoder-specific profile + container tag.
   case "$VIDEO_ENCODER_FFMPEG" in
     hevc_videotoolbox)
-      # RF12: hevc_videotoolbox encodes only 4:2:0 (8-bit Main / 10-bit Main10). Reject a 4:2:2/4:4:4
+      # hevc_videotoolbox encodes only 4:2:0 (8-bit Main / 10-bit Main10). Reject a 4:2:2/4:4:4
       # target up front with a clean error instead of forwarding an unsupported pix_fmt into a VT
       # encode that would fail cryptically mid-run. (Software libx265 honors 4:2:2/4:4:4; VT does not.)
       if [[ "$TARGET_PIXFMT" == *422* || "$TARGET_PIXFMT" == *444* ]]; then
@@ -7651,7 +7650,7 @@ build_videotoolbox_params() {
 # (consumed via -x265-params / -svtav1-params / -x264-params in the video
 # pipeline); hardware backends populate their own arg arrays.
 #
-# Phase 2: the VideoToolbox arm populates VIDEOTOOLBOX_ARGS[]. The software
+# The VideoToolbox arm populates VIDEOTOOLBOX_ARGS[]. The software
 # HEVC param builder (build_x265_params) is still invoked even when VT is in
 # effect, because --print-effective-config and downstream DV conversion code
 # may reference X265_PARAMS — harmless for VT encodes, and preserves behavior
@@ -7676,7 +7675,7 @@ build_video_encoder_params() {
 # resolve_video_encoder — map (VIDEO_CODEC, HW_ACCEL_RESOLVED) to the concrete
 # ffmpeg `-c:v` argument, applying compatibility gates along the way.
 #
-# Phase 2 wires the VideoToolbox arm. Dolby Vision is NOT a gate: the DV
+# The VideoToolbox arm is wired here. Dolby Vision is NOT a gate: the DV
 # pipeline (Section 26) extracts the RPU from the source and injects it into
 # the encoded bitstream post-hoc via dovi_tool, which is encoder-agnostic.
 # Frame-count parity is already verified at the end of run_video_pipeline, so
@@ -7725,7 +7724,7 @@ resolve_video_encoder() {
   fi
 
   # OS guard: hardware acceleration is supported on macOS (Apple VideoToolbox) only.
-  # On Linux, fall back to software and warn exactly once here (H11).
+  # On Linux, fall back to software and warn exactly once here.
   if [[ "$(uname -s)" != "Darwin" ]]; then
     warn "Hardware acceleration is currently supported on macOS (VideoToolbox) only. Falling back to software encoding."
     HW_ACCEL_FALLBACK_REASON="Linux hardware acceleration is not supported in this release (software fallback)."
@@ -7840,7 +7839,7 @@ _source_has_dv_metadata() {
 # "8") read directly from the DOVI configuration record in the metadata cache, or
 # nothing if the source carries no DV side data. Read-only: writes no globals and
 # emits no notes/report, so it is safe to call from the skip-if-ideal copy gate,
-# where IS_DV/DV_SRC_PROFILE are not yet populated (C1). Mirrors the JSON arm of
+# where IS_DV/DV_SRC_PROFILE are not yet populated. Mirrors the JSON arm of
 # detect_dv_info().
 # Globals: METADATA_CACHE (read)
 _source_dv_profile() {
@@ -7890,7 +7889,7 @@ detect_dv_info() {
 
   # Seed the output-profile vars to the source values. This is correct for the
   # genuine P8 passthrough path (output stays 8.<source-compat>); the P7/P5→P8.1
-  # convert-success branch in run_video_pipeline overrides these to 8/1 (CR-1).
+  # convert-success branch in run_video_pipeline overrides these to 8/1.
   DV_OUT_PROFILE="$DV_SRC_PROFILE"
   DV_OUT_COMPAT_ID="$DV_SRC_COMPAT_ID"
 
@@ -7971,7 +7970,7 @@ _dv_mp4box_wrap(){
   # Defense-in-depth: require BOTH values to be plain integers before feeding them into the
   # mp4box `:dvp=PROFILE.COMPAT_ID` hint. Safe in practice (DOVI-box integers can't carry : or =),
   # but a numeric guard keeps a malformed probe value from ever reaching the mp4box arg string.
-  # CR-1: consume the OUTPUT profile (8.1 after a P7/P5 convert; otherwise the source value) so
+  # Consume the OUTPUT profile (8.1 after a P7/P5 convert; otherwise the source value) so
   # the dvcC box never mis-signals a converted single-layer stream.
   if [[ "${DV_OUT_PROFILE:-}" =~ ^[0-9]+$ && "${DV_OUT_COMPAT_ID:-}" =~ ^[0-9]+$ ]]; then
     dvp_hint=":dvp=${DV_OUT_PROFILE}.${DV_OUT_COMPAT_ID}"
@@ -8014,7 +8013,7 @@ verify_dv_container_record() {
   fi
 
   if printf '%s\n' "$out_probe" | grep -qiE "$DV_CONTAINER_PATTERN"; then
-    # CR-1: a DOVI record being *present* is not enough on the converted path — MP4Box's
+    # A DOVI record being *present* is not enough on the converted path — MP4Box's
     # `:dvp=` overrides the written dv_profile regardless of the RPU NALs, so a stale source
     # value here ships a container that mis-signals the (now single-layer P8.1) stream. When
     # this run converted P7/P5 → P8.1 (DV_OUT_PROFILE=8), assert the *value*, not just presence.
@@ -8067,7 +8066,7 @@ verify_dv_container_record() {
 
     # If mp4box produced a dvcC-bearing video MP4, remux it with audio/subs from original output.
     if (( fallback_ok )); then
-      # L6 (known, accepted): dv_final lives in WORKDIR, so the `mv -f "$dv_final" "$TMP_OUT"` below
+      # Known, accepted: dv_final lives in WORKDIR, so the `mv -f "$dv_final" "$TMP_OUT"` below
       # is cross-filesystem when --workdir puts WORKDIR on a different volume than OUT_DIR — there it
       # degrades to a full copy+unlink of the multi-GB DV file (and is not atomic). Kept in WORKDIR
       # deliberately: a failed fallback remux is then auto-cleaned with WORKDIR instead of orphaning
@@ -8079,13 +8078,13 @@ verify_dv_container_record() {
       remux_cmd+=(-map 0:v:0)          # Video from mp4box mux
       remux_cmd+=(-map 1:a? -map 1:s?) # Audio + subs from original mux
       remux_cmd+=(-c copy)
-      # D9 (verified non-issue): no -map_metadata/-map_chapters override is needed here even
+      # Verified non-issue: no -map_metadata/-map_chapters override is needed here even
       # under --strip-metadata / --no-keep-chapters. Input 0 ($dv_video_mp4) is a *raw HEVC ES*
       # wrapped by mp4box, so it carries no source-origin global metadata and no chapters (only
       # mp4box's own major_brand/encoder/creation_time tags, the GPAC analogue of ffmpeg's
       # muxer tags on the normal path). Input 1 ($TMP_OUT) was already produced by mux_final in
       # the post-strip state, so ffmpeg's default chapter copy reflects the flag too. The earlier
-      # audit (D9) suspected an input-0 leak; ffprobe of a real wrapped ES confirmed none.
+      # audit suspected an input-0 leak; ffprobe of a real wrapped ES confirmed none.
       remux_cmd+=(-strict unofficial -tag:v dvh1)
       remux_cmd+=(-movflags +faststart)
       remux_cmd+=(-f "$MUX_FORMAT" "$dv_final")
@@ -8219,7 +8218,7 @@ declare -a SUB_MT_LANGS=()        # language tag per kept track
 declare -a SUB_MT_TITLES=()       # title tag per kept track (empty if unset)
 declare -a SUB_MT_TYPES=()        # "forced" | "full" | "sdh" per kept track
 
-# ── Unified subtitle track list (Subs_Fix Phase 2) ──────────────────────────
+# ── Unified subtitle track list ─────────────────────────────────────────────
 # One data model shared by both selectors (single-track build_subtitle_plan and
 # multi-track run_subtitle_pipeline_multi) and consumed by the one emitter
 # (_emit_sub_tracks in mux_final). Each index is one output subtitle track.
@@ -8238,12 +8237,12 @@ declare -a SUB_MT_TYPES=()        # "forced" | "full" | "sdh" per kept track
 #   CODEC       — desired -c:s codec ("copy" | "srt" | "mov_text") or the source
 #                 codec name for the emitter to decide from.
 #   DISPOSITION — "forced" | "hearing_impaired" | "0".
-#   ROUTING     — "embed" (default) | "burn" | "export". Phases 4–5 populate this;
-#                 the emitter only emits ROUTING=embed tracks (burn/export are
-#                 handled by the video-burn / external-export paths respectively).
+#   ROUTING     — "embed" (default) | "burn" | "export". The subtitle selectors
+#                 populate this; the emitter only emits ROUTING=embed tracks (burn/export
+#                 are handled by the video-burn / external-export paths respectively).
 #
-# Additive in Phase 2: declared and unit-tested, but nothing populates or reads
-# these yet — the selectors and emitter are wired up in Phases 3–5.
+# Populated by the subtitle selectors (merge_subtitle_sources / build_subtitle_plan)
+# and consumed by _emit_sub_tracks in mux_final.
 declare -a SUB_TRACKS_KIND=()
 declare -a SUB_TRACKS_VALUE=()
 declare -a SUB_TRACKS_LANG=()
@@ -8304,11 +8303,11 @@ _sub_track_field() {
   esac
 }
 
-# ── Shared subtitle emitter (Subs_Fix Phase 3) ──────────────────────────────
+# ── Shared subtitle emitter ─────────────────────────────────────────────────
 # The one place that turns chosen subtitle tracks into ffmpeg input/-map/-c:s/
-# metadata/disposition arguments, for BOTH single- and multi-track modes. Built
-# and unit-tested here; mux_final is wired to call _emit_sub_tracks in Phases 4–5
-# (multi first, then single). These functions mutate the mux_final-scoped arrays
+# metadata/disposition arguments, for BOTH single- and multi-track modes.
+# mux_final calls _emit_sub_tracks (multi first, then single).
+# These functions mutate the mux_final-scoped arrays
 # and counters: ff_in, ff_map, ff_codec, next_idx, _src_input_idx, _ext_sub_paths,
 # _ext_sub_idxs (bash dynamic scope — they are mux_final locals at call time).
 
@@ -8326,7 +8325,7 @@ _sub_track_field() {
 #     Added as a DEDUPLICATED -i input (same path reused, not re-added) and mapped
 #     as "$idx:s:0".
 #
-# Out-of-scope (Subs_Fix.md §8): embedded subs are mapped without -copyts, so a
+# Out-of-scope: embedded subs are mapped without -copyts, so a
 # source whose container start_time != 0 leaves the same small residual offset the
 # multi-track path already has today — deliberately not compensated here.
 _add_sub_stream() {
@@ -8371,14 +8370,14 @@ _add_sub_stream() {
 # (SUB_TRACKS_CODEC = the codec of the data actually muxed: the source stream codec
 # for embedded tracks, the prepared-file codec for file tracks; both selectors set
 # it). This is the pre-unification multi-track codec case verbatim, so multi-track
-# output is identical by construction (Phase 4 populates SUB_TRACKS_CODEC from
-# SUB_MT_CODECS):
+# output is identical by construction (the multi-track selector populates
+# SUB_TRACKS_CODEC from SUB_MT_CODECS):
 #   MKV     : ass/ssa → copy if SUB_PRESERVE_TEXT_FORMAT else srt; everything else
 #             (other text or bitmap) → copy (stream-copied).
 #   MP4/MOV : text → mov_text; bitmap (PGS/VobSub) → die 12 (can't live in MP4).
 # (The old single-track _sub_codec_for_file emitted `srt` for a prepared text file;
 # the unified rule emits `copy` instead — identical subrip output in MKV, just a
-# different command token. Single-track folds onto this in Phase 5.)
+# different command token. Single-track folds onto this same rule.)
 # Title + disposition derive from TYPE (forced→Forced/forced, sdh→SDH/
 # hearing_impaired, *→<Type>/0), a near-verbatim lift of the pre-unification
 # mux_final logic; SUB_TRACKS_DISPOSITION carries the same resolved value for a
@@ -8471,7 +8470,7 @@ declare -a ALL_SUB_TITLES=()      # title tag per entry (empty for external file
 # directly (color_primaries/transfer/space + pix_fmt) and reads only config that is
 # already set at skip time, so it is correct on BOTH the normal pipeline path AND
 # the skip-if-ideal path — where TARGET_PIXFMT is not yet computed and still holds
-# its "yuv420p" default (the C1 bug). This mirrors the 4:2:0 bit-depth arm of
+# its "yuv420p" default (the stale-pixfmt bug). This mirrors the 4:2:0 bit-depth arm of
 # decide_color_and_pixfmt() (its source of truth — keep the two in sync if that
 # logic changes). It does NOT replicate decide's SDR 4:4:4/4:2:2 chroma-preservation
 # branch, which downgrades a forced-10-bit target back to 8-bit for an 8-bit source;
@@ -8538,7 +8537,7 @@ _video_is_copy_compliant() {
 
   # Pixel-format (bit-depth) gate. Self-sufficient so it is correct on BOTH the
   # normal pipeline path AND the skip-if-ideal path, where TARGET_PIXFMT is not yet
-  # computed and still holds its "yuv420p" default (C1). Decide the INTENDED output
+  # computed and still holds its "yuv420p" default. Decide the INTENDED output
   # bit depth from the profile/SDR config + freshly-probed source color metadata
   # (_output_pixfmt_is_10bit) instead of reading the stale TARGET_PIXFMT, and detect
   # the source's depth with decide_color_and_pixfmt's own 10-bit predicate.
@@ -8559,7 +8558,7 @@ _video_is_copy_compliant() {
     fi
   fi
 
-  # RF2 (HIGH-2): forced-subtitle burn-in requires a re-encode — a stream-copy cannot
+  # Forced-subtitle burn-in requires a re-encode — a stream-copy cannot
   # burn the forced track into the video. Gate on the config flag SUB_BURN_FORCED (set at
   # both call sites, unlike the runtime SRT_FORCED_BURN_PATH which is not yet populated when
   # check_skip_if_ideal calls us). Without this, the copy branch returned 0 before the burn
@@ -8572,7 +8571,7 @@ _video_is_copy_compliant() {
     return 1
   fi
 
-  # RF2b (HIGH-2, secondary): reject copy when chroma downsampling is required — a 4:2:2/4:4:4
+  # Reject copy when chroma downsampling is required — a 4:2:2/4:4:4
   # source under a Direct-Play profile (FORCE_CHROMA_420=1) must be re-encoded to 4:2:0, not
   # shipped verbatim. Chroma is read from the source pix_fmt exactly as decide_color_and_pixfmt
   # derives it.
@@ -8588,7 +8587,7 @@ _video_is_copy_compliant() {
   # detect_dv_info have run, so IS_DV/DV_SRC_PROFILE are authoritative (and stay so
   # for frame-probe-only or text-fallback DV, where the cache JSON has no DOVI
   # record). On the skip-if-ideal path they are still their defaults (IS_DV=0,
-  # DV_SRC_PROFILE="") — the C1 bug — so fall back to a read-only probe of the
+  # DV_SRC_PROFILE="") on the skip-if-ideal path — so fall back to a read-only probe of the
   # source's DV profile from the metadata cache.
   if (( ! DISABLE_DV )) && _is_atv_directplay_profile "${PROFILE_NAME:-}"; then
     local _cc_is_dv="$IS_DV" _cc_dv_profile="${DV_SRC_PROFILE:-}"
@@ -8804,7 +8803,7 @@ run_video_pipeline() {
   # for any MKV output path.
   #
   # Both libx265 and hevc_videotoolbox produce raw Annex B HEVC suitable for
-  # dovi_tool inject-rpu (verified in the Phase 2 DV spike — RPU round-trips
+  # dovi_tool inject-rpu (RPU round-trips
   # bit-perfect through VT). VIDEO_ENCODER_FFMPEG captures both cases.
   local -i v_needs_raw_es=0
   if { [[ "$VIDEO_ENCODER_FFMPEG" == "libx265" ]] || [[ "$VIDEO_ENCODER_FFMPEG" == "hevc_videotoolbox" ]]; } \
@@ -8843,7 +8842,7 @@ run_video_pipeline() {
   local -a vf_filters=()
   local -a encode_args=()
   local _enc_cwd=""    # if set, run the encode ffmpeg from this dir (forced-sub burn-in)
-  local thread_args=()   # RF9: expanded array-safe below (empty when THREADS unset — bash-4.3 set -u)
+  local thread_args=()   # Expanded array-safe below (empty when THREADS unset — bash-4.3 set -u)
   [[ -n "${THREADS:-}" ]] && thread_args=(-threads "$THREADS")
 
   # Tone-mapping filter (universal profile: HDR→SDR)
@@ -8891,7 +8890,7 @@ run_video_pipeline() {
   # Dispatch on VIDEO_ENCODER_FFMPEG (set by resolve_video_encoder). This is
   # the concrete ffmpeg `-c:v` value and captures both software and hardware
   # backends for each logical codec. AV1 (libsvtav1/libaom-av1) remains
-  # software-only in Phase 2; HEVC/H.264 may route to VideoToolbox when
+  # software-only; HEVC/H.264 may route to VideoToolbox when
   # HW_ACCEL_RESOLVED=videotoolbox.
   case "$VIDEO_ENCODER_FFMPEG" in
     libsvtav1|libaom-av1)
@@ -8924,7 +8923,7 @@ run_video_pipeline() {
 
     libx264)
       # H.264 software encode (universal / youtube-upload profile)
-      # F9: H.264 output is always 8-bit 4:2:0 (yuv420p) for universal device compatibility —
+      # H.264 output is always 8-bit 4:2:0 (yuv420p) for universal device compatibility —
       # the only chroma/depth H.264 decoders are guaranteed to play. TARGET_PIXFMT/FORCE_CHROMA_420
       # are intentionally NOT honored here (4:2:2/4:4:4 or 10-bit H.264 has poor device support and
       # no profile selects libx264 for HDR). The hevc_videotoolbox/libx265 arms do honor TARGET_PIXFMT.
@@ -9149,7 +9148,7 @@ run_video_pipeline() {
       note "Source DV is Profile ${DV_SRC_PROFILE} — will convert to Profile 8 after injection…"
       dv_needs_convert=1
 
-      # F8: Profile 5 carries an IPT-PQ-c2 ("ICtCp") base layer, not a standard BT.2020 image.
+      # Profile 5 carries an IPT-PQ-c2 ("ICtCp") base layer, not a standard BT.2020 image.
       # muxm decodes and re-encodes that base layer as-is, and `dovi_tool convert -d` rewrites
       # ONLY the RPU — the base-layer pixels are never color-converted out of IPT. So a P5→P8.1
       # conversion is best-effort: on non-DV players (which ignore the RPU) the base layer may
@@ -9246,7 +9245,7 @@ run_video_pipeline() {
     if (( _conv_rc == 0 )) && [[ -s "$V_MIXED" ]]; then
       note "DV profile converted (P${DV_SRC_PROFILE} → P8.1)"
       report_add "dv_rpu_action" "converted P${DV_SRC_PROFILE} → P8.1"
-      # CR-1: the muxed stream is now single-layer P8.1 — the container dvcC/dvvC
+      # The muxed stream is now single-layer P8.1 — the container dvcC/dvvC
       # box must signal 8.1, NOT the stale source profile. Override the output vars.
       DV_OUT_PROFILE=8; DV_OUT_COMPAT_ID=1
       # video_injected is now superseded by the converted V_MIXED — reclaim it.
@@ -9423,9 +9422,9 @@ run_video_pipeline() {
         # Stamp source fps as an INPUT option (raw-hevc demuxer defaults to 25/50fps).
         local -a fps_in2=()
         [[ -n "$SRC_FPS" ]] && fps_in2=(-r "$SRC_FPS")
-        # CR-5/RF9: array-safe expansion — a bare "${fps_in2[@]}" raises `unbound variable`
+        # Array-safe expansion — a bare "${fps_in2[@]}" raises `unbound variable`
         # under set -u on bash < 4.4 (documented floor 4.3) when SRC_FPS is empty (0-element
-        # array). Matches the four sibling fps expansions; see the RF9 note above (~fps_arg).
+        # array). Matches the four sibling fps expansions; see the note above (~fps_arg).
         ffmpeg "${FFMPEG_FLAGS[@]}" \
              ${fps_in2[@]+"${fps_in2[@]}"} \
              -i "$V_MIXED" \
@@ -9478,11 +9477,11 @@ _audio_stream_count(){
 # _probe_stream_field TYPE IDX FIELD — echo FIELD of the IDX-th stream of codec_type TYPE from the
 # metadata cache (single jq call). FIELD is a jq path under the stream object, so a container tag
 # is reached by passing "tags.<name>". The _audio_*/_sp_sub_* field+tag accessors are one-line
-# wrappers over this (L7 — they were four byte-identical bodies differing only in the type string).
+# wrappers over this (they were four byte-identical bodies differing only in the type string).
 # Globals: METADATA_CACHE (read)
 _probe_stream_field(){
   local type="$1" idx="$2" field="$3"
-  # RF12 (E4): no head -n1 — `.[$idx].$field // empty` selects ONE stream's scalar field, so jq emits
+  # No head -n1 — `.[$idx].$field // empty` selects ONE stream's scalar field, so jq emits
   # at most a single line already; the head was redundant.
   _jq_cache -r \
     "[.streams[] | select(.codec_type==\"$type\")] | .[$idx].$field // empty" || true
@@ -9565,7 +9564,7 @@ _audio_descriptive_title() {
 # Args: $1 — codec name (lowercased)
 # Globals: AUDIO_CODEC_PREFERENCE (read), _AUDIO_CODEC_RANK_CACHE/_AUDIO_CODEC_RANK_PREF (r/w)
 _audio_codec_rank(){
-  # Cache is per-subshell — each $(...) invocation starts fresh (L1).
+  # Cache is per-subshell — each $(...) invocation starts fresh.
   declare -gA _AUDIO_CODEC_RANK_CACHE 2>/dev/null || true
   local codec="$1"
   if [[ "$AUDIO_CODEC_PREFERENCE" != "$_AUDIO_CODEC_RANK_PREF" ]]; then
@@ -9587,13 +9586,13 @@ _audio_codec_rank(){
 # Check if a language tag matches any entry in AUDIO_LANG_PREF.
 # Both the stream tag and each pref entry are run through _norm_lang_code, so 2-letter
 # and 3-letter codes (and 639-2/B vs /T variants) match symmetrically: `en`↔`eng`,
-# `ja`↔`jpn`, `fre`↔`fra` (H2). Returns 0 (true) if the tag matches, 1 otherwise.
+# `ja`↔`jpn`, `fre`↔`fra`. Returns 0 (true) if the tag matches, 1 otherwise.
 # Args: $1 — language tag (e.g., "en", "eng", "spa", "und")
 # Globals: AUDIO_LANG_PREF (read)
 _audio_lang_matches(){
   local lang pref
-  local -a prefs   # Phase 5: declare local (sibling _sub_lang_matches does) — don't leak to global scope
-  # CR-6: empty AUDIO_LANG_PREF (the documented keep-all `--audio-lang-pref ""`) yields a
+  local -a prefs   # Declare local (sibling _sub_lang_matches does) — don't leak to global scope
+  # Empty AUDIO_LANG_PREF (the documented keep-all `--audio-lang-pref ""`) yields a
   # 0-element prefs array; `for pref in "${prefs[@]}"` aborts under set -u on bash < 4.4.
   # Guard at entry (empty pref matches nothing — callers treat empty as keep-all upstream),
   # mirroring the `-n` gating the other call sites already apply and the _sub_lang_matches note.
@@ -9609,7 +9608,7 @@ _audio_lang_matches(){
 }
 
 # Subtitle analogue of _audio_lang_matches: does a subtitle language tag match any
-# entry in SUB_LANG_PREF, normalizing BOTH sides via _norm_lang_code (H2)? This closes
+# entry in SUB_LANG_PREF, normalizing BOTH sides via _norm_lang_code? This closes
 # the embedded-vs-external asymmetry — an embedded `en` sub now survives an `eng` filter,
 # matching how external `movie.en.srt` (parsed to `eng`) is already treated.
 # An empty/whitespace-only SUB_LANG_PREF matches nothing here; callers gate on
@@ -9618,7 +9617,7 @@ _audio_lang_matches(){
 _sub_lang_matches(){
   local lang pref
   local -a prefs
-  # CR-6 (symmetry/defense-in-depth): same empty-array footgun as _audio_lang_matches.
+  # Symmetry/defense-in-depth: same empty-array footgun as _audio_lang_matches.
   [[ -n "$SUB_LANG_PREF" ]] || return 1
   lang="$(_norm_lang_code "$1")"
   IFS=',' read -r -a prefs <<< "$SUB_LANG_PREF"
@@ -9646,14 +9645,14 @@ _audio_is_commentary(){
 # in a single jq call (replaces separate jq forks per stream).
 # Returns: codec\tchannels\tlanguage\tbit_rate\ttitle\tdisposition.comment\t
 #          disposition.visual_impaired\tdisposition.hearing_impaired  (tab-delimited)
-# RF3: the three trailing disposition flags (0/1) let _score_audio_stream demote a
+# The three trailing disposition flags (0/1) let _score_audio_stream demote a
 # flagged-but-untitled commentary/description track and let the stereo paths drop one
 # without separate disposition jq probes. They are APPENDED after title (which has the full
 # control range stripped, so it is one field) — every _split_tab consumer of this record reads
 # the extra fields (real vars or `_` sinks) so the flags never fold into `title`.
-# RF8 (security): title AND language are sanitized at extraction — the full C0 control range plus
+# Security: title AND language are sanitized at extraction — the full C0 control range plus
 # DEL (jq gsub on U+0000..U+001F and U+007F) is replaced with a space, so a hostile track title
-# can't inject terminal escape sequences into output or the persistent log. (This subsumes the
+# can't inject terminal escape sequences into output or the persistent log. (This subsumes an
 # earlier \t\n\r-only strip on title.)
 # Args: $1 — audio stream index (0-based, relative to audio streams)
 # Globals: METADATA_CACHE (read)
@@ -9729,8 +9728,8 @@ _score_audio_stream(){
   # Single jq call fetches all fields at once
   local info codec lang ch br title rank score comment vi hi
   info="$(_audio_stream_info "$idx")"
-  # RF3: also read the three disposition flags (comment / visual_impaired / hearing_impaired).
-  _split_tab "$info" codec ch lang br title comment vi hi  # C2: non-collapsing — preserve empty lang/title
+  # Also read the three disposition flags (comment / visual_impaired / hearing_impaired).
+  _split_tab "$info" codec ch lang br title comment vi hi  # Non-collapsing split — preserve empty lang/title
 
   _normalize_codec_lang codec lang
   [[ -z "$ch" || ! "$ch" =~ ^[0-9]+$ ]] && ch=0
@@ -9771,7 +9770,7 @@ _score_audio_stream(){
     score=$(( score + br_bonus ))
   fi
 
-  # Commentary/descriptive track penalty — RF3: demote on the DISPOSITION flags
+  # Commentary/descriptive track penalty — demote on the DISPOSITION flags
   # (comment / visual_impaired / hearing_impaired), not just a title keyword. A track
   # flagged disposition.comment with an empty/non-English title would otherwise escape
   # the penalty and, under the default codec preference (lossless mains rank last), could
@@ -9804,7 +9803,7 @@ select_best_audio(){
       # Fetch full record for the overridden track so caller can destructure (L2b).
       local _ov_info _ov_codec _ov_ch _ov_lang _ov_br _ov_title
       _ov_info="$(_audio_stream_info "$AUDIO_TRACK_OVERRIDE")"
-      _split_tab "$_ov_info" _ov_codec _ov_ch _ov_lang _ov_br _ov_title _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
+      _split_tab "$_ov_info" _ov_codec _ov_ch _ov_lang _ov_br _ov_title _ _ _  # Non-collapsing split: sink the trailing disposition fields
       _normalize_codec_lang _ov_codec _ov_lang
       [[ -z "$_ov_ch"  || ! "$_ov_ch"  =~ ^[0-9]+$ ]] && _ov_ch=0
       [[ -z "$_ov_br"  || ! "$_ov_br"  =~ ^[0-9]+$ ]] && _ov_br=0
@@ -9820,18 +9819,18 @@ select_best_audio(){
   if (( AUDIO_PREFER_STEREO )); then
     local ps_best_line="" ps_best_score=-999999
     for (( i=0; i<n; i++ )); do
-      # RF3: read channels/title/disposition from the single _audio_stream_info record
+      # Read channels/title/disposition from the single _audio_stream_info record
       # (collapses the two separate disposition jq probes this loop used to fork per stream).
       local ps_info ps_ch ps_lang ps_title ps_comment ps_vi ps_hi ps_line ps_score
       ps_info="$(_audio_stream_info "$i")"
-      _split_tab "$ps_info" _ ps_ch ps_lang _ ps_title ps_comment ps_vi ps_hi  # C2: non-collapsing (codec/br unused here)
+      _split_tab "$ps_info" _ ps_ch ps_lang _ ps_title ps_comment ps_vi ps_hi  # Non-collapsing split (codec/br unused here)
       [[ -z "$ps_ch" || ! "$ps_ch" =~ ^[0-9]+$ ]] && ps_ch=0
       (( ps_ch != 2 )) && continue
       _audio_is_commentary "$ps_title" && continue
       (( ps_comment )) && continue
       (( ps_vi )) && continue
       (( ps_hi )) && continue
-      # RF4: honor AUDIO_LANG_PREF — skip a wrong-language stereo so an English-preferring
+      # Honor AUDIO_LANG_PREF — skip a wrong-language stereo so an English-preferring
       # encode of an English-5.1 + foreign-2.0 source does not pick the foreign stereo. Only
       # gates when a preference is set; an empty AUDIO_LANG_PREF keeps the old language-agnostic
       # behavior. When no preferred-language stereo exists, the loop finds nothing and falls
@@ -9883,7 +9882,7 @@ select_best_audio(){
       local marker=""
       # The record's trailing title/raw_br fields are irrelevant to this score-summary line, but
       # _split_tab must still consume all 7 fields (else s_lang would absorb the remainder) — sink
-      # them into `_`. (C2: non-collapsing split.)
+      # them into `_`. (Non-collapsing split.)
       _split_tab "${score_lines[$i]}" s_score s_idx s_codec s_ch s_lang _ _
       [[ "$s_idx" == "$best_idx" ]] && marker=" ★"
       score_summary+="#${s_idx}: ${s_codec} ${s_ch}ch [${s_lang}] = ${s_score}${marker}  "
@@ -9891,12 +9890,12 @@ select_best_audio(){
     log "• Score: ${score_summary% }"
   fi
 
-  # Guard: if scoring produced no winner (all tracks failed), default to track 0 (M5).
+  # Guard: if scoring produced no winner (all tracks failed), default to track 0.
   if [[ -z "$best_line" ]]; then
     warn "Audio scoring failed for all tracks; defaulting to track 0."
     local _g_info _g_codec _g_ch _g_lang _g_br _g_title
     _g_info="$(_audio_stream_info "0")"
-    _split_tab "$_g_info" _g_codec _g_ch _g_lang _g_br _g_title _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
+    _split_tab "$_g_info" _g_codec _g_ch _g_lang _g_br _g_title _ _ _  # Non-collapsing split: sink the trailing disposition fields
     _normalize_codec_lang _g_codec _g_lang
     [[ -z "$_g_ch" || ! "$_g_ch" =~ ^[0-9]+$ ]] && _g_ch=0
     [[ -z "$_g_br" || ! "$_g_br" =~ ^[0-9]+$ ]] && _g_br=0
@@ -9909,7 +9908,7 @@ select_best_audio(){
 }
 
 # _split_tab RECORD VAR1 [VAR2 …] — split RECORD on LITERAL tabs into the named variables,
-# PRESERVING empty middle fields (C2). A plain `IFS=$'\t' read` collapses empty/leading fields
+# PRESERVING empty middle fields. A plain `IFS=$'\t' read` collapses empty/leading fields
 # because tab is IFS-whitespace, so an untagged-language or untitled audio track (empty MIDDLE
 # field in codec⇥ch⇥lang⇥br⇥title) shifted its bitrate into the next variable and silently wrote
 # garbage like `language=640000` into the output metadata. Manual %%/#-parameter-expansion splits
@@ -9935,7 +9934,7 @@ _split_tab(){
 }
 
 # _parse_audio_record — split a select_best_audio record (idx\tcodec\tch\tlang\ttitle\traw_br) into
-# six globals, PRESERVING empty fields. Thin wrapper over _split_tab (C2): a plain `IFS=$'\t' read`
+# six globals, PRESERVING empty fields. Thin wrapper over _split_tab: a plain `IFS=$'\t' read`
 # collapses an empty MIDDLE field (tab is IFS-whitespace), so an untitled track shifted its bitrate
 # into `title` and left the bitrate empty. _split_tab never collapses, so an empty title stays
 # empty and raw_br lands in _AREC_BR.
@@ -9947,7 +9946,7 @@ _parse_audio_record(){
 # Check whether a TARGET DEVICE can Direct Play this audio codec — independent of MUX_FORMAT.
 # This answers the device-capability question ("will Apple TV / Plex Direct Play stream-copy this
 # track untouched?"), NOT the container question ("can this container physically hold the codec?").
-# The two were conflated (F1): aliasing _sii_audio_is_container_safe() made EVERY codec "copyable"
+# The two were conflated: aliasing _sii_audio_is_container_safe() made EVERY codec "copyable"
 # on a matroska target, so atv-directplay-* / streaming-* (MKV) would stream-copy TrueHD/DTS-HD MA
 # the device cannot Direct Play, instead of transcoding to E-AC-3 as documented. The whitelist
 # below is the real device set; container fitness stays in _sii_audio_is_container_safe() /
@@ -9986,7 +9985,7 @@ audio_lossless_muxable(){
 _sii_audio_is_container_safe() {
   local codec="$1"
   [[ "$MUX_FORMAT" == "matroska" ]] && return 0
-  # MP4/MOV/M4V: whitelist — only these codecs are safe to mux (M2)
+  # MP4/MOV/M4V: whitelist — only these codecs are safe to mux
   case "$MUX_FORMAT" in
     mp4|mov|m4v)
       case "$codec" in
@@ -10027,7 +10026,7 @@ _audio_codec_ext() {
     libmp3lame)         echo "mp3" ;;
     libvorbis)          echo "ogg" ;;
     aac)                echo "aac" ;;
-    # L4: the AAC encoder variants (libfdk_aac, AudioToolbox aac_at) produce raw AAC that has no
+    # The AAC encoder variants (libfdk_aac, AudioToolbox aac_at) produce raw AAC that has no
     # bare-`.libfdk_aac`/`.aac_at` muxer — wrap in .m4a (mirrors _audio_copy_ext's alac→m4a). Without
     # this, a --audio-force-codec libfdk_aac/aac_at transcode named the intermediate after the raw
     # encoder, ffmpeg could not choose a muxer, and the run die 43'd late (the crash this map prevents).
@@ -10069,7 +10068,7 @@ audio_transcode_target(){
   elif (( ch >= 6 )); then
     echo "eac3 $EAC3_BITRATE_5_1"
   else
-    # D7: the ≤2ch (stereo/mono) aac transcode honors --stereo-bitrate (STEREO_BITRATE),
+    # The ≤2ch (stereo/mono) aac transcode honors --stereo-bitrate (STEREO_BITRATE),
     # not a hard-coded 192k. Default STEREO_BITRATE is "192k", so the default is unchanged.
     echo "aac ${STEREO_BITRATE:-192k}"
   fi
@@ -10114,11 +10113,11 @@ _build_audio_keep_list(){
   for (( i=0; i<n; i++ )); do
     local info codec lang ch br title comment vi hi
     info="$(_audio_stream_info "$i")"
-    # CR-3: capture the three trailing disposition flags (comment / visual_impaired /
+    # Capture the three trailing disposition flags (comment / visual_impaired /
     # hearing_impaired) instead of sinking them — the commentary filter below ORs them in,
     # mirroring _score_audio_stream so a disposition-flagged but untitled/foreign-titled
     # commentary/AD track is dropped, not just one matched by the title keyword regex.
-    _split_tab "$info" codec ch lang br title comment vi hi  # C2: non-collapsing — preserve empty lang/title
+    _split_tab "$info" codec ch lang br title comment vi hi  # Non-collapsing split — preserve empty lang/title
     _normalize_codec_lang codec lang
 
     # Filter 1: language
@@ -10129,7 +10128,7 @@ _build_audio_keep_list(){
       fi
     fi
 
-    # Filter 2: commentary — RF3/CR-3: drop on the DISPOSITION flags too, not just a title keyword.
+    # Filter 2: commentary — drop on the DISPOSITION flags too, not just a title keyword.
     if (( ! AUDIO_KEEP_COMMENTARY )) && { _audio_is_commentary "$title" || (( comment )) || (( vi )) || (( hi )); }; then
       dropped_reasons+=("#$i: ${codec} ${ch}ch [$lang] — commentary/descriptive")
       continue
@@ -10180,7 +10179,7 @@ run_audio_pipeline_multi(){
   if [[ -z "$keep_list" ]]; then
     local _n_audio; _n_audio="$(_audio_stream_count)"
     if (( _n_audio > 0 )); then
-      # H3: the language/commentary filter dropped EVERY audio track, but the source HAS
+      # The language/commentary filter dropped EVERY audio track, but the source HAS
       # audio. Never silently ship a video-only file — fall back to the best-scored track and
       # warn loudly (mirrors select_best_audio's single-track "default to track 0" guard).
       local _fallback_idx
@@ -10215,7 +10214,7 @@ run_audio_pipeline_multi(){
     # 5.5: capture the three disposition flags (previously sunk) — same predicate
     # _build_audio_keep_list uses to filter, reused here (not re-derived) so the commentary
     # signal can never drift between "was this kept" and "is this commentary".
-    _split_tab "$info" codec ch lang br title comment vi hi  # C2: non-collapsing
+    _split_tab "$info" codec ch lang br title comment vi hi  # Non-collapsing split
     _normalize_codec_lang codec lang
 
     AUDIO_MT_INDICES+=("$idx")
@@ -10244,7 +10243,7 @@ run_audio_pipeline_multi(){
   for (( i=0; i<n_total; i++ )); do
     local _ainfo _c _ch_i _l _br_i _t pretty marker=""
     _ainfo="$(_audio_stream_info "$i")"
-    _split_tab "$_ainfo" _c _ch_i _l _br_i _t _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
+    _split_tab "$_ainfo" _c _ch_i _l _br_i _t _ _ _  # Non-collapsing split: sink the trailing disposition fields
     _normalize_codec_lang _c _l
     [[ -z "$_br_i" || ! "$_br_i" =~ ^[0-9]+$ ]] && _br_i=0
 
@@ -10317,7 +10316,7 @@ run_audio_pipeline(){
     elif [[ -n "${AUDIO_FORCE_CODEC:-}" ]]; then
       note "[Audio] Keeping a single audio track: --audio-force-codec is set (multi-track mode off)."
     else
-      # D5: --prefer-stereo / --stereo-fallback are single-track intents; multi-track mode
+      # --prefer-stereo / --stereo-fallback are single-track intents; multi-track mode
       # copies all source audio tracks as-is and cannot honor them. Announce rather than
       # silently ignore (says == does). Gated on _CLI_*_EXPLICIT so the warning fires ONLY when
       # the user actually typed the flag — never for a value carried by a profile/config or the
@@ -10347,7 +10346,7 @@ run_audio_pipeline(){
   for (( i=0; i<n; i++ )); do
     local _ainfo _c _ch_i _l _br_i _t pretty
     _ainfo="$(_audio_stream_info "$i")"
-    _split_tab "$_ainfo" _c _ch_i _l _br_i _t _ _ _  # C2: non-collapsing (RF3: sink trailing disposition fields)
+    _split_tab "$_ainfo" _c _ch_i _l _br_i _t _ _ _  # Non-collapsing split: sink the trailing disposition fields
     _normalize_codec_lang _c _l
     [[ -z "$_br_i" || ! "$_br_i" =~ ^[0-9]+$ ]] && _br_i=0
 
@@ -10355,7 +10354,7 @@ run_audio_pipeline(){
     log "  $pretty"
   done
 
-  # F9: guard the bitrate suffix with (( br > 0 )) — a 0/absent bitrate must not render ", 0kbps"
+  # Guard the bitrate suffix with (( br > 0 )) — a 0/absent bitrate must not render ", 0kbps"
   # (mirrors the per-stream display loop above). br is numeric here (normalized by select_best_audio).
   local _sel_br_suffix=""
   (( br > 0 )) && _sel_br_suffix=", $((br/1000))kbps"
@@ -10370,7 +10369,7 @@ run_audio_pipeline(){
   A_PRIMARY_LANG="$lang"
   A_PRIMARY_TITLE="${title:-}"
   A_PRIMARY_CHANNELS="$ch"
-  # Stereo-fallback defaults (F7): a downmix is AAC in the primary's language. A native stereo
+  # Stereo-fallback defaults: a downmix is AAC in the primary's language. A native stereo
   # track (copy or transcode) overrides these with its own codec/language in the block below.
   A_STEREO_LANG="$lang"
   A_STEREO_CODEC="aac"
@@ -10417,7 +10416,7 @@ run_audio_pipeline(){
     else
       read -r _ tgt_br <<< "$(audio_transcode_target "$effective_ch")"
       if [[ "$tgt_codec" == "aac" ]]; then
-        # L (Phase 5): honor STEREO_BITRATE instead of a hardcoded 256k. Masked today because
+        # Honor STEREO_BITRATE instead of a hardcoded 256k. Masked today because
         # `universal` (the only profile forcing AAC) sets STEREO_BITRATE=256k, but --stereo-bitrate
         # / a .muxmrc override was silently ignored on the force-AAC path.
         tgt_br="$STEREO_BITRATE"
@@ -10428,7 +10427,7 @@ run_audio_pipeline(){
     fi
   # Step 2: Lossless passthrough (if enabled and codec is lossless)
   elif (( AUDIO_LOSSLESS_PASSTHROUGH )) && audio_is_lossless "$codec"; then
-    # F4: only stream-copy untouched when the container can hold the codec AND the channel count
+    # Only stream-copy untouched when the container can hold the codec AND the channel count
     # is uncapped. A MAX_AUDIO_CHANNELS cap (effective_ch < ch) cannot be applied to a lossless
     # copy, so a capped source must fall through to transcode (which applies -ac) — the same
     # `(( effective_ch == ch ))` guard Steps 1 and 3 already carry.
@@ -10440,7 +10439,7 @@ run_audio_pipeline(){
       # Lossless but either can't mux into the target container OR the channel cap applies —
       # transcode to the best compatible codec (effective_ch is enforced via -ac downstream).
       read -r tgt_codec tgt_br <<< "$(audio_transcode_target "$effective_ch")"
-      # D3: --audio-force-bitrate overrides the auto bitrate for any transcoded non-lossless
+      # --audio-force-bitrate overrides the auto bitrate for any transcoded non-lossless
       # output, not just the --audio-force-codec path (Step 1, above). No double-apply: this is
       # a separate elif branch from Step 1.
       [[ -n "${AUDIO_FORCE_BITRATE:-}" ]] && tgt_br="$AUDIO_FORCE_BITRATE"
@@ -10460,7 +10459,7 @@ run_audio_pipeline(){
   # Step 4: Fallback → transcode to eac3 (surround) or aac (stereo)
   else
     read -r tgt_codec tgt_br <<< "$(audio_transcode_target "$effective_ch")"
-    # D3: --audio-force-bitrate overrides the auto bitrate here too (standalone, no forced
+    # --audio-force-bitrate overrides the auto bitrate here too (standalone, no forced
     # codec). Separate elif from Step 1, so no double-apply. (The bitrate is logged once after
     # the channel cap below, so it reflects the final post-cap value.)
     [[ -n "${AUDIO_FORCE_BITRATE:-}" ]] && tgt_br="$AUDIO_FORCE_BITRATE"
@@ -10505,7 +10504,7 @@ run_audio_pipeline(){
     local acopy_pid=$!
     local _acopy_rc=0; _await_tracked_pid "$acopy_pid" "Copying audio stream" || _acopy_rc=$?
     if (( _acopy_rc != 0 )); then
-      _check_disk_full "$WORKDIR/audio_primary.err"   # L5: surface ENOSPC, like the die 40/41 paths
+      _check_disk_full "$WORKDIR/audio_primary.err"   # Surface ENOSPC, like the die 40/41 paths
       die 43 "Audio copy failed. See: $WORKDIR/audio_primary.err"
     fi
   else
@@ -10529,7 +10528,7 @@ run_audio_pipeline(){
     local total_secs
     total_secs="$(_get_source_duration_secs)"
     if ! _ffmpeg_run_with_ui transcode_args "Transcoding audio" "$WORKDIR/audio_primary.err" "$total_secs"; then
-      _check_disk_full "$WORKDIR/audio_primary.err"   # L5: surface ENOSPC, like the die 40/41 paths
+      _check_disk_full "$WORKDIR/audio_primary.err"   # Surface ENOSPC, like the die 40/41 paths
       die 43 "Audio transcode to $tgt_codec failed. See: $WORKDIR/audio_primary.err"
     fi
   fi
@@ -10549,16 +10548,16 @@ run_audio_pipeline(){
     _ns_total="$(_audio_stream_count)"
     for (( _ns_i = 0; _ns_i < _ns_total; _ns_i++ )); do
       (( _ns_i == idx )) && continue
-      # RF3: disposition flags now come from the single _audio_stream_info record (no extra
+      # Disposition flags now come from the single _audio_stream_info record (no extra
       # per-stream disposition jq probes).
       _ns_info="$(_audio_stream_info "$_ns_i")"
-      _split_tab "$_ns_info" _ns_c _ns_ch _ns_l _ns_br _ns_t _ns_comment _ns_vi _ns_hi  # C2: non-collapsing
+      _split_tab "$_ns_info" _ns_c _ns_ch _ns_l _ns_br _ns_t _ns_comment _ns_vi _ns_hi  # Non-collapsing split
       _ns_c="${_ns_c,,}"; _ns_l="${_ns_l,,}"
       [[ -z "$_ns_l" ]] && _ns_l="$TAG_LANGUAGE_DEFAULT"
       [[ -z "$_ns_ch" || ! "$_ns_ch" =~ ^[0-9]+$ ]] && _ns_ch=0
       # Must be exactly 2 channels
       (( _ns_ch != 2 )) && continue
-      # Language must match primary track (und matches anything). CR-7: normalize BOTH sides via
+      # Language must match primary track (und matches anything). Normalize BOTH sides via
       # _norm_lang_code so an `en`-tagged native stereo matches an `eng` primary (and 639-2/B vs /T),
       # mirroring _audio_lang_matches — otherwise a code mismatch needlessly synthesizes an AAC
       # downmix instead of stream-copying the existing native stereo. `und` normalizes to `und`,
@@ -10595,11 +10594,11 @@ run_audio_pipeline(){
       fi
     else
       note "[Audio] Native stereo track found (stream #${_native_si}, ${_native_sc} 2ch); using it instead of creating a stereo downmix."
-      # F7: the fallback now carries the chosen native track's language (not the primary's) so
+      # The fallback now carries the chosen native track's language (not the primary's) so
       # mux_final tags it honestly. The codec stays "aac" for the transcode path; the copy path
       # below overrides it with the real native codec.
       A_STEREO_LANG="$_native_sl"
-      # Copy if codec is compatible with the output container; otherwise transcode to AAC (M2).
+      # Copy if codec is compatible with the output container; otherwise transcode to AAC.
       local _ns_do_copy=0
       _sii_audio_is_container_safe "$_native_sc" && _ns_do_copy=1
       if (( ! _ns_do_copy )); then
@@ -10613,7 +10612,7 @@ run_audio_pipeline(){
           mark_done "Stereo fallback prepared (native)"
         fi
       else
-        # F7: stream-copy keeps the native codec — record it so the output track is labeled with
+        # Stream-copy keeps the native codec — record it so the output track is labeled with
         # its real codec (e.g. "(AC-3)"), not a hardcoded "aac".
         A_STEREO_CODEC="$_native_sc"
         # Stream-copy: the intermediate must use an extension matching the
@@ -10668,7 +10667,7 @@ _sp_sub_lang(){
 }
 
 # Heuristic: check if a subtitle title string indicates forced/signs content.
-# Matches "forced", "signs", "foreign" as whole words (word-anchored, M2) so titles like
+# Matches "forced", "signs", "foreign" as whole words (word-anchored) so titles like
 # "Designs"/"Foreigner"/"Cosigns" don't false-match — important because a "forced" track is
 # burned into the video under SUB_BURN_FORCED.
 # Args: $1 — title string to test
@@ -10680,7 +10679,7 @@ _is_forced_title(){
 
 # Heuristic: check if a subtitle title string indicates SDH/HI content.
 # Matches "sdh", "hi", "cc", "caption", "hearing", "impaired" as whole words (every
-# alternative word-anchored, M2) so "Soccer"/"vaccine"/"Account" (containing "cc") and
+# alternative word-anchored) so "Soccer"/"vaccine"/"Account" (containing "cc") and
 # "history" (containing "hi") don't false-match.
 # Args: $1 — title string to test
 # Returns: 0 if match, 1 otherwise
@@ -10692,10 +10691,10 @@ _is_sdh_title(){
 # _sub_stream_info — Fetch all scan-relevant fields for one subtitle stream
 # in a single jq call (replaces 3–4 separate jq forks per stream).
 # Returns: codec\tlanguage\ttitle\tforced\thearing_impaired  (tab-delimited)
-# F3: hearing_impaired disposition is emitted so SDH can be classified by disposition, not just
+# Hearing_impaired disposition is emitted so SDH can be classified by disposition, not just
 #     title. ALL consumers `read -r codec lang title forced hi` — a 4-field read would fold the
 #     hi field into `forced`, corrupting the `(( forced ))` checks (see the fallback below too).
-# RF8 (security): attacker-controlled title/language tags are sanitized at extraction — the full C0
+# Security: attacker-controlled title/language tags are sanitized at extraction — the full C0
 #     control range plus DEL (jq gsub on U+0000..U+001F and U+007F) is replaced with a space, so
 #     a hostile track title can't inject terminal escape sequences into the scan output or log.
 # Args: $1 — subtitle stream index (0-based, relative to subtitle streams)
@@ -10720,7 +10719,7 @@ _is_text_sub_codec(){
 
 _container_supports_bitmap_subs(){ [[ "$MUX_FORMAT" == "matroska" ]]; }
 
-# RF6: a single-track subtitle CANDIDATE that cannot be turned into a track for the current output
+# A single-track subtitle CANDIDATE that cannot be turned into a track for the current output
 # container — a bitmap codec (PGS/VobSub/DVD) when the container can't carry it (non-MKV) AND OCR is
 # disabled, so it can neither be stream-copied nor OCR'd to text. Used to (a) keep a usable text
 # sidecar that would otherwise be deduped against such an embedded bitmap, and (b) skip the bitmap in
@@ -10779,7 +10778,7 @@ _ocr_lang_flags(){
 # invocation sites in _prepare_subtitle and _prepare_ext_subtitle. The caller remains responsible
 # for relocating any stray output .srt and validating the result — that differs enough between
 # call sites (1 vs 2 candidate relocate paths, different diagnostics) to stay inline.
-# M3: _ACTIVE_FFMPEG_PID is registered on the line immediately after the background launch and
+# _ACTIVE_FFMPEG_PID is registered on the line immediately after the background launch and
 # cleared only AFTER wait — a SIGINT before the wait must not orphan the OCR child.
 # Args: $1 — OCR input path; $2 — log file to capture OCR tool output; $3 — spinner label;
 #       $4 — nameref to the caller's already-populated _ocr_lang_flags array
@@ -10806,7 +10805,7 @@ _prepare_subtitle(){
   local idx="$1" codec srt sup vob_base
 
   if [[ ! -d "$WORKDIR" ]]; then
-    # L (Phase 5): echo ""+rc0, not rc1. Callers capture via `sub_path="$(...)"` (a plain, non-local
+    # Echo ""+rc0, not rc1. Callers capture via `sub_path="$(...)"` (a plain, non-local
     # assignment), where a non-zero command substitution would trip set -e and abort the whole run.
     # An exotic mid-run workdir loss should warn-and-skip the subtitle, not kill the encode.
     warn "[Subs] Workdir disappeared — cannot extract subtitle #$idx"
@@ -10827,7 +10826,7 @@ _prepare_subtitle(){
   fi
 
   # Compute PGS-preserve decision before the dry-run check so the dry-run branch
-  # can advertise the .sup path, matching the real run (H13).
+  # can advertise the .sup path, matching the real run.
   local _preserve_pgs=0
   if [[ "$codec" == "hdmv_pgs_subtitle" || "$codec" == "pgs" ]]; then
     sup="$WORKDIR/sub.${idx}.sup"
@@ -10891,7 +10890,7 @@ _prepare_subtitle(){
       ;;
 
     hdmv_pgs_subtitle|pgs)
-      # _preserve_pgs and sup already computed before the top-level DRY_RUN check (H13).
+      # _preserve_pgs and sup already computed before the top-level DRY_RUN check.
       # sup is set to "$WORKDIR/sub.${idx}.sup" when codec is PGS.
 
       ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:s:"$idx" -c:s copy "$sup" 2>"$WORKDIR/sub_${idx}_extract.err" &
@@ -11081,7 +11080,7 @@ _prepare_ext_subtitle(){
       _ocr_lang_flags _ocr_lang "$SUB_OCR_TOOL" "$SUB_OCR_LANG"
       _run_ocr "$ext_path" "$WORKDIR/ext_ocr_vobsub.log" "OCR external VobSub: $basename_label" _ocr_lang
 
-      # RF7: some OCR tools write the .srt next to the source .idx, not into the workdir. Relocate
+      # Some OCR tools write the .srt next to the source .idx, not into the workdir. Relocate
       # it before the existence check (mirrors the .sup branch above) — otherwise a SUCCESSFUL
       # VobSub OCR left $srt_out empty and was misreported as "OCR failed" and dropped.
       local vob_srt="${ext_path%.idx}.srt"
@@ -11127,7 +11126,7 @@ SRT_SDH=""
 SRT_FORCED_BURN_PATH=""           # Set when SUB_BURN_FORCED=1; used by video pipeline
 declare -a EXTERNAL_SRT_PATHS=()  # Paths of external SRT files exported alongside output
 # DIRECT_SUB_RELIDX — relative index of a text subtitle the single-track fallback
-# direct-maps from source (Subs_Fix Phase 6 removed the old SRT_DIRECT_MAP signal
+# direct-maps from source (there is no separate SRT_DIRECT_MAP signal
 # flag; build_subtitle_plan now records the fallback straight into SUB_TRACKS_*).
 DIRECT_SUB_RELIDX=""
 
@@ -11218,7 +11217,7 @@ _norm_lang_code(){
 #   forced|signs|foreign  → type = forced
 #   sdh|hearing|cc        → type = sdh
 #   2-3 letter alpha      → language code (first match wins)
-#   hi                    → language (Hindi) when it fills the empty language slot, else type=sdh (CR-13)
+#   hi                    → language (Hindi) when it fills the empty language slot, else type=sdh
 #   anything else         → ignored
 #
 # Examples:
@@ -11226,7 +11225,7 @@ _norm_lang_code(){
 #   movie.en.srt          → lang=en,  type=full
 #   movie.forced.en.srt   → lang=en,  type=forced
 #   movie.en.sdh.srt      → lang=en,  type=sdh
-#   movie.hi.srt          → lang=hi,  type=full   (Hindi, not SDH — CR-13)
+#   movie.hi.srt          → lang=hi,  type=full   (Hindi, not SDH)
 #   movie.eng.hi.srt      → lang=eng, type=sdh    (language already set → hi = SDH marker)
 #
 # Args:    $1 — source file stem (basename without extension, may contain dots)
@@ -11258,7 +11257,7 @@ _parse_ext_sub_filename(){
       *)
         # Accept the first 2-3 letter purely alphabetic segment as language code.
         # Normalize 2-letter ISO 639-1 codes to 3-letter ISO 639-2/T codes.
-        # CR-13: `hi` is ambiguous — both the SDH (hearing-impaired) keyword AND ISO-639-1 for
+        # `hi` is ambiguous — both the SDH (hearing-impaired) keyword AND ISO-639-1 for
         # Hindi. Classify as LANGUAGE first when it fills the still-empty language slot
         # (`movie.hi.srt` → lang=hi/full); only treat it as the SDH marker once a language is
         # already set (`movie.eng.hi.srt` → sdh). Explicit `sdh`/`hearing`/`cc` is unaffected (above).
@@ -11311,7 +11310,7 @@ discover_external_subtitles(){
   local src_stem
   src_stem="$(basename -- "${SRC_ABS%.*}")"
 
-  # CR-4: src_stem is interpolated into a `find -name` glob below, so any glob metacharacter in the
+  # src_stem is interpolated into a `find -name` glob below, so any glob metacharacter in the
   # source name (`* ? [`) is matched as a wildcard, not literally — extremely common in anime naming
   # like `[Group] Show - 01 [1080p].mkv` (the very files the animation profiles target). `[1080p]`
   # then becomes a one-char class, so the real sidecar is MISSED and an unrelated `… 1.srt` decoy can
@@ -11327,7 +11326,7 @@ discover_external_subtitles(){
   local -a sub_exts=( srt ass ssa vtt sup idx )
   local ext fpath fname parsed lang stype codec
 
-  # H3: sort the null-delimited find output portably. `sort -z` is GNU-only; stock-macOS BSD
+  # Sort the null-delimited find output portably. `sort -z` is GNU-only; stock-macOS BSD
   # `sort` (older Darwin) has no -z, where the old unconditional `sort -z` failed inside the
   # process substitution and — masked by `set -e` not crossing the `<( )` boundary — yielded
   # EMPTY output, silently dropping every sidecar. Probe once (mirrors _sed_inplace's GNU/BSD
@@ -11344,7 +11343,7 @@ discover_external_subtitles(){
     while IFS= read -r -d '' fpath; do
       [[ -z "$fpath" || ! -f "$fpath" ]] && continue
 
-      # Reject sidecar paths containing control characters, mirroring the SRC_ABS/OUT guards (L2):
+      # Reject sidecar paths containing control characters, mirroring the SRC_ABS/OUT guards:
       # a newline/tab/etc. in the name could corrupt a log or report line downstream. Warn (with the
       # control bytes rendered as '?' so the warning itself stays clean) and skip — never mux it.
       if [[ "$fpath" =~ [[:cntrl:]] ]]; then
@@ -11359,7 +11358,7 @@ discover_external_subtitles(){
 
       fname="$(basename -- "$fpath")"
       parsed="$(_parse_ext_sub_filename "$src_stem" "$fname")"
-      _split_tab "$parsed" lang stype  # C2: non-collapsing (producer always emits both fields, but keep the pattern uniform)
+      _split_tab "$parsed" lang stype  # Non-collapsing split (producer always emits both fields, but keep the pattern uniform)
       codec="$(_ext_sub_codec_from_ext "$ext")"
 
       EXT_SUB_PATHS+=("$fpath")
@@ -11405,10 +11404,10 @@ merge_subtitle_sources(){
   for (( i=0; i<n; i++ )); do
     local info codec lang title forced hi stype
     info="$(_sub_stream_info "$i")"
-    _split_tab "$info" codec lang title forced hi  # C2: non-collapsing — empty lang/title must not shift forced/hi (sub classification)
+    _split_tab "$info" codec lang title forced hi  # Non-collapsing split — empty lang/title must not shift forced/hi (sub classification)
     _normalize_codec_lang codec lang
 
-    # F3: classify SDH by the hearing_impaired disposition OR an SDH/HI title — a track tagged
+    # Classify SDH by the hearing_impaired disposition OR an SDH/HI title — a track tagged
     # hearing_impaired but titled plainly ("English") was previously mis-classified "full".
     if (( forced )) || _is_forced_title "$title"; then
       stype="forced"
@@ -11426,14 +11425,14 @@ merge_subtitle_sources(){
   done
 
   # Append external subtitle files, de-duplicating by normalized language + type against BOTH:
-  #   - embedded streams (M3): a `movie.en.srt` next to an embedded `eng` track is skipped; and
-  #   - externals already kept this pass (L3): two sidecars that normalize to the same (lang, type)
+  #   - embedded streams: a `movie.en.srt` next to an embedded `eng` track is skipped; and
+  #   - externals already kept this pass: two sidecars that normalize to the same (lang, type)
   #     — e.g. `movie.en.srt` + `movie.eng.srt` — must not both survive into a multi-track output
   #     (single-track mode already takes first-match-wins, but multi-track keeps every passing
   #     track, so without this the duplicate ships, capped only by SUB_MAX_TRACKS).
   # `n` is the embedded count; the externals are appended after those first `n` entries.
   local j _ext_kept=0 _ext_deduped=0
-  local _ext_seen=" "   # L3: space-padded set of already-kept external "lang_n:type" pairs
+  local _ext_seen=" "   # Space-padded set of already-kept external "lang_n:type" pairs
   for (( j=0; j<${#EXT_SUB_PATHS[@]}; j++ )); do
     local _xlang="${EXT_SUB_LANGS[$j]}" _xtype="${EXT_SUB_TYPES[$j]}"
     local _xlang_n; _xlang_n="$(_norm_lang_code "$_xlang")"
@@ -11441,7 +11440,7 @@ merge_subtitle_sources(){
     for (( k=0; k<n; k++ )); do
       if [[ "$(_norm_lang_code "${ALL_SUB_LANGS[$k]}")" == "$_xlang_n" \
             && "${ALL_SUB_TYPES[$k]}" == "$_xtype" ]]; then
-        # RF6: an embedded match only suppresses an external sidecar if the embedded track is
+        # An embedded match only suppresses an external sidecar if the embedded track is
         # actually DELIVERABLE in the target container. An undeliverable embedded bitmap (non-MKV
         # output, OCR off) can't produce a track, so it must NOT dedup away a usable text sidecar —
         # otherwise the bitmap is dropped at mux and the sidecar is already gone (silent loss).
@@ -11451,7 +11450,7 @@ merge_subtitle_sources(){
     done
     local _xkey="${_xlang_n}:${_xtype}"
     if (( ! _dup )) && [[ "$_ext_seen" == *" ${_xkey} "* ]]; then
-      _dup=1; _dup_src="external"   # L3: collides with an earlier sidecar, not an embedded track
+      _dup=1; _dup_src="external"   # Collides with an earlier sidecar, not an embedded track
     fi
     if (( _dup )); then
       note "[Subs] Skipping external $(basename -- "${EXT_SUB_PATHS[$j]}") — a matching ${_xlang_n} ${_xtype} subtitle (${_dup_src}) is already present."
@@ -11512,7 +11511,7 @@ _build_subtitle_keep_list(){
     local src_label
     src_label="$(_source_label "$src")"
 
-    # Filter 1: language (normalized both sides — H2)
+    # Filter 1: language (normalized both sides)
     if [[ -n "${SUB_LANG_PREF:-}" ]]; then
       if ! _sub_lang_matches "$lang"; then
         dropped_reasons+=("$src_label: ${codec} [$lang] — language not in SUB_LANG_PREF")
@@ -11585,7 +11584,7 @@ run_subtitle_pipeline_multi(){
     return 0
   fi
 
-  # D6: --no-sub-preserve-bitmap requests OCR of bitmap (PGS/VobSub) subs to text, but
+  # --no-sub-preserve-bitmap requests OCR of bitmap (PGS/VobSub) subs to text, but
   # multi-track subtitle mode stream-copies every kept track and never OCRs (documented).
   # Announce that the OCR request is inert here rather than silently ignoring it (says ==
   # does). Container is MKV-gated (bitmap subs only survive into Matroska) and only fires on
@@ -11610,7 +11609,7 @@ run_subtitle_pipeline_multi(){
   SUB_MT_TITLES=()
   SUB_MT_TYPES=()
 
-  # Subs_Fix Phase 4: also populate the unified SUB_TRACKS_* model so mux_final can
+  # Also populate the unified SUB_TRACKS_* model so mux_final can
   # render every kept track through the shared _emit_sub_tracks emitter. The legacy
   # SUB_MT_* arrays are retained for the multi-track log/report summaries below.
   _sub_tracks_reset
@@ -11788,7 +11787,7 @@ _sub_plan_add_embed(){
 }
 
 build_subtitle_plan(){
-  # Subs_Fix Phase 5: reset the unified model up front so it covers the single-track
+  # Reset the unified model up front so it covers the single-track
   # path, the multi-track delegate (harmless double-reset), AND the early returns
   # below — otherwise a prior file's tracks could leak into a SKIP_SUBS/no-subs file.
   _sub_tracks_reset
@@ -11811,7 +11810,7 @@ build_subtitle_plan(){
   # Demote to single-track if the user set overrides that are incompatible.
   if (( SUB_MULTI_TRACK )); then
     if (( SUB_BURN_FORCED )); then
-      # Phase 5: warn (not note) — the user's multi-track request is being silently overridden by
+      # Warn (not note) — the user's multi-track request is being silently overridden by
       # --sub-burn-forced. NOTE: no `return` here on purpose — this case INTENTIONALLY falls through
       # to the single-track selection below (that IS the demotion). A return would skip it entirely.
       warn "[Subs] --sub-burn-forced overrides multi-track: keeping a single subtitle track (multi-track mode off)."
@@ -11849,12 +11848,12 @@ build_subtitle_plan(){
     local lang="${ALL_SUB_LANGS[$i]}"
     local stype="${ALL_SUB_TYPES[$i]}"
 
-    # Language filter (normalized both sides — H2)
+    # Language filter (normalized both sides)
     if [[ -n "${SUB_LANG_PREF:-}" ]]; then
       _sub_lang_matches "$lang" || continue
     fi
 
-    # RF6: skip a candidate that can't be delivered as a single track in this container — a bitmap
+    # Skip a candidate that can't be delivered as a single track in this container — a bitmap
     # subtitle with a non-MKV output and OCR disabled. Skipping it lets selection fall through to a
     # container-usable same-type candidate (e.g. a text `.srt` sidecar, kept by the codec-aware
     # dedup above) instead of choosing a bitmap that fails to prepare and silently drops the track.
@@ -11966,7 +11965,7 @@ build_subtitle_plan(){
   # Fallback: try direct-mapping a TEXT subtitle from embedded streams if NOTHING was prepared.
   # Only attempt when at least one SUB_INCLUDE_* flag is enabled and all preparation failed.
   # External files are always handled via the main selection loop above (not the fallback).
-  # H2: gate on "nothing PREPARED", not just "nothing EMBEDDED". On burn+export profiles
+  # Gate on "nothing PREPARED", not just "nothing EMBEDDED". On burn+export profiles
   # (universal: SUB_BURN_FORCED=1, SUB_EXPORT_EXTERNAL=1) a forced sub routes to
   # SRT_FORCED_BURN_PATH and a full sub to EXTERNAL_SRT_PATHS, leaving SRT_FORCED/FULL/SDH empty
   # even though subtitles WERE prepared — without these two extra clauses the fallback would
@@ -12027,7 +12026,7 @@ mux_final() {
 
   local next_idx=0
   local vid_idx="" a_primary_idx="" a_stereo_idx=""
-  # (Subs_Fix Phase 6: the old single-track subtitle locals — s_forced_idx/s_full_idx/
+  # (The old single-track subtitle locals — s_forced_idx/s_full_idx/
   # s_sdh_idx, forced_present/full_present/sdh_present, src_sub_idx — are gone; the
   # unified _emit_sub_tracks now owns subtitle input/-map/-c:s for both modes.)
   local _src_input_idx=""   # shared index when source is used as ffmpeg input
@@ -12095,7 +12094,7 @@ mux_final() {
 
   # Subtitle inputs (both modes) are registered by _emit_sub_tracks below, via
   # _add_sub_stream: embedded tracks reuse the shared source input ($_src_input_idx),
-  # file tracks add deduped -i inputs (Subs_Fix Phase 5).
+  # file tracks add deduped -i inputs.
 
   # Build stream mapping
   # When VIDEO_COPY_FROM_SOURCE, source is the first input; -map N:v:0
@@ -12114,13 +12113,13 @@ mux_final() {
   fi
 
   # Subtitle -map entries (both modes) are emitted by _emit_sub_tracks below,
-  # alongside the inputs and per-stream tagging (Subs_Fix Phase 5).
+  # alongside the inputs and per-stream tagging.
 
   # Codec settings: copy everything; subtitle codecs are assigned per-stream below
   ff_codec+=( -c copy )
 
   # Subtitle inputs, -map entries, and per-stream tagging — emitted in ONE pass by
-  # the unified emitter for BOTH single- and multi-track modes (Subs_Fix Phase 5).
+  # the unified emitter for BOTH single- and multi-track modes.
   # SUB_TRACKS_* is populated by build_subtitle_plan (single) or
   # run_subtitle_pipeline_multi (multi); empty (e.g. --no-subtitles) is a no-op.
   (( ! SKIP_SUBS )) && _emit_sub_tracks
@@ -12283,7 +12282,7 @@ mux_final() {
   mark_done "Mux final ${OUTPUT_EXT}"
 }
 
-# _check_multitrack_container_safety — M1: hard-stop BEFORE the encode when multi-track
+# _check_multitrack_container_safety — hard-stop BEFORE the encode when multi-track
 # COPY mode would have to drop or degrade a kept stream to fit the target container.
 # Multi-track mode stream-copies every kept audio/subtitle track verbatim; MKV carries
 # everything losslessly, but MP4/MOV cannot hold lossless HD audio (TrueHD/DTS-HD MA),
@@ -12311,9 +12310,9 @@ _check_multitrack_container_safety() {
     _an="$(_audio_stream_count)"
     for (( _ai=0; _ai<_an; _ai++ )); do
       _info="$(_audio_stream_info "$_ai")"
-      # CR-3: capture the disposition flags and OR them into the commentary drop, matching
+      # Capture the disposition flags and OR them into the commentary drop, matching
       # the keep-filter in _build_audio_keep_list (this must stay in sync with it).
-      _split_tab "$_info" _codec _ch _lang _br _title _comment _vi _hi  # C2: non-collapsing — keep-filter mirrors _build_audio_keep_list
+      _split_tab "$_info" _codec _ch _lang _br _title _comment _vi _hi  # Non-collapsing split — keep-filter mirrors _build_audio_keep_list
       _normalize_codec_lang _codec _lang
       [[ -n "${AUDIO_LANG_PREF:-}" ]] && ! _audio_lang_matches "$_lang" && continue
       (( ! AUDIO_KEEP_COMMENTARY )) && { _audio_is_commentary "$_title" || (( _comment )) || (( _vi )) || (( _hi )); } && continue
@@ -12369,7 +12368,7 @@ _video_codec_label() {
 
 # ===== Section 30: Main =======================================================================
 main() {
-  # ---- Startup banner: confirm the impactful decisions up front (Phase 3). ----
+  # ---- Startup banner: confirm the impactful decisions up front. ----
   # Two parts: this banner echoes the resolved POLICY (config + profile + CLI — all known now),
   # and a single "▶ Plan:" line printed later (post-probe, before the video pipeline) reports the
   # CONCRETE facts that aren't known yet here — actual encoder, target pixfmt, color class, DV
@@ -12443,7 +12442,7 @@ main() {
       # Source is ideal — write report and exit clean.
       # Record the metadata/chapters disposition for --report-json, mirroring mux_final's
       # report_add on the normal path (same "stripped"/"preserved" values and order). The
-      # skip-if-ideal remux below honors --strip-metadata / --no-keep-chapters (D2), and the
+      # skip-if-ideal remux below honors --strip-metadata / --no-keep-chapters, and the
       # raw-hardlink branch only runs when neither flag demands a change, so these flag-driven
       # values always match the actual output. Must precede write_json_report, which serializes
       # REPORT_ENTRIES immediately below (the skip-if-ideal path returns before mux_final runs).
@@ -12461,7 +12460,7 @@ main() {
         _sii_total_s="$(_sub_count)"
         (( ${#SII_AUDIO_INDICES[@]} < _sii_total_a )) && _sii_needs_remux=1
         (( ${#SII_SUB_INDICES[@]} < _sii_total_s )) && _sii_needs_remux=1
-        # D2: --strip-metadata / --no-keep-chapters must reach the output even on the
+        # --strip-metadata / --no-keep-chapters must reach the output even on the
         # skip-the-encode path. Force the copy-remux branch (never the raw hardlink, which
         # would ship the source verbatim) whenever either flag demands a change.
         (( STRIP_METADATA )) && _sii_needs_remux=1
@@ -12488,7 +12487,7 @@ main() {
 
           _sii_meta+=( -c copy )
 
-          # D2: honor --no-keep-chapters / --strip-metadata on the skip-if-ideal remux,
+          # Honor --no-keep-chapters / --strip-metadata on the skip-if-ideal remux,
           # reusing mux_final's exact tokens AND order (chapters, then metadata, then the
           # profile comment below) so our own comment metadata survives the strip.
           if (( ! KEEP_CHAPTERS )); then
@@ -12592,12 +12591,12 @@ main() {
     if _source_has_dv_metadata; then
       warn "Source contains Dolby Vision but DV handling is disabled (${_dv_skip_source}). Use --dv to override."
       report_add "dv_detected" "skipped (present in source)"
-      # F2: these profiles strip DV and emit a 10-bit HDR10 stream (DISABLE_DV=1, HDR10 target).
+      # These profiles strip DV and emit a 10-bit HDR10 stream (DISABLE_DV=1, HDR10 target).
       # If the source carries DV but no HDR10 static metadata (mastering display / MaxCLL), the
       # stripped output has missing brightness data → dim/washed-out on HDR10-only displays — so
       # warn and point at archive (preserve DV). Skipped when tone-mapping to SDR (then the output
-      # isn't HDR10 and the metadata is irrelevant). Pre-fix this lived in the dead _dv_rc==0 arm,
-      # where DISABLE_DV is always 0 (detect_dv returns 2 when DISABLE_DV=1), so it never fired.
+      # isn't HDR10 and the metadata is irrelevant). This check runs on the DISABLE_DV path;
+      # the _dv_rc==0 arm always has DISABLE_DV=0 (detect_dv returns 2 when DISABLE_DV=1).
       if (( ! TONEMAP_HDR_TO_SDR )); then
         case "${PROFILE_NAME:-}" in
           hdr10-hq|streaming-hevc|streaming-av1|av1-hq) _check_hdr10_static_metadata ;;
@@ -12613,7 +12612,7 @@ main() {
     report_add "dv_detected" "false"
   fi
 
-  # M1: in multi-track copy mode, hard-stop NOW (before the encode) if the target
+  # In multi-track copy mode, hard-stop NOW (before the encode) if the target
   # container can't carry a kept stream losslessly — recommend MKV. Runs before the
   # single-track advisory warnings below so it pre-empts a redundant warn-then-die.
   _check_multitrack_container_safety
@@ -12681,12 +12680,12 @@ main() {
     warn "H.264 + HDR source ($PROFILE_DESC) without tone-mapping: the encoder ($VIDEO_ENCODER_FFMPEG) produces 8-bit yuv420p — output will carry HDR metadata but the video data is 8-bit and will appear washed out. Use --tonemap for correct SDR output."
   fi
 
-  # Deferred warning (C6): H.264 cannot carry Dolby Vision. Post-probe, so IS_DV is known.
+  # Deferred warning: H.264 cannot carry Dolby Vision. Post-probe, so IS_DV is known.
   _warn_h264_drops_dv
 
   [[ -n "$LEVEL_VALUE" ]] && apply_level_vbv "$LEVEL_VALUE"
 
-  # ▶ Plan line (Phase 3): the CONCRETE facts now known post-probe/resolution — actual ffmpeg
+  # ▶ Plan line: the CONCRETE facts now known post-probe/resolution — actual ffmpeg
   # encoder, target pixfmt (+ bit depth), color class, and DV in/out intent. Complements the
   # policy banner above (which echoed config-resolved intent before any of this was known).
   # Audio/subtitle concretes are decided in their pipelines below and narrated there.
@@ -12759,7 +12758,7 @@ main() {
           + "\t" + "\(.width)x\(.height)"
           + "\t" + (.r_frame_rate // "?"))
         + "\t" + ([.streams[] | select(.codec_type=="subtitle")] | length | tostring)' 2>/dev/null)"
-      _split_tab "$_v_summary" v_codec v_res v_fps s_count  # C2: non-collapsing (keep the pattern uniform; fields here are never empty)
+      _split_tab "$_v_summary" v_codec v_res v_fps s_count  # Non-collapsing split (keep the pattern uniform; fields here are never empty)
       v_codec="${v_codec% }"
       # Convert fractional fps like 24000/1001 to decimal
       if [[ "$v_fps" == */* ]]; then
@@ -12801,7 +12800,7 @@ main() {
       local _a_rec a_codec a_ch a_lang a_br a_title a_layout
       while IFS= read -r _a_rec; do
         a_had_audio=1
-        # C2: non-collapsing split — an empty bit_rate field must not shift title/layout left.
+        # Non-collapsing split — an empty bit_rate field must not shift title/layout left.
         _split_tab "$_a_rec" a_codec a_ch a_lang a_br a_title a_layout
         local a_line a_ch_label
         # Descriptive channel label

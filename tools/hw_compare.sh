@@ -231,7 +231,7 @@ score_vmaf() {
   VMAF_SCORE_RESULT=""
 
   local tmp
-  tmp=$(mktemp "${TMPDIR:-/tmp}/hw_compare_vmaf.XXXXXX.json")  # Phase 6: honor $TMPDIR (macOS per-user dir)
+  tmp=$(mktemp "${TMPDIR:-/tmp}/hw_compare_vmaf.XXXXXX.json")  # honor $TMPDIR (macOS per-user dir)
 
   local filter ok=0
   filter="[0:v]format=${pixfmt}[d];[1:v]format=${pixfmt}[r];[d][r]libvmaf=model=version=vmaf_v0.6.1:n_subsample=5:log_fmt=json:log_path=${tmp}"

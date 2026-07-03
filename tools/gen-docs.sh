@@ -56,7 +56,7 @@ trap 'rm -f "$tmp"' EXIT
   "$MUXM" --emit-man
 } > "$tmp"
 
-# RF11: the .TH date is generated from muxm's RELEASE_DATE via the __DATE__ token. Assert the
+# The .TH date is generated from muxm's RELEASE_DATE via the __DATE__ token. Assert the
 # substitution actually happened — a leaked literal __DATE__ (or a missing/garbled date) means the
 # man-emit substitution broke, which the docs-parity guard alone could NOT catch (both sides derive
 # from the same heredoc). A real ISO date in the .TH line must be present.
