@@ -4320,7 +4320,7 @@ _create_config() {
   # — reject it with die 11 rather than quoting garbage into the generated config. Same pattern as
   # the main CLI's _validate_rate_arg. Complements the unconditional quoting in _V above.
   local _cc_num_var
-  for _cc_num_var in CRF_VALUE THREADS STEREO_BITRATE AUDIO_FORCE_BITRATE \
+  for _cc_num_var in CRF_VALUE STEREO_BITRATE AUDIO_FORCE_BITRATE \
                      MAX_COPY_BITRATE LEVEL_VALUE AV1_MAXRATE AV1_BUFSIZE; do
     if [[ -n "${_CC_OVERRIDES[$_cc_num_var]:-}" ]] \
        && [[ ! "${_CC_OVERRIDES[$_cc_num_var]}" =~ $_RE_BITRATE ]]; then
@@ -4328,6 +4328,19 @@ _create_config() {
    Expected a number, optionally with a k/M/G suffix (e.g. 20, 1.5, 256k)."
     fi
   done
+
+  # THREADS is NOT a rate: it must be a strict positive integer (both the runtime pools=/lp= guard
+  # and the --threads CLI arm require ^[1-9][0-9]*$). RV3-03: the shared _RE_BITRATE loop above
+  # would wrongly accept "4k"/"1.5" here — a value the runtime silently ignores. Validate as a
+  # positive integer and normalize to base-10 so a leading-zero value (e.g. "04") is written as its
+  # decimal form "4" (a value the runtime accepts), never rejected or octal-mangled.
+  if [[ -n "${_CC_OVERRIDES[THREADS]:-}" ]]; then
+    if [[ ! "${_CC_OVERRIDES[THREADS]}" =~ ^[0-9]+$ ]] || (( 10#${_CC_OVERRIDES[THREADS]} < 1 )); then
+      die 11 "Invalid numeric value for THREADS: '${_CC_OVERRIDES[THREADS]}'
+   Expected a positive integer (CPU thread/core count; e.g. 4)."
+    fi
+    _CC_OVERRIDES[THREADS]=$(( 10#${_CC_OVERRIDES[THREADS]} ))
+  fi
 
   # Normalize deprecated aliases (single call site via _normalize_profile).
   _normalize_profile profile
@@ -5261,6 +5274,27 @@ _require_val(){
 # Args: $1 = flag name (for the message), $2 = the value.
 _validate_level_arg(){ [[ "$2" =~ $_RE_LEVEL ]]   || die 11 "Invalid $1 '$2': expected a numeric H.265/H.264 level like 5.1 or 4.0."; }
 _validate_rate_arg(){  [[ "$2" =~ $_RE_BITRATE ]] || die 11 "Invalid $1 '$2': expected a bitrate like 20000k, 5M, or a plain integer (bits/s)."; }
+# _rate_to_kbps VALUE — convert a bitrate string ($_RE_BITRATE grammar) to an integer kbps, or echo
+# "" for a value that doesn't match the grammar. RV3-03: the MAX_COPY_BITRATE ceiling check used a
+# bare "${v%k}" strip that only handled a lowercase `k` — an uppercase `K` or an `M`/`G` value
+# (e.g. "80M", "80000K") failed the follow-up integer regex and SILENTLY disabled the ceiling. This
+# honors the whole case-insensitive k/M/G grammar the CLI/config validators already accept. The
+# numeric part is documented as kbps (see the generated-config comment), so a bare number and a
+# `k`/`K` suffix are kbps as-is; `M`→×1000 kbps; `G`→×1e6 kbps. awk handles the optional decimal
+# (e.g. "1.5M"); LC_ALL=C pins the decimal point so a comma-locale can't corrupt it. Always returns
+# 0 (the empty string is the failure sentinel) — a non-zero rc would abort `x="$(_rate_to_kbps …)"`
+# under `set -e` before the caller's own empty-string guard could run.
+_rate_to_kbps(){
+  local v="$1" num mult
+  [[ "$v" =~ $_RE_BITRATE ]] || { echo ""; return 0; }
+  case "$v" in
+    *[kK]) num="${v%[kK]}"; mult=1 ;;
+    *[mM]) num="${v%[mM]}"; mult=1000 ;;
+    *[gG]) num="${v%[gG]}"; mult=1000000 ;;
+    *)     num="$v";        mult=1 ;;   # bare number: documented as kbps
+  esac
+  LC_ALL=C awk -v n="$num" -v m="$mult" 'BEGIN{ printf "%.0f", n*m }'
+}
 # Reject an unknown --audio-force-codec encoder at parse time (die 11) instead of letting an
 # encoder muxm can't name an intermediate for surface as a cryptic late die 43 after track scanning.
 # SYNC: this allow-list must stay in step with the real (non-fallback) arms of _audio_codec_ext —
@@ -5369,10 +5403,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --hw-accel-quality)
       _require_val "$1" "$#" "${2:-}"; HW_ACCEL_QUALITY="$2"; _CLI_HW_ACCEL_QUALITY_EXPLICIT=1
-      # Accept integer 0–100 (VT/NVENC quality scales both fit this range).
-      if [[ ! "$HW_ACCEL_QUALITY" =~ ^[0-9]+$ ]] || (( HW_ACCEL_QUALITY < 0 )) || (( HW_ACCEL_QUALITY > 100 )); then
+      # Accept integer 0–100 (VT/NVENC quality scales both fit this range). RV3-03: force base-10
+      # in the range check so a leading-zero value (e.g. "080") isn't read as octal by (( )) —
+      # which throws a raw "value too great for base" error on an "08"/"09" digit — then normalize
+      # to the decimal form for a clean effective-config display. (A `^[0-9]+$` value is never
+      # negative, so the old `< 0` arm was dead and is dropped.)
+      if [[ ! "$HW_ACCEL_QUALITY" =~ ^[0-9]+$ ]] || (( 10#$HW_ACCEL_QUALITY > 100 )); then
         die 11 "Invalid --hw-accel-quality: \"$HW_ACCEL_QUALITY\". Must be an integer between 0 and 100."
       fi
+      HW_ACCEL_QUALITY=$((10#$HW_ACCEL_QUALITY))
       shift 2
       ;;
     --hw-accel-allow-sw)    HW_ACCEL_ALLOW_SW=1; shift ;;
@@ -5383,7 +5422,7 @@ while [[ $# -gt 0 ]]; do
     --no-tonemap) TONEMAP_HDR_TO_SDR=0; shift ;;
     --sdr-force-10bit) SDR_FORCE_10BIT=1; shift ;;
     --no-sdr-force-10bit) SDR_FORCE_10BIT=0; shift ;;
-    --max-copy-bitrate) _require_val "$1" "$#" "${2:-}"; MAX_COPY_BITRATE="$2"; shift 2 ;;
+    --max-copy-bitrate) _require_val "$1" "$#" "${2:-}"; _validate_rate_arg "$1" "$2"; MAX_COPY_BITRATE="$2"; shift 2 ;;
 
     --audio-track)        _require_val "$1" "$#" "${2:-}"; AUDIO_TRACK_OVERRIDE="$2"; shift 2 ;;
     --audio-lang-pref)    _require_val "$1" "$#" "${2:-}"; AUDIO_LANG_PREF="$2"; shift 2 ;;
@@ -5393,7 +5432,7 @@ while [[ $# -gt 0 ]]; do
     --stereo-fallback) ADD_STEREO_IF_MULTICH=1; _CLI_ADD_STEREO_IF_MULTICH_EXPLICIT=1; shift ;;
     --no-stereo-fallback) ADD_STEREO_IF_MULTICH=0; _CLI_ADD_STEREO_IF_MULTICH_EXPLICIT=1; shift ;;
     --audio-force-codec)   _require_val "$1" "$#" "${2:-}"; _validate_force_codec_arg "$1" "$2"; AUDIO_FORCE_CODEC="$2"; shift 2 ;;
-    --audio-force-bitrate) _require_val "$1" "$#" "${2:-}"; AUDIO_FORCE_BITRATE="$2"; shift 2 ;;
+    --audio-force-bitrate) _require_val "$1" "$#" "${2:-}"; _validate_rate_arg "$1" "$2"; AUDIO_FORCE_BITRATE="$2"; shift 2 ;;
     --audio-lossless-passthrough) AUDIO_LOSSLESS_PASSTHROUGH=1; shift ;;
     --no-audio-lossless-passthrough) AUDIO_LOSSLESS_PASSTHROUGH=0; shift ;;
     --audio-titles) INCLUDE_AUDIO_TITLES=1; shift ;;
@@ -6228,6 +6267,10 @@ fi
 [[ -n "$AV1_MAXRATE"  && ! "$AV1_MAXRATE"  =~ $_RE_BITRATE ]] && die 11 "Invalid AV1_MAXRATE from config: expected a bitrate like 20000k (got: ${AV1_MAXRATE})"
 [[ -n "$AV1_BUFSIZE"  && ! "$AV1_BUFSIZE"  =~ $_RE_BITRATE ]] && die 11 "Invalid AV1_BUFSIZE from config: expected a bitrate like 40000k (got: ${AV1_BUFSIZE})"
 [[ ! "$STEREO_BITRATE" =~ $_RE_BITRATE ]]                    && die 11 "Invalid STEREO_BITRATE from config: expected a bitrate like 192k (got: ${STEREO_BITRATE})"
+# RV3-03: MAX_COPY_BITRATE and AUDIO_FORCE_BITRATE gained parse-time _validate_rate_arg guards;
+# a sourced .muxmrc assigns them directly, so re-validate here too (both optional → gate on -n).
+[[ -n "$MAX_COPY_BITRATE"    && ! "$MAX_COPY_BITRATE"    =~ $_RE_BITRATE ]] && die 11 "Invalid MAX_COPY_BITRATE from config: expected a bitrate like 80000k or 80M (got: ${MAX_COPY_BITRATE})"
+[[ -n "$AUDIO_FORCE_BITRATE" && ! "$AUDIO_FORCE_BITRATE" =~ $_RE_BITRATE ]] && die 11 "Invalid AUDIO_FORCE_BITRATE from config: expected a bitrate like 256k (got: ${AUDIO_FORCE_BITRATE})"
 
 # Resolve and validate source file
 SRC_ABS="$(realpath_fallback "$SRC")"
@@ -8721,12 +8764,13 @@ _video_is_copy_compliant() {
     fi
 
     if [[ -n "$src_br_bps" && "$src_br_bps" =~ ^[0-9]+$ ]] && (( src_br_bps > 0 )); then
-      # MAX_COPY_BITRATE is specified as e.g. "80000k" — strip the trailing 'k'
-      # suffix to get a plain integer, then convert kbps → bps for comparison.
-      max_br_kbps="${MAX_COPY_BITRATE%k}"
-      # Guard: validate numeric before arithmetic to prevent bash error on bad config
-      if [[ ! "$max_br_kbps" =~ ^[0-9]+$ ]]; then
-        warn "--max-copy-bitrate '${MAX_COPY_BITRATE}' is not a valid rate (expected e.g. '80000k') — skipping the bitrate ceiling check."
+      # RV3-03: parse MAX_COPY_BITRATE through the shared $_RE_BITRATE grammar (via _rate_to_kbps),
+      # not a bare "${%k}" strip — the old strip only handled a lowercase `k`, so "80M"/"80000K"
+      # failed the follow-up integer regex and SILENTLY disabled the ceiling. _rate_to_kbps returns
+      # the integer kbps for the whole case-insensitive k/M/G grammar (or "" for a genuinely bad rate).
+      max_br_kbps="$(_rate_to_kbps "$MAX_COPY_BITRATE")"
+      if [[ -z "$max_br_kbps" || ! "$max_br_kbps" =~ ^[0-9]+$ ]]; then
+        warn "--max-copy-bitrate '${MAX_COPY_BITRATE}' is not a valid rate (expected e.g. '80000k', '80M') — skipping the bitrate ceiling check."
       else
         max_br_bps=$(( max_br_kbps * 1000 ))
         if (( src_br_bps > max_br_bps )); then
@@ -9895,16 +9939,23 @@ select_best_audio(){
 
   # Handle user override with validation
   if [[ -n "${AUDIO_TRACK_OVERRIDE:-}" ]]; then
-    if [[ "$AUDIO_TRACK_OVERRIDE" =~ ^[0-9]+$ ]] && (( AUDIO_TRACK_OVERRIDE >= 0 && AUDIO_TRACK_OVERRIDE < n )); then
+    # RV3-03: coerce to base 10 BEFORE the bounds check. Bash `(( ))` reads a leading-zero value as
+    # octal (e.g. "010" → 8) while the jq stream lookup and the `-map` index the record feeds are
+    # decimal-only ("010" → 10) — so an un-coerced override could pass a bounds check against index
+    # 8 yet map ffmpeg stream 10 (a silently-wrong track, or an out-of-range map). Compute the
+    # decimal index once and use it for the bounds check, the lookup, and the emitted record.
+    local _ato=-1
+    [[ "$AUDIO_TRACK_OVERRIDE" =~ ^[0-9]+$ ]] && _ato=$((10#$AUDIO_TRACK_OVERRIDE))
+    if (( _ato >= 0 && _ato < n )); then
       # Fetch full record for the overridden track so caller can destructure (L2b).
       local _ov_info _ov_codec _ov_ch _ov_lang _ov_br _ov_title
-      _ov_info="$(_audio_stream_info "$AUDIO_TRACK_OVERRIDE")"
+      _ov_info="$(_audio_stream_info "$_ato")"
       _split_tab "$_ov_info" _ov_codec _ov_ch _ov_lang _ov_br _ov_title _ _ _  # Non-collapsing split: sink the trailing disposition fields
       _normalize_codec_lang _ov_codec _ov_lang
       [[ -z "$_ov_ch"  || ! "$_ov_ch"  =~ ^[0-9]+$ ]] && _ov_ch=0
       [[ -z "$_ov_br"  || ! "$_ov_br"  =~ ^[0-9]+$ ]] && _ov_br=0
       printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$AUDIO_TRACK_OVERRIDE" "$_ov_codec" "$_ov_ch" "$_ov_lang" "${_ov_title:-}" "$_ov_br"
+        "$_ato" "$_ov_codec" "$_ov_ch" "$_ov_lang" "${_ov_title:-}" "$_ov_br"
       return 0
     fi
     warn "Requested --audio-track $AUDIO_TRACK_OVERRIDE is invalid (must be 0-$((n-1))). Using auto-selection."

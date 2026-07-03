@@ -1531,6 +1531,7 @@ test_cli() {
   _test_cli_value_flag_no_value
   _test_cli_value_validation
   _test_cli_crf_octal
+  _test_cli_rate_family_validation
   _test_cli_dashdash
   _test_cli_config_missing_val
   _test_cli_replace_source_eof
@@ -1673,6 +1674,30 @@ _test_cli_create_config() {
   else
     fail "cli-create-config-home-unset: --create-config user with \$HOME unset: ${cfg_home_out:0:200}"
   fi
+
+  # RV3-03: --create-config validates THREADS as a strict positive integer (not the shared
+  # _RE_BITRATE grammar, which would wrongly accept "4k"/"1.5" — values the runtime silently
+  # ignores). A leading-zero value is normalized to its decimal form so the written config carries
+  # a value the runtime's ^[1-9][0-9]*$ guard accepts.
+  local _thr_dir; _thr_dir="$(mktemp -d "$TESTDIR/thr.XXXXXX")"
+  # "04" → written as decimal "4" (correct decimal interpretation, never octal, never rejected).
+  ( cd "$_thr_dir" && HOME="$_thr_dir" "$MUXM" --create-config project atv-directplay-hq --threads 04 >/dev/null 2>&1 )
+  if [[ -f "$_thr_dir/.muxmrc" ]] && grep -qE '^THREADS="?4"?$' "$_thr_dir/.muxmrc"; then
+    pass "cli-create-config-threads: --threads 04 is normalized to decimal 4 in the generated config"
+  else
+    fail "cli-create-config-threads: --threads 04 not normalized to 4 (got: $(grep -E '^THREADS=' "$_thr_dir/.muxmrc" 2>/dev/null || echo '<no THREADS line>'))"
+  fi
+  # A rate-suffixed / non-integer THREADS must be rejected cleanly (die 11), not written.
+  local _thr_out
+  _thr_out="$(cd "$_thr_dir" && HOME="$_thr_dir" "$MUXM" --create-config project atv-directplay-hq --threads 4k 2>&1)" || true
+  if printf '%s\n' "$_thr_out" | grep -qiF "Invalid numeric value for THREADS"; then
+    pass "cli-create-config-threads: --threads 4k (rate suffix) rejected cleanly (not accepted as the _RE_BITRATE loop would)"
+  else
+    fail "cli-create-config-threads: --threads 4k not rejected (got: $(printf '%s\n' "$_thr_out" | grep -iE 'Invalid|THREADS' | head -1))"
+  fi
+  _thr_out="$(cd "$_thr_dir" && HOME="$_thr_dir" "$MUXM" --create-config project atv-directplay-hq --threads 0 2>&1)" || true
+  assert_contains "Invalid numeric value for THREADS" "cli-create-config-threads: --threads 0 rejected (not a positive integer)" "$_thr_out"
+  rm -rf "$_thr_dir"
 }
 
 # L3: --level and the rate flags (--av1-maxrate/--av1-bufsize/--stereo-bitrate) are validated at
@@ -1804,6 +1829,47 @@ _test_cli_crf_octal() {
   assert_no_file "$outfile" "cli-crf-octal: no output written when --dry-run/--no-disk-check follow a leading-zero --crf"
   assert_not_contains "value too great for base" "cli-crf-octal: leading-zero --crf + later flags leaves no arithmetic error" "$out"
   rm -f "$outfile"
+}
+
+# RV3-03: the numeric-CLI-validation family. --max-copy-bitrate / --audio-force-bitrate now run
+# _validate_rate_arg at their parse arm AND at the Section-15 post-config re-check (matching every
+# sibling rate flag); --hw-accel-quality reads its range check in base 10 (no octal crash on a
+# leading zero). Parse-time guards fire before source resolution, so a nonexistent source is fine.
+_test_cli_rate_family_validation() {
+  local out
+  _rf_msg(){ (cd "$TESTDIR" && "$MUXM" "$@" --dry-run /no/such/rfsrc.mkv y.mkv 2>&1) || true; }
+  _rf_reject(){ local label="$1" sub="$2"; shift 2; out="$(_rf_msg "$@")"
+    if printf '%s\n' "$out" | grep -qiF "$sub"; then pass "$label"
+    else fail "$label — no '$sub' (got: $(printf '%s\n' "$out" | grep -iE 'Invalid|not found' | head -1))"; fi; }
+  _rf_accept(){ local label="$1" bad_re="$2"; shift 2; out="$(_rf_msg "$@")"
+    if printf '%s\n' "$out" | grep -qiE "$bad_re"; then fail "$label — value wrongly rejected at parse"; else pass "$label"; fi; }
+
+  # Parse-time rejection of garbage.
+  _rf_reject "cli-rate-family: --max-copy-bitrate notarate rejected at parse"    "Invalid --max-copy-bitrate"    --max-copy-bitrate notarate
+  _rf_reject "cli-rate-family: --max-copy-bitrate 1x2 rejected at parse"         "Invalid --max-copy-bitrate"    --max-copy-bitrate 1x2
+  _rf_reject "cli-rate-family: --audio-force-bitrate notarate rejected at parse" "Invalid --audio-force-bitrate"  --audio-force-bitrate notarate
+  _rf_reject "cli-rate-family: --audio-force-bitrate 1x2 rejected at parse"      "Invalid --audio-force-bitrate"  --audio-force-bitrate 1x2
+  # Valid values (incl. uppercase K and M) must NOT trip the parse guard.
+  _rf_accept "cli-rate-family: valid --max-copy-bitrate 80M + --audio-force-bitrate 256k accepted" "Invalid (--max-copy-bitrate|--audio-force-bitrate)" --max-copy-bitrate 80M --audio-force-bitrate 256k
+  _rf_accept "cli-rate-family: valid --max-copy-bitrate 80000K accepted"                            "Invalid --max-copy-bitrate" --max-copy-bitrate 80000K
+
+  # --hw-accel-quality: a leading-zero value must read in base 10 (no raw "value too great for
+  # base"); an out-of-range zero-padded value still dies cleanly.
+  out="$(run_muxm --hw-accel-quality 080 --print-effective-config)"
+  assert_matches "HW_ACCEL_QUALITY += 80\$" "cli-rate-family: --hw-accel-quality 080 → decimal 80 (base-10, not octal)" "$out"
+  assert_not_contains "value too great for base" "cli-rate-family: --hw-accel-quality 080 leaves no arithmetic error" "$out"
+  _rf_reject "cli-rate-family: --hw-accel-quality 0101 (=101) rejected cleanly" "Invalid --hw-accel-quality" --hw-accel-quality 0101
+
+  # Config-bypass: a sourced .muxmrc assigns these rate globals directly; the Section-15 re-checks
+  # must still reject garbage (mirroring the AV1_MAXRATE bypass test). Isolated HOME.
+  local _rfdir; _rfdir="$(mktemp -d "$TESTDIR/rf.XXXXXX")"; : > "$_rfdir/src.mkv"
+  printf 'MAX_COPY_BITRATE=notarate\n' > "$_rfdir/.muxmrc"
+  out="$(cd "$_rfdir" && HOME="$_rfdir" "$MUXM" --dry-run src.mkv out.mkv 2>&1)" || true
+  assert_contains "Invalid MAX_COPY_BITRATE from config" "cli-rate-family: config MAX_COPY_BITRATE=garbage rejected after load (bypass closed)" "$out"
+  printf 'AUDIO_FORCE_BITRATE=1x2\n' > "$_rfdir/.muxmrc"
+  out="$(cd "$_rfdir" && HOME="$_rfdir" "$MUXM" --dry-run src.mkv out.mkv 2>&1)" || true
+  assert_contains "Invalid AUDIO_FORCE_BITRATE from config" "cli-rate-family: config AUDIO_FORCE_BITRATE=garbage rejected after load (bypass closed)" "$out"
+  rm -rf "$_rfdir"
 }
 
 # M2: a value-flag used as the FINAL token (no value after it) must error cleanly —
@@ -9757,6 +9823,29 @@ printf '%s|%s' \"\$PROFILE_DESC\" \"\$TARGET_PIXFMT\"" -- "$pix" "$prim" "$trc" 
   _dcp_assert "unit-decide-color-and-pixfmt color: tonemap HDR→SDR → SDR-TONEMAP/yuv420p" "SDR-TONEMAP|yuv420p" "$(_dcp yuv420p10le bt2020 smpte2084 bt2020nc 'TONEMAP_HDR_TO_SDR=1')"
 }
 
+_test_unit_rate_to_kbps() {
+  # RV3-03: _rate_to_kbps converts a $_RE_BITRATE string to integer kbps across the whole
+  # case-insensitive k/M/G grammar (the old MAX_COPY_BITRATE `%k` strip only handled lowercase k,
+  # so "80M"/"80000K" silently disabled the ceiling). The numeric part is documented as kbps.
+  local body rebit
+  body="$(_extract_muxm_fns _rate_to_kbps)" || { fail "unit-rate-to-kbps: could not extract _rate_to_kbps"; return; }
+  rebit="$(grep -E '^readonly _RE_BITRATE=' "$MUXM")"
+  _rtk_assert(){
+    local label="$1" want="$2" got
+    got="$(bash -c "$rebit"$'\n'"$body"$'\n''_rate_to_kbps "$1"' -- "$3")"
+    if [[ "$got" == "$want" ]]; then pass "$label (=$got)"; else fail "$label — got '$got', want '$want'"; fi
+  }
+  _rtk_assert "unit-rate-to-kbps: 80000k → 80000 kbps"          80000    80000k
+  _rtk_assert "unit-rate-to-kbps: 80000K (uppercase) → 80000"   80000    80000K
+  _rtk_assert "unit-rate-to-kbps: 80M → 80000 kbps"            80000    80M
+  _rtk_assert "unit-rate-to-kbps: 80m (lowercase) → 80000"     80000    80m
+  _rtk_assert "unit-rate-to-kbps: 5G → 5000000 kbps"           5000000  5G
+  _rtk_assert "unit-rate-to-kbps: 1.5M (decimal) → 1500 kbps"  1500     1.5M
+  _rtk_assert "unit-rate-to-kbps: bare 20000 → 20000 kbps"     20000    20000
+  _rtk_assert "unit-rate-to-kbps: invalid 'abc' → empty"       ""       abc
+  _rtk_assert "unit-rate-to-kbps: invalid '80X' → empty"       ""       80X
+}
+
 _test_unit_select_best_audio() {
   # 2.2: direct unit test of select_best_audio — which audio track the user gets (never called by
   # a test before). Mock the I/O boundary (_audio_stream_count + _audio_stream_info), source the
@@ -9795,6 +9884,24 @@ select_best_audio | cut -f1" -- "$tracks" "$override"
   # (Without normalization: en≠eng, no bonus, the 6ch jpn track would win.)
   local h2lang; h2lang="$(_tr eac3 6 jpn 448000 '')"$'\n'"$(_tr aac 2 en 128000 '')"
   _sba_assert "unit-select-best-audio select: en-tagged English wins lang bonus over a 6ch foreign track (H2)" 1 "$(_sba_idx "$h2lang")"
+
+  # RV3-03: a zero-padded --audio-track index must resolve in BASE 10, matching the decimal jq
+  # stream lookup (and the ffmpeg `-map` index the record feeds) — never bash-octal. Build 11
+  # tracks (indices 0–10) so "010" (decimal 10, octal 8) is unambiguous; "08" is octal-INVALID and
+  # the pre-fix bounds check `(( 08 … ))` raised a raw "value too great for base" arithmetic error,
+  # discarding the override and auto-selecting. The pre-fix path also echoed the raw padded string
+  # as the chosen index ("007", "010"), so these assertions pin the normalized decimal form.
+  local many="" _mi
+  for (( _mi=0; _mi<11; _mi++ )); do
+    [[ -n "$many" ]] && many+=$'\n'
+    many+="$(_tr aac 2 eng 128000 "t$_mi")"
+  done
+  _sba_assert "unit-select-best-audio override: zero-padded 010 → decimal 10 (not octal 8)"       10 "$(_sba_idx "$many" 010)"
+  _sba_assert "unit-select-best-audio override: zero-padded 007 → decimal 7"                       7 "$(_sba_idx "$many" 007)"
+  _sba_assert "unit-select-best-audio override: octal-invalid 08 → decimal 8 (no arith error)"     8 "$(_sba_idx "$many" 08)"
+  # Out-of-range zero-padded index (decimal 18 > 10) → clean auto-selection fallback (idx 0 wins
+  # the all-equal score), never a silently-wrong in-range octal track.
+  _sba_assert "unit-select-best-audio override: out-of-range 018 → clean auto-selection fallback"  0 "$(_sba_idx "$many" 018)"
 }
 
 # RF3 + RF4: audio-selection correctness driven by DISPOSITION flags and prefer-stereo language.
@@ -10368,8 +10475,11 @@ _test_unit_video_copy_compliant() {
   # 4.2: _output_pixfmt_is_10bit delegates its 4 color-field probes to
   # _probe_video_color_fields (which itself uses _split_tab) — pull both in too.
   body="$(_extract_muxm_fns _video_is_copy_compliant _lower _output_pixfmt_is_10bit _is_atv_directplay_profile \
-                            _probe_video_color_fields _split_tab)" \
-    || { fail "unit-video-copy-compliant: could not extract _video_is_copy_compliant + _lower + _output_pixfmt_is_10bit + _is_atv_directplay_profile"; return; }
+                            _probe_video_color_fields _split_tab _rate_to_kbps)" \
+    || { fail "unit-video-copy-compliant: could not extract _video_is_copy_compliant + _lower + _output_pixfmt_is_10bit + _is_atv_directplay_profile + _rate_to_kbps"; return; }
+  # RV3-03: _video_is_copy_compliant now parses MAX_COPY_BITRATE via _rate_to_kbps, which references
+  # the readonly _RE_BITRATE grammar — seed it into the harness (once per bash -c, so readonly is fine).
+  body="$(grep -E '^readonly _RE_BITRATE=' "$MUXM")"$'\n'"$body"
   # $1=src_codec $2=src_pix $3=src_prim $4=src_trc $5=src_bitrate(bps) $6=extra global overrides.
   # Emits "<rc>|<reject reason>". Bitrate is always a real number so the size/duration stat
   # fallback in the ceiling check is never reached (keeps the ceiling scenario deterministic).
@@ -10458,13 +10568,18 @@ if _video_is_copy_compliant; then printf "0|%s" "$_COPY_REJECT_REASON"; else pri
   # Control B: 4:2:2 source but chroma preservation ON (FORCE_CHROMA_420=0) → not RF2b-gated.
   _vcc_assert "unit-video-copy-chroma-force: chroma preservation on + 4:2:2 → not gated" 0 "" "$(_vcc hevc yuv422p10le '' '' 5000000 'FORCE_CHROMA_420=0')"
 
-  # 3.6: --max-copy-bitrate non-`k` rate formats. The `%k` strip makes the trailing 'k' optional,
-  # so a bare integer ("80000") is a valid kbps ceiling: 100 Mbps exceeds it → re-encode, 20 Mbps
-  # is under it → copyable. A non-numeric rate ("80M") is rejected by the validity guard — muxm
-  # WARNs and SKIPS the ceiling (does not crash, does not block the copy) → copyable.
-  _vcc_assert "unit-video-copy-bitrate-ceiling copy-compliant: non-k ceiling '80000' exceeded → re-encode" 1 "MAX_COPY_BITRATE" "$(_vcc hevc yuv420p '' '' 100000000 'MAX_COPY_BITRATE=80000')"
-  _vcc_assert "unit-video-copy-bitrate-ceiling copy-compliant: non-k ceiling '80000' not exceeded → copyable" 0 ""              "$(_vcc hevc yuv420p '' ''  20000000 'MAX_COPY_BITRATE=80000')"
-  _vcc_assert "unit-video-copy-bitrate-ceiling copy-compliant: invalid rate '80M' → warn + ceiling skipped (copyable)" 0 ""      "$(_vcc hevc yuv420p '' '' 100000000 'MAX_COPY_BITRATE=80M')"
+  # 3.6 / RV3-03: --max-copy-bitrate now honors the whole case-insensitive k/M/G grammar (via the
+  # shared _rate_to_kbps), not a bare lowercase-`k` strip. The numeric part is documented as kbps,
+  # so a bare integer and a `k`/`K` suffix are kbps as-is; `M`→×1000 kbps, `G`→×1e6 kbps. So "80M"
+  # and "80000K" are an 80 Mbps ceiling that a 100 Mbps source EXCEEDS (→ re-encode) but a 20 Mbps
+  # source does NOT (→ copyable) — previously "80M"/"80000K" failed the `%k` strip and SILENTLY
+  # disabled the ceiling (copyable regardless). A genuinely un-parseable rate still warns + skips.
+  _vcc_assert "unit-video-copy-bitrate-ceiling: bare '80000' kbps exceeded → re-encode"    1 "MAX_COPY_BITRATE" "$(_vcc hevc yuv420p '' '' 100000000 'MAX_COPY_BITRATE=80000')"
+  _vcc_assert "unit-video-copy-bitrate-ceiling: bare '80000' kbps not exceeded → copyable"  0 ""                "$(_vcc hevc yuv420p '' ''  20000000 'MAX_COPY_BITRATE=80000')"
+  _vcc_assert "unit-video-copy-bitrate-ceiling: '80M' ceiling exceeded (100 Mbps) → re-encode"   1 "MAX_COPY_BITRATE" "$(_vcc hevc yuv420p '' '' 100000000 'MAX_COPY_BITRATE=80M')"
+  _vcc_assert "unit-video-copy-bitrate-ceiling: '80M' ceiling not exceeded (20 Mbps) → copyable" 0 ""                "$(_vcc hevc yuv420p '' ''  20000000 'MAX_COPY_BITRATE=80M')"
+  _vcc_assert "unit-video-copy-bitrate-ceiling: '80000K' (uppercase) ceiling exceeded → re-encode" 1 "MAX_COPY_BITRATE" "$(_vcc hevc yuv420p '' '' 100000000 'MAX_COPY_BITRATE=80000K')"
+  _vcc_assert "unit-video-copy-bitrate-ceiling: un-parseable rate '80X' → warn + ceiling skipped (copyable)" 0 "" "$(_vcc hevc yuv420p '' '' 100000000 'MAX_COPY_BITRATE=80X')"
 }
 
 _test_unit_pixfmt_gate_helpers() {
@@ -10747,6 +10862,7 @@ test_unit() {
   _test_unit_fps_helpers
   _test_unit_extract_helper
   _test_unit_score_audio_stream
+  _test_unit_rate_to_kbps
   _test_unit_select_best_audio
   _test_unit_audio_disposition
   _test_unit_decide_color_and_pixfmt
