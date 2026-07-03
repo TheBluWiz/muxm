@@ -7723,6 +7723,29 @@ decide_color_and_pixfmt() {
 }
 
 # ===== Section 23: x265 params & Level/VBV guardrails ========================================
+# _x265_strip_hdr_keys PARAMS — echo PARAMS (a colon-joined x265 param string) with every
+# baked HDR10/PQ color key removed (hdr10, hdr10-opt, hdr-opt, colorprim, transfer, colormatrix,
+# range). RV3-06: wrap PARAMS in sentinel colons first, so EVERY "key=value" pair is colon-delimited
+# on both sides — start, middle, end, and sole-content all collapse to one uniform ":key=value:"
+# shape strippable by a single ":key=[^:]*" pattern per key. The prior two-pattern-per-key form
+# (`:key=…` global + `^key=…:` once) missed the sole-content case — e.g. `--x265-params hdr10=1` as
+# the WHOLE string has no leading colon for the first pattern and no trailing colon for the second,
+# so the HDR10 signal survived and got baked into an SDR/HLG encode. Each removed unit is exactly
+# `:key=value`, so joins never leave a doubled colon; the leading/trailing sentinels are stripped last.
+_x265_strip_hdr_keys() {
+  local _p
+  _p="$(printf ':%s:' "$1" | sed \
+    's/:hdr10=[^:]*//g
+     s/:hdr10-opt=[^:]*//g
+     s/:hdr-opt=[^:]*//g
+     s/:colorprim=[^:]*//g
+     s/:transfer=[^:]*//g
+     s/:colormatrix=[^:]*//g
+     s/:range=[^:]*//g')"
+  _p="${_p#:}"; _p="${_p%:}"
+  printf '%s' "$_p"
+}
+
 # Build the final X265_PARAMS string from X265_PARAMS_BASE.
 # Adds or strips HDR-specific x265 parameters based on the detected color profile:
 #   - Non-HDR10: removes :hdr-opt=1
@@ -7736,15 +7759,8 @@ build_x265_params() {
   # hdr10=1/transfer=smpte2084/colorprim=bt2020/etc. in, which must NOT signal PQ on non-PQ (HLG/SDR)
   # content and must be de-duplicated before the HDR10 path re-appends them. Both color paths start
   # from this clean slate, so the strip — previously duplicated verbatim in both branches — is hoisted
-  # here and each branch only appends what it needs.
-  X265_PARAMS="$(printf '%s' "$X265_PARAMS" | sed \
-    's/:hdr10=[^:]*//g; s/^hdr10=[^:]*://
-     s/:hdr10-opt=[^:]*//g; s/^hdr10-opt=[^:]*://
-     s/:hdr-opt=[^:]*//g; s/^hdr-opt=[^:]*://
-     s/:colorprim=[^:]*//g; s/^colorprim=[^:]*://
-     s/:transfer=[^:]*//g; s/^transfer=[^:]*://
-     s/:colormatrix=[^:]*//g; s/^colormatrix=[^:]*://
-     s/:range=[^:]*//g; s/^range=[^:]*://')"
+  # here and each branch only appends what it needs. (Delimiter-anchored via _x265_strip_hdr_keys.)
+  X265_PARAMS="$(_x265_strip_hdr_keys "$X265_PARAMS")"
 
   if [[ "$PROFILE_DESC" == "HDR10" ]]; then
     X265_PARAMS="${X265_PARAMS}:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited"

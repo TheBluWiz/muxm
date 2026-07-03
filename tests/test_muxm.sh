@@ -4718,6 +4718,30 @@ test_hdr() {
     fi
   fi
 
+  # RV3-06: an SDR encode carrying a SOLE HDR x265 key — `--x265-params transfer=smpte2084` as the
+  # WHOLE param string — must NOT bake the PQ transfer into the output. build_x265_params strips the
+  # baked HDR/PQ keys; before the fix the sole-content case survived (no leading/trailing colon for
+  # the old two-pattern strip to anchor on), so the PQ transfer VUI reached the encoded stream. muxm
+  # sets no `-color_trc` for this untagged SDR source, so the only thing that could set
+  # color_transfer=smpte2084 here is the unstripped x265 param — a clean discriminator. (hdr10=1
+  # alone leaves no ffprobe-visible VUI in common builds, so transfer= is used as the probeable key;
+  # the exhaustive per-key/per-position strip coverage lives in _test_unit_x265_strip_hdr_keys.)
+  # Skip-first guard (not an else-skip) per the soft-skip ratchet.
+  if ! ffmpeg_has_encoder libx265; then
+    skip "hdr-x265-strip-sdr: ffmpeg lacks libx265 — cannot exercise the x265-params HDR-key strip"
+  else
+    local x265strip_out="$TESTDIR/hdr_x265strip_sdr.mkv"
+    if assert_encode "hdr-x265-strip-sdr: SDR encode with a sole --x265-params transfer=smpte2084 produced" "$x265strip_out" \
+         --output-ext mkv --crf 28 --preset ultrafast --x265-params "transfer=smpte2084" "$TESTDIR/basic_sdr_subs.mkv"; then
+      local xstf; xstf="$(probe_video "$x265strip_out" color_transfer)"
+      if [[ "$xstf" != *"2084"* ]]; then
+        pass "hdr-x265-strip-sdr: a sole '--x265-params transfer=smpte2084' is stripped on an SDR encode (color_transfer='$xstf', no PQ baked in)"
+      else
+        fail "hdr-x265-strip-sdr: SDR output carries SMPTE 2084 transfer ('$xstf') — the sole-content x265 HDR key was not stripped (RV3-06 regression)"
+      fi
+    fi
+  fi
+
   # --no-tonemap config flag
   local out
   out="$(run_muxm --no-tonemap --print-effective-config)"
@@ -9712,6 +9736,60 @@ build_av1_params; echo "$SVT_AV1_PARAMS"')"
   fi
 }
 
+# RV3-06: build_x265_params strips baked HDR10/PQ color keys so they can't signal PQ on an SDR/HLG
+# encode. The strip (factored into _x265_strip_hdr_keys) is delimiter-anchored, so a key=value pair
+# is removed at the start, middle, end, AND as the WHOLE string. Before the fix the sole-content
+# case survived (e.g. `--x265-params hdr10=1`), baking HDR10 into an SDR stream.
+_test_unit_x265_strip_hdr_keys() {
+  local body
+  body="$(_extract_muxm_fns _x265_strip_hdr_keys)" \
+    || { fail "unit-x265-strip: could not extract _x265_strip_hdr_keys"; return; }
+  _strip(){ bash -c "$body"$'\n''_x265_strip_hdr_keys "$1"' -- "$1"; }
+
+  # Every stripped key, in all four positions (sole / start / middle / end), must be GONE.
+  local k pos label inp out fail_before=$FAIL
+  for k in hdr10 hdr10-opt hdr-opt colorprim transfer colormatrix range; do
+    for pos in "sole:${k}=1" "start:${k}=1:aq-mode=3:psy-rd=2.0" "middle:aq-mode=3:${k}=1:psy-rd=2.0" "end:aq-mode=3:psy-rd=2.0:${k}=1"; do
+      label="${pos%%:*}"; inp="${pos#*:}"
+      out="$(_strip "$inp")"
+      if printf '%s' "$out" | grep -qE "(^|:)${k}="; then
+        fail "unit-x265-strip: key '$k' survived at position '$label' — in='$inp' out='$out'"
+      fi
+    done
+  done
+  (( FAIL == fail_before )) && pass "unit-x265-strip: all 7 HDR/PQ keys (hdr10, hdr10-opt, hdr-opt, colorprim, transfer, colormatrix, range) stripped in all 4 positions (sole/start/middle/end)"
+
+  # Sole key → empty; empty input → empty.
+  [[ -z "$(_strip 'hdr10=1')" ]] && pass "unit-x265-strip: a sole 'hdr10=1' strips to the empty string" || fail "unit-x265-strip: sole hdr10=1 did not strip to empty (got '$(_strip 'hdr10=1')')"
+  [[ -z "$(_strip '')" ]] && pass "unit-x265-strip: empty input → empty output" || fail "unit-x265-strip: empty input produced non-empty output"
+
+  # Non-target keys preserved AND no doubled colon left by a run of adjacent HDR-key removals.
+  out="$(_strip 'profile=main10:repeat-headers=1:hdr-opt=1:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited:aq-mode=3:psy-rd=2.0')"
+  if [[ "$out" == "profile=main10:repeat-headers=1:aq-mode=3:psy-rd=2.0" ]]; then
+    pass "unit-x265-strip: non-HDR keys preserved and no doubled colon after adjacent HDR-key removals"
+  else
+    fail "unit-x265-strip: expected 'profile=main10:repeat-headers=1:aq-mode=3:psy-rd=2.0', got '$out'"
+  fi
+
+  # End-to-end: build_x265_params on an SDR profile must NOT leave a user-supplied sole hdr10=1 baked in.
+  local bx_body e2e
+  bx_body="$(_extract_muxm_fns _x265_strip_hdr_keys build_x265_params)" \
+    || { fail "unit-x265-strip: could not extract build_x265_params"; return; }
+  e2e="$(bash -c "$bx_body"$'\n''X265_PARAMS_BASE="hdr10=1"; PROFILE_DESC="SDR"; VIDEO_ENCODER_FFMPEG="libx265"; THREADS=""; build_x265_params; printf "%s" "$X265_PARAMS"')"
+  if ! printf '%s' "$e2e" | grep -qE '(^|:)hdr10='; then
+    pass "unit-x265-strip: build_x265_params on an SDR profile drops a user-supplied sole 'hdr10=1' (no HDR10 baked in)"
+  else
+    fail "unit-x265-strip: build_x265_params left hdr10 in an SDR encode — X265_PARAMS='$e2e'"
+  fi
+  # Control: an HDR10 profile RE-adds signaling (the strip didn't break the HDR path).
+  e2e="$(bash -c "$bx_body"$'\n''X265_PARAMS_BASE="aq-mode=3"; PROFILE_DESC="HDR10"; VIDEO_ENCODER_FFMPEG="libx265"; THREADS=""; build_x265_params; printf "%s" "$X265_PARAMS"')"
+  if printf '%s' "$e2e" | grep -qE '(^|:)hdr10=1' && printf '%s' "$e2e" | grep -qF 'transfer=smpte2084'; then
+    pass "unit-x265-strip: build_x265_params on an HDR10 profile re-adds hdr10/transfer signaling (strip didn't break the HDR path)"
+  else
+    fail "unit-x265-strip: build_x265_params HDR10 path missing signaling — X265_PARAMS='$e2e'"
+  fi
+}
+
 _test_unit_fps_helpers() {
   # ---- _fps_to_decimal ----
   # Converts a frame rate (exact rational "num/den" or a plain decimal) to a
@@ -10906,6 +10984,7 @@ test_unit() {
   _test_unit_apply_level_vbv
   _test_unit_mapping_helpers
   _test_unit_av1_helpers
+  _test_unit_x265_strip_hdr_keys
   _test_unit_fps_helpers
   _test_unit_extract_helper
   _test_unit_score_audio_stream
