@@ -363,6 +363,17 @@ assert_no_file() {
   fi
 }
 
+# Assert FILE still exists and its cksum still matches EXPECTED_SUM (captured earlier via
+# `cksum FILE`). Usage: assert_source_unchanged FILE EXPECTED_SUM LABEL
+assert_source_unchanged() {
+  local file="$1" expected_sum="$2" label="$3"
+  if [[ -f "$file" && "$(cksum "$file" 2>/dev/null)" == "$expected_sum" ]]; then
+    pass "$label: source byte-for-byte untouched"
+  else
+    fail "$label: source missing or modified"
+  fi
+}
+
 # _keepworkdir_logfile CAPTURED_OUTPUT — echo the path of a run's workdir logfile, located via the
 # "Keeping workdir:" line a -K run prints (run_muxm always passes -K). Empty (return 1) if absent.
 # muxm routes its internal log() lines to the logfile instead of leaking them to the
@@ -432,14 +443,17 @@ probe_format() {
   ffprobe -v error -show_entries "format=$field" -of csv=p=0 "$file" 2>/dev/null | head -1 || true
 }
 
-# Count streams of a given type. Echoes "-1" (and returns 1) when ffprobe itself fails
-# (missing/corrupt file) — distinct from a genuine zero-stream count — so callers can tell
-# "no streams of this type" apart from "couldn't probe the file at all" instead of both
-# collapsing to "0" (Test_Review.md Tier A #2). Note: 'wc -l' strips padding from BSD wc
+# Count streams of a given type. Echoes "-1" when ffprobe itself fails (missing/corrupt file)
+# — distinct from a genuine zero-stream count — so callers can tell "no streams of this type"
+# apart from "couldn't probe the file at all" instead of both collapsing to "0"
+# (Test_Review.md Tier A #2). Always returns 0 (like the probe_* helpers' own internal
+# `|| true` guards above) so a bare `x="$(count_streams ...)"` at any call site survives this
+# file's `set -euo pipefail` — the failure is signaled via the "-1" return value, which callers
+# must check explicitly, not via a set -e abort. Note: 'wc -l' strips padding from BSD wc
 # (macOS compat) via tr -d ' '.
 count_streams() {
   local file="$1" type="$2" out
-  out="$(ffprobe -v error -select_streams "$type" -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null)" || { printf '%s' "-1"; return 1; }
+  out="$(ffprobe -v error -select_streams "$type" -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null)" || { printf '%s' "-1"; return 0; }
   if [[ -z "$out" ]]; then
     printf '%s' "0"
   else
@@ -1699,19 +1713,18 @@ _test_cli_value_validation() {
 
   # L4: every allow-listed encoder (incl. the newly-mapped libfdk_aac/aac_at) must pass the parse
   # guard — the run fails later only for the missing source, never with "Invalid --audio-force-codec".
-  # _afc_all_ok tracks whether every iteration passed; the closing pass() only fires if it
-  # survives the loop, so a single rejected codec can't be masked by an unconditional pass
-  # (Test_Review.md Tier A #4 — previously fail() could fire inside the loop and pass() would
-  # still fire right after it, claiming "all accepted" regardless).
-  local _afc _afc_all_ok=1
+  # fail_before snapshots $FAIL so the closing pass() only fires if the loop added no new
+  # failures — the same idiom run_suite_tracked uses — so a single rejected codec can't be
+  # masked by an unconditional pass (Test_Review.md Tier A #4 — previously fail() could fire
+  # inside the loop and pass() would still fire right after it, claiming "all accepted" regardless).
+  local _afc fail_before=$FAIL
   for _afc in libopus libmp3lame libvorbis aac libfdk_aac aac_at ac3 eac3 flac; do
     out="$(_l3_msg --audio-force-codec "$_afc")"
     if printf '%s\n' "$out" | grep -qiF "Invalid --audio-force-codec"; then
       fail "cli-audio-force-codec-allowlist: --audio-force-codec $_afc wrongly rejected at parse"
-      _afc_all_ok=0
     fi
   done
-  (( _afc_all_ok )) && pass "cli-audio-force-codec-allowlist: all allow-listed --audio-force-codec encoders accepted at parse (incl. libfdk_aac, aac_at)"
+  (( FAIL == fail_before )) && pass "cli-audio-force-codec-allowlist: all allow-listed --audio-force-codec encoders accepted at parse (incl. libfdk_aac, aac_at)"
 
   # 4.1: --checksum-algo now validates at parse time via the same inline-validator shape as its
   # siblings (_validate_checksum_algo_arg), instead of only being caught by a separate case
@@ -5051,6 +5064,7 @@ EOF
   rm -f "$_l6_src"
 
   _test_audio_native_stereo
+  _test_audio_native_stereo_flac
   _test_audio_directplay
   _test_audio_maxchannels
   _test_audio_stereo_label
@@ -5929,65 +5943,6 @@ _test_audio_native_stereo() {
   assert_contains "No native stereo track available" \
     "Commentary stereo skipped, downmix used instead" "$out"
 
-  # Test 4 (regression): non-AAC native stereo must be stream-copied into MKV.
-  # Reproduces the "Project Hail Mary" report: EAC3 5.1 primary + FLAC 2.0 stereo.
-  # The native-stereo copy path wrote to a hardcoded audio_stereo.aac intermediate;
-  # ffmpeg picks the muxer from that extension, and the .aac (ADTS) muxer rejects
-  # FLAC ("adts muxer supports only codec aac"), so the copy failed and muxm
-  # silently dropped the stereo track — output had only the surround stream.
-  # Earlier tests used an AAC native track (copy into .aac happens to work) and
-  # only asserted the "Native stereo track found" log line, which is emitted
-  # before the copy, so the failure went undetected. This test probes the actual
-  # output streams to prove the stereo track survived.
-  local nf_src="$TESTDIR/native_stereo_flac.mkv"
-  local nf_out="$TESTDIR/native_stereo_flac_out.mkv"
-  log "Testing native FLAC stereo stream-copied into MKV (regression)..."
-  # Skip-first guard (not an else-skip): a minimal ffmpeg build without a FLAC encoder can't
-  # build this fixture at all, and feeding run_muxm a source that silently failed to encode
-  # would previously produce a confusing hard fail unrelated to the feature under test
-  # (Test_Review.md Tier B).
-  if ! ffmpeg_has_encoder flac; then
-    skip "audio-native-stereo-flac: ffmpeg lacks a FLAC encoder — cannot build the regression fixture"
-  else
-  ffmpeg -hide_banner -loglevel error -y \
-    -f lavfi -i "color=c=teal:s=320x240:r=24:d=1" \
-    -f lavfi -i "sine=frequency=440:duration=1" \
-    -f lavfi -i "sine=frequency=660:duration=1" \
-    -c:v libx264 -preset ultrafast -crf 28 \
-    -map 0:v -map 1:a -map 2:a \
-    -c:a:0 eac3 -b:a:0 384k -ac:a:0 6 \
-    -c:a:1 flac -ac:a:1 2 \
-    -metadata:s:a:0 language=eng \
-    -metadata:s:a:1 language=eng \
-    "$nf_src"
-  if [[ ! -s "$nf_src" ]]; then
-    skip "audio-native-stereo-flac: fixture failed to encode"
-  else
-  out="$(run_muxm --crf 51 --preset ultrafast --output-ext mkv --stereo-fallback "$nf_src" "$nf_out")"
-  assert_contains "Native stereo track found" \
-    "FLAC native stereo: preference path taken" "$out"
-  if [[ -s "$nf_out" ]]; then
-    # A dropped stereo track would leave a single audio stream.
-    assert_stream_count "FLAC native stereo: stereo track muxed into output" "$nf_out" a 2 2
-    local nf_ch nf_codec
-    nf_ch="$(probe_audio "$nf_out" channels 1)"
-    nf_codec="$(probe_audio "$nf_out" codec_name 1)"
-    if [[ "$nf_ch" == "2" ]]; then
-      pass "FLAC native stereo: second track is 2ch"
-    else
-      fail "FLAC native stereo: second track channels — expected '2', got '$nf_ch'"
-    fi
-    if [[ "$nf_codec" == "flac" ]]; then
-      pass "FLAC native stereo: stream-copied (codec_name=flac, not transcoded/dropped)"
-    else
-      fail "FLAC native stereo: stereo codec — expected 'flac', got '$nf_codec'"
-    fi
-  else
-    fail "FLAC native stereo: no output produced"
-  fi
-  fi
-  fi
-
   # Test 5 (regression): the MP4/MOV copy branch also copies AC3/EAC3 verbatim,
   # so a non-AAC stereo (AC3 here) hit the same hardcoded-.aac failure. The fix
   # derives the intermediate extension from the native codec for these too.
@@ -6041,6 +5996,65 @@ _test_audio_native_stereo() {
   out="$(run_muxm --crf 51 --preset ultrafast --output-ext mp4 --prefer-stereo "$TESTDIR/surround_only.mkv")"
   assert_contains "selecting the best track by score" \
     "--prefer-stereo fallthrough: surround-only source falls back to score-based selection" "$out"
+}
+
+# Regression: non-AAC native stereo must be stream-copied into MKV.
+# Reproduces the "Project Hail Mary" report: EAC3 5.1 primary + FLAC 2.0 stereo.
+# The native-stereo copy path wrote to a hardcoded audio_stereo.aac intermediate;
+# ffmpeg picks the muxer from that extension, and the .aac (ADTS) muxer rejects
+# FLAC ("adts muxer supports only codec aac"), so the copy failed and muxm
+# silently dropped the stereo track — output had only the surround stream.
+# Earlier tests used an AAC native track (copy into .aac happens to work) and
+# only asserted the "Native stereo track found" log line, which is emitted
+# before the copy, so the failure went undetected. This test probes the actual
+# output streams to prove the stereo track survived. Split out of
+# _test_audio_native_stereo into its own function (mirrors _test_audio_maxchannels'
+# style) so the FLAC-encoder and fixture-build guards can use a plain early return
+# instead of nesting the rest of the test inside two levels of if/else.
+_test_audio_native_stereo_flac() {
+  if ! ffmpeg_has_encoder flac; then
+    skip "audio-native-stereo-flac: ffmpeg lacks a FLAC encoder — cannot build the regression fixture"; return
+  fi
+  local nf_src="$TESTDIR/native_stereo_flac.mkv"
+  local nf_out="$TESTDIR/native_stereo_flac_out.mkv"
+  local out
+  log "Testing native FLAC stereo stream-copied into MKV (regression)..."
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=teal:s=320x240:r=24:d=1" \
+    -f lavfi -i "sine=frequency=440:duration=1" \
+    -f lavfi -i "sine=frequency=660:duration=1" \
+    -c:v libx264 -preset ultrafast -crf 28 \
+    -map 0:v -map 1:a -map 2:a \
+    -c:a:0 eac3 -b:a:0 384k -ac:a:0 6 \
+    -c:a:1 flac -ac:a:1 2 \
+    -metadata:s:a:0 language=eng \
+    -metadata:s:a:1 language=eng \
+    "$nf_src"
+  if [[ ! -s "$nf_src" ]]; then
+    skip "audio-native-stereo-flac: fixture failed to encode"; return
+  fi
+  out="$(run_muxm --crf 51 --preset ultrafast --output-ext mkv --stereo-fallback "$nf_src" "$nf_out")"
+  assert_contains "Native stereo track found" \
+    "FLAC native stereo: preference path taken" "$out"
+  if [[ -s "$nf_out" ]]; then
+    # A dropped stereo track would leave a single audio stream.
+    assert_stream_count "FLAC native stereo: stereo track muxed into output" "$nf_out" a 2 2
+    local nf_ch nf_codec
+    nf_ch="$(probe_audio "$nf_out" channels 1)"
+    nf_codec="$(probe_audio "$nf_out" codec_name 1)"
+    if [[ "$nf_ch" == "2" ]]; then
+      pass "FLAC native stereo: second track is 2ch"
+    else
+      fail "FLAC native stereo: second track channels — expected '2', got '$nf_ch'"
+    fi
+    if [[ "$nf_codec" == "flac" ]]; then
+      pass "FLAC native stereo: stream-copied (codec_name=flac, not transcoded/dropped)"
+    else
+      fail "FLAC native stereo: stereo codec — expected 'flac', got '$nf_codec'"
+    fi
+  else
+    fail "FLAC native stereo: no output produced"
+  fi
 }
 
 # === Suite: Subtitle Pipeline ===
@@ -7802,7 +7816,7 @@ test_collision() {
     -c:a aac -b:a 128k -ac 2
   # Checksum the source once so every "should not touch the source" assertion below can prove
   # byte-for-byte non-modification, not just "a file still happens to be at this path".
-  local coll_src_sum; coll_src_sum="$(cksum "$coll_src" 2>/dev/null)"
+  local coll_src_sum; coll_src_sum="$(cksum "$coll_src" 2>/dev/null)" || true
 
   # ---- Auto-version: movie.mp4 → movie(1).mp4 ----
   log "Testing auto-versioning: movie.mp4 → movie(1).mp4"
@@ -7817,11 +7831,7 @@ test_collision() {
   fi
   # Auto-versioning must never touch the original source (Test_Review.md Tier A #6 — the
   # collision suite previously never verified the wrong file wasn't modified).
-  if [[ -f "$coll_src" && "$(cksum "$coll_src" 2>/dev/null)" == "$coll_src_sum" ]]; then
-    pass "Auto-version: original source movie.mp4 byte-for-byte untouched"
-  else
-    fail "Auto-version: original source movie.mp4 missing or modified after a supposedly non-destructive run"
-  fi
+  assert_source_unchanged "$coll_src" "$coll_src_sum" "Auto-version"
 
   # ---- Increment: movie(1).mp4 exists → movie(2).mp4 ----
   log "Testing auto-versioning increment: movie(1) exists → movie(2).mp4"
@@ -7832,11 +7842,7 @@ test_collision() {
   else
     fail "Auto-version increment: movie(2).mp4 not found"
   fi
-  if [[ -f "$coll_src" && "$(cksum "$coll_src" 2>/dev/null)" == "$coll_src_sum" ]]; then
-    pass "Auto-version increment: original source movie.mp4 still byte-for-byte untouched"
-  else
-    fail "Auto-version increment: original source movie.mp4 missing or modified"
-  fi
+  assert_source_unchanged "$coll_src" "$coll_src_sum" "Auto-version increment"
 
   # ---- Further increment: movie(1) and movie(2) exist → movie(3).mp4 ----
   log "Testing auto-versioning further increment: → movie(3).mp4"
@@ -7847,11 +7853,7 @@ test_collision() {
   else
     fail "Auto-version further: movie(3).mp4 not found"
   fi
-  if [[ -f "$coll_src" && "$(cksum "$coll_src" 2>/dev/null)" == "$coll_src_sum" ]]; then
-    pass "Auto-version further: original source movie.mp4 still byte-for-byte untouched"
-  else
-    fail "Auto-version further: original source movie.mp4 missing or modified"
-  fi
+  assert_source_unchanged "$coll_src" "$coll_src_sum" "Auto-version further"
 
   # ---- No collision when source ext != output ext (e.g., .mkv → .mp4) ----
   log "Testing no collision when extensions differ (.mkv → .mp4)"
@@ -7883,11 +7885,7 @@ test_collision() {
   assert_contains "force-replace-source" "--replace-source: error suggests --force-replace-source" "$rs_out"
   # A rejected --replace-source attempt must leave the source exactly as it was
   # (Test_Review.md Tier A #6).
-  if [[ -f "$coll_src" && "$(cksum "$coll_src" 2>/dev/null)" == "$coll_src_sum" ]]; then
-    pass "--replace-source (rejected): source movie.mp4 byte-for-byte untouched"
-  else
-    fail "--replace-source (rejected): source movie.mp4 missing or modified despite the rejection"
-  fi
+  assert_source_unchanged "$coll_src" "$coll_src_sum" "--replace-source (rejected)"
 
   # ---- --force-replace-source: replaces the original file ----
   log "Testing --force-replace-source replaces original"
@@ -7897,8 +7895,9 @@ test_collision() {
   gen_media "$frs_src" red \
     -c:v libx264 -preset ultrafast -crf 28 \
     -c:a aac -b:a 128k -ac 2
-  local original_size
+  local original_size original_codec
   original_size="$(stat -c%s "$frs_src" 2>/dev/null || stat -f%z "$frs_src" 2>/dev/null || echo 0)"
+  original_codec="$(probe_video "$frs_src" codec_name)"
   out="$(run_muxm --force-replace-source --crf 28 --preset ultrafast "$frs_src")"
   assert_contains "replaced" "--force-replace-source: replacement note" "$out"
   if [[ -f "$frs_src" && -s "$frs_src" ]]; then
@@ -7906,16 +7905,17 @@ test_collision() {
     new_size="$(stat -c%s "$frs_src" 2>/dev/null || stat -f%z "$frs_src" 2>/dev/null || echo 0)"
     local frs_codec
     frs_codec="$(probe_video "$frs_src" codec_name)"
-    # Since the source is re-encoded with the SAME codec/crf/preset it started with, a
-    # decodable-video check alone can't tell "replaced" from "left untouched" — the untouched
-    # file would still be valid libx264 (Test_Review.md Tier A #6). Requiring the byte size to
-    # have actually changed proves a real re-encode happened, not just a no-op.
-    if [[ -n "$frs_codec" && "$new_size" != "$original_size" ]]; then
-      pass "--force-replace-source: source replaced with valid video ($frs_codec, ${original_size} → ${new_size} bytes)"
+    # The re-encode above passes no --video-codec, so it falls through to muxm's default
+    # (currently libx265/hevc), not the source's libx264/h264 — comparing codec_name directly
+    # proves a real re-encode happened without relying on a byte-size delta, which could in
+    # principle coincide if a future default ever matched the source's codec. Byte size is
+    # still checked as a secondary signal (Test_Review.md Tier A #6).
+    if [[ -n "$frs_codec" && "$frs_codec" != "$original_codec" ]]; then
+      pass "--force-replace-source: source replaced with valid video ($original_codec → $frs_codec, ${original_size} → ${new_size} bytes)"
     elif [[ -z "$frs_codec" ]]; then
       fail "--force-replace-source: replaced file is not a decodable video (size: $original_size → $new_size)"
     else
-      fail "--force-replace-source: file size unchanged ($original_size bytes) — no evidence the source was actually re-encoded"
+      fail "--force-replace-source: codec unchanged ($frs_codec) — no evidence the source was actually re-encoded (size: $original_size → $new_size)"
     fi
   else
     fail "--force-replace-source: source file missing after encode"
@@ -8675,8 +8675,9 @@ _test_unit_filesize() {
   if [[ "$result" == "1.5 MB (1572864 bytes)" ]]; then pass "filesize_pretty(~1.5 MB)"; else fail "filesize_pretty(~1.5 MB) expected '1.5 MB (1572864 bytes)', got '$result'"; fi
 
   # >1 GiB (GB path) — use a sparse file so no real disk space is consumed. Exact value
-  # asserted per the Tier B rationale above (bc's scale=2 truncates 1073741825/1073741824
-  # to 1.00, not rounds — verified against the real bc build this suite requires).
+  # asserted per the Tier B rationale above. Note: 1073741825/1073741824 ≈ 1.0000000009,
+  # so this value happens to round to "1.00" the same way it truncates — it does NOT by
+  # itself distinguish a truncating bc from a rounding one, just verifies the GB path fires.
   if command -v truncate &>/dev/null; then
     truncate -s 1073741825 "$fsz_dir/onegb"
     result="$(muxm_fn filesize_pretty "$fsz_dir/onegb")"
@@ -12426,7 +12427,11 @@ EOF
        "$TESTDIR/ext_sub_source.mkv" "$outfile" >/dev/null 2>&1 && [[ -f "$outfile" && -s "$outfile" ]]; then
     local max1_count
     max1_count="$(count_streams "$outfile" s)"
-    if (( max1_count <= 1 )); then
+    # count_streams' "-1" probe-failure sentinel would otherwise satisfy this upper-bound-only
+    # `<= 1` check and false-pass a corrupt/unprobeable output — reject it explicitly.
+    if [[ "$max1_count" == "-1" ]]; then
+      fail "SUB_MAX_TRACKS=1 — could not probe '$outfile' (missing, empty, or corrupt)"
+    elif (( max1_count <= 1 )); then
       pass "SUB_MAX_TRACKS=1: external subs limited to ≤1 (got $max1_count)"
     else
       fail "SUB_MAX_TRACKS=1: expected ≤1 subtitle track, got $max1_count"
@@ -14671,10 +14676,11 @@ _test_meta_soft_skip() {
         if (t=="" || t~/^#/) next
         if (ss) {
           if (t=="fi") { c++; ie=0; ss=0; next }
-          # Tolerate a trailing statement between `skip` and `fi` (e.g. `return 0`) — still the
-          # same soft-skip shape the ratchet exists to catch. Bail (do not count) only if a new
-          # control-flow construct starts, since that means the else-body is no longer a
-          # trivial skip-and-fall-through block.
+          # Tolerate any number of trailing statements between `skip` and `fi` (e.g. `return 0`,
+          # or several such lines) — still the same soft-skip shape the ratchet exists to catch.
+          # Bail (do not count) only if a new control-flow construct starts, since that means
+          # the else-body is no longer a trivial skip-and-fall-through block. This only makes
+          # the ratchet stricter (more likely to count a block), never more permissive.
           if (t ~ /^(if|elif|else|case|for|while|until|esac|done)([ \t;]|$)/ || t ~ /^[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*\{?$/) { ie=0; ss=0; next }
           next
         }
