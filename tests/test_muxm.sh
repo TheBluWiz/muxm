@@ -1714,9 +1714,10 @@ _test_cli_value_validation() {
   # L4: every allow-listed encoder (incl. the newly-mapped libfdk_aac/aac_at) must pass the parse
   # guard — the run fails later only for the missing source, never with "Invalid --audio-force-codec".
   # fail_before snapshots $FAIL so the closing pass() only fires if the loop added no new
-  # failures — the same idiom run_suite_tracked uses — so a single rejected codec can't be
-  # masked by an unconditional pass (Test_Review.md Tier A #4 — previously fail() could fire
-  # inside the loop and pass() would still fire right after it, claiming "all accepted" regardless).
+  # failures — the same fail-count-snapshot idiom the suite runner itself relies on — so a
+  # single rejected codec can't be masked by an unconditional pass (Test_Review.md Tier A #4 —
+  # previously fail() could fire inside the loop and pass() would still fire right after it,
+  # claiming "all accepted" regardless).
   local _afc fail_before=$FAIL
   for _afc in libopus libmp3lame libvorbis aac libfdk_aac aac_at ac3 eac3 flac; do
     out="$(_l3_msg --audio-force-codec "$_afc")"
