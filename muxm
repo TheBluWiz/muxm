@@ -3131,7 +3131,10 @@ _warn_if_not_on_manpath(){
   case ":$_resolved:" in
     *":$_mandir:"*) ;;  # already on the search path — nothing to warn about
     *)
+      # shellcheck disable=SC2016  # backticks are literal decoration around the %s placeholder
       printf '  ⚠️  %s is not on your man search path — `man %s` may not find it.\n' "$_mandir" "$CLI_NAME"
+      # shellcheck disable=SC2016  # $MANPATH is a copy-pasteable shell snippet for the user,
+      # not an expansion of this process's env — must stay literal.
       printf '     Add it with: export MANPATH="%s:$MANPATH"\n' "$_mandir"
       ;;
   esac

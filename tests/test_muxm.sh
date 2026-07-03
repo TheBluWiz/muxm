@@ -1651,6 +1651,8 @@ _test_cli_create_config() {
   # ---- 1.6: $HOME unset gives a muxm-specific diagnostic, not a raw bash "unbound variable" ----
   local cfg_home_out cfg_home_rc
   cfg_home_out="$(cd "$TESTDIR" && env -u HOME "$MUXM" --create-config user atv-directplay-hq 2>&1)" && cfg_home_rc=$? || cfg_home_rc=$?
+  # shellcheck disable=SC2016  # '$HOME is not set' is a literal substring to grep -F for in
+  # muxm's own diagnostic text, not a variable meant to expand here.
   if [[ "$cfg_home_rc" -ne 0 ]] && grep -qiF '$HOME is not set' <<<"$cfg_home_out" && ! grep -qiF 'unbound variable' <<<"$cfg_home_out"; then
     pass "cli-create-config-home-unset: --create-config user with \$HOME unset gives a muxm-specific diagnostic"
   else
@@ -7949,7 +7951,8 @@ test_collision() {
     local _m4_dir; _m4_dir="$(mktemp -d "$TESTDIR/m4.XXXXXX")"
     local _m4_src="$_m4_dir/src.mkv" _m4_out="$_m4_dir/out.mkv"
     # Hidden output lock: muxm computes "$(dirname OUT)/.$(basename OUT).lock".
-    local _m4_lock="$_m4_dir/.$(basename "$_m4_out").lock"
+    local _m4_lock
+    _m4_lock="$_m4_dir/.$(basename "$_m4_out").lock"
     ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=320x180:rate=24:duration=1" \
       -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p "$_m4_src" 2>/dev/null
     if [[ ! -s "$_m4_src" ]]; then
@@ -9912,9 +9915,11 @@ _test_unit_empty_array_safe() {
   # version string — that the BARE form actually still errors there (macOS's system /bin/bash is a
   # real pre-4.4 build even when a modern bash is on PATH via Homebrew).
   local old_bash=""
+  # shellcheck disable=SC2016  # the bare "${arr[@]}" form must reach /bin/bash literally,
+  # unexpanded (applies to the elif's inline bash -c below — a disable comment can't sit
+  # between an if and its own elif, shellcheck only accepts it before the whole compound command).
   if [[ -n "${BASH_43:-}" && -x "${BASH_43:-}" ]]; then
     old_bash="$BASH_43"
-  # shellcheck disable=SC2016  # the bare "${arr[@]}" form must reach /bin/bash literally, unexpanded
   elif [[ -x /bin/bash ]] && ! /bin/bash -c 'set -u; arr=(); printf "%s" "${arr[@]}"' >/dev/null 2>&1; then
     old_bash="/bin/bash"
   fi
@@ -10966,6 +10971,8 @@ _test_unit_refresh_mandb() {
 _test_unit_require_sudo_for() {
   local body
   body="$(_extract_muxm_fns _require_sudo_for)" || { fail "unit-require-sudo-for: _require_sudo_for not found in muxm"; return; }
+  # shellcheck disable=SC2016  # stub body; "$1"/"$2" must reach the child bash -c literally,
+  # unexpanded here — same pattern as _make_brew_stub above.
   local die_stub='die(){ printf "DIE|%s|%s\n" "$1" "$2"; exit "$1"; }'
 
   # NOTE: PATH must be reassigned as the FIRST statement INSIDE the bash -c script body, not as
@@ -11108,6 +11115,8 @@ _test_unit_ocr_lang_flags() {
   # whole script when the function is called as a plain statement — exactly how every real call
   # site invokes _ocr_lang_flags. Without set -e here, a regression of that class would go
   # undetected even though it crashes every real pgsrip/custom-tool run with no language set.
+  # shellcheck disable=SC2016  # this is a literal, single-quoted nested-bash-c script body;
+  # ${o[*]} etc. must reach the child bash unexpanded — same pattern as _make_brew_stub.
   script='set -e'$'\n'"$body"$'\n''
     declare -a o
     _ocr_lang_flags o pgsrip eng;         echo "pgsrip:${o[*]}"
@@ -11140,6 +11149,8 @@ _test_unit_ocr_lang_flags() {
   else
     fail "unit-ocr-lang-flags: expected 1 call in _prepare_subtitle and 2 in _prepare_ext_subtitle, got $ps_count and $pes_count"
   fi
+  # shellcheck disable=SC2016  # searching muxm's own source text for the literal substring
+  # case "$SUB_OCR_TOOL" in — not a variable meant to expand in this test.
   if ! grep -q 'case "\$SUB_OCR_TOOL" in' <<<"$ps$pes"; then
     pass "unit-ocr-lang-flags: no inlined SUB_OCR_TOOL case statement remains in either function"
   else
@@ -11162,6 +11173,9 @@ _test_unit_run_ocr() {
   local logfile; logfile="$(mktemp)"
 
   local out script
+  # shellcheck disable=SC2016  # literal, single-quoted nested-bash-c script body; the
+  # "'"$logfile"'" splice below closes/reopens the surrounding single quotes just to expand
+  # $logfile NOW — the rest of the script (lang, etc.) must stay literal for the child bash.
   script="spinner(){ :; }"$'\n'"SUB_OCR_TOOL=\"$stub_bin/fake_ocr\""$'\n'"$body"$'\n''
     declare -a lang=(--language eng)
     _run_ocr /tmp/muxm_test_ocr_input.sup "'"$logfile"'" "test label" lang
@@ -11208,6 +11222,8 @@ _test_unit_audio_pretty_line() {
   # sites invoke _audio_pretty_line. Without set -e here, a regression of that class would go
   # undetected even though it crashes every real run on a 0-bitrate/untitled track (the C
   # scenario below — a very common case, not an edge case).
+  # shellcheck disable=SC2016  # literal, single-quoted nested-bash-c script body; $out etc.
+  # must reach the child bash unexpanded — same pattern as _make_brew_stub.
   script='set -e'$'\n'"$body"$'\n''
     declare out
     _audio_pretty_line out 0 eac3 6 eng "" 384000;          echo "A:$out"
@@ -11909,12 +11925,16 @@ test_completions() {
   # ---- 1.6: $HOME unset gives a muxm-specific diagnostic, not a raw bash "unbound variable" ----
   local out16 rc16
   out16="$(cd "$TESTDIR" && env -u HOME "$MUXM" --install-completions 2>&1)" && rc16=$? || rc16=$?
+  # shellcheck disable=SC2016  # '$HOME is not set' is a literal substring to grep -F for in
+  # muxm's own diagnostic text, not a variable meant to expand here.
   if [[ "$rc16" -ne 0 ]] && grep -qiF '$HOME is not set' <<<"$out16" && ! grep -qiF 'unbound variable' <<<"$out16"; then
     pass "completions-home-unset-diagnostic: --install-completions with \$HOME unset gives a muxm-specific diagnostic"
   else
     fail "completions-home-unset-diagnostic: --install-completions with \$HOME unset: ${out16:0:200}"
   fi
   out16="$(cd "$TESTDIR" && env -u HOME "$MUXM" --uninstall-completions 2>&1)" && rc16=$? || rc16=$?
+  # shellcheck disable=SC2016  # '$HOME is not set' is a literal substring to grep -F for in
+  # muxm's own diagnostic text, not a variable meant to expand here.
   if [[ "$rc16" -ne 0 ]] && grep -qiF '$HOME is not set' <<<"$out16" && ! grep -qiF 'unbound variable' <<<"$out16"; then
     pass "completions-home-unset-diagnostic: --uninstall-completions with \$HOME unset gives a muxm-specific diagnostic"
   else
