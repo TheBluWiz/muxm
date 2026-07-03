@@ -1530,6 +1530,7 @@ test_cli() {
   _test_cli_robustness
   _test_cli_value_flag_no_value
   _test_cli_value_validation
+  _test_cli_crf_octal
   _test_cli_dashdash
   _test_cli_config_missing_val
   _test_cli_replace_source_eof
@@ -1765,6 +1766,44 @@ _test_cli_value_validation() {
     fail "cli-numeric-flag-validation: config AV1_MAXRATE=garbage not rejected after load (got: $(printf '%s\n' "$_l3out" | grep -iE 'Invalid|not found|empty' | head -1))"
   fi
   rm -rf "$_l3dir"
+}
+
+# RV3-01: CRF_VALUE carries no `declare -i` attribute, so its CLI arm coerces the value in
+# base 10 (10#) — a leading-zero value must never be re-interpreted as octal at assignment
+# time. Before the fix, `--crf 08` threw a raw "value too great for base" bash arithmetic
+# error that unwound the whole parse loop, silently dropped every flag typed afterward
+# (--dry-run, --no-disk-check), and fell through to help text with exit 0 while a real encode
+# still ran and wrote output. These cases assert clean base-10 accept / clean die() instead,
+# and that a flag placed AFTER a leading-zero --crf is honored rather than discarded.
+_test_cli_crf_octal() {
+  local out pair in want src="$TESTDIR/basic_sdr_subs.mkv"
+
+  # Leading-zero values that ARE valid CRFs (≤51) must be accepted as their DECIMAL value,
+  # never octal — including "08"/"048", whose "8" digit would make an octal parse hard-error.
+  for pair in "048:48" "051:51" "007:7" "08:8"; do
+    in="${pair%%:*}"; want="${pair##*:}"
+    out="$(run_muxm --crf "$in" --print-effective-config)"
+    assert_matches "CRF_VALUE += ${want}\$" "cli-crf-octal: --crf $in accepted as decimal $want (base-10, not octal)" "$out"
+    assert_not_contains "value too great for base" "cli-crf-octal: --crf $in leaves no raw bash arithmetic error" "$out"
+  done
+
+  # A leading-zero value that is out of range must die() cleanly (exit 11) — not throw a raw
+  # arithmetic error and fall through to help with exit 0.
+  out="$(run_muxm --crf 099 --print-effective-config)"
+  assert_contains "Invalid --crf" "cli-crf-octal: out-of-range --crf 099 gives a clean die(), not an arithmetic error" "$out"
+  assert_not_contains "value too great for base" "cli-crf-octal: --crf 099 leaves no raw bash arithmetic error" "$out"
+  assert_exit "$EXIT_VALIDATION" "cli-crf-octal: --crf 099 exits $EXIT_VALIDATION" --crf 099 --print-effective-config
+
+  # Regression (the core of Finding #1): a flag placed AFTER a leading-zero --crf must NOT be
+  # silently dropped. With the bug, the arithmetic error unwound the parse loop and discarded
+  # --dry-run/--no-disk-check, so a real encode ran and wrote output. Assert the dry-run banner
+  # still fires, NO output file is written, and no arithmetic error leaks.
+  local outfile="$TESTDIR/crf_octal_dryrun_out.mp4"; rm -f "$outfile"
+  out="$(run_muxm --crf 08 --dry-run --no-disk-check "$src" "$outfile")"
+  assert_contains "DRY-RUN" "cli-crf-octal: --dry-run typed after --crf 08 still takes effect (not dropped)" "$out"
+  assert_no_file "$outfile" "cli-crf-octal: no output written when --dry-run/--no-disk-check follow a leading-zero --crf"
+  assert_not_contains "value too great for base" "cli-crf-octal: leading-zero --crf + later flags leaves no arithmetic error" "$out"
+  rm -f "$outfile"
 }
 
 # M2: a value-flag used as the FINAL token (no value after it) must error cleanly —
@@ -2266,6 +2305,36 @@ EOF
   assert_contains "SUB_OCR_TOOL              = pgsrip" "--ocr-tool sets SUB_OCR_TOOL in effective config" "$ocr_out"
 }
 
+# RV3-01: a .muxmrc assigning CRF_VALUE directly must round-trip in BASE 10, not octal.
+# CRF_VALUE is intentionally NOT `declare -i`, so a config value like "010" survives as a raw
+# string to the base-10 normalization (→ decimal 10, never octal 8), and "08" no longer hard-
+# errors at *source* time (previously it printed "value too great for base" and silently fell
+# back to the default 18). An out-of-range config value still dies cleanly on a real run.
+_test_config_crf_octal() {
+  local h="$TESTDIR/crf_octal_home"; mkdir -p "$h"
+  local out code
+
+  # "010": the silent-octal trap. Must report decimal 10, never octal 8.
+  printf 'CRF_VALUE="010"\n' > "$h/.muxmrc"
+  out="$(cd "$TESTDIR" && HOME="$h" "$MUXM" --print-effective-config 2>&1)"
+  assert_matches "CRF_VALUE += 10\$" 'config-crf-octal: .muxmrc CRF_VALUE="010" reports decimal 10 (not octal 8)' "$out"
+  assert_not_contains "value too great for base" 'config-crf-octal: CRF_VALUE="010" leaves no raw bash arithmetic error' "$out"
+
+  # "08": not a valid octal digit sequence — previously a hard source-time error + default fallback.
+  printf 'CRF_VALUE="08"\n' > "$h/.muxmrc"
+  out="$(cd "$TESTDIR" && HOME="$h" "$MUXM" --print-effective-config 2>&1)"
+  assert_matches "CRF_VALUE += 8\$" 'config-crf-octal: .muxmrc CRF_VALUE="08" reports decimal 8 (no source-time error)' "$out"
+  assert_not_contains "value too great for base" 'config-crf-octal: CRF_VALUE="08" leaves no raw bash arithmetic error' "$out"
+
+  # Out-of-range config value still dies cleanly. print_effective_config exits before the range
+  # guard, so exercise the guard on a real (dry) run.
+  printf 'CRF_VALUE="099"\n' > "$h/.muxmrc"
+  out="$(cd "$TESTDIR" && HOME="$h" "$MUXM" --dry-run --no-disk-check "$TESTDIR/basic_sdr_subs.mkv" "$TESTDIR/crf_cfg_out.mp4" 2>&1)" && code=$? || code=$?
+  assert_contains "Invalid CRF_VALUE from config" 'config-crf-octal: out-of-range config CRF_VALUE="099" dies cleanly' "$out"
+  assert_not_contains "value too great for base" 'config-crf-octal: CRF_VALUE="099" leaves no raw bash arithmetic error' "$out"
+  rm -rf "$h" "$TESTDIR/crf_cfg_out.mp4"
+}
+
 _test_config_create_overrides() {
   # --create-config with CLI overrides should produce a .muxmrc where the
   # overridden values are uncommented and set to the supplied values.
@@ -2707,6 +2776,7 @@ test_config() {
   _test_config_create
   _test_config_layering
   _test_config_validation
+  _test_config_crf_octal
   _test_config_create_overrides
   _test_config_deprecation_bridge
   _test_config_create_escape
@@ -3786,6 +3856,14 @@ test_dryrun() {
   out="$(run_muxm --dry-run "$TESTDIR/basic_sdr_subs.mkv" "$outfile")"
   assert_contains "DRY-RUN" "Dry-run announces itself" "$out"
   assert_no_file "$outfile" "Dry-run does not create output"
+
+  # RV3-01: --dry-run must still short-circuit when a leading-zero --crf precedes it. Before the
+  # fix, `--crf 08` threw a raw bash arithmetic error that unwound the parse loop and dropped the
+  # following --dry-run, so a real encode ran. Assert the dry-run banner fires and no file is written.
+  local octal_out="$TESTDIR/dryrun_crf_octal_out.mp4"; rm -f "$octal_out"
+  out="$(run_muxm --crf 08 --dry-run "$TESTDIR/basic_sdr_subs.mkv" "$octal_out")"
+  assert_contains "DRY-RUN" "Dry-run short-circuits even after a leading-zero --crf (08)" "$out"
+  assert_no_file "$octal_out" "Dry-run after leading-zero --crf writes no output"
 
   # Dry-run with profile
   out="$(run_muxm --dry-run --profile streaming "$TESTDIR/hevc_sdr_51.mkv")"

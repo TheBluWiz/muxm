@@ -232,7 +232,12 @@ declare -a SII_SUB_INDICES=()
 
 # ===== Section 4: Opinionated defaults ========================================================
 # ---- Video encode (x265/x264)
-declare -i CRF_VALUE=18
+# CRF_VALUE is a plain string, NOT `declare -i`, on purpose (RV3-01). A config-file
+# assignment like CRF_VALUE="010" or "08" would octal-coerce (or hard-error) at *source*
+# time under `declare -i`, before any validation could see the raw value. Keeping it a
+# string lets the raw value survive to the base-10 normalization below (before
+# print_effective_config) and the Section-15 re-validation, both of which force `10#`.
+CRF_VALUE=18
 PRESET_VALUE="slower"
 X265_PARAMS_BASE='profile=main10:repeat-headers=1:hdr-opt=1:aq-mode=3:aq-strength=1.3:psy-rd=2.0:psy-rdoq=1.0:rc-lookahead=60'
 X264_PARAMS_BASE=""   # Advanced x264 parameter string (e.g., youtube-upload profile)
@@ -1508,7 +1513,15 @@ _muxm_try_source "./.muxmrc"   # Sources from $PWD — intentional project-level
 # rename warning always fires while the legacy alias is present.
 if [[ -n "${AUDIO_SCORE_LANG_BONUS_ENG:-}" ]]; then
   if [[ "$AUDIO_SCORE_LANG_BONUS" == "${_MUXM_PRE_CONFIG[AUDIO_SCORE_LANG_BONUS]}" ]]; then
-    AUDIO_SCORE_LANG_BONUS="$AUDIO_SCORE_LANG_BONUS_ENG"
+    # RV3-01: AUDIO_SCORE_LANG_BONUS is `declare -i`, so a plain assignment of a leading-zero
+    # legacy value (e.g. "010") would octal-reinterpret it (→ 8) or hard-error ("08"). Force
+    # base 10 for well-formed integers; leave any other value to the declare -i assignment so
+    # its existing (arithmetic) handling of non-plain values is unchanged.
+    if [[ "$AUDIO_SCORE_LANG_BONUS_ENG" =~ ^[0-9]+$ ]]; then
+      AUDIO_SCORE_LANG_BONUS=$((10#$AUDIO_SCORE_LANG_BONUS_ENG))
+    else
+      AUDIO_SCORE_LANG_BONUS="$AUDIO_SCORE_LANG_BONUS_ENG"
+    fi
   fi
   # shellcheck disable=SC2016
   printf '⚠️  Deprecated: AUDIO_SCORE_LANG_BONUS_ENG → rename to AUDIO_SCORE_LANG_BONUS in your .muxmrc\n' >&2
@@ -5317,7 +5330,11 @@ while [[ $# -gt 0 ]]; do
       if [[ ! "$_crf_in" =~ ^[0-9]+$ ]] || (( 10#$_crf_in > 51 )); then
         die 11 "Invalid --crf: integer 0–51 expected (got: ${_crf_in})"
       fi
-      CRF_VALUE="$_crf_in"; _CLI_CRF_EXPLICIT=1; shift 2 ;;
+      # RV3-01: force base-10. A plain CRF_VALUE="$_crf_in" would re-trigger octal
+      # interpretation of a leading-zero value (e.g. "08") at assignment time and throw a
+      # raw, untrapped bash arithmetic error that unwinds the whole parse loop — silently
+      # dropping every flag typed after --crf (including --dry-run) while a real encode runs.
+      CRF_VALUE=$((10#$_crf_in)); _CLI_CRF_EXPLICIT=1; shift 2 ;;
     -p|--preset)
       _require_val "$1" "$#" "${2:-}"; PRESET_VALUE="$2"; _CLI_PRESET_EXPLICIT=1
       is_valid_preset "$PRESET_VALUE" || die 11 "Invalid preset: $PRESET_VALUE. Valid presets: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo."
@@ -6080,6 +6097,14 @@ EOF
   exit 0
 }
 
+# RV3-01: normalize CRF_VALUE to base-10 BEFORE print_effective_config, so the diagnostic
+# reports the same decimal value the encode will use — not a leading-zero string a .muxmrc
+# assigned (e.g. CRF_VALUE="010", which would otherwise display "010" and, without this
+# normalization, octal-reinterpret to 8 the first time it hit an arithmetic context). Only
+# well-formed integers are coerced; a non-numeric value is left untouched for the Section-15
+# re-validation below to reject cleanly with a die().
+if [[ "$CRF_VALUE" =~ ^[0-9]+$ ]]; then CRF_VALUE=$((10#$CRF_VALUE)); fi
+
 # When --print-effective-config is requested, resolve the output container + ATV subtitle
 # policy FIRST (mirroring Section 15) so the diagnostic reports what the encode will actually do
 # — not pre-resolution globals (which mis-reported OUTPUT_EXT and masked the SUB_PRESERVE_*
@@ -6186,9 +6211,12 @@ case "$OUTPUT_EXT" in
   *) die 11 "Invalid OUTPUT_EXT: must be mp4, m4v, mov, or mkv (got: $OUTPUT_EXT)" ;;
 esac
 
-# Re-validate CRF_VALUE after config load: a sourced config can assign directly to the
-# declare -i variable, bypassing the CLI parser guard.
-if [[ ! "$CRF_VALUE" =~ ^[0-9]+$ ]] || (( CRF_VALUE > 51 )); then
+# Re-validate CRF_VALUE after config load: a sourced config can assign the global directly,
+# bypassing the CLI parser guard. RV3-01: force `10#` in the range check so a leading-zero
+# value (e.g. "08", "048") is compared in base 10, never octal-reinterpreted into a raw bash
+# arithmetic error. (The normalization before print_effective_config already coerced any
+# well-formed value to decimal; the `10#` here keeps this guard correct on its own.)
+if [[ ! "$CRF_VALUE" =~ ^[0-9]+$ ]] || (( 10#$CRF_VALUE > 51 )); then
   die 11 "Invalid CRF_VALUE from config: integer 0–51 expected (got: ${CRF_VALUE})"
 fi
 

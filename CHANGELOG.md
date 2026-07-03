@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ## [Unreleased]
 
+### Fixed
+- **`--crf` with a leading-zero value no longer octal-coerces, throws a raw bash arithmetic error, and silently drops every flag typed after it (RV3-01)** — `CRF_VALUE` carried bash's `declare -i` attribute, so the CLI arm's plain `CRF_VALUE="$_crf_in"` re-triggered octal interpretation *after* the base-10 bounds check had already validated the value. A malformed-but-plausible `--crf 08` threw an untrapped `value too great for base` arithmetic error that unwound the entire CLI parse loop, silently discarded every subsequent flag (including `--dry-run` and `--no-disk-check`), and fell through to help text with exit 0 — while a real encode still ran and wrote output to disk. `CRF_VALUE` is no longer `declare -i` (so a config-file value survives as a raw string instead of octal-coercing or hard-erroring at *source* time); the CLI arm now assigns `$((10#$_crf_in))`, a base-10 normalization runs before `print_effective_config` (so a `.muxmrc` `CRF_VALUE="010"` reports decimal 10, not a silently-wrong octal 8), and the Section-15 post-config re-validation forces `10#` in its range check. The audit of every other `declare -i` global assigned from raw CLI/config input found one further site of the same hazard class — the `AUDIO_SCORE_LANG_BONUS_ENG → AUDIO_SCORE_LANG_BONUS` deprecation bridge — now likewise base-10-normalized. New `cli`/`config`/`dryrun` regression tests assert clean base-10 accept, clean `die()` on out-of-range, and that a flag placed after a leading-zero `--crf` is honored rather than dropped.
+
 ## [1.5.1] - 2026-07-03
 
 ### Security
