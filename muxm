@@ -195,6 +195,12 @@ PRINT_EFFCONF=0
 declare -i _MULTI_PROFILE_MODE=0
 declare -a _MULTI_PROFILES=()
 declare -a _ORIG_FILTERED_ARGS=()
+# RV3-12: indices (into _ORIG_FILTERED_ARGS) of the args the parser classified as POSITIONALS
+# (source/output). Recorded by ROLE during parsing so multi-profile child-flag reconstruction can
+# drop them by position, never by value-match (a flag value equal to a source/output path must not
+# be misidentified as a positional).
+declare -a _POSITIONAL_ARG_IDXS=()
+declare -i _MAIN_ARGC0=0
 
 # Metadata cache for performance optimization
 METADATA_CACHE=""
@@ -1243,6 +1249,23 @@ readonly _VALID_LOGLEVEL_STR="quiet, panic, fatal, error, warning, info, verbose
 is_valid_hw_accel(){
   case "$1" in
     none|auto|videotoolbox|nvenc) return 0;;
+    *) return 1;;
+  esac
+}
+
+# Validate VIDEO_CODEC / PRESET_VALUE enum values. Defined EARLY (before _create_config_prescan runs
+# at top level) so BOTH the CLI parse arms AND _create_config's override validation can reuse them —
+# RV3-12: --create-config previously persisted an invalid --video-codec/--preset override with no
+# enum check. Keep in sync with the profile appliers / x265 preset set.
+is_valid_video_codec(){
+  case "$1" in
+    libx265|libx264|libsvt-av1|libaom-av1) return 0;;
+    *) return 1;;
+  esac
+}
+is_valid_preset(){
+  case "$1" in
+    ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo) return 0;;
     *) return 1;;
   esac
 }
@@ -4424,6 +4447,17 @@ _create_config() {
     _CC_OVERRIDES[THREADS]=$(( 10#${_CC_OVERRIDES[THREADS]} ))
   fi
 
+  # RV3-12: enum-validate the VIDEO_CODEC / PRESET_VALUE overrides, reusing the SAME validators the
+  # CLI parse arms use (is_valid_video_codec / is_valid_preset) — previously --create-config
+  # persisted whatever string was passed (e.g. --video-codec bogus) into the generated .muxmrc, so a
+  # later run only failed at the post-config re-check, on a config the user thinks is valid.
+  if [[ -n "${_CC_OVERRIDES[VIDEO_CODEC]:-}" ]] && ! is_valid_video_codec "${_CC_OVERRIDES[VIDEO_CODEC]}"; then
+    die 11 "Invalid --video-codec '${_CC_OVERRIDES[VIDEO_CODEC]}': must be libx265, libx264, libsvt-av1, or libaom-av1."
+  fi
+  if [[ -n "${_CC_OVERRIDES[PRESET_VALUE]:-}" ]] && ! is_valid_preset "${_CC_OVERRIDES[PRESET_VALUE]}"; then
+    die 11 "Invalid --preset '${_CC_OVERRIDES[PRESET_VALUE]}': valid presets are ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo."
+  fi
+
   # Normalize deprecated aliases (single call site via _normalize_profile).
   _normalize_profile profile
 
@@ -5124,7 +5158,13 @@ apply_profile
 # SUBSHELL at the call site ("$(_probe_profile_ext …)"); callers must invoke it that way.
 _probe_profile_ext() {
   local OUTPUT_EXT="mp4"
-  "apply_profile_${1//-/_}" 2>/dev/null || true
+  # RV3-12: normalize a deprecated alias to its canonical name BEFORE dispatch — otherwise
+  # apply_profile_<alias> (e.g. apply_profile_dv_archival) does not exist, fails silently (the
+  # `2>/dev/null || true` below), and OUTPUT_EXT falls back to the wrong "mp4" default (the M2 bug
+  # class). The multi-profile caller already normalizes _MULTI_PROFILES, so this is defense-in-depth
+  # for any future call site; PROFILE_ALIASES is used directly (no warn — this is a silent probe).
+  local _p="${PROFILE_ALIASES[$1]:-$1}"
+  "apply_profile_${_p//-/_}" 2>/dev/null || true
   echo "${OUTPUT_EXT}"
 }
 
@@ -5170,28 +5210,27 @@ _run_multi_profiles() {
   # child invocation ("Too many arguments" / a flag left without its value). Each child is
   # re-invoked with the source (and per-profile output) re-appended after the injected
   # --profile/--output-ext below, so _child_flags must contain ONLY flags.
+  # RV3-12: drop the source/output positionals by the INDEX the parser recorded for each (by ROLE),
+  # not by value-matching against POSITIONALS — a value-match dropped the FIRST arg equal to a
+  # positional path, so a flag VALUE byte-identical to the source/output (e.g. `--workdir out.mkv`
+  # where the output is also out.mkv) was misidentified and dropped, corrupting the child flags.
+  local -A _drop_pos=()
+  local _pi
+  for _pi in ${_POSITIONAL_ARG_IDXS[@]+"${_POSITIONAL_ARG_IDXS[@]}"}; do _drop_pos[$_pi]=1; done
   local -a _child_flags=()
-  local -a _pos_pending=("${POSITIONALS[@]}")   # multiset of positional values to drop
-  local _ofa _ppi _dropped
-  local -i _skip_next=0
+  local _ofa
+  local -i _skip_next=0 _idx=0
   for _ofa in ${_ORIG_FILTERED_ARGS[@]+"${_ORIG_FILTERED_ARGS[@]}"}; do
-    # Strip the user's --output-ext (and its value) here — the per-profile --output-ext is
-    # injected at the child invocation below, and it comes BEFORE _child_flags, so a retained user
-    # value would re-override it in the child parser (last --output-ext wins) and mislabel the
-    # container (file named .archive.mkv but actually MP4). The user's intent is instead honored by
-    # making OUTPUT_EXT the per-profile ext for EVERY profile (see _OUTPUT_EXT_EXPLICIT below).
-    # (muxm's parser has no --flag=value form, so the space-separated pair is the only case.)
-    if (( _skip_next )); then _skip_next=0; continue; fi
-    if [[ "$_ofa" == "--output-ext" ]]; then _skip_next=1; continue; fi
-    _dropped=0
-    for _ppi in "${!_pos_pending[@]}"; do
-      if [[ "$_ofa" == "${_pos_pending[$_ppi]}" ]]; then
-        unset '_pos_pending[$_ppi]'   # remove one occurrence per positional
-        _dropped=1
-        break
-      fi
-    done
-    (( _dropped )) || _child_flags+=("$_ofa")
+    if (( _skip_next )); then _skip_next=0; _idx=$(( _idx + 1 )); continue; fi      # --output-ext's value: drop
+    if [[ -n "${_drop_pos[$_idx]:-}" ]]; then _idx=$(( _idx + 1 )); continue; fi    # positional (by parser index): drop
+    # Strip the user's --output-ext (and its value) — the per-profile --output-ext is injected at
+    # the child invocation below (BEFORE _child_flags), so a retained user value would re-override
+    # it in the child parser (last --output-ext wins) and mislabel the container (file named
+    # .archive.mkv but actually MP4). The per-profile ext is applied to EVERY profile instead
+    # (see _OUTPUT_EXT_EXPLICIT). muxm has no --flag=value form, so the space-separated pair is the only case.
+    if [[ "$_ofa" == "--output-ext" ]]; then _skip_next=1; _idx=$(( _idx + 1 )); continue; fi
+    _child_flags+=("$_ofa")
+    _idx=$(( _idx + 1 ))
   done
 
   # Pre-compute per-profile extensions and output paths (needed for warning + invocation).
@@ -5328,12 +5367,8 @@ EOF
 
 print_version(){ echo "${APP_NAME} v${VERSION} (${CLI_NAME})"; }
 
-is_valid_preset(){
-  case "$1" in
-    ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo) return 0;;
-    *) return 1;;
-  esac
-}
+# (is_valid_preset / is_valid_video_codec are defined early — near is_valid_hw_accel — so both the
+# CLI parse arms below and _create_config_prescan's override validation can share them. RV3-12.)
 
 # Die clearly when a value-taking flag receives another flag as its value.
 # Empty-string values are allowed (some flags use "" as "no filter").
@@ -5404,6 +5439,10 @@ _validate_checksum_algo_arg(){
 }
 
 POSITIONALS=()
+# _ORIG_FILTERED_ARGS was captured as this same (post-`--profile`-filter) "$@", so an arg's index
+# in it is (_MAIN_ARGC0 - current $#). Record that for each POSITIONAL below (RV3-12).
+_MAIN_ARGC0=$#
+_POSITIONAL_ARG_IDXS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) print_usage; exit 0 ;;
@@ -5472,10 +5511,7 @@ while [[ $# -gt 0 ]]; do
     --no-dv-convert-p81) DV_CONVERT_TO_P81_IF_FAIL=0; shift ;;
     --video-codec)
       _require_val "$1" "$#" "${2:-}"; VIDEO_CODEC="$2"
-      case "$VIDEO_CODEC" in
-        libx265|libx264|libsvt-av1|libaom-av1) ;;
-        *) die 11 "Invalid --video-codec: must be libx265, libx264, libsvt-av1, or libaom-av1 (got: $VIDEO_CODEC)" ;;
-      esac
+      is_valid_video_codec "$VIDEO_CODEC" || die 11 "Invalid --video-codec: must be libx265, libx264, libsvt-av1, or libaom-av1 (got: $VIDEO_CODEC)"
       shift 2
       ;;
     --hw-accel)
@@ -5571,9 +5607,14 @@ while [[ $# -gt 0 ]]; do
     # below, so the token can never reach this case. (The old arm's `shift 2` would also over-shift
     # a lone trailing `--profile`.) A stray `--profile` now correctly hits the unknown-option guard.
 
-    --) shift; POSITIONALS+=("$@"); break ;;  # Fold remaining args back in (the `--` end-of-options idiom, e.g. `muxm -- -dashname.mkv`); the arity check below still guards
+    --)  # Fold remaining args back in (the `--` end-of-options idiom, e.g. `muxm -- -dashname.mkv`);
+         # the arity check below still guards. RV3-12: record each folded arg's _ORIG_FILTERED_ARGS
+         # index (first post-`--` arg is one past `--` itself) so they drop by position, not value.
+      _da_idx=$(( _MAIN_ARGC0 - $# + 1 )); shift
+      for _da in "$@"; do _POSITIONAL_ARG_IDXS+=("$_da_idx"); POSITIONALS+=("$_da"); _da_idx=$(( _da_idx + 1 )); done
+      break ;;
     -*) die 11 "Unknown option: $1. $USAGE_SHORT" ;;
-    *) POSITIONALS+=("$1"); shift ;;
+    *) _POSITIONAL_ARG_IDXS+=("$(( _MAIN_ARGC0 - $# ))"); POSITIONALS+=("$1"); shift ;;
   esac
 done
 

@@ -1698,6 +1698,34 @@ _test_cli_create_config() {
   _thr_out="$(cd "$_thr_dir" && HOME="$_thr_dir" "$MUXM" --create-config project atv-directplay-hq --threads 0 2>&1)" || true
   assert_contains "Invalid numeric value for THREADS" "cli-create-config-threads: --threads 0 rejected (not a positive integer)" "$_thr_out"
   rm -rf "$_thr_dir"
+
+  # RV3-12: --create-config must enum-validate VIDEO_CODEC / PRESET_VALUE overrides (reusing the CLI's
+  # own is_valid_video_codec / is_valid_preset) and NOT persist a bogus value into the generated
+  # .muxmrc — previously it wrote whatever string was passed, and a later run only died at load.
+  local _cc_enum_dir; _cc_enum_dir="$(mktemp -d "$TESTDIR/ccenum.XXXXXX")"
+  local _cc_vc_out
+  _cc_vc_out="$(cd "$_cc_enum_dir" && HOME="$_cc_enum_dir" "$MUXM" --create-config project atv-directplay-hq --video-codec bogus 2>&1)" || true
+  if printf '%s\n' "$_cc_vc_out" | grep -qiF "Invalid --video-codec 'bogus'" && [[ ! -f "$_cc_enum_dir/.muxmrc" ]]; then
+    pass "cli-create-config-enum: --create-config --video-codec bogus dies cleanly and writes no .muxmrc"
+  else
+    fail "cli-create-config-enum: --video-codec bogus not rejected / .muxmrc persisted (got: $(printf '%s\n' "$_cc_vc_out" | grep -iE 'Invalid' | head -1); muxmrc-present=$([[ -f "$_cc_enum_dir/.muxmrc" ]] && echo yes || echo no))"
+  fi
+  rm -f "$_cc_enum_dir/.muxmrc"
+  local _cc_pr_out
+  _cc_pr_out="$(cd "$_cc_enum_dir" && HOME="$_cc_enum_dir" "$MUXM" --create-config project atv-directplay-hq --preset bogus 2>&1)" || true
+  if printf '%s\n' "$_cc_pr_out" | grep -qiF "Invalid --preset 'bogus'" && [[ ! -f "$_cc_enum_dir/.muxmrc" ]]; then
+    pass "cli-create-config-enum: --create-config --preset bogus dies cleanly and writes no .muxmrc"
+  else
+    fail "cli-create-config-enum: --preset bogus not rejected / .muxmrc persisted (got: $(printf '%s\n' "$_cc_pr_out" | grep -iE 'Invalid' | head -1))"
+  fi
+  # Control: a VALID override is accepted and persisted.
+  ( cd "$_cc_enum_dir" && HOME="$_cc_enum_dir" "$MUXM" --create-config project atv-directplay-hq --video-codec libx264 --preset fast >/dev/null 2>&1 )
+  if grep -qE '^VIDEO_CODEC="?libx264"?$' "$_cc_enum_dir/.muxmrc" 2>/dev/null && grep -qE '^PRESET_VALUE="?fast"?$' "$_cc_enum_dir/.muxmrc" 2>/dev/null; then
+    pass "cli-create-config-enum: valid --video-codec/--preset overrides are accepted and persisted"
+  else
+    fail "cli-create-config-enum: valid overrides not persisted (got: $(grep -E '^VIDEO_CODEC=|^PRESET_VALUE=' "$_cc_enum_dir/.muxmrc" 2>/dev/null | tr '\n' ' '))"
+  fi
+  rm -rf "$_cc_enum_dir"
 }
 
 # L3: --level and the rate flags (--av1-maxrate/--av1-bufsize/--stereo-bitrate) are validated at
@@ -13793,6 +13821,55 @@ test_multi_profile() {
 
   _test_mp_output_ext_container
   _test_multi_profile_dispatch_diagnosed
+  _test_mp_probe_profile_ext_alias
+  _test_mp_positional_value_collision
+}
+
+# RV3-12: _probe_profile_ext must normalize a deprecated alias to its canonical name BEFORE dispatch
+# (defense-in-depth) — otherwise apply_profile_<alias> doesn't exist, fails silently, and OUTPUT_EXT
+# falls back to the wrong "mp4" default. Extract it + PROFILE_ALIASES + apply_profile_archive and
+# assert the alias resolves to the canonical profile's ext (dv-archival → archive → mkv).
+_test_mp_probe_profile_ext_alias() {
+  local body
+  body="$(grep -E '^declare -A PROFILE_ALIASES' "$MUXM"; _extract_muxm_fns _probe_profile_ext apply_profile_archive)" \
+    || { fail "mp-probe-profile-ext-alias: could not extract _probe_profile_ext + helpers"; return; }
+  local _alias_ext _canon_ext
+  _alias_ext="$(bash -c "$body"$'\n''_probe_profile_ext dv-archival' 2>/dev/null)"
+  _canon_ext="$(bash -c "$body"$'\n''_probe_profile_ext archive' 2>/dev/null)"
+  if [[ "$_alias_ext" == "mkv" && "$_alias_ext" == "$_canon_ext" ]]; then
+    pass "mp-probe-profile-ext-alias: _probe_profile_ext normalizes 'dv-archival' → archive's container ($_alias_ext), not the wrong mp4 default"
+  else
+    fail "mp-probe-profile-ext-alias: expected mkv for both, got alias='$_alias_ext' canonical='$_canon_ext'"
+  fi
+}
+
+# RV3-12: multi-profile child-flag reconstruction must drop the source/output positionals by the
+# parser-recorded INDEX (role), not by value-match — so a flag VALUE byte-identical to the source or
+# output path isn't misidentified and dropped (which corrupted the child flags → "Too many
+# arguments"). Uses --sub-lang-pref (accepts any string) set equal to the output/source positional.
+_test_mp_positional_value_collision() {
+  local _csrc="$TESTDIR/basic_sdr_subs.mkv"
+  if [[ ! -f "$_csrc" ]]; then
+    skip "mp-positional-value-collision: basic_sdr_subs.mkv fixture not found"
+    return
+  fi
+  local _out
+  # (a) flag value == OUTPUT positional string.
+  _out="$(run_muxm --sub-lang-pref out.mkv --profile streaming-hevc,streaming-av1 --dry-run "$_csrc" out.mkv)"
+  if ! printf '%s' "$_out" | grep -qiE 'Too many arguments|requires a value|Unknown option' \
+     && printf '%s' "$_out" | grep -qF 'Profile 1/2' && printf '%s' "$_out" | grep -qF 'Profile 2/2'; then
+    pass "mp-positional-value-collision: a --sub-lang-pref value equal to the OUTPUT path doesn't corrupt the child flags (both profiles run)"
+  else
+    fail "mp-positional-value-collision: output-collision corrupted the child flags: $(printf '%s' "$_out" | grep -iE 'Too many|requires a value|Unknown' | head -1)"
+  fi
+  # (b) flag value == SOURCE positional string (basename passed as the source positional).
+  _out="$(run_muxm_in "$TESTDIR" --sub-lang-pref basic_sdr_subs.mkv --profile streaming-hevc,streaming-av1 --dry-run basic_sdr_subs.mkv mpc_out.mkv)"
+  if ! printf '%s' "$_out" | grep -qiE 'Too many arguments|requires a value|Unknown option' \
+     && printf '%s' "$_out" | grep -qF 'Profile 2/2'; then
+    pass "mp-positional-value-collision: a --sub-lang-pref value equal to the SOURCE path doesn't corrupt the child flags"
+  else
+    fail "mp-positional-value-collision: source-collision corrupted the child flags: $(printf '%s' "$_out" | grep -iE 'Too many|requires a value|Unknown' | head -1)"
+  fi
 }
 
 # RV3-10: a multi-profile dispatch FAILURE must surface muxm's own diagnostic (a die() error +
