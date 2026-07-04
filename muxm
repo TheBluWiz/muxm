@@ -403,6 +403,11 @@ declare -i SUB_PRESERVE_BITMAP=1
 declare -i _CLI_SUB_PRESERVE_TEXT_FORMAT_EXPLICIT=0
 declare -i _CLI_SUB_PRESERVE_BITMAP_EXPLICIT=0
 
+# RV3-13: 1 when the user explicitly typed --no-checksum on the CLI. --checksum-algo enables
+# checksums as a convenience side effect; this flag lets an explicit --no-checksum win regardless
+# of the order the two are typed (otherwise "--no-checksum --checksum-algo X" silently re-enabled).
+declare -i _CLI_NO_CHECKSUM_EXPLICIT=0
+
 # ---- Multi-track subtitles (archive profile)
 # Keep all matching subtitle tracks instead of selecting one per type.
 # When enabled, build_subtitle_plan skips single-track selection; subtitle streams
@@ -4334,6 +4339,7 @@ _create_config() {
   # Parse config override flags into global associative array _CC_OVERRIDES.
   declare -gA _CC_OVERRIDES=()
   local _cc_flag _cc_val _cc_oi=0
+  local -i _cc_no_checksum=0   # RV3-13: mirror the runtime parser — explicit --no-checksum wins over --checksum-algo's implicit enable
   while (( _cc_oi < ${#_cc_override_argv[@]} )); do
     _cc_flag="${_cc_override_argv[$_cc_oi]}"
     case "$_cc_flag" in
@@ -4356,8 +4362,9 @@ _create_config() {
       --disk-check)                 _CC_OVERRIDES[DISK_CHECK]=1;                                                                       (( ++_cc_oi )) ;;
       --no-disk-check)              _CC_OVERRIDES[DISK_CHECK]=0;                                                                       (( ++_cc_oi )) ;;
       --checksum)                   _CC_OVERRIDES[CHECKSUM]=1;                                                                         (( ++_cc_oi )) ;;
-      --no-checksum)                _CC_OVERRIDES[CHECKSUM]=0;                                                                         (( ++_cc_oi )) ;;
-      --checksum-algo)              _cc_need_val; _CC_OVERRIDES[CHECKSUM_ALGO]="$_cc_val"; _CC_OVERRIDES[CHECKSUM]=1;                 (( _cc_oi += 2 )) ;;
+      --no-checksum)                _CC_OVERRIDES[CHECKSUM]=0; _cc_no_checksum=1;                                                      (( ++_cc_oi )) ;;
+      # RV3-13: --checksum-algo implies checksums, but an explicit --no-checksum (any order) wins.
+      --checksum-algo)              _cc_need_val; _CC_OVERRIDES[CHECKSUM_ALGO]="$_cc_val"; (( _cc_no_checksum )) || _CC_OVERRIDES[CHECKSUM]=1; (( _cc_oi += 2 )) ;;
       # Encoding params
       --x265-params)                _cc_need_val;_CC_OVERRIDES[X265_PARAMS_BASE]="$_cc_val";          (( _cc_oi += 2 )) ;;
       --x264-params)                _cc_need_val;_CC_OVERRIDES[X264_PARAMS_BASE]="$_cc_val";          (( _cc_oi += 2 )) ;;
@@ -5459,8 +5466,10 @@ while [[ $# -gt 0 ]]; do
 
     --dry-run) DRY_RUN=1; shift ;;
     --checksum) CHECKSUM=1; shift ;;
-    --no-checksum) CHECKSUM=0; shift ;;
-    --checksum-algo) _require_val "$1" "$#" "${2:-}"; _validate_checksum_algo_arg "$1" "$2"; CHECKSUM_ALGO="$2"; CHECKSUM=1; shift 2 ;;
+    --no-checksum) CHECKSUM=0; _CLI_NO_CHECKSUM_EXPLICIT=1; shift ;;
+    # RV3-13: --checksum-algo enables checksums as a side effect, but an explicit --no-checksum
+    # (in any order) wins — don't silently re-enable what the user just turned off.
+    --checksum-algo) _require_val "$1" "$#" "${2:-}"; _validate_checksum_algo_arg "$1" "$2"; CHECKSUM_ALGO="$2"; (( _CLI_NO_CHECKSUM_EXPLICIT )) || CHECKSUM=1; shift 2 ;;
     --disk-check) DISK_CHECK=1; shift ;;
     --no-disk-check) DISK_CHECK=0; shift ;;
 
@@ -6267,6 +6276,16 @@ EOF
 # re-validation below to reject cleanly with a die().
 if [[ "$CRF_VALUE" =~ ^[0-9]+$ ]]; then CRF_VALUE=$((10#$CRF_VALUE)); fi
 
+# Validate OUTPUT_EXT (security: an invalid container reaches ffmpeg's muxer/-f selection). Shared
+# by --print-effective-config (below) and Section 15's real-run path, so the diagnostic reports the
+# SAME die a real run would hit instead of silently "accepting" a bogus --output-ext and exiting 0.
+_validate_output_ext_or_die() {
+  case "$OUTPUT_EXT" in
+    mp4|m4v|mov|mkv|"") ;;  # "" = container passthrough, resolved below once source is known
+    *) die 11 "Invalid OUTPUT_EXT: must be mp4, m4v, mov, or mkv (got: $OUTPUT_EXT)" ;;
+  esac
+}
+
 # When --print-effective-config is requested, resolve the output container + ATV subtitle
 # policy FIRST (mirroring Section 15) so the diagnostic reports what the encode will actually do
 # — not pre-resolution globals (which mis-reported OUTPUT_EXT and masked the SUB_PRESERVE_*
@@ -6275,6 +6294,9 @@ if [[ "$CRF_VALUE" =~ ^[0-9]+$ ]]; then CRF_VALUE=$((10#$CRF_VALUE)); fi
 # Multi-profile mode prints per child downstream, so skip resolution there (each child resolves
 # its own container). Stays before Section 14 so the diagnostic still runs without ffmpeg/jq/bc.
 if (( PRINT_EFFCONF )); then
+  # Reject a bogus --output-ext up front (before resolution and the multi-profile guard) so the
+  # diagnostic can't report an invalid container as "accepted" when a real run would die 11.
+  _validate_output_ext_or_die
   if (( ! _MULTI_PROFILE_MODE )); then
     SRC="${POSITIONALS[0]:-}"
     OUT="${POSITIONALS[1]:-}"
@@ -6376,11 +6398,9 @@ OUT="${POSITIONALS[1]:-}"
 (( ${#POSITIONALS[@]} > 2 )) && die 11 "Too many arguments — unexpected: ${POSITIONALS[*]:2}. $USAGE_SHORT"
 [[ -z "$SRC" ]] && { print_usage; exit 0; }
 
-# Validate output extension (security: prevent command injection)
-case "$OUTPUT_EXT" in
-  mp4|m4v|mov|mkv|"") ;;  # "" = container passthrough, resolved below once source is known
-  *) die 11 "Invalid OUTPUT_EXT: must be mp4, m4v, mov, or mkv (got: $OUTPUT_EXT)" ;;
-esac
+# Validate output extension (security: prevent command injection). Shared with the
+# --print-effective-config early-exit path so both reject an invalid container identically.
+_validate_output_ext_or_die
 
 # Re-validate CRF_VALUE after config load: a sourced config can assign the global directly,
 # bypassing the CLI parser guard. RV3-01: force `10#` in the range check so a leading-zero
@@ -7004,14 +7024,38 @@ _acquire_out_lock() {
     rm -rf "$lock" 2>/dev/null || true
   done
   printf '%s\n' "$$" > "$lock/pid" 2>/dev/null || true
+  # RV3-13: a --replace-source run renames its output ONTO the source it just read. Drop a marker
+  # so a concurrent run that READS this same file (its OUT differs, so it never contends on this
+  # lock) can refuse to start rather than read a file that's about to be replaced out from under it.
+  # OUT -ef SRC when replacing, so this lock IS the source's lock — no second lock needed.
+  if (( ${_REPLACING_SOURCE:-0} )); then : > "$lock/replacing-src" 2>/dev/null || true; fi
   _OUT_LOCK_HELD=1
+}
+
+# _check_src_replace_lock — refuse to start when another LIVE muxm run is mid-replace of this run's
+# SOURCE (its output is being renamed onto $SRC_ABS). Checks — does NOT acquire — the source's own
+# hidden lock (…/.<src-basename>.lock) for a live owner carrying the replacing-src marker. Two
+# ordinary runs that merely READ the same source into different outputs never mark that lock, so
+# they don't block each other. Best-effort only: a reader that already started before the marker
+# appeared can still be clobbered (no full reader/writer lock) — a narrow, documented window.
+_check_src_replace_lock() {
+  local _sl; _sl="$(dirname "$SRC_ABS")/.$(basename "$SRC_ABS").lock"
+  [[ -d "$_sl" && -e "$_sl/replacing-src" ]] || return 0
+  local _owner=""; [[ -r "$_sl/pid" ]] && read -r _owner < "$_sl/pid" 2>/dev/null
+  if [[ "$_owner" =~ ^[0-9]+$ ]] && kill -0 "$_owner" 2>/dev/null; then
+    die 11 "Source is being replaced by another live muxm run (PID $_owner): $SRC_ABS — wait for it to finish before reading this file, or use a different source."
+  fi
+  return 0
 }
 
 # The EXIT trap is already armed (just after workdir creation) so the lock is guaranteed to
 # be released, and the print-config / multi-profile early exits are already behind us — take an
 # advisory lock on $OUT so two concurrent runs can't clobber each other's output, report, or log.
 # Dry runs write nothing — skip.
-(( DRY_RUN )) || _acquire_out_lock
+if (( ! DRY_RUN )); then
+  _check_src_replace_lock   # refuse if another live run is mid-replace of our source (RV3-13)
+  _acquire_out_lock
+fi
 
 # ===== Section 19: Disk space preflight =======================================================
 # Estimates required disk space before starting an encode and aborts early if
@@ -7087,7 +7131,21 @@ _av1_preset_multiplier() {
 }
 
 # _gb — format a byte count as "X.X" for GiB display (integer fallback).
-_gb() { LC_NUMERIC=C printf '%.1f' "$(echo "scale=2; ${1:-0} / $BYTES_PER_GIB" | bc 2>/dev/null)" 2>/dev/null || echo "$(( ${1:-0} / BYTES_PER_GIB ))"; }
+# RV3-13: capture bc's output and validate it before printf. The old one-liner piped bc straight
+# into `printf '%.1f'`; when bc failed/was absent the substitution was empty, printf still emitted
+# "0.0" (and returned non-zero), so the `|| echo <int>` fallback ALSO ran and its integer was
+# concatenated onto the "0.0" — a garbled value like "0.05". Now the fallback is mutually exclusive.
+# bc emits a leading-dot form (".05") for sub-1 results, so the numeric guard allows an optional
+# leading digit-run. The bc assignment is guarded (`|| _bcv=""`) so a bc failure can't abort under set -e.
+_gb() {
+  local _bcv
+  _bcv="$(echo "scale=2; ${1:-0} / $BYTES_PER_GIB" | bc 2>/dev/null)" || _bcv=""
+  if [[ "$_bcv" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+    LC_NUMERIC=C printf '%.1f' "$_bcv"
+  else
+    printf '%d' "$(( ${1:-0} / BYTES_PER_GIB ))"
+  fi
+}
 
 # disk_free_warn — smart disk space preflight
 # Estimates output size from source bitrate + CRF/preset tables, then warns
@@ -13065,7 +13123,11 @@ main() {
   # policy banner above (which echoed config-resolved intent before any of this was known).
   # Audio/subtitle concretes are decided in their pipelines below and narrated there.
   local _p_bits _p_dv
-  case "$TARGET_PIXFMT" in *10le|*10be|*10) _p_bits=" 10-bit" ;; *) _p_bits=" 8-bit" ;; esac
+  # RV3-13: derive the bit-depth label from the actual pixfmt depth rather than treating "8-bit" as
+  # the catch-all for anything non-10-bit — a 12-bit target (yuv420p12le) was mislabeled "8-bit".
+  # ffmpeg pixfmts encode depth as trailing digits after the plane letter (yuv420p10le, p010le,
+  # yuv444p12le); an 8-bit format has none (yuv420p, gbrp), so that's the only true 8-bit case.
+  if [[ "$TARGET_PIXFMT" =~ p0?([0-9]{2})(le|be)?$ ]]; then _p_bits=" ${BASH_REMATCH[1]}-bit"; else _p_bits=" 8-bit"; fi
   if (( IS_DV )); then (( DISABLE_DV )) && _p_dv="drop" || _p_dv="keep"; else _p_dv="none"; fi
   say "▶ Plan: $(_video_codec_label "$VIDEO_ENCODER_FFMPEG")${_p_bits} (${VIDEO_ENCODER_FFMPEG}, ${TARGET_PIXFMT}) · ${OUTPUT_EXT^^} · ${PROFILE_DESC} · DV: ${_p_dv}"
 
@@ -13174,6 +13236,10 @@ main() {
       ' 2>/dev/null)"
       local _a_rec a_codec a_ch a_lang a_br a_title a_layout
       while IFS= read -r _a_rec; do
+        # RV3-13: a here-string over an EMPTY variable ("$a_raw_all" when the output has zero audio
+        # streams) still yields one empty-line iteration — skip it so `a_had_audio` stays 0 and the
+        # "Audio : none" fallback fires, instead of printing a bogus blank single-track line.
+        [[ -z "$_a_rec" ]] && continue
         a_had_audio=1
         # Non-collapsing split — an empty bit_rate field must not shift title/layout left.
         _split_tab "$_a_rec" a_codec a_ch a_lang a_br a_title a_layout

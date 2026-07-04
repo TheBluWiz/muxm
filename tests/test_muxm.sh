@@ -1531,6 +1531,7 @@ test_cli() {
   _test_cli_value_flag_no_value
   _test_cli_value_validation
   _test_cli_crf_octal
+  _test_cli_print_effconf_output_ext
   _test_cli_rate_family_validation
   _test_cli_dashdash
   _test_cli_config_missing_val
@@ -1725,6 +1726,17 @@ _test_cli_create_config() {
   else
     fail "cli-create-config-enum: valid overrides not persisted (got: $(grep -E '^VIDEO_CODEC=|^PRESET_VALUE=' "$_cc_enum_dir/.muxmrc" 2>/dev/null | tr '\n' ' '))"
   fi
+
+  # RV3-13: the create-config override collector mirrors the runtime parser — --checksum-algo enables
+  # checksums as a side effect, but an explicit --no-checksum (any order) must win. Assert the
+  # persisted .muxmrc keeps CHECKSUM="0" even though --checksum-algo follows --no-checksum.
+  rm -f "$_cc_enum_dir/.muxmrc"
+  ( cd "$_cc_enum_dir" && HOME="$_cc_enum_dir" "$MUXM" --create-config project atv-directplay-hq --no-checksum --checksum-algo sha256 >/dev/null 2>&1 )
+  if grep -qE '^CHECKSUM="?0"?$' "$_cc_enum_dir/.muxmrc" 2>/dev/null; then
+    pass "cli-create-config-enum: --no-checksum --checksum-algo sha256 persists CHECKSUM=0 (algo doesn't re-enable)"
+  else
+    fail "cli-create-config-enum: expected CHECKSUM=0 persisted, got: $(grep -E '^CHECKSUM=' "$_cc_enum_dir/.muxmrc" 2>/dev/null | tr '\n' ' ')"
+  fi
   rm -rf "$_cc_enum_dir"
 }
 
@@ -1857,6 +1869,24 @@ _test_cli_crf_octal() {
   assert_no_file "$outfile" "cli-crf-octal: no output written when --dry-run/--no-disk-check follow a leading-zero --crf"
   assert_not_contains "value too great for base" "cli-crf-octal: leading-zero --crf + later flags leaves no arithmetic error" "$out"
   rm -f "$outfile"
+}
+
+# RV3-13: --print-effective-config must run Section 15's OUTPUT_EXT validation before its early
+# exit, so it reports the same die() a real run would hit instead of silently "accepting" a bogus
+# --output-ext and exiting 0. Both the single- and multi-profile diagnostic paths must reject it.
+_test_cli_print_effconf_output_ext() {
+  local out
+  # (a) invalid --output-ext → clean die 11, and the config is NOT printed as if accepted.
+  out="$(run_muxm --print-effective-config --output-ext bogus)"
+  assert_contains "Invalid OUTPUT_EXT" "cli-effconf-output-ext: --print-effective-config --output-ext bogus reports the validation failure" "$out"
+  assert_not_contains "OUTPUT_EXT                = bogus" "cli-effconf-output-ext: a bogus --output-ext is not printed as an accepted config value" "$out"
+  assert_exit "$EXIT_VALIDATION" "cli-effconf-output-ext: --print-effective-config --output-ext bogus exits $EXIT_VALIDATION" --print-effective-config --output-ext bogus
+  # (b) multi-profile diagnostic path rejects it too (validation is before the multi-profile guard).
+  assert_exit "$EXIT_VALIDATION" "cli-effconf-output-ext: multi-profile --print-effective-config --output-ext bogus also dies $EXIT_VALIDATION" \
+    --print-effective-config --output-ext bogus --profile streaming-hevc,streaming-av1
+  # (c) control: a valid --output-ext still prints the config and exits 0.
+  out="$(run_muxm --print-effective-config --output-ext mkv)"
+  assert_contains "OUTPUT_EXT                = mkv" "cli-effconf-output-ext: a valid --output-ext is reported and the diagnostic still runs" "$out"
 }
 
 # RV3-03: the numeric-CLI-validation family. --max-copy-bitrate / --audio-force-bitrate now run
@@ -2089,6 +2119,18 @@ test_toggles() {
 
   out="$(run_muxm --checksum-algo auto --print-effective-config)"
   assert_contains "CHECKSUM_ALGO             = auto" "--checksum-algo auto: registered" "$out"
+
+  # RV3-13: --checksum-algo enables checksums as a side effect, but an explicit --no-checksum must
+  # win regardless of the order the two are typed (previously "--no-checksum --checksum-algo X"
+  # silently re-enabled checksums because the algo arm unconditionally set CHECKSUM=1).
+  out="$(run_muxm --no-checksum --checksum-algo sha256 --print-effective-config)"
+  assert_contains "CHECKSUM                  = 0" "--no-checksum --checksum-algo sha256: checksums stay OFF (algo doesn't re-enable)" "$out"
+  assert_contains "CHECKSUM_ALGO             = sha256" "--no-checksum --checksum-algo sha256: the algo value is still recorded" "$out"
+  out="$(run_muxm --checksum-algo sha256 --no-checksum --print-effective-config)"
+  assert_contains "CHECKSUM                  = 0" "--checksum-algo sha256 --no-checksum: order-independent, checksums stay OFF" "$out"
+  # Control: --checksum-algo alone (no --no-checksum) still enables checksums as before.
+  out="$(run_muxm --checksum-algo sha256 --print-effective-config)"
+  assert_contains "CHECKSUM                  = 1" "--checksum-algo sha256 alone: still enables checksums (convenience preserved)" "$out"
 
   out="$(run_muxm --x264-params "profile=high:aq-mode=2" --print-effective-config)"
   assert_contains "X264_PARAMS_BASE          = profile=high:aq-mode=2" "--x264-params: value registered" "$out"
@@ -4899,6 +4941,28 @@ test_hdr() {
       fi
     fi
     rm -rf "$_c444"
+  fi
+
+  # RV3-13: the pre-run "▶ Plan" banner derives its bit-depth label from TARGET_PIXFMT. The old
+  # `case *10le|*10be|*10) 10-bit ;; *) 8-bit` used 8-bit as the catch-all, so a 12-bit target
+  # (yuv420p12le) was mislabeled "8-bit". The label now reads the real trailing depth. This test
+  # EXTRACTS the exact label expression from muxm (grepped by its BASH_REMATCH marker) and evals
+  # it, so it tracks the live code rather than a copy — a regression here fails red.
+  local _bd_line
+  _bd_line="$(grep -F 'BASH_REMATCH[1]}-bit' "$MUXM" | grep -F 'TARGET_PIXFMT' | head -1)"
+  if [[ -z "$_bd_line" ]]; then
+    fail "hdr-bitdepth-label: could not locate the plan-banner bit-depth label expression in muxm (renamed/reformatted?)"
+  else
+    local _bd_pair _bd_pix _bd_want _bd_got _bd_all_ok=1
+    for _bd_pair in "yuv420p:8-bit" "yuv420p10le:10-bit" "yuv420p12le:12-bit" "p010le:10-bit" "yuv444p16le:16-bit"; do
+      _bd_pix="${_bd_pair%%:*}"; _bd_want="${_bd_pair##*:}"
+      _bd_got="$(bash -c "TARGET_PIXFMT='$_bd_pix'; _p_bits=''; $_bd_line; printf '%s' \"\${_p_bits# }\"" 2>/dev/null)"
+      if [[ "$_bd_got" != "$_bd_want" ]]; then
+        _bd_all_ok=0
+        fail "hdr-bitdepth-label: TARGET_PIXFMT=$_bd_pix → expected '$_bd_want', got '${_bd_got:-empty}'"
+      fi
+    done
+    (( _bd_all_ok )) && pass "hdr-bitdepth-label: the plan banner labels 8/10/12/16-bit targets by their real depth (12-bit no longer mislabeled '8-bit')"
   fi
 }
 
@@ -7827,6 +7891,37 @@ test_output() {
 
   _test_output_cleanup_on_checksum_fail
   _test_sii_single_track_no_overship
+  _test_output_audio_none_summary
+}
+
+# RV3-13: the post-mux compact stream summary must print "Audio : none" when the output has zero
+# audio streams — not a bogus blank single-track line. The audio metadata is fed to a `while read`
+# loop via a here-string; over an EMPTY variable a here-string still yields ONE empty-line iteration
+# (bash appends a trailing newline), which used to set a_had_audio=1 and print a garbage line. The
+# loop now skips the empty record so the "none" fallback fires. Skip-first guard on the fixture.
+_test_output_audio_none_summary() {
+  if ! ffmpeg_has_encoder libx265; then
+    skip "output-audio-none: ffmpeg lacks libx265 — cannot build the video-only fixture"
+    return
+  fi
+  local _na_src="$TESTDIR/audio_none_src.mkv" _na_out="$TESTDIR/audio_none_out.mkv"
+  # A video-only source (testsrc2 emits no audio) → the muxed output carries zero audio streams.
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=320x180:rate=24:duration=1" \
+    -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p "$_na_src" 2>/dev/null || true
+  if [[ ! -s "$_na_src" ]]; then
+    skip "output-audio-none: could not build the video-only fixture"
+    return
+  fi
+  # --no-skip-if-ideal forces a real encode/mux (else a compliant source is copy-remuxed and the
+  # compact summary — the code under test — is never reached).
+  local _na_log
+  _na_log="$(run_muxm --no-skip-if-ideal --no-disk-check --crf 30 --preset ultrafast --output-ext mkv "$_na_src" "$_na_out")"
+  if grep -qE '^[[:space:]]*Audio : none[[:space:]]*$' <<<"$_na_log"; then
+    pass "output-audio-none: a zero-audio output prints 'Audio : none' in the compact summary"
+  else
+    fail "output-audio-none: expected 'Audio : none', got audio summary line(s): $(grep -iE 'Audio :' <<<"$_na_log" | head -3 | tr '\n' '|')"
+  fi
+  rm -f "$_na_src" "$_na_out"
 }
 
 # RV3-02 (headline regression): a single-track profile (atv-directplay-hq) fed a video-compliant
@@ -8573,6 +8668,81 @@ test_collision() {
     fi
     rm -rf "$_m4_dir"
   fi
+
+  # ---- M5 (RV3-13): a run must refuse to read a SOURCE that another LIVE run is mid-replacing
+  #      (--replace-source renames its output onto the source). A replacer holds the source's own
+  #      hidden lock (OUT -ef SRC) and drops a "replacing-src" marker in it; every run checks that
+  #      lock before reading and dies (exit 11) if a live owner carries the marker. Two ordinary
+  #      runs that merely READ the same source into DIFFERENT outputs never mark the lock, so they
+  #      must NOT block each other. Deterministic: pre-plant the marker with a live PID (mirrors M4,
+  #      not a flaky `&` overlap of two real runs). Skip-first guard on the encoder/fixture. ----
+  # M5-producer (RV3-13): the WRITER half of the source-replace lock, tested deterministically by
+  # extracting _acquire_out_lock and running it — a real replacer (_REPLACING_SOURCE=1) must drop
+  # the replacing-src marker into its lock, and a non-replacer (0) must NOT. Guards against a future
+  # edit that disables the whole protection (marker never written) while the consumer tests, which
+  # pre-plant the marker by hand, would stay green. No ffmpeg needed (pure function extraction).
+  local _al_body _al_dir
+  _al_body="$(awk '/^_acquire_out_lock\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ -z "$_al_body" ]]; then
+    fail "collision-source-replace-marker: could not extract _acquire_out_lock (renamed/reformatted?)"
+  else
+    _al_dir="$(mktemp -d "$TESTDIR/alm.XXXXXX")"
+    bash -c "set -eEuo pipefail; die(){ exit \$1; }; OUT='$_al_dir/vid.mkv'; _REPLACING_SOURCE=1; _OUT_LOCK_HELD=0; $_al_body"$'\n'"_acquire_out_lock" 2>/dev/null || true
+    if [[ -e "$_al_dir/.vid.mkv.lock/replacing-src" ]]; then
+      pass "collision-source-replace-marker: a --replace-source run writes the replacing-src marker into its lock"
+    else
+      fail "collision-source-replace-marker: _REPLACING_SOURCE=1 did not write the replacing-src marker (protection disabled?)"
+    fi
+    rm -rf "$_al_dir/.vid.mkv.lock"
+    bash -c "set -eEuo pipefail; die(){ exit \$1; }; OUT='$_al_dir/vid.mkv'; _REPLACING_SOURCE=0; _OUT_LOCK_HELD=0; $_al_body"$'\n'"_acquire_out_lock" 2>/dev/null || true
+    if [[ ! -e "$_al_dir/.vid.mkv.lock/replacing-src" && -d "$_al_dir/.vid.mkv.lock" ]]; then
+      pass "collision-source-replace-marker: an ordinary run acquires the lock WITHOUT the replacing-src marker"
+    else
+      fail "collision-source-replace-marker: _REPLACING_SOURCE=0 mis-wrote the marker or failed to acquire the lock"
+    fi
+    rm -rf "$_al_dir"
+  fi
+
+  if ! ffmpeg_has_encoder libx265; then
+    skip "collision-source-replace-lock: ffmpeg lacks libx265 — cannot build the source-replace fixture"
+  else
+    local _m5_dir; _m5_dir="$(mktemp -d "$TESTDIR/m5.XXXXXX")"
+    local _m5_src="$_m5_dir/shared.mkv" _m5_out="$_m5_dir/other.mkv"
+    local _m5_srclock; _m5_srclock="$_m5_dir/.$(basename "$_m5_src").lock"
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=320x180:rate=24:duration=1" \
+      -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p "$_m5_src" 2>/dev/null
+    if [[ ! -s "$_m5_src" ]]; then
+      skip "collision-source-replace-lock: could not build the source-replace fixture"
+    else
+      local _m5_code
+      # (a) A live owner holding the source lock WITH the replacing-src marker → a reader (different
+      #     OUT) refuses with exit 11 and writes nothing, rather than reading a soon-to-be-replaced file.
+      sleep 30 & local _m5_live=$!
+      mkdir "$_m5_srclock"; printf '%s\n' "$_m5_live" > "$_m5_srclock/pid"; : > "$_m5_srclock/replacing-src"
+      (cd "$_m5_dir" && "$MUXM" --output-ext mkv "$_m5_src" "$_m5_out" >/dev/null 2>&1) && _m5_code=$? || _m5_code=$?
+      if [[ "$_m5_code" == "$EXIT_VALIDATION" && ! -e "$_m5_out" ]]; then
+        pass "collision-source-replace-lock: a reader refuses a source a live run is replacing (exit 11, no output)"
+      else
+        fail "collision-source-replace-lock: expected exit 11 with no output against a live replace-marker, got exit $_m5_code, output present: $([[ -e "$_m5_out" ]] && echo yes || echo no)"
+      fi
+      kill "$_m5_live" 2>/dev/null || true; wait "$_m5_live" 2>/dev/null || true; rm -rf "$_m5_srclock"
+
+      # (b) Control: a live owner holding the SAME source lock but WITHOUT the replacing-src marker
+      #     (an ordinary run, not a replacer) must NOT block a second run reading that source — two
+      #     concurrent reads into different outputs are legitimate and must not deadlock.
+      sleep 30 & local _m5_live2=$!
+      mkdir "$_m5_srclock"; printf '%s\n' "$_m5_live2" > "$_m5_srclock/pid"   # no replacing-src marker
+      rm -f "$_m5_out"
+      (cd "$_m5_dir" && "$MUXM" --output-ext mkv "$_m5_src" "$_m5_out" >/dev/null 2>&1) && _m5_code=$? || _m5_code=$?
+      if [[ "$_m5_code" == 0 && -s "$_m5_out" ]]; then
+        pass "collision-source-replace-lock: a source lock WITHOUT the replace marker does not block an ordinary read (two readers OK)"
+      else
+        fail "collision-source-replace-lock: an unmarked source lock wrongly blocked a read (exit $_m5_code, output: $([[ -s "$_m5_out" ]] && echo yes || echo no))"
+      fi
+      kill "$_m5_live2" 2>/dev/null || true; wait "$_m5_live2" 2>/dev/null || true; rm -rf "$_m5_srclock"
+    fi
+    rm -rf "$_m5_dir"
+  fi
 }
 
 test_edge() {
@@ -9274,6 +9444,33 @@ _test_unit_filesize() {
     rm -f "$fsz_dir/onegb"
   else
     skip "filesize_pretty(GB path) — truncate not available"
+  fi
+}
+
+# RV3-13: _gb formats a byte count as "X.X" GiB, with an integer fallback when bc is unavailable.
+# The old one-liner piped bc straight into `printf '%.1f'`; on bc failure the substitution was
+# empty, printf still emitted "0.0" AND returned non-zero, so the `|| echo <int>` fallback ALSO ran
+# and concatenated — producing a garbled "0.05". Assert: the happy path is correct, and a FAILING
+# bc yields a clean integer (no "0.0" prefix) without aborting the function under set -e.
+_test_unit_gb_fallback() {
+  local result
+  # Happy path (real bc): exact GiB formatting.
+  result="$(muxm_fn _gb 1073741824)"          # exactly 1 GiB
+  if [[ "$result" == "1.0" ]]; then pass "_gb(1 GiB)=1.0"; else fail "_gb(1 GiB) expected '1.0', got '$result'"; fi
+  result="$(muxm_fn _gb 536870912)"           # 0.5 GiB — sub-1, bc emits leading-dot ".50"
+  if [[ "$result" == "0.5" ]]; then pass "_gb(0.5 GiB)=0.5 (sub-1 leading-dot bc output handled)"; else fail "_gb(0.5 GiB) expected '0.5', got '$result'"; fi
+
+  # Failing bc: the fallback must be a CLEAN integer, mutually exclusive with the printf path.
+  local gb_body deps gb_out gb_rc
+  gb_body="$(awk '/^_gb\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  deps="$(grep -E '^readonly BYTES_PER_(GIB|MIB)=' "$MUXM")"
+  gb_rc=0
+  # 5368709120 / 1073741824 = 5 exactly. Stub bc to fail so the integer branch is forced.
+  gb_out="$(bash -c "set -eEuo pipefail; $deps"$'\n'"bc(){ return 127; }"$'\n'"$gb_body"$'\n'"_gb 5368709120" 2>/dev/null)" || gb_rc=$?
+  if [[ "$gb_rc" -eq 0 && "$gb_out" == "5" ]]; then
+    pass "_gb(5 GiB, bc failing): clean integer fallback '5' (no garbled '0.05'), survives set -e"
+  else
+    fail "_gb(5 GiB, bc failing): expected exit 0 and '5', got exit $gb_rc and '$gb_out'"
   fi
 }
 
@@ -11268,6 +11465,7 @@ test_unit() {
   _test_unit_sub_plan_add_embed
   _test_unit_validation_helpers
   _test_unit_filesize
+  _test_unit_gb_fallback
   _test_unit_sii_container_safety
   _test_unit_misc_helpers
   _test_unit_disk_preflight
