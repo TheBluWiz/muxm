@@ -5286,6 +5286,7 @@ EOF
   _test_audio_container_safety
   _test_audio_verify_display
   _test_audio_forceaac_stereo_bitrate
+  _test_audio_vorbis_copy
   _test_audio_lossless_skip_drop
   _test_sii_single_track_extra_audio
   _test_audio_disposition_commentary
@@ -5663,6 +5664,65 @@ _test_audio_forceaac_stereo_bitrate() {
     fail "audio-forceaac-stereo-bitrate: forced-AAC bitrate ignored STEREO_BITRATE (transcode log: '${_tlog:-<none>}')"
   fi
   rm -rf "$_d"
+
+  # RV3-08: the forced-AAC STEREO_BITRATE override must also fire for the libfdk_aac / aac_at AAC
+  # encoders (keyed on the NATIVE codec via _encoder_to_codec), not just the literal "aac". A 6ch
+  # source discriminates: audio_transcode_target(6) returns the eac3 5.1 bitrate (640k), so ONLY the
+  # override changes it to STEREO_BITRATE (96k). Per-encoder skip-first guard (aac_at is macOS-only,
+  # libfdk_aac needs a special ffmpeg build).
+  local _6d="$TESTDIR/l_forceaac6"; mkdir -p "$_6d/h"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=blue:s=320x240:r=24:d=2" -f lavfi -i "sine=d=2" \
+    -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p10le -c:a ac3 -ac 6 -metadata:s:a:0 language=eng \
+    "$_6d/src.mkv" 2>/dev/null || true
+  if [[ ! -s "$_6d/src.mkv" ]]; then
+    skip "audio-forceaac-stereo-bitrate: could not build a 6ch ac3 fixture for the AAC-variant override check"
+  else
+    printf 'STEREO_BITRATE=96k\n' > "$_6d/.muxmrc"
+    local _enc _6log
+    for _enc in aac_at libfdk_aac; do
+      if ! ffmpeg_has_encoder "$_enc"; then
+        skip "audio-forceaac-stereo-bitrate: ffmpeg lacks the $_enc encoder — cannot test its forced-AAC bitrate override"
+        continue
+      fi
+      rm -rf "$_6d"/.muxm.tmp.* "$_6d/out.mkv"
+      ( cd "$_6d" && HOME="$_6d/h" "$MUXM" -K --no-skip-if-ideal --audio-force-codec "$_enc" --crf 30 --preset ultrafast src.mkv out.mkv >/dev/null 2>&1 )
+      _6log="$(grep -rh "audio transcode:" "$_6d"/.muxm.tmp.*/muxm.*.log 2>/dev/null | head -1)"
+      if [[ "$_6log" == *"bitrate=96k"* ]]; then
+        pass "audio-forceaac-stereo-bitrate: forced $_enc on 6ch honors STEREO_BITRATE (96k), not the eac3 640k (RV3-08)"
+      else
+        fail "audio-forceaac-stereo-bitrate: forced $_enc on 6ch ignored STEREO_BITRATE (transcode log: '${_6log:-<none>}')"
+      fi
+    done
+  fi
+  rm -rf "$_6d"
+}
+
+# RV3-08: a Vorbis source stream-COPIED (--audio-force-codec libvorbis on a matching source) must
+# name its intermediate with a muxable extension (.ogg), not `.vorbis` — else ffmpeg can't choose a
+# muxer and the run dies 43. Assert the copy path yields a valid Vorbis-audio output. Skip-first guard.
+_test_audio_vorbis_copy() {
+  if ! ffmpeg_has_encoder libvorbis || ! ffmpeg_has_encoder libx265; then
+    skip "audio-vorbis-copy: ffmpeg lacks libvorbis/libx265 — cannot build/run the Vorbis copy path"
+    return
+  fi
+  local _vd="$TESTDIR/l_vorbis"; mkdir -p "$_vd/h"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=green:s=320x240:r=24:d=2" -f lavfi -i "sine=d=2" \
+    -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p10le -c:a libvorbis -ac 2 -metadata:s:a:0 language=eng \
+    "$_vd/src.mkv" 2>/dev/null || true
+  if [[ "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$_vd/src.mkv" 2>/dev/null)" != "vorbis" ]]; then
+    skip "audio-vorbis-copy: could not build a Vorbis-audio fixture"
+    rm -rf "$_vd"; return
+  fi
+  local _vcode=0
+  ( cd "$_vd" && HOME="$_vd/h" "$MUXM" -K --no-skip-if-ideal --output-ext mkv --audio-force-codec libvorbis \
+      --crf 30 --preset ultrafast src.mkv out.mkv >/dev/null 2>&1 ) || _vcode=$?
+  local _vout; _vout="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$_vd/out.mkv" 2>/dev/null)"
+  if [[ "$_vcode" -eq 0 && "$_vout" == "vorbis" ]]; then
+    pass "audio-vorbis-copy: --audio-force-codec libvorbis on a Vorbis source copies via a valid .ogg intermediate (output keeps vorbis, no die 43)"
+  else
+    fail "audio-vorbis-copy: expected a successful Vorbis copy (rc 0, output vorbis), got rc=$_vcode output-codec='${_vout:-none}'"
+  fi
+  rm -rf "$_vd"
 }
 
 # L5: the audio copy/transcode failure paths (die 43) must surface the disk-full hint like the
@@ -7953,6 +8013,39 @@ test_containers() {
     skip "containers-multitrack-hard-stop: TrueHD fixture could not be generated (ffmpeg truehd encoder unavailable)"
   fi
 
+  # RV3-08: a FOREIGN-language lossless-only multi-track source. The keep-list filters EVERY track
+  # by language (AUDIO_LANG_PREF=eng vs a jpn-only source), but run_audio_pipeline_multi force-keeps
+  # the best-scored track so the output isn't left without audio. The preflight now evaluates that
+  # same force-keep candidate against the container rule, so this dies 11 FAST (before the re-encode)
+  # instead of proceeding and dying 41 late at mux_final. The existing (eng) case above is caught by
+  # both old and new code (the track is kept); only this force-keep path is new. Skip-first guards.
+  if ! ffmpeg_has_encoder truehd || ! ffmpeg_has_encoder libx265; then
+    skip "containers-multitrack-forcekeep: ffmpeg lacks truehd/libx265 — cannot build the foreign lossless-only fixture"
+  else
+    local _fk_dir; _fk_dir="$(mktemp -d "$TESTDIR/fkthd.XXXXXX")"; mkdir -p "$_fk_dir/h"
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=red:s=320x240:r=24:d=1" -f lavfi -i "sine=duration=1" \
+      -map 0:v -map 1:a -c:v libx265 -preset ultrafast -crf 30 -strict -2 -c:a truehd -ac 2 \
+      -metadata:s:a:0 language=jpn "$_fk_dir/jthd.mkv" 2>/dev/null || true
+    if [[ ! -s "$_fk_dir/jthd.mkv" ]]; then
+      skip "containers-multitrack-forcekeep: could not build the jpn TrueHD fixture"
+    else
+      printf 'AUDIO_MULTI_TRACK=1\nAUDIO_LANG_PREF=eng\n' > "$_fk_dir/.muxmrc"
+      local _fk_log _fk_code=0
+      _fk_log="$(cd "$_fk_dir" && HOME="$_fk_dir/h" "$MUXM" --output-ext mp4 --preset ultrafast --crf 30 jthd.mkv out.mp4 2>&1)" || _fk_code=$?
+      if [[ "$_fk_code" -eq "$EXIT_VALIDATION" ]] && printf '%s' "$_fk_log" | grep -qiE "can't preserve|--output-ext mkv"; then
+        pass "containers-multitrack-forcekeep: foreign-language lossless-only source → force-keep candidate hard-stops the preflight (exit 11)"
+      else
+        fail "containers-multitrack-forcekeep: expected an exit-11 hard-stop, got exit $_fk_code (log: $(printf '%s' "$_fk_log" | grep -iE 'ERROR|preserve|die' | head -1))"
+      fi
+      if printf '%s' "$_fk_log" | grep -qiE 'Encoding video|final mux failed'; then
+        fail "containers-multitrack-forcekeep: hard-stop fired too late (encode/mux started) — the die-41-at-mux_final regression"
+      else
+        pass "containers-multitrack-forcekeep: hard-stop fired before any encode (not late at mux_final)"
+      fi
+    fi
+    rm -rf "$_fk_dir"
+  fi
+
   # (a) styled ASS → MP4 multi-track: hard-stop (would flatten to plain mov_text).
   if [[ -f "$TESTDIR/ass_subs.mkv" ]]; then
     local _m1b_log _m1b_code=0
@@ -8946,6 +9039,9 @@ _test_unit_audio_helpers() {
   assert_muxm_fn_stdout "_audio_copy_ext('flac')=flac"        "flac"      _audio_copy_ext "" "flac"
   assert_muxm_fn_stdout "_audio_copy_ext('dts')=dts"          "dts"       _audio_copy_ext "" "dts"
   assert_muxm_fn_stdout "_audio_copy_ext('alac')=m4a"          "m4a"       _audio_copy_ext "" "alac"
+  # RV3-08: Vorbis has no bare `.vorbis` muxer — the copy path must map it to .ogg (else a
+  # stream-copied Vorbis source names its intermediate audio_primary.vorbis and dies 43).
+  assert_muxm_fn_stdout "_audio_copy_ext('vorbis')=ogg"        "ogg"       _audio_copy_ext "" "vorbis"
 }
 
 _test_unit_sub_helpers() {

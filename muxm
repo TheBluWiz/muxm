@@ -9690,7 +9690,8 @@ run_video_pipeline() {
 # assigned without `local` in run_audio_pipeline / run_audio_pipeline_multi precisely because
 # mux_final and other downstream functions consume them after the pipeline returns (a `local`
 # would not survive the return). Key variables consumed downstream: A_PRIMARY_LANG, A_PRIMARY_TITLE,
-# A_PRIMARY_CHANNELS, A_STEREO_LANG, A_PRIMARY, AAC_STEREO, HAS_AUDIO.
+# A_PRIMARY_CHANNELS, A_PRIMARY_CODEC, A_STEREO_LANG, A_STEREO_CODEC, A_PRIMARY, AAC_STEREO, HAS_AUDIO.
+# (mux_final reads A_PRIMARY_CODEC/A_STEREO_CODEC for the descriptive audio-track titles.)
 # Count audio streams in source file
 # Returns: Integer count (0 if none)
 # Globals: METADATA_CACHE
@@ -10246,6 +10247,7 @@ _audio_copy_ext(){
     alac)                         echo "m4a" ;;   # ffmpeg has no .alac muxer; .m4a (ipod) works
     pcm_s16le|pcm_s24le|pcm_s32le) echo "wav" ;;  # raw PCM needs a container
     dca)                          echo "dts" ;;    # ffprobe reports dca, muxer expects .dts
+    vorbis)                       echo "ogg" ;;    # RV3-08: ffmpeg has no bare `.vorbis` muxer — Vorbis is muxed in .ogg (copy-path twin of _audio_codec_ext's libvorbis→ogg / L4's libfdk_aac→m4a)
     *)                            echo "$codec" ;; # aac, ac3, eac3, flac, dts, etc. work as-is
   esac
 }
@@ -10646,10 +10648,12 @@ run_audio_pipeline(){
       report_add "audio_action" "copy (already $_tgt_native)"
     else
       read -r _ tgt_br <<< "$(audio_transcode_target "$effective_ch")"
-      if [[ "$tgt_codec" == "aac" ]]; then
+      if [[ "$_tgt_native" == "aac" ]]; then
         # Honor STEREO_BITRATE instead of a hardcoded 256k. Masked today because
         # `universal` (the only profile forcing AAC) sets STEREO_BITRATE=256k, but --stereo-bitrate
-        # / a .muxmrc override was silently ignored on the force-AAC path.
+        # / a .muxmrc override was silently ignored on the force-AAC path. RV3-08: key on the
+        # NATIVE codec (_encoder_to_codec) so the override also fires for the libfdk_aac / aac_at
+        # AAC encoders, not just the literal "aac" (consistent with L4).
         tgt_br="$STEREO_BITRATE"
       fi
       [[ -n "${AUDIO_FORCE_BITRATE:-}" ]] && tgt_br="$AUDIO_FORCE_BITRATE"
@@ -12578,19 +12582,26 @@ _check_multitrack_container_safety() {
   local -a _blk=()
   local _ext="${OUTPUT_EXT,,}"
 
-  # ---- Audio: every kept track is stream-copied (-c copy); MP4/MOV can't carry the
-  # lossless HD codecs.  Keep-filter mirrors _build_audio_keep_list (language + commentary).
+  # ---- Audio: every kept track is stream-copied (-c copy); MP4/MOV can't carry the lossless HD
+  # codecs.  RV3-08: derive the kept indices from _build_audio_keep_list itself — the single source
+  # of truth for the language/commentary filter — instead of re-deriving that filter inline (which
+  # had to be hand-kept in sync). When the filter drops EVERY track but the source HAS audio,
+  # run_audio_pipeline_multi force-keeps the best-scored track; evaluate THAT same fallback candidate
+  # against the container rule too, so a foreign-language lossless-only source into MP4/MOV fails this
+  # preflight (before the long re-encode) rather than late at mux_final (die 41). (_build_audio_keep_list
+  # re-runs in the pipeline, so its dropped-track log lines appear twice at -v — an accepted cost.)
   if (( AUDIO_MULTI_TRACK )) && (( ! SKIP_AUDIO )); then
-    local _an _ai _info _codec _ch _lang _br _title _comment _vi _hi _profile
-    _an="$(_audio_stream_count)"
-    for (( _ai=0; _ai<_an; _ai++ )); do
-      _info="$(_audio_stream_info "$_ai")"
-      # Capture the disposition flags and OR them into the commentary drop, matching
-      # the keep-filter in _build_audio_keep_list (this must stay in sync with it).
-      _split_tab "$_info" _codec _ch _lang _br _title _comment _vi _hi  # Non-collapsing split — keep-filter mirrors _build_audio_keep_list
-      _normalize_codec_lang _codec _lang
-      [[ -n "${AUDIO_LANG_PREF:-}" ]] && ! _audio_lang_matches "$_lang" && continue
-      (( ! AUDIO_KEEP_COMMENTARY )) && { _audio_is_commentary "$_title" || (( _comment )) || (( _vi )) || (( _hi )); } && continue
+    local _ai _codec _profile
+    local -a _keep_idxs=()
+    read -r -a _keep_idxs <<< "$(_build_audio_keep_list)"
+    if (( ${#_keep_idxs[@]} == 0 )) && (( $(_audio_stream_count) > 0 )); then
+      # Filter dropped every track but the source has audio → mirror the pipeline's force-keep
+      # fallback and evaluate the best-scored track (the one that will actually ship).
+      local _fk_idx; _fk_idx="$(select_best_audio | cut -f1)"
+      [[ "$_fk_idx" =~ ^[0-9]+$ ]] && _keep_idxs=("$_fk_idx")
+    fi
+    for _ai in ${_keep_idxs[@]+"${_keep_idxs[@]}"}; do
+      _codec="$(_audio_field "$_ai" codec_name)"; _codec="${_codec,,}"
       case "$_codec" in
         truehd|mlp) _blk+=("audio #${_ai}: ${_codec} (lossless)") ;;
         dts|dca)
