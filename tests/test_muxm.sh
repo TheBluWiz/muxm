@@ -3950,6 +3950,32 @@ printf "%s " "${VIDEOTOOLBOX_ARGS[@]}"')"
     fi
   fi
 
+  # RV3-11: on a non-macOS host, --hw-accel nvenc must surface the NVENC-specific reason ("NVENC
+  # not supported in this build"), NOT the generic macOS-only OS guard ("supported on macOS only")
+  # — nvenc is the one non-macOS backend. resolve_video_encoder's OS guard used to fire and return
+  # before the nvenc arm was reached. Extract it and drive with uname stubbed to Linux +
+  # HW_ACCEL_RESOLVED=nvenc; assert the NVENC message wins over the macOS message (host-independent).
+  local _rve_body _rve_out
+  _rve_body="$(_extract_muxm_fns resolve_video_encoder)" || _rve_body=""
+  if [[ -z "$_rve_body" ]]; then
+    fail "hw-accel-nvenc-message: could not extract resolve_video_encoder"
+  else
+    _rve_out="$(bash -c '
+VIDEO_CODEC=libx265; HW_ACCEL_RESOLVED=nvenc; VIDEO_ENCODER_FFMPEG=""; HW_ACCEL_FALLBACK_REASON=""
+uname(){ echo Linux; }
+ffmpeg_has_encoder(){ return 1; }
+note(){ :; }; warn(){ printf "WARN:%s\n" "$*"; }
+'"$_rve_body"'
+resolve_video_encoder
+printf "REASON:%s\n" "$HW_ACCEL_FALLBACK_REASON"')"
+    if printf '%s' "$_rve_out" | grep -qiE 'NVENC is not supported in this build' \
+       && ! printf '%s' "$_rve_out" | grep -qiE 'supported on macOS'; then
+      pass "hw-accel-nvenc-message: --hw-accel nvenc on a Linux host reports the NVENC-specific reason, not the macOS-only guard"
+    else
+      fail "hw-accel-nvenc-message: expected the NVENC reason, got: $(printf '%s' "$_rve_out" | grep -iE 'WARN|REASON' | head -2 | tr '\n' ' ')"
+    fi
+  fi
+
   # --- Cleanup ---
   rm -rf "$rc_home"
 }
@@ -4819,6 +4845,32 @@ test_hdr() {
       fi
     fi
     rm -f "$_hdrs_src" "$_hdrs_out"
+  fi
+
+  # RV3-11: --sdr-force-10bit must survive CHROMA PRESERVATION on a non-4:2:0 source. When
+  # FORCE_CHROMA_420=0 preserves a 4:4:4 source, the bit-depth suffix must come from the already-
+  # decided target (yuv444p10le), not the source's 8-bit depth — otherwise SDR_FORCE_10BIT silently
+  # lost effect and the output stayed 8-bit (yuv444p). FORCE_CHROMA_420 is config-only (no CLI flag),
+  # so both knobs go in a .muxmrc. Skip-first guards per the ratchet.
+  if ! ffmpeg_has_encoder libx265; then
+    skip "sdr-force10-chroma-preserve: ffmpeg lacks libx265 for the 4:4:4 10-bit encode"
+  else
+    local _c444="$TESTDIR/sdr10chroma"; mkdir -p "$_c444/h"
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=gray:s=320x240:r=24:d=1" -f lavfi -i "sine=d=1" \
+      -c:v libx264 -pix_fmt yuv444p -c:a aac -ac 2 -shortest "$_c444/src.mkv" 2>/dev/null || true
+    if [[ "$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$_c444/src.mkv" 2>/dev/null)" != "yuv444p" ]]; then
+      skip "sdr-force10-chroma-preserve: could not build an 8-bit yuv444p fixture"
+    else
+      printf 'FORCE_CHROMA_420=0\nSDR_FORCE_10BIT=1\n' > "$_c444/.muxmrc"
+      ( cd "$_c444" && HOME="$_c444/h" "$MUXM" -K --no-disk-check --output-ext mkv --crf 30 --preset ultrafast src.mkv out.mkv >/dev/null 2>&1 )
+      local _c444_pix; _c444_pix="$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$_c444/out.mkv" 2>/dev/null)"
+      if [[ "$_c444_pix" == "yuv444p10le" ]]; then
+        pass "sdr-force10-chroma-preserve: --sdr-force-10bit on an 8-bit 4:4:4 source (chroma preserved) lands at 10-bit (yuv444p10le)"
+      else
+        fail "sdr-force10-chroma-preserve: expected yuv444p10le, got '${_c444_pix:-none}' (SDR_FORCE_10BIT lost under chroma preservation?)"
+      fi
+    fi
+    rm -rf "$_c444"
   fi
 }
 
@@ -11235,6 +11287,8 @@ test_unit() {
   _test_unit_warn_if_not_on_manpath
   _test_unit_dv_give_up_to_base
   _test_unit_dv_mp4box_wrap
+  _test_unit_dv_ffmpeg_wrap_mp4
+  _test_unit_dv_frame_count_sentinel
   _test_unit_ocr_lang_flags
   _test_unit_run_ocr
   _test_unit_audio_pretty_line
@@ -11737,15 +11791,17 @@ _test_unit_dv_give_up_to_base() {
   fi
 
   # Structural: run_video_pipeline must route EVERY give-up branch through this one helper —
-  # exactly 5 call sites (RPU validation, inject failure, inject-empty, convert failure, frame
-  # mismatch) — so none can silently omit the OUTPUT_HAS_DV reset again.
+  # exactly 6 call sites (RV3-11 folded in the sixth, "DV extract failed" — total-RPU-extraction
+  # failure — which previously hand-duplicated the sequence and omitted the OUTPUT_HAS_DV reset):
+  # RPU validation, inject failure, inject-empty, convert failure, frame mismatch, extract failed.
+  # Match the call form (`_dv_give_up_to_base "`) so a comment mentioning the helper isn't counted.
   local rvp_body call_count
   rvp_body="$(awk '/^run_video_pipeline\(\)/,/^\}/' "$MUXM")"
-  call_count="$(grep -c '_dv_give_up_to_base ' <<<"$rvp_body")"
-  if [[ "$call_count" -eq 5 ]]; then
-    pass "unit-dv-give-up-to-base: run_video_pipeline routes all 5 DV give-up branches through _dv_give_up_to_base"
+  call_count="$(grep -c '_dv_give_up_to_base "' <<<"$rvp_body")"
+  if [[ "$call_count" -eq 6 ]]; then
+    pass "unit-dv-give-up-to-base: run_video_pipeline routes all 6 DV give-up branches through _dv_give_up_to_base (incl. the RV3-11 extract-failed branch)"
   else
-    fail "unit-dv-give-up-to-base: expected 5 _dv_give_up_to_base call sites in run_video_pipeline, found $call_count"
+    fail "unit-dv-give-up-to-base: expected 6 _dv_give_up_to_base call sites in run_video_pipeline, found $call_count"
   fi
 }
 
@@ -11762,6 +11818,58 @@ _test_unit_dv_mp4box_wrap() {
     pass "unit-dv-mp4box-wrap: verify_dv_container_record and run_video_pipeline both delegate to _dv_mp4box_wrap"
   else
     fail "unit-dv-mp4box-wrap: a DV mp4box-wrap call site still inlines the block instead of calling _dv_mp4box_wrap"
+  fi
+}
+
+# RV3-11: the three DV-pre-wrap ffmpeg call sites (base-fallback timestamp wrap + the two DV
+# pre-wrap paths) now route through _dv_ffmpeg_wrap_mp4. Assert it reproduces each prior shape's
+# args: hvc1 base (NO -strict unofficial), dvh1 DV (+strict unofficial), and array-safe fps
+# (present when SRC_FPS is set, omitted when empty). Stubs ffmpeg to record its argv.
+_test_unit_dv_ffmpeg_wrap_mp4() {
+  local body
+  body="$(_extract_muxm_fns _dv_ffmpeg_wrap_mp4)" || { fail "unit-dv-ffmpeg-wrap: could not extract _dv_ffmpeg_wrap_mp4"; return; }
+  _wrap_args(){   # $1=tag $2=SRC_FPS → recorded ffmpeg argv (the helper redirects the ffmpeg
+                  # command's stdout to its log arg, so the stub records argv to a side file instead)
+    local _af; _af="$(mktemp)"
+    bash -c "FFMPEG_FLAGS=(-hide_banner -loglevel error -y); SRC_FPS='$2'; _AF='$_af'
+_await_tracked_pid(){ wait \"\$1\" 2>/dev/null; return 0; }
+ffmpeg(){ printf '%s' \"\$*\" > \"\$_AF\"; }
+$body
+_dv_ffmpeg_wrap_mp4 IN.hevc OUT.mp4 log.txt '$1' 'lbl'"
+    cat "$_af"; rm -f "$_af"
+  }
+  local _hvc _dvh _dvh_nofps
+  _hvc="$(_wrap_args hvc1 24)"
+  _dvh="$(_wrap_args dvh1 24)"
+  _dvh_nofps="$(_wrap_args dvh1 '')"
+  if [[ "$_hvc" == *"-r 24 -i IN.hevc -c:v copy -tag:v hvc1 -movflags +faststart -f mp4 OUT.mp4"* ]]; then
+    pass "unit-dv-ffmpeg-wrap: hvc1 base shape reproduced (fps, NO -strict, hvc1 tag)"
+  else
+    fail "unit-dv-ffmpeg-wrap: hvc1 shape wrong: '$_hvc'"
+  fi
+  if [[ "$_dvh" == *"-r 24 -i IN.hevc -c:v copy -strict unofficial -tag:v dvh1 -movflags +faststart -f mp4 OUT.mp4"* ]]; then
+    pass "unit-dv-ffmpeg-wrap: dvh1 DV shape reproduced (fps, +strict unofficial, dvh1 tag)"
+  else
+    fail "unit-dv-ffmpeg-wrap: dvh1 shape wrong: '$_dvh'"
+  fi
+  if [[ "$_dvh_nofps" != *"-r "* && "$_dvh_nofps" == *"-i IN.hevc -c:v copy -strict unofficial -tag:v dvh1"* ]]; then
+    pass "unit-dv-ffmpeg-wrap: empty SRC_FPS omits -r (array-safe, no spurious empty arg)"
+  else
+    fail "unit-dv-ffmpeg-wrap: empty-fps shape wrong: '$_dvh_nofps'"
+  fi
+}
+
+# RV3-11: the RPU/frame-count verify must report "unverified" when a count is the documented
+# 0 = counting-failed sentinel, not silently pass. Structural: the check now has TWO "unverified"
+# report sites — the new inner else (0-sentinel) and the pre-existing outer else (non-numeric).
+_test_unit_dv_frame_count_sentinel() {
+  local rvp _n
+  rvp="$(awk '/^run_video_pipeline\(\)/,/^\}/' "$MUXM")"
+  _n="$(grep -c 'dv_frame_count_match" "unverified"' <<<"$rvp")"
+  if [[ "$_n" -eq 2 ]]; then
+    pass "unit-dv-frame-count-sentinel: the RPU/frame-count check reports 'unverified' for BOTH the 0-sentinel and non-numeric cases (2 sites)"
+  else
+    fail "unit-dv-frame-count-sentinel: expected 2 'unverified' report sites in the frame-count check, found $_n (the 0-sentinel else may be missing → silent pass)"
   fi
 }
 

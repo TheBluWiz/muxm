@@ -7736,8 +7736,13 @@ decide_color_and_pixfmt() {
     fi
     # Honor FORCE_CHROMA_420=0 by preserving source chroma on the SDR path.
     if (( ! FORCE_CHROMA_420 )) && [[ "$chroma" != "420" ]]; then
+      # RV3-11: derive the bit-depth suffix from the ALREADY-DECIDED target (tgt_pix, which the
+      # if/elif/else above set to yuv420p10le when SDR_FORCE_10BIT is on), NOT the source's own
+      # bit depth (is_10bit). Otherwise --sdr-force-10bit silently lost effect on an 8-bit
+      # non-4:2:0 source: tgt_pix was set to yuv420p10le, then overwritten here with an 8-bit
+      # yuv444p/yuv422p because the source was 8-bit.
       local _cbit="p"
-      (( is_10bit )) && _cbit="p10le"
+      [[ "$tgt_pix" == *10le ]] && _cbit="p10le"
       case "$chroma" in
         444) tgt_pix="yuv444${_cbit}" ;;
         422) tgt_pix="yuv422${_cbit}" ;;
@@ -7979,6 +7984,17 @@ resolve_video_encoder() {
     return 0
   fi
 
+  # NVENC dispatch is not wired up in this build; fall back to software. RV3-11: this backend-
+  # specific reason must fire BEFORE the macOS-only OS guard below — nvenc is the one non-macOS
+  # backend, so a Linux user requesting --hw-accel nvenc would otherwise get the misleading
+  # "switch to macOS" message instead of the accurate "NVENC not supported in this build" reason.
+  if [[ "$HW_ACCEL_RESOLVED" == "nvenc" ]]; then
+    HW_ACCEL_FALLBACK_REASON="NVENC is not supported in this build; using software encoding"
+    warn "Hardware acceleration disabled for this encode: $HW_ACCEL_FALLBACK_REASON."
+    # VIDEO_ENCODER_FFMPEG is already the normalized software codec name from the top of this function.
+    return 0
+  fi
+
   # OS guard: hardware acceleration is supported on macOS (Apple VideoToolbox) only.
   # On Linux, fall back to software and warn exactly once here.
   if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -7988,19 +8004,13 @@ resolve_video_encoder() {
     return 0
   fi
 
-  # Backend-specific encoder selection.
+  # Backend-specific encoder selection. (nvenc is handled above, before the OS guard.)
   case "$HW_ACCEL_RESOLVED" in
     videotoolbox)
       case "$VIDEO_CODEC" in
         libx265) VIDEO_ENCODER_FFMPEG="hevc_videotoolbox" ;;
         libx264) VIDEO_ENCODER_FFMPEG="h264_videotoolbox" ;;
       esac
-      ;;
-    nvenc)
-      # NVENC dispatch is not wired up in this build; fall back to software.
-      HW_ACCEL_FALLBACK_REASON="NVENC is not supported in this build; using software encoding"
-      warn "Hardware acceleration disabled for this encode: $HW_ACCEL_FALLBACK_REASON."
-      # VIDEO_ENCODER_FFMPEG is already set to the normalized software codec name.
       ;;
   esac
 }
@@ -8930,6 +8940,28 @@ _video_is_copy_compliant() {
 # non-raw-ES V_MIXED (already a timestamped .mkv intermediate), and dry runs. Fail-soft:
 # on any wrap error, leave V_MIXED as the raw ES so mux_final can still try (and surface
 # the existing error) rather than aborting the give-up path.
+# _dv_ffmpeg_wrap_mp4 IN OUT LOG TAG LABEL — RV3-11: the single "wrap a raw HEVC ES into a
+# timestamped MP4 (stream-copy, +faststart, source fps stamped as an input option)" invocation,
+# collapsing three byte-identical-modulo-tag ffmpeg call sites (the base-fallback timestamp wrap
+# and the two DV pre-wrap paths). The raw-hevc demuxer defaults headerless ES to 25/50fps, so
+# SRC_FPS is stamped via `-r` when set (array-safe under set -u / bash 4.3). TAG is the -tag:v
+# codec tag: "dvh1" for a live-DV stream — which additionally needs `-strict unofficial` so ffmpeg
+# accepts the DV signaling — or "hvc1" for a plain HEVC base (no -strict). Runs the ffmpeg in the
+# background under _await_tracked_pid (SIGINT-safe) and returns its exit code; the caller inspects
+# OUT and decides what to do. Reads: FFMPEG_FLAGS, SRC_FPS.
+_dv_ffmpeg_wrap_mp4() {
+  local _in="$1" _out="$2" _log="$3" _tag="$4" _label="$5"
+  local -a _fps=() _strict=()
+  [[ -n "${SRC_FPS:-}" ]] && _fps=(-r "$SRC_FPS")
+  [[ "$_tag" == "dvh1" ]] && _strict=(-strict unofficial)
+  ffmpeg "${FFMPEG_FLAGS[@]}" ${_fps[@]+"${_fps[@]}"} -i "$_in" \
+       -c:v copy ${_strict[@]+"${_strict[@]}"} -tag:v "$_tag" -movflags +faststart \
+       -f mp4 "$_out" >"$_log" 2>&1 &
+  local _pid=$!
+  local _rc=0; _await_tracked_pid "$_pid" "$_label" || _rc=$?
+  return "$_rc"
+}
+
 _dv_fallback_timestamp_wrap() {
   [[ "$MUX_FORMAT" == "matroska" ]] || return 0
   [[ "$V_MIXED" == *.hevc ]] || return 0
@@ -8943,14 +8975,10 @@ _dv_fallback_timestamp_wrap() {
   # V_MIXED==V_BASE; once we repoint V_MIXED below it is genuinely dead.
   local _superseded_es="$V_MIXED"
   local _ts_wrap="$WORKDIR/video_base_timestamped.mp4"
-  local -a _ts_fps=()
-  # Raw-hevc demuxer defaults headerless ES to 25fps; stamp the real source fps.
-  [[ -n "$SRC_FPS" ]] && _ts_fps=(-r "$SRC_FPS")
-  ffmpeg "${FFMPEG_FLAGS[@]}" ${_ts_fps[@]+"${_ts_fps[@]}"} -i "$V_MIXED" \
-       -c:v copy -tag:v hvc1 -movflags +faststart \
-       -f mp4 "$_ts_wrap" >"$WORKDIR/base_timestamp_wrap.log" 2>&1 &
-  local _ts_pid=$!
-  local _ts_rc=0; _await_tracked_pid "$_ts_pid" "Wrapping base video for MKV mux (timestamps)" || _ts_rc=$?
+  # hvc1 (plain HEVC base, NO Dolby Vision) via the shared wrap helper (RV3-11).
+  local _ts_rc=0
+  _dv_ffmpeg_wrap_mp4 "$V_MIXED" "$_ts_wrap" "$WORKDIR/base_timestamp_wrap.log" hvc1 \
+    "Wrapping base video for MKV mux (timestamps)" || _ts_rc=$?
   if (( _ts_rc == 0 )) && [[ -s "$_ts_wrap" ]]; then
     note "✅ Base video wrapped into timestamped MP4 for the MKV mux (no Dolby Vision)."
     report_add "dv_fallback_wrap" "timestamped wrap (mkv, no dv)"
@@ -9362,9 +9390,11 @@ run_video_pipeline() {
   if (( ! rpu_extracted && ! DRY_RUN )); then
     warn "All DV RPU extraction methods failed; using base video."
     if (( ALLOW_DV_FALLBACK )); then
-      V_MIXED="$V_BASE"
-      _dv_fallback_timestamp_wrap   # MKV needs timestamps the raw base ES lacks
-      mark_done "Use base video (DV extract failed)"
+      # RV3-11: route through the shared _dv_give_up_to_base helper like the other five give-up
+      # branches — the hand-duplicated sequence here omitted the OUTPUT_HAS_DV=0 reset that the
+      # helper structurally guarantees (RV2-06), so this sixth branch could reach end-of-run with
+      # OUTPUT_HAS_DV still 1 despite having fallen back to the base (non-DV) video.
+      _dv_give_up_to_base "DV extract failed"
       return 0
     fi
     die 40 "Dolby Vision RPU extraction failed and fallback is disabled"
@@ -9563,6 +9593,13 @@ run_video_pipeline() {
         note "RPU frame count verified: video=$v_frames, rpu=$rpu_frames (within tolerance)."
         report_add "dv_frame_count_match" "ok (video=$v_frames, rpu=$rpu_frames)"
       fi
+    else
+      # RV3-11: a 0 count is _count_video_frames's documented "counting failed" sentinel (and
+      # dovi_tool can report 0 the same way). Report it UNVERIFIED — exactly like the non-numeric
+      # case in the outer else — instead of silently passing the desync check (the old no-else
+      # here fell through with no report/warning, claiming a clean run it never actually verified).
+      note "Could not verify RPU/video frame count alignment (a count returned 0 = counting failed)."
+      report_add "dv_frame_count_match" "unverified"
     fi
   else
     note "Could not verify RPU/video frame count alignment (counting unavailable)."
@@ -9637,20 +9674,10 @@ run_video_pipeline() {
     # would corrupt the stream.
     if (( ! prewrap_ok )); then
       rm -f "$dv_prewrap" 2>/dev/null || true
-      # Stamp source fps as an INPUT option — ffmpeg's raw-hevc demuxer also
-      # defaults headerless ES to 25fps (and can field-double to 50fps).
-      local -a fps_in=()
-      [[ -n "$SRC_FPS" ]] && fps_in=(-r "$SRC_FPS")
-      ffmpeg "${FFMPEG_FLAGS[@]}" \
-           ${fps_in[@]+"${fps_in[@]}"} \
-           -i "$V_MIXED" \
-           -c:v copy \
-           -strict unofficial \
-           -tag:v dvh1 \
-           -movflags +faststart \
-           -f mp4 "$dv_prewrap" >"$WORKDIR/dv_prewrap.log" 2>&1 &
-      local pw_ff_pid=$!
-      local _pw_ff_rc=0; _await_tracked_pid "$pw_ff_pid" "Pre-wrapping DV video (ffmpeg fallback)" || _pw_ff_rc=$?
+      # dvh1 (live DV, +strict unofficial) via the shared wrap helper (RV3-11).
+      local _pw_ff_rc=0
+      _dv_ffmpeg_wrap_mp4 "$V_MIXED" "$dv_prewrap" "$WORKDIR/dv_prewrap.log" dvh1 \
+        "Pre-wrapping DV video (ffmpeg fallback)" || _pw_ff_rc=$?
       if (( _pw_ff_rc == 0 )) && [[ -s "$dv_prewrap" ]]; then
         if _dv_probe_has_config_record "$dv_prewrap"; then  # M-DRY-a
           V_DV_MP4="$dv_prewrap"
@@ -9676,22 +9703,10 @@ run_video_pipeline() {
         # Matroska mux fails with "Can't write packet with unknown timestamp".
         warn "DV pre-wrap did not yield a dvcC box; wrapping raw ES into a timestamped MP4 for the MKV mux."
         rm -f "$dv_prewrap" 2>/dev/null || true
-        # Stamp source fps as an INPUT option (raw-hevc demuxer defaults to 25/50fps).
-        local -a fps_in2=()
-        [[ -n "$SRC_FPS" ]] && fps_in2=(-r "$SRC_FPS")
-        # Array-safe expansion — a bare "${fps_in2[@]}" raises `unbound variable`
-        # under set -u on bash < 4.4 (documented floor 4.3) when SRC_FPS is empty (0-element
-        # array). Matches the four sibling fps expansions; see the note above (~fps_arg).
-        ffmpeg "${FFMPEG_FLAGS[@]}" \
-             ${fps_in2[@]+"${fps_in2[@]}"} \
-             -i "$V_MIXED" \
-             -c:v copy \
-             -strict unofficial \
-             -tag:v dvh1 \
-             -movflags +faststart \
-             -f mp4 "$dv_prewrap" >"$WORKDIR/dv_prewrap.log" 2>&1 &
-        local pw_ts_pid=$!
-        local _pw_ts_rc=0; _await_tracked_pid "$pw_ts_pid" "Wrapping DV video for MKV mux (timestamps)" || _pw_ts_rc=$?
+        # dvh1 (live DV, +strict unofficial) via the shared wrap helper (RV3-11).
+        local _pw_ts_rc=0
+        _dv_ffmpeg_wrap_mp4 "$V_MIXED" "$dv_prewrap" "$WORKDIR/dv_prewrap.log" dvh1 \
+          "Wrapping DV video for MKV mux (timestamps)" || _pw_ts_rc=$?
         if (( _pw_ts_rc == 0 )) && [[ -s "$dv_prewrap" ]]; then
           V_DV_MP4="$dv_prewrap"
           note "✅ DV video wrapped into timestamped MP4 for MKV mux (RPU preserved in-band)."
