@@ -1608,10 +1608,12 @@ _dep_check_only(){
   say "Checking which tools are already available:"
   printf '\n'
 
-  local -i total=0 found=0 missing=0
+  local -i total=0 found=0 missing=0 required_missing=0
 
+  # $2 == "required" flags a core tool (ffmpeg/ffprobe/jq/bc); its absence is a hard failure that
+  # must exit non-zero (RV3-09), not the advisory exit 0 used when only recommended tools are missing.
   _check_tool(){
-    local _tool="$1"
+    local _tool="$1" _req="${2:-}"
     total=$(( total + 1 ))
     printf "  %-14s" "$_tool"
     if command -v "$_tool" >/dev/null 2>&1; then
@@ -1620,11 +1622,12 @@ _dep_check_only(){
     else
       printf "❌ not found\n"
       missing=$(( missing + 1 ))
+      [[ "$_req" == required ]] && required_missing=$(( required_missing + 1 ))
     fi
   }
 
   say "Core (required):"
-  _check_tool ffmpeg
+  _check_tool ffmpeg required
   # Check for libass support in ffmpeg (needed for --sub-burn-forced)
   if command -v ffmpeg >/dev/null 2>&1; then
     printf "  %-14s" "  └ libass"
@@ -1634,9 +1637,9 @@ _dep_check_only(){
       printf "⚠️  built without libass — --sub-burn-forced will not work\n"
     fi
   fi
-  _check_tool ffprobe
-  _check_tool jq
-  _check_tool bc
+  _check_tool ffprobe required
+  _check_tool jq required
+  _check_tool bc required
   printf '\n'
 
   say "Dolby Vision pipeline (recommended):"
@@ -1679,8 +1682,16 @@ _dep_check_only(){
     printf "  %s\n" "Arch:     pacman -S <pkg>          openSUSE: zypper install <pkg>   (package names match the dnf/apt column above; pgsrip via pipx)"
     printf '\n'
     say "After installing, re-run: ${CLI_NAME} --install-dependencies"
-    note "Advisory check — $missing tool(s) missing. No automatic install available on this platform."
-    exit 0  # Advisory: report only, not a failure
+    # RV3-09: a missing REQUIRED tool (ffmpeg/ffprobe/jq/bc) is a hard failure — exit non-zero so
+    # `--setup`'s per-step status check (which runs this in a subshell) counts a genuine failure
+    # instead of the old always-`exit 0` that let `--setup` print "Setup complete — ready" on a box
+    # with no ffmpeg. Only-recommended-tools-missing keeps the advisory exit 0.
+    if (( required_missing > 0 )); then
+      warn "$required_missing required tool(s) missing (ffmpeg/ffprobe/jq/bc) — muxm cannot run until they are installed."
+      exit 10
+    fi
+    note "Advisory check — $missing recommended tool(s) missing. No automatic install available on this platform."
+    exit 0  # Advisory: only recommended tools missing — report only, not a failure
   fi
 
   say "✅ All tools found."
@@ -6276,6 +6287,15 @@ fi
 # Same fail-fast preflight for the software x26x encoders — runs after detect_hw_accel so
 # HW_ACCEL_RESOLVED is known (the HW path uses hevc_videotoolbox/hevc_nvenc, not libx265/libx264).
 _preflight_sw_video_encoder
+
+# RV3-09: same fail-fast preflight for a FORCED audio encoder (--audio-force-codec / config). A
+# platform-locked encoder — aac_at (macOS AudioToolbox), libfdk_aac (special build), or an absent
+# libopus/libvorbis/libmp3lame on a minimal ffmpeg — was previously only discovered AFTER the whole
+# video pipeline finished, as a cryptic die 43 (hours of wasted encode). Catch it here instead.
+# Native encoders (aac/ac3/eac3/flac) always pass. Skipped when audio is off (--skip-audio).
+if [[ -n "${AUDIO_FORCE_CODEC:-}" ]] && (( ! SKIP_AUDIO )) && ! ffmpeg_has_encoder "$AUDIO_FORCE_CODEC"; then
+  die 10 "--audio-force-codec '${AUDIO_FORCE_CODEC}' encoder is not available in this ffmpeg build. Install a complete ffmpeg (e.g., brew install ffmpeg-full, or run muxm --install-dependencies), or choose a different --audio-force-codec."
+fi
 
 # Strict check for explicit hardware acceleration requests. detect_hw_accel
 # ran earlier (Section 13b) as a non-fatal probe so --print-effective-config

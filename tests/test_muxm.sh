@@ -12871,6 +12871,79 @@ test_setup() {
     fail "setup-man-target-dir-broken-brew: expected a clean die on empty brew --prefix (rc=$bad_rc): ${bad_out:0:200}"
   fi
 
+  # ---- RV3-09: a forced audio encoder ffmpeg LACKS must fail FAST (Section-14 die 10, before the
+  #      video pipeline), not late at die 43 after hours of encode. Find an allow-listed encoder this
+  #      ffmpeg does not have (libfdk_aac/aac_at are platform-locked); if all are present, skip.
+  #      Uses a real fixture so the run reaches the preflight. Skip-first guards per the ratchet. ----
+  local _afc_missing="" _afc_e
+  for _afc_e in libfdk_aac aac_at libopus libvorbis libmp3lame; do
+    if ! ffmpeg_has_encoder "$_afc_e"; then _afc_missing="$_afc_e"; break; fi
+  done
+  if [[ -z "$_afc_missing" ]] || ! ffmpeg_has_encoder libx265; then
+    skip "setup-audio-force-codec-preflight: no unavailable allow-listed audio encoder, or ffmpeg lacks libx265 for the target"
+  else
+    local _afc_dir; _afc_dir="$(mktemp -d "$TESTDIR/afcpre.XXXXXX")"; mkdir -p "$_afc_dir/h"
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=gray:s=320x240:r=24:d=1" -f lavfi -i "sine=d=1" \
+      -c:v libx264 -preset ultrafast -crf 30 -c:a aac -ac 2 -shortest "$_afc_dir/src.mkv" 2>/dev/null || true
+    if [[ ! -s "$_afc_dir/src.mkv" ]]; then
+      skip "setup-audio-force-codec-preflight: could not build the source fixture"
+    else
+      local _afc_log _afc_code=0
+      _afc_log="$(cd "$_afc_dir" && HOME="$_afc_dir/h" "$MUXM" -K --no-disk-check --output-ext mkv --audio-force-codec "$_afc_missing" \
+        --crf 30 --preset ultrafast src.mkv out.mkv 2>&1)" || _afc_code=$?
+      if [[ "$_afc_code" -ne 0 ]] && printf '%s' "$_afc_log" | grep -qiE "encoder is not available in this ffmpeg build" \
+         && ! printf '%s' "$_afc_log" | grep -qiE 'Encoding video'; then
+        pass "setup-audio-force-codec-preflight: --audio-force-codec $_afc_missing (unavailable) fails fast at the Section-14 preflight, before any video encode"
+      else
+        fail "setup-audio-force-codec-preflight: expected a fast preflight fail for $_afc_missing (code=$_afc_code, encode-started=$(printf '%s' "$_afc_log" | grep -qiE 'Encoding video' && echo yes || echo no))"
+      fi
+    fi
+    rm -rf "$_afc_dir"
+  fi
+
+  # ---- RV3-09: _dep_check_only must exit NON-ZERO when a REQUIRED tool (ffmpeg/ffprobe/jq/bc) is
+  #      missing — so --setup's per-step status check counts a genuine failure instead of the old
+  #      always-exit-0 that let --setup print "Setup complete — ready" on a box with no ffmpeg. An
+  #      only-recommended-missing check stays advisory (exit 0). Function-level (stubs `command -v`),
+  #      since faithfully removing ffmpeg while keeping muxm runnable via PATH is platform-fragile
+  #      (the shebang needs a 4.4+ bash, whose dir also holds ffmpeg). ----
+  local _dc_body
+  _dc_body="$(_extract_muxm_fns _dep_check_only _detect_mp4box)" || _dc_body=""
+  if [[ -z "$_dc_body" ]]; then
+    fail "setup-dep-check-required: could not extract _dep_check_only"
+  else
+    _dc_rc(){   # $1 = space-separated tools to report FOUND (all others missing) → _dep_check_only exit code
+      local _rc=0
+      ( export _DC_FOUND=" $1 "
+        bash -c 'APP_NAME=MuxMaster; VERSION=1.5.1; CLI_NAME=muxm; MP4BOX_CMD=""
+say(){ :; }; note(){ :; }; warn(){ :; }
+command(){ if [[ "$1" == "-v" ]]; then [[ "$_DC_FOUND" == *" $2 "* ]] && { printf "/usr/bin/%s" "$2"; return 0; }; return 1; fi; builtin command "$@"; }
+'"$_dc_body"'
+_dep_check_only >/dev/null 2>&1' ) || _rc=$?
+      echo "$_rc"
+    }
+    if [[ "$(_dc_rc "")" -ne 0 ]]; then
+      pass "setup-dep-check-required: all tools missing → non-zero exit (required tools absent, not the old advisory 0)"
+    else
+      fail "setup-dep-check-required: all-missing should exit non-zero, got 0"
+    fi
+    if [[ "$(_dc_rc "ffprobe jq bc dovi_tool MP4Box tesseract pgsrip")" -ne 0 ]]; then
+      pass "setup-dep-check-required: a single missing REQUIRED tool (ffmpeg) → non-zero exit"
+    else
+      fail "setup-dep-check-required: missing ffmpeg should exit non-zero"
+    fi
+    if [[ "$(_dc_rc "ffmpeg ffprobe jq bc")" -eq 0 ]]; then
+      pass "setup-dep-check-required: required present, only recommended missing → advisory exit 0 (unchanged)"
+    else
+      fail "setup-dep-check-required: recommended-only-missing should stay advisory (exit 0)"
+    fi
+    if [[ "$(_dc_rc "ffmpeg ffprobe jq bc dovi_tool MP4Box tesseract pgsrip")" -eq 0 ]]; then
+      pass "setup-dep-check-required: all tools found → exit 0"
+    else
+      fail "setup-dep-check-required: all-found should exit 0"
+    fi
+  fi
+
   # ---- Cleanup ----
   rm -rf "$fake_home"
 }
