@@ -10960,9 +10960,25 @@ _container_supports_bitmap_subs(){ [[ "$MUX_FORMAT" == "matroska" ]]; }
 _sub_candidate_undeliverable(){
   local c="$1"
   _is_text_sub_codec "$c" && return 1            # text is always deliverable
-  _container_supports_bitmap_subs && return 1     # MKV stream-copies the bitmap as-is
-  (( SUB_ENABLE_OCR )) && return 1                # OCR converts the bitmap → text
-  return 0                                        # bitmap, non-MKV, OCR off → undeliverable
+  case "$c" in
+    hdmv_pgs_subtitle|pgs)
+      # PGS: _prepare_subtitle can stream-copy it into MKV (bitmap preserve) OR OCR it to text.
+      _container_supports_bitmap_subs && return 1   # MKV stream-copies the PGS bitmap as-is
+      (( SUB_ENABLE_OCR )) && return 1              # OCR converts the PGS bitmap → text
+      return 0                                      # non-MKV + OCR off → undeliverable
+      ;;
+    *)
+      # RV3-07: VobSub (dvd_subtitle) / DVB (dvb_subtitle) and any other non-text, non-PGS bitmap.
+      # _prepare_subtitle has NO arm for these — no stream-copy, no OCR path; they fall into its
+      # unsupported-codec catch-all and return empty — so they are undeliverable in EVERY config.
+      # The prior blanket `_container_supports_bitmap_subs && return 1` wrongly reported them
+      # deliverable on an MKV target, so a matching text sidecar got deduped away while the embedded
+      # bitmap was then silently dropped at prepare time — leaving the output with ZERO subtitles.
+      # Reporting them undeliverable keeps the usable text sidecar (and skips the bitmap in
+      # single-track selection so that sidecar is chosen).
+      return 0
+      ;;
+  esac
 }
 
 # Find the first text-based subtitle in a preferred language for direct stream copy.
@@ -10973,7 +10989,13 @@ _pick_direct_text_sub_relidx(){
   # shellcheck disable=SC2046  # Intentional word-splitting of integer list
   for i in $(list_sub_indices); do
     lang="$(_sp_sub_lang "$i")"
-    _sub_lang_matches "$lang" || continue
+    # RV3-07: gate the language filter on `-n SUB_LANG_PREF`, matching every sibling call site
+    # (the main selection loop, _build_subtitle_keep_list). An empty SUB_LANG_PREF is documented as
+    # "keep all languages" — but _sub_lang_matches returns false for an empty pref, so without this
+    # gate the last-resort fallback matched NOTHING and found no candidate at all.
+    if [[ -n "${SUB_LANG_PREF:-}" ]] && ! _sub_lang_matches "$lang"; then
+      continue
+    fi
     codec="$(_sp_sub_field "$i" codec_name)"; codec="${codec,,}"
     if _is_text_sub_codec "$codec"; then
       echo "$i"
@@ -11046,6 +11068,20 @@ _prepare_subtitle(){
 
   codec="$(_sp_sub_field "$idx" codec_name)"; codec="${codec,,}"
   srt="$WORKDIR/sub.${idx}.srt"
+
+  # RV3-07: codec-support gate — placed BEFORE the DRY_RUN branch so a --dry-run preview and the
+  # real run agree on which codecs are deliverable. The real `case "$codec"` below only handles text
+  # (subrip/ass/ssa/webvtt/vtt) and PGS; any other codec (dvd_subtitle/dvb_subtitle/…) hits its
+  # catch-all and returns empty. Without this gate the dry-run branch fabricated a fake `.srt`
+  # success for those, so the preview claimed a subtitle the real run silently drops.
+  case "$codec" in
+    subrip|srt|ass|ssa|webvtt|vtt|hdmv_pgs_subtitle|pgs) ;;   # handled by the case below
+    *)
+      warn "[Subs] Unsupported subtitle codec '$codec' for #$idx — skipping."
+      echo ""
+      return 0
+      ;;
+  esac
 
   # Check if we should preserve native text format (ASS/SSA) for this run.
   # Conditions: SUB_PRESERVE_TEXT_FORMAT=1, output container is MKV, and codec is ASS/SSA.
@@ -12145,7 +12181,11 @@ build_subtitle_plan(){
 
   # Prepare selected subtitles (up to SUB_MAX_TRACKS)
   local sub_path pick_count=0
-  if [[ -n "$forced_uidx" ]]; then
+  # RV3-07: gate the forced branch on SUB_MAX_TRACKS too — the immediately-following full/sdh
+  # branches already do (`$pick_count -lt $SUB_MAX_TRACKS`), so without this a SUB_MAX_TRACKS=0
+  # ("no subtitle tracks") config still let a forced subtitle through. pick_count is 0 here, so
+  # the guard suppresses the forced sub exactly when SUB_MAX_TRACKS=0.
+  if [[ -n "$forced_uidx" && $pick_count -lt $SUB_MAX_TRACKS ]]; then
     sub_path="$(_prepare_sub_from_source "${ALL_SUB_SOURCES[$forced_uidx]}")"
     if [[ -z "$sub_path" ]]; then
       : # preparation failed; skip silently
@@ -12203,7 +12243,11 @@ build_subtitle_plan(){
   # wrongly re-embed a contradictory soft mov_text track on top of the burn + external export.
   if [[ -z "$SRT_FORCED" && -z "$SRT_FULL" && -z "$SRT_SDH" ]] \
      && [[ -z "$SRT_FORCED_BURN_PATH" ]] && (( ${#EXTERNAL_SRT_PATHS[@]} == 0 )) \
+     && (( SUB_MAX_TRACKS > 0 )) \
      && (( SUB_INCLUDE_FORCED || SUB_INCLUDE_FULL || SUB_INCLUDE_SDH )); then
+    # RV3-07: gate the direct-map last-resort on SUB_MAX_TRACKS too. SUB_MAX_TRACKS=0 means "no
+    # subtitle tracks"; without this, a forced (or any) text sub suppressed by the per-type
+    # SUB_MAX_TRACKS guards above would be silently re-added here, defeating the cap.
     DIRECT_SUB_RELIDX="$(_pick_direct_text_sub_relidx)"
     if [[ -n "$DIRECT_SUB_RELIDX" ]]; then
       # Unified: the direct-map text fallback folds into an embedded:N track — mapped

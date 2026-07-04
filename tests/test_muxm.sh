@@ -6865,6 +6865,81 @@ SRT
   _test_subs_no_reembed
   _test_subs_forced_copy_gate
   _test_sii_single_track_subs_ideality
+  _test_subs_rv3_07
+}
+
+# RV3-07: subtitle codec deliverability & dry-run fidelity + the two Section-28 mediums.
+#   (2) _prepare_subtitle's DRY-RUN branch must not fabricate a fake success for a codec the real run
+#       drops — the codec-support gate now runs before the dry-run branch (function-level, since
+#       ffmpeg cannot synthesize an embedded bitmap-subtitle fixture — see the RF6 note).
+#   (3) _pick_direct_text_sub_relidx must match ANY language when SUB_LANG_PREF is empty (keep-all).
+#   (4) SUB_MAX_TRACKS=0 suppresses even a forced subtitle (forced branch + direct-map fallback gated).
+# (Fix (1) — VobSub/DVB undeliverability keeping the text sidecar — is covered by the updated
+#  _test_unit_rf6_subtitle_fallback, the only feasible level for an embedded-bitmap scenario.)
+_test_subs_rv3_07() {
+  # ---- (2) dry-run fidelity of _prepare_subtitle for an unsupported codec ----
+  local ps_body
+  ps_body="$(_extract_muxm_fns _prepare_subtitle)" || { fail "rv3-07: could not extract _prepare_subtitle"; return; }
+  _dry_prep(){   # $1=codec → the dry-run prepared path (empty if the codec is dropped)
+    local _w; _w="$(mktemp -d)"
+    local _out
+    _out="$(bash -c "WORKDIR='$_w'; DRY_RUN=1; MUX_FORMAT=matroska; SUB_PRESERVE_TEXT_FORMAT=0; SUB_PRESERVE_BITMAP=1; SUB_BURN_FORCED=0; CODEC='$1'
+warn(){ :; }; note(){ :; }
+_sp_sub_field(){ printf '%s' \"\$CODEC\"; }
+_container_supports_bitmap_subs(){ [[ \"\$MUX_FORMAT\" == matroska ]]; }
+$ps_body
+_prepare_subtitle 0" 2>/dev/null)"
+    rm -rf "$_w"
+    printf '%s' "$_out"
+  }
+  [[ -z "$(_dry_prep dvd_subtitle)" ]] && pass "rv3-07(2): --dry-run drops an unsupported VobSub codec (no fabricated success — matches the real run)" || fail "rv3-07(2): --dry-run fabricated a success for dvd_subtitle"
+  [[ -z "$(_dry_prep dvb_subtitle)" ]] && pass "rv3-07(2): --dry-run drops an unsupported DVB codec"                                              || fail "rv3-07(2): --dry-run fabricated a success for dvb_subtitle"
+  [[ -n "$(_dry_prep subrip)"      ]] && pass "rv3-07(2): --dry-run still previews a supported text codec (subrip)"                                || fail "rv3-07(2): --dry-run dropped a supported subrip codec"
+
+  # ---- (3) _pick_direct_text_sub_relidx honors an empty (keep-all) SUB_LANG_PREF ----
+  local pk_body
+  pk_body="$(_extract_muxm_fns _pick_direct_text_sub_relidx _is_text_sub_codec)" || { fail "rv3-07: could not extract _pick_direct_text_sub_relidx"; return; }
+  _pick(){   # $1=SUB_LANG_PREF → picked relidx (empty if none). Boundary: one fra text sub.
+    bash -c "SUB_LANG_PREF='$1'
+list_sub_indices(){ echo 0; }
+_sp_sub_lang(){ echo fra; }
+_sp_sub_field(){ echo subrip; }
+_sub_lang_matches(){ [[ \"\$SUB_LANG_PREF\" == *fra* ]]; }
+$pk_body
+_pick_direct_text_sub_relidx" 2>/dev/null
+  }
+  [[ "$(_pick '')" == 0 ]] && pass "rv3-07(3): empty SUB_LANG_PREF (keep-all) selects a non-preferred-language text sub in the direct-map fallback" || fail "rv3-07(3): empty SUB_LANG_PREF found no candidate (got '$(_pick '')')"
+  [[ -z "$(_pick eng)"  ]] && pass "rv3-07(3): SUB_LANG_PREF=eng with only a fra sub finds no direct-map candidate (filter respected)"              || fail "rv3-07(3): SUB_LANG_PREF=eng wrongly matched a fra sub"
+
+  # ---- (4) SUB_MAX_TRACKS=0 suppresses a lone forced subtitle (real encode) ----
+  # Skip-first guard (not an else-skip) per the soft-skip ratchet.
+  if ! ffmpeg_has_encoder libx265; then
+    skip "rv3-07(4): ffmpeg lacks libx265 — cannot run the forced-subtitle encode"
+  else
+    local _mt_dir; _mt_dir="$(mktemp -d "$TESTDIR/rv307mt.XXXXXX")"; mkdir -p "$_mt_dir/h"
+    printf '1\n00:00:00,000 --> 00:00:01,000\n[Foreign]\n' > "$_mt_dir/f.srt"
+    ffmpeg -hide_banner -loglevel error -y \
+      -f lavfi -i "color=c=gray:s=320x240:r=24:d=2" -f lavfi -i "sine=frequency=440:duration=2" -i "$_mt_dir/f.srt" \
+      -c:v libx264 -preset ultrafast -crf 30 -c:a aac -b:a 128k -ac 2 -c:s srt \
+      -map 0:v -map 1:a -map 2 -metadata:s:s:0 language=eng -metadata:s:s:0 title="Forced" -disposition:s:0 forced \
+      "$_mt_dir/fsrc.mkv" 2>/dev/null || true
+    if [[ ! -s "$_mt_dir/fsrc.mkv" ]]; then
+      skip "rv3-07(4): could not build the forced-subtitle fixture"
+    else
+      printf 'SUB_MAX_TRACKS=0\n' > "$_mt_dir/.muxmrc"
+      ( cd "$_mt_dir" && HOME="$_mt_dir/h" "$MUXM" -K --no-disk-check --output-ext mkv --crf 30 --preset ultrafast fsrc.mkv out0.mkv >/dev/null 2>&1 )
+      local _n0; _n0="$(ffprobe -v error -select_streams s -show_entries stream=index -of csv=p=0 "$_mt_dir/out0.mkv" 2>/dev/null | awk 'END{print NR}')"
+      printf 'SUB_MAX_TRACKS=1\n' > "$_mt_dir/.muxmrc"
+      ( cd "$_mt_dir" && HOME="$_mt_dir/h" "$MUXM" -K --no-disk-check --output-ext mkv --crf 30 --preset ultrafast fsrc.mkv out1.mkv >/dev/null 2>&1 )
+      local _n1; _n1="$(ffprobe -v error -select_streams s -show_entries stream=index -of csv=p=0 "$_mt_dir/out1.mkv" 2>/dev/null | awk 'END{print NR}')"
+      if [[ "$_n0" == 0 && "$_n1" == 1 ]]; then
+        pass "rv3-07(4): SUB_MAX_TRACKS=0 suppresses a lone forced subtitle (0 subs); SUB_MAX_TRACKS=1 keeps it (1 sub)"
+      else
+        fail "rv3-07(4): SUB_MAX_TRACKS=0 → $_n0 subs (want 0), SUB_MAX_TRACKS=1 → $_n1 subs (want 1)"
+      fi
+    fi
+    rm -rf "$_mt_dir"
+  fi
 }
 
 # RV3-02: for a single-track profile, check_skip_if_ideal previously had NO subtitle-ideality arm
@@ -10166,10 +10241,16 @@ _sub_candidate_undeliverable \"\$1\"; echo \$?" -- "$1" "$2" "$3"
   }
   _u_assert(){ local label="$1" want="$2" got="$3"; if [[ "$got" == "$want" ]]; then pass "$label"; else fail "$label — got rc=$got, expected $want"; fi; }
   _u_assert "RF6(a): text sub (subrip) is always deliverable"                 1 "$(_undeliv subrip mp4 0)"
-  _u_assert "RF6(a): bitmap + MKV is deliverable (stream-copy)"               1 "$(_undeliv hdmv_pgs_subtitle matroska 0)"
-  _u_assert "RF6(a): bitmap + MP4 + OCR on is deliverable (OCR→text)"         1 "$(_undeliv hdmv_pgs_subtitle mp4 1)"
-  _u_assert "RF6(a): bitmap + MP4 + OCR off is UNDELIVERABLE"                 0 "$(_undeliv hdmv_pgs_subtitle mp4 0)"
-  _u_assert "RF6(a): VobSub (dvd_subtitle) + MOV + OCR off is UNDELIVERABLE"  0 "$(_undeliv dvd_subtitle mov 0)"
+  _u_assert "RF6(a): PGS + MKV is deliverable (stream-copy)"                  1 "$(_undeliv hdmv_pgs_subtitle matroska 0)"
+  _u_assert "RF6(a): PGS + MP4 + OCR on is deliverable (OCR→text)"            1 "$(_undeliv hdmv_pgs_subtitle mp4 1)"
+  _u_assert "RF6(a): PGS + MP4 + OCR off is UNDELIVERABLE"                    0 "$(_undeliv hdmv_pgs_subtitle mp4 0)"
+  # RV3-07: VobSub (dvd_subtitle) / DVB (dvb_subtitle) have NO _prepare_subtitle arm (no stream-copy,
+  # no OCR path) — so they are UNDELIVERABLE in EVERY config, including MKV and with OCR on. The old
+  # blanket MKV/OCR short-circuit wrongly reported them deliverable.
+  _u_assert "RF6(a)/RV3-07: VobSub (dvd_subtitle) + MKV is UNDELIVERABLE (no prepare arm)"    0 "$(_undeliv dvd_subtitle matroska 0)"
+  _u_assert "RF6(a)/RV3-07: VobSub (dvd_subtitle) + MP4 + OCR on is UNDELIVERABLE"            0 "$(_undeliv dvd_subtitle mp4 1)"
+  _u_assert "RF6(a)/RV3-07: VobSub (dvd_subtitle) + MOV + OCR off is UNDELIVERABLE"           0 "$(_undeliv dvd_subtitle mov 0)"
+  _u_assert "RF6(a)/RV3-07: DVB (dvb_subtitle) + MKV + OCR on is UNDELIVERABLE"               0 "$(_undeliv dvb_subtitle matroska 1)"
 
   # ---- (b) merge_subtitle_sources codec-aware dedup ----
   local body_m
@@ -10177,35 +10258,37 @@ _sub_candidate_undeliverable \"\$1\"; echo \$?" -- "$1" "$2" "$3"
               _is_forced_title _is_sdh_title _sub_candidate_undeliverable _is_text_sub_codec \
               _container_supports_bitmap_subs)" \
     || { fail "RF6(b): could not extract merge_subtitle_sources + helpers"; return; }
-  # Mock the embedded-stream I/O boundary: one embedded bitmap (dvd_subtitle) eng/full. A single ext
+  # Mock the embedded-stream I/O boundary: one embedded bitmap (codec = $3) eng/full. A single ext
   # sidecar (srt eng/full) collides on (lang,type). Emits the final ALL_SUB_SOURCES element count.
-  # $1=MUX_FORMAT $2=SUB_ENABLE_OCR
+  # $1=MUX_FORMAT $2=SUB_ENABLE_OCR $3=embedded codec
   _merge_count(){
-    bash -c "MUX_FORMAT=\"\$1\"; SUB_ENABLE_OCR=\"\$2\"; TAG_LANGUAGE_DEFAULT=und
+    bash -c "MUX_FORMAT=\"\$1\"; SUB_ENABLE_OCR=\"\$2\"; TAG_LANGUAGE_DEFAULT=und; _EMB_CODEC=\"\$3\"
 note(){ :; }; report_add(){ :; }
 _sub_count(){ echo 1; }
-_sub_stream_info(){ printf 'dvd_subtitle\teng\t\t0\t0\n'; }   # codec lang title forced hi (bitmap, full)
+_sub_stream_info(){ printf '%s\teng\t\t0\t0\n' \"\$_EMB_CODEC\"; }   # codec lang title forced hi (full)
 EXT_SUB_PATHS=(/x/movie.en.srt); EXT_SUB_LANGS=(eng); EXT_SUB_TYPES=(full); EXT_SUB_CODECS=(srt)
 $body_m
 merge_subtitle_sources
-echo \"\${#ALL_SUB_SOURCES[@]}\"" -- "$1" "$2"
+echo \"\${#ALL_SUB_SOURCES[@]}\"" -- "$1" "$2" "$3"
   }
   _m_assert(){ local label="$1" want="$2" got="$3"; if [[ "$got" == "$want" ]]; then pass "$label (sources=$got)"; else fail "$label — ALL_SUB_SOURCES=$got, expected $want"; fi; }
-  # MP4 + OCR off: embedded bitmap is undeliverable → sidecar KEPT → 2 sources.
-  _m_assert "RF6(b): undeliverable embedded bitmap does NOT dedup away the text sidecar (MP4/no-OCR)" 2 "$(_merge_count mp4 0)"
-  # MKV: embedded bitmap is deliverable (stream-copy) → sidecar deduped → 1 source (unchanged).
-  _m_assert "RF6(b): deliverable embedded bitmap (MKV) still dedups the sidecar" 1 "$(_merge_count matroska 0)"
-  # MP4 + OCR on: embedded bitmap is deliverable (OCR) → sidecar deduped → 1 source (unchanged).
-  _m_assert "RF6(b): deliverable embedded bitmap (MP4+OCR) still dedups the sidecar" 1 "$(_merge_count mp4 1)"
+  # PGS: deliverable on MKV / MP4+OCR → sidecar deduped (1); undeliverable MP4/no-OCR → kept (2).
+  _m_assert "RF6(b): deliverable embedded PGS (MKV) dedups the text sidecar"         1 "$(_merge_count matroska 0 hdmv_pgs_subtitle)"
+  _m_assert "RF6(b): deliverable embedded PGS (MP4+OCR) dedups the text sidecar"     1 "$(_merge_count mp4 1 hdmv_pgs_subtitle)"
+  _m_assert "RF6(b): undeliverable embedded PGS (MP4/no-OCR) keeps the text sidecar" 2 "$(_merge_count mp4 0 hdmv_pgs_subtitle)"
+  # RV3-07: an embedded VobSub is undeliverable in EVERY config, so it must NEVER dedup away the
+  # matching text sidecar (the zero-subtitles bug: the sidecar was dropped, then the bitmap failed to prepare).
+  _m_assert "RF6(b)/RV3-07: embedded VobSub (MKV) keeps the text sidecar (no false dedup)"      2 "$(_merge_count matroska 0 dvd_subtitle)"
+  _m_assert "RF6(b)/RV3-07: embedded VobSub (MP4+OCR) keeps the text sidecar (no false dedup)"  2 "$(_merge_count mp4 1 dvd_subtitle)"
 
   # ---- (c) build_subtitle_plan selection skips the undeliverable bitmap, picks the text sidecar ----
   local body_p
   body_p="$(_extract_muxm_fns build_subtitle_plan _sub_candidate_undeliverable _is_text_sub_codec \
               _container_supports_bitmap_subs _sub_lang_matches _norm_lang_code)" \
     || { fail "RF6(c): could not extract build_subtitle_plan + helpers"; return; }
-  # ALL_SUB_SOURCES already merged: embedded bitmap (i=0) + text sidecar (i=1), both eng/full.
-  # Mock the prepare/export boundary so we can see WHICH source was selected and prepared.
-  # $1=MUX_FORMAT $2=SUB_ENABLE_OCR → emits the prepared SRT_FULL marker ("embedded:0" or "ext:...").
+  # ALL_SUB_SOURCES already merged: embedded bitmap (i=0, codec = $3) + text sidecar (i=1), both
+  # eng/full. Mock the prepare/export boundary so we can see WHICH source was selected and prepared.
+  # $1=MUX_FORMAT $2=SUB_ENABLE_OCR $3=embedded codec → prepared SRT_FULL marker ("embedded:0"/"ext:…").
   _plan_pick(){
     bash -c "MUX_FORMAT=\"\$1\"; SUB_ENABLE_OCR=\"\$2\"
 SKIP_SUBS=0; SUB_MULTI_TRACK=0; SUB_BURN_FORCED=0; SUB_EXPORT_EXTERNAL=0
@@ -10213,7 +10296,7 @@ SUB_LANG_PREF=''; SUB_INCLUDE_FORCED=1; SUB_INCLUDE_FULL=1; SUB_INCLUDE_SDH=1
 SUB_SOLE_EXT_FALLBACK=1; SUB_MAX_TRACKS=3
 SRT_FORCED=''; SRT_FULL=''; SRT_SDH=''; SRT_FORCED_BURN_PATH=''; EXTERNAL_SRT_PATHS=()
 ALL_SUB_SOURCES=('embedded:0' 'ext:/x/movie.en.srt')
-ALL_SUB_CODECS=('dvd_subtitle' 'srt'); ALL_SUB_LANGS=('eng' 'eng')
+ALL_SUB_CODECS=(\"\$3\" 'srt'); ALL_SUB_LANGS=('eng' 'eng')
 ALL_SUB_TYPES=('full' 'full'); ALL_SUB_TITLES=('' '')
 say(){ :; }; note(){ :; }; report_add(){ :; }; mark_done(){ :; }; warn(){ :; }
 _pick_direct_text_sub_relidx(){ echo ''; }
@@ -10221,22 +10304,29 @@ _prepare_sub_from_source(){ printf '%s\n' \"\$1\"; }      # echo the SOURCE desc
 _export_or_embed_sub(){ _SUB_EMBED_PATH=\"\$1\"; }        # embed path = the prepared source marker
 $body_p
 build_subtitle_plan
-printf '%s\n' \"\$SRT_FULL\"" -- "$1" "$2"
+printf '%s\n' \"\$SRT_FULL\"" -- "$1" "$2" "$3"
   }
-  local _pick_mp4 _pick_mkv
-  _pick_mp4="$(_plan_pick mp4 0)"
-  _pick_mkv="$(_plan_pick matroska 0)"
-  # MP4/no-OCR: the bitmap (i=0) is undeliverable → skipped → the text sidecar (ext) is selected.
-  if [[ "$_pick_mp4" == ext:* ]]; then
-    pass "RF6(c): MP4/no-OCR selection skips the undeliverable bitmap, picks the text sidecar ($_pick_mp4)"
+  local _pick_pgs_mkv _pick_vob_mkv _pick_vob_mp4
+  _pick_pgs_mkv="$(_plan_pick matroska 0 hdmv_pgs_subtitle)"
+  _pick_vob_mkv="$(_plan_pick matroska 0 dvd_subtitle)"
+  _pick_vob_mp4="$(_plan_pick mp4 0 dvd_subtitle)"
+  # PGS on MKV is deliverable, so first-match selects the embedded bitmap (embedded:0) — no change.
+  if [[ "$_pick_pgs_mkv" == embedded:0 ]]; then
+    pass "RF6(c): MKV selects a deliverable embedded PGS first (embedded:0) — no behavior change"
   else
-    fail "RF6(c): MP4/no-OCR selected '$_pick_mp4' — expected the ext text sidecar (bitmap not skipped)"
+    fail "RF6(c): MKV/PGS selected '$_pick_pgs_mkv' — expected embedded:0 (first-match)"
   fi
-  # MKV control: the bitmap is deliverable, so first-match selects it (embedded:0) — unchanged.
-  if [[ "$_pick_mkv" == embedded:0 ]]; then
-    pass "RF6(c): MKV control selects the (deliverable) embedded bitmap first — no behavior change"
+  # RV3-07: a VobSub is undeliverable in EVERY container, so selection must skip it and pick the
+  # text sidecar — on MKV (the case the old code got wrong) as well as MP4.
+  if [[ "$_pick_vob_mkv" == ext:* ]]; then
+    pass "RF6(c)/RV3-07: MKV skips the undeliverable embedded VobSub, picks the text sidecar ($_pick_vob_mkv)"
   else
-    fail "RF6(c): MKV control selected '$_pick_mkv' — expected embedded:0 (first-match unchanged)"
+    fail "RF6(c)/RV3-07: MKV/VobSub selected '$_pick_vob_mkv' — expected the ext text sidecar (bitmap not skipped)"
+  fi
+  if [[ "$_pick_vob_mp4" == ext:* ]]; then
+    pass "RF6(c): MP4 skips the undeliverable embedded VobSub, picks the text sidecar ($_pick_vob_mp4)"
+  else
+    fail "RF6(c): MP4/VobSub selected '$_pick_vob_mp4' — expected the ext text sidecar"
   fi
 }
 
