@@ -10491,6 +10491,36 @@ _sub_stream_info 0" -- "$_json" 2>/dev/null)"
 # Homebrew, so that's tried automatically — confirmed empirically (does the bare form actually error
 # there?), not by parsing a version string (format varies across GNU/BSD bash builds). Skips only on
 # hosts with neither (e.g. a modern-only Linux box).
+# RV3-10: on_error() must mirror its failure message into _LOG_BUFFER when the §17 tee is not yet
+# live (_LOG_READY=0), exactly like die() — so an ERR-trap failure that fires before the logfile
+# exists is not lost from the persisted log (previously on_error wrote only to stderr). When the tee
+# IS live (_LOG_READY=1) it must NOT mirror (the tee already captures stderr → no double-write).
+_test_unit_on_error_log_buffer() {
+  local body
+  body="$(_extract_muxm_fns on_error _log_buffer_mirror)" \
+    || { fail "unit-on-error-log-buffer: could not extract on_error + _log_buffer_mirror"; return; }
+  # $1 = _LOG_READY value → emits the resulting _LOG_BUFFER contents.
+  _oe_buf(){
+    bash -c "_LOG_READY=$1; _LOG_BUFFER=''; _PFX_ERR='X '; FAILED=0; EXIT_CODE=0; _ERROR_PRINTED=0
+$body
+on_error 123 'somecmd' 7 2>/dev/null
+printf '%s' \"\$_LOG_BUFFER\""
+  }
+  local _b0 _b1
+  _b0="$(_oe_buf 0)"
+  _b1="$(_oe_buf 1)"
+  if [[ "$_b0" == *"Command failed at line 123"* ]]; then
+    pass "unit-on-error-log-buffer: on_error mirrors its message into _LOG_BUFFER pre-§17 (_LOG_READY=0), matching die()"
+  else
+    fail "unit-on-error-log-buffer: pre-§17 on_error did not capture the message (buffer='$_b0')"
+  fi
+  if [[ -z "$_b1" ]]; then
+    pass "unit-on-error-log-buffer: on_error does NOT mirror once the tee is live (_LOG_READY=1) — no double-write"
+  else
+    fail "unit-on-error-log-buffer: on_error wrongly mirrored when _LOG_READY=1 (buffer='$_b1')"
+  fi
+}
+
 _test_unit_empty_array_safe() {
   # (1) Idiom behavior: empty → 0 extra args (NOT one empty arg, as "${arr[@]:-}" would give).
   local n_empty n_full
@@ -11181,6 +11211,7 @@ test_unit() {
   _test_unit_build_subtitle_lists
   _test_unit_rf6_subtitle_fallback
   _test_unit_metadata_sanitize
+  _test_unit_on_error_log_buffer
   _test_unit_empty_array_safe
   _test_unit_no_bare_fps_array
   _test_unit_grep_flags
@@ -13653,6 +13684,50 @@ test_multi_profile() {
     "mp-dv-archival-container: dv-archival alias emits a deprecation warning in multi-profile mode" "$out"
 
   _test_mp_output_ext_container
+  _test_multi_profile_dispatch_diagnosed
+}
+
+# RV3-10: a multi-profile dispatch FAILURE must surface muxm's own diagnostic (a die() error +
+# meaningful exit code), not a bare untrapped `set -e` exit — _run_multi_profiles runs BEFORE the
+# ERR/EXIT/INT/TERM traps are armed (those belong to single-profile runs), so the call site now wraps
+# it in a subshell and routes any non-zero result through die(). A read-only output directory makes
+# every child fail FAST (die 11 at the writability check, before any encode), so this is quick and
+# deterministic. Also locks the corrected doc comment. Skip-first guards per the ratchet.
+_test_multi_profile_dispatch_diagnosed() {
+  # Doc-only fix (RV3-10): the dispatch comment must not claim the on_exit EXIT trap fires there.
+  if grep -qE 'on_exit EXIT trap fires after this exit' "$MUXM"; then
+    fail "mp-dispatch-diagnosed: stale comment still claims the on_exit EXIT trap fires at multi-profile dispatch"
+  else
+    pass "mp-dispatch-diagnosed: multi-profile dispatch comment no longer misstates when the on_exit trap is armed"
+  fi
+
+  if ! ffmpeg_has_encoder libx265; then
+    skip "mp-dispatch-diagnosed: ffmpeg lacks libx265 — cannot build the source fixture"
+    return
+  fi
+  local _dir; _dir="$(mktemp -d "$TESTDIR/mpdiag.XXXXXX")"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=gray:s=320x240:r=24:d=1" -f lavfi -i "sine=d=1" \
+    -c:v libx264 -preset ultrafast -crf 30 -c:a aac -ac 2 -shortest "$_dir/src.mkv" 2>/dev/null || true
+  if [[ ! -s "$_dir/src.mkv" ]]; then
+    skip "mp-dispatch-diagnosed: could not build the source fixture"
+    rm -rf "$_dir"; return
+  fi
+  local _ro="$_dir/ro"; mkdir -p "$_ro"; chmod 555 "$_ro"
+  if [[ -w "$_ro" ]]; then
+    skip "mp-dispatch-diagnosed: cannot make the output dir read-only (running as root?)"
+    chmod 755 "$_ro"; rm -rf "$_dir"; return
+  fi
+  local _out _rc=0
+  _out="$(cd "$_dir" && "$MUXM" -K --no-disk-check --profile streaming-hevc,streaming-av1 \
+    --crf 30 --preset ultrafast src.mkv "$_ro/out.mkv" 2>&1)" || _rc=$?
+  chmod 755 "$_ro"
+  # Diagnosed failure: non-zero exit AND muxm's own die() error text, not a bare shell abort.
+  if [[ "$_rc" -ne 0 ]] && printf '%s' "$_out" | grep -qiE "Multi-profile dispatch failed"; then
+    pass "mp-dispatch-diagnosed: a failing multi-profile dispatch exits non-zero with muxm's own die() diagnostic, not a bare untrapped set -e exit"
+  else
+    fail "mp-dispatch-diagnosed: expected a diagnosed non-zero exit (rc=$_rc): $(printf '%s' "$_out" | grep -iE 'dispatch failed|summary|FAIL' | head -1)"
+  fi
+  rm -rf "$_dir"
 }
 
 # Map a probed format_name to the container extension it represents, then assert it matches the

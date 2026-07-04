@@ -940,6 +940,9 @@ on_error(){
   EXIT_CODE="$status"
   FAIL_MSG="Command failed at line $lineno: $cmd (exit $status)"
   printf "${_PFX_ERR-❌ ERROR: }%s\n" "$FAIL_MSG" >&2
+  # RV3-10: mirror into _LOG_BUFFER when the §17 tee is not yet live, matching die() — otherwise an
+  # ERR-trap failure that fires before the logfile exists is lost from the persisted log (only stderr).
+  [[ "${_LOG_READY:-0}" == "1" ]] || _log_buffer_mirror "${_PFX_ERR-❌ ERROR: }" "$FAIL_MSG"
   _ERROR_PRINTED=1   # cause printed here; on_exit will not echo it again
   # Note: This trap does not call exit directly. Under set -e, the shell
   # exits after the ERR trap returns, which triggers the EXIT trap (on_exit)
@@ -6378,9 +6381,19 @@ fi
 # but before WORKDIR/TMP_OUT creation (those belong to single-profile children only).
 # Each child sub-invocation runs independently with its own workdir and pipeline.
 if (( _MULTI_PROFILE_MODE )); then
-  _run_multi_profiles
-  # on_exit EXIT trap fires after this exit; WORKDIR/TMP_OUT are empty → no-op cleanup.
-  exit $?
+  # RV3-10: _run_multi_profiles runs BEFORE the ERR/EXIT/INT/TERM traps are armed (Sections 17/18 —
+  # those belong to single-profile runs only). Run it in a subshell so an unexpected `set -e` abort
+  # inside it (e.g. a failing dirname/basename/_probe_profile_ext in the child-flag reconstruction)
+  # exits the SUBSHELL, not the parent raw, and route any non-zero result through die() — so a
+  # failure in this un-trapped window still surfaces muxm's own diagnostic + exit code instead of a
+  # bare, message-less `set -e` exit. (Normal completion returns 0 = all profiles passed.)
+  _mp_rc=0
+  ( _run_multi_profiles ) || _mp_rc=$?
+  (( _mp_rc == 0 )) || die "$_mp_rc" "Multi-profile dispatch failed (exit ${_mp_rc}) — see the per-profile output above."
+  # NOTE: the on_exit EXIT trap is NOT armed at this point (it is installed in Section 17, which
+  # only single-profile runs reach), so nothing runs on this exit beyond the shell's own teardown;
+  # WORKDIR/TMP_OUT were never created here, so there is nothing to clean up.
+  exit 0
 fi
 # ---- End multi-profile dispatch --------------------------------------------------------------
 
