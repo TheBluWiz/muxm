@@ -11519,10 +11519,10 @@ _ocr_ext_subtitle(){
     return 0
   fi
 
-  local srt_out="$WORKDIR/ext_${basename_label%.$fext}.srt"
+  local srt_out="$WORKDIR/ext_${basename_label%."$fext"}.srt"
 
   if (( DRY_RUN )); then
-    printf "1\n00:00:00,000 --> 00:00:00,500\n(dry-run external $kind)\n" >"$srt_out" 2>/dev/null || true
+    printf '1\n00:00:00,000 --> 00:00:00,500\n(dry-run external %s)\n' "$kind" >"$srt_out" 2>/dev/null || true
     note "[Subs] DRY-RUN: would OCR external $kind $basename_label"
     echo "$srt_out"
     return 0
@@ -11534,7 +11534,7 @@ _ocr_ext_subtitle(){
 
   # Some OCR tools write the .srt next to the source file, not into the workdir. Relocate it before
   # the existence check — otherwise a SUCCESSFUL OCR leaves $srt_out empty and is misreported as failed.
-  local relocated="${ext_path%.$fext}.srt"
+  local relocated="${ext_path%."$fext"}.srt"
   if [[ -s "$relocated" ]]; then
     mv -f "$relocated" "$srt_out" || true
   fi
@@ -12185,6 +12185,8 @@ run_subtitle_pipeline_multi(){
 
     # Check if this unified index survived the filter
     local _is_kept=0
+    # shellcheck disable=SC2086  # intentional word-split: keep_list is a space-separated integer
+    # list; _int_in_list expects each index as its own positional arg (quoting would pass it as one).
     if _int_in_list "$i" $keep_list; then _is_kept=1; fi
 
     if (( _is_kept )); then

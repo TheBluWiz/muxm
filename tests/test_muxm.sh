@@ -5541,6 +5541,7 @@ _test_audio_empty_langpref_no_crash() {
   else
     fail "audio-empty-langpref-no-crash: _audio_lang_matches does not delegate to _lang_matches with AUDIO_LANG_PREF"
   fi
+  # shellcheck disable=SC2016  # literal grep -F of the delegation line (globals must stay unexpanded).
   if printf '%s\n' "$s_body" | grep -qF '_lang_matches "$1" "$SUB_LANG_PREF"'; then
     pass "audio-empty-langpref-no-crash: _sub_lang_matches delegates to _lang_matches with SUB_LANG_PREF (symmetry)"
   else
@@ -9188,7 +9189,7 @@ _test_edge_control_char_nonc_locale() {
     return
   fi
   local _d; _d="$(mktemp -d "$TESTDIR/ctrlc.XXXXXX")"
-  local _ctrl_src="$_d/$(printf 'src\x01bad').mkv"
+  local _ctrl_src; _ctrl_src="$_d/$(printf 'src\x01bad').mkv"
   ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=160x120:rate=24:duration=1" \
     -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p "$_ctrl_src" 2>/dev/null
   if [[ ! -e "$_ctrl_src" ]]; then skip "edge-control-char-nonc-locale: could not build a control-char-named fixture (filesystem restriction)"; rm -rf "$_d"; return; fi
