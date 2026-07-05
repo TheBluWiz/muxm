@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2015  # file-wide: the pervasive `[[ cond ]] && pass "..." || fail "..."`
+# assertion idiom. pass()/skip()/section() all end in printf (arithmetic + printf), so they always
+# return 0 — `|| fail` can never fire spuriously. Purely cosmetic; keeps the harness's convention.
 # =============================================================================
 #  muxm Test Harness v2.0
 #  Automated testing for MuxMaster — generates synthetic media and validates
