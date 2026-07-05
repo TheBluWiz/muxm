@@ -389,6 +389,12 @@ declare -i SUB_MAX_TRACKS=3
 
 declare -i SUB_ENABLE_OCR=1
 SUB_OCR_TOOL="sub2srt"
+# Explicit-tracking for --ocr-tool (mirrors _CLI_CRF_EXPLICIT): 1 when the user typed
+# --ocr-tool on the CLI. Lets the Section-14 OCR-validation check tell "still at the
+# compiled-in sub2srt default" apart from "user explicitly chose sub2srt", so the
+# pgsrip auto-fallback (for hosts where --install-dependencies installed pgsrip but
+# --create-config was never run) never overrides an explicit choice.
+declare -i _CLI_OCR_TOOL_EXPLICIT=0
 SUB_OCR_LANG="eng"
 # Preserve native text subtitle formats (ASS/SSA) instead of converting to SRT.
 # Only effective when the output container supports it (MKV). Ignored for MP4/MOV.
@@ -1358,6 +1364,11 @@ _prefer_complete_ffmpeg(){
   # Prefer the keg only if it is genuinely complete (never switch to a broken keg).
   _ffmpeg_bin_is_complete "$_kegbin/ffmpeg" || return 0
   export PATH="$_kegbin:$PATH"
+  # Invalidate any encoder list memoized from the pre-fixup ffmpeg (e.g. detect_hw_accel
+  # runs before this and may have already populated the cache) so the next
+  # ffmpeg_has_encoder call re-probes against the newly-preferred complete build.
+  _FFMPEG_ENCODERS_CACHE=""
+  _FFMPEG_ENCODERS_CACHED=0
   note "Using ffmpeg-full for libass/AV1 support: $_kegbin (keg-only — not on your default PATH)."
 }
 
@@ -1396,9 +1407,9 @@ detect_hw_accel(){
       ;;
     auto)
       # Prefer platform-native backend first (videotoolbox on macOS, then nvenc).
-      if [[ " ${HW_ACCEL_AVAILABLE[*]} " == *" videotoolbox "* ]]; then
+      if (( ${#HW_ACCEL_AVAILABLE[@]} > 0 )) && [[ " ${HW_ACCEL_AVAILABLE[*]} " == *" videotoolbox "* ]]; then
         HW_ACCEL_RESOLVED="videotoolbox"
-      elif [[ " ${HW_ACCEL_AVAILABLE[*]} " == *" nvenc "* ]]; then
+      elif (( ${#HW_ACCEL_AVAILABLE[@]} > 0 )) && [[ " ${HW_ACCEL_AVAILABLE[*]} " == *" nvenc "* ]]; then
         HW_ACCEL_RESOLVED="nvenc"
       else
         HW_ACCEL_RESOLVED="none"
@@ -1408,7 +1419,7 @@ detect_hw_accel(){
     videotoolbox|nvenc)
       # Non-fatal: if explicit backend is missing, leave HW_ACCEL_RESOLVED="none".
       # Section 14 runs a strict check and dies with a precise error message.
-      if [[ " ${HW_ACCEL_AVAILABLE[*]} " == *" $HW_ACCEL "* ]]; then
+      if (( ${#HW_ACCEL_AVAILABLE[@]} > 0 )) && [[ " ${HW_ACCEL_AVAILABLE[*]} " == *" $HW_ACCEL "* ]]; then
         HW_ACCEL_RESOLVED="$HW_ACCEL"
       else
         HW_ACCEL_RESOLVED="none"
@@ -2831,15 +2842,22 @@ Keep temporary workdir on failure.
 .B \-\-keep\-log
 On a clean run, copy the run log to
 .I <output>.muxm.log
-next to the output. On failure, a self\-contained diagnostics bundle \(em the log plus
+next to the output. On failure, diagnostics are written regardless of this
+flag. By default that is a small, self\-contained bundle \(em the log plus
 the relevant
 .IR *.err " / " *.log
-files \(em is written to
-.I <output>.muxm\-debug/
-regardless of this flag. Unlike
-.BR \-k " / " \-K ,
-which preserve the entire multi\-GB workdir, this keeps only the small
-log and diagnostics.
+files \(em written to
+.IR <output>.muxm\-debug/ .
+But if
+.BR \-k ", " \-K ", or " DEBUG=1
+is also in effect, the small\-bundle copy is skipped and the
+.B entire
+temporary workdir (including the multi\-GB video/audio intermediates) is
+instead renamed in place to a visible
+.I muxm\-debug.<suffix>
+directory on the workdir's own volume (under
+.B \-\-workdir
+this lands there rather than beside the output).
 .TP
 .B \-\-quiet
 Reduce muxm's own terminal narration to warnings and errors only (good for scripts
@@ -5578,7 +5596,7 @@ while [[ $# -gt 0 ]]; do
     --no-sub-sdh) SUB_INCLUDE_SDH=0; shift ;;
     --ocr-lang)  _require_val "$1" "$#" "${2:-}"; SUB_OCR_LANG="$2"; shift 2 ;;
     --no-ocr) SUB_ENABLE_OCR=0; shift ;;
-    --ocr-tool)  _require_val "$1" "$#" "${2:-}"; SUB_OCR_TOOL="$2"; shift 2 ;;
+    --ocr-tool)  _require_val "$1" "$#" "${2:-}"; SUB_OCR_TOOL="$2"; _CLI_OCR_TOOL_EXPLICIT=1; shift 2 ;;
     --sub-burn-forced) SUB_BURN_FORCED=1; shift ;;
     --no-sub-burn-forced) SUB_BURN_FORCED=0; shift ;;
     --sub-export-external) SUB_EXPORT_EXTERNAL=1; shift ;;
@@ -6388,6 +6406,24 @@ case "$HW_ACCEL" in
 esac
 
 if (( SUB_ENABLE_OCR )); then
+  # Auto-fallback: SUB_OCR_TOOL still reads its compiled-in default ("sub2srt") but sub2srt isn't
+  # installed while pgsrip+tesseract are. This is exactly the case where the user followed
+  # --install-dependencies (which installs pgsrip, not sub2srt; see _pipx_ensure) but never ran
+  # --create-config to pick that up. Mirrors _create_config's own auto-detection so both paths
+  # agree. Gated on !_CLI_OCR_TOOL_EXPLICIT so an explicit --ocr-tool sub2srt is never overridden;
+  # note this tracker is CLI-only (matching the existing _CLI_*_EXPLICIT convention) — a .muxmrc
+  # that explicitly writes SUB_OCR_TOOL="sub2srt" is indistinguishable from the untouched default
+  # and will also be upgraded to pgsrip here if sub2srt is absent. Accepted: the fallback only
+  # ever activates when sub2srt is missing, so the practical effect is OCR that works instead of
+  # silently skipping — a config author who truly wants sub2srt only (with it not yet installed)
+  # is the rare case this doesn't perfectly serve.
+  if (( ! _CLI_OCR_TOOL_EXPLICIT )) && [[ "$SUB_OCR_TOOL" == "sub2srt" ]] \
+     && ! command -v sub2srt >/dev/null 2>&1 \
+     && command -v pgsrip >/dev/null 2>&1 && command -v tesseract >/dev/null 2>&1; then
+    note "[Subs] OCR tool defaulted to 'sub2srt', which isn't installed; found 'pgsrip' + tesseract instead — using pgsrip for PGS OCR. Run --create-config or pass --ocr-tool explicitly to silence this."
+    SUB_OCR_TOOL="pgsrip"
+  fi
+
   # Security: reject OCR tool names containing shell metacharacters to prevent
   # injection via --ocr-tool or a malicious .muxmrc. Allows alphanumerics,
   # dots, hyphens, underscores, and forward slashes (for paths).
@@ -9148,16 +9184,17 @@ _dv_fallback_timestamp_wrap() {
 }
 
 # 2.1: shared tail for every "give up on DV, fall back to base video" branch inside
-# run_video_pipeline. Collapses five near-identical blocks (RPU validation failure, inject
-# failure, inject-empty, dovi_tool convert failure, RPU/frame-count mismatch) that each
-# repeated: warn → alias V_MIXED to V_BASE → clear DV state → _dv_fallback_timestamp_wrap →
-# mark_done → return 0. Since all five call sites now go through this single path, it also
-# structurally guarantees OUTPUT_HAS_DV is reset on every give-up — an audit while extracting
-# this found the reset was already present at only two of the five original call sites
-# (convert failure, frame mismatch); harmless today since OUTPUT_HAS_DV is still 0 at every
-# give-up point in the current control flow (see the comment on _dv_fallback_timestamp_wrap),
-# but a latent trap for any future refactor that could reach these branches with it already 1.
-# Any call-site step that ISN'T common to all five (the pre-give-up _reclaim of a completed
+# run_video_pipeline. Collapses six near-identical blocks (DV extract failed, RPU validation
+# failure, inject failure, inject-empty, dovi_tool convert failure, RPU/frame-count mismatch)
+# that each repeated: warn → alias V_MIXED to V_BASE → clear DV state →
+# _dv_fallback_timestamp_wrap → mark_done → return 0. Since all six call sites now go through
+# this single path, it also structurally guarantees OUTPUT_HAS_DV is reset on every give-up —
+# an audit while extracting this found the reset was already present at only two of the six
+# original call sites (convert failure, frame mismatch); harmless today since OUTPUT_HAS_DV is
+# still 0 at every give-up point in the current control flow (see the comment on
+# _dv_fallback_timestamp_wrap), but a latent trap for any future refactor that could reach
+# these branches with it already 1.
+# Any call-site step that ISN'T common to all six (the pre-give-up _reclaim of a completed
 # V_INJECTED/V_MIXED on the convert-failure/frame-mismatch branches, which only apply once a
 # real intermediate file exists) stays inline at the call site, run BEFORE this helper.
 # The caller must still `return 0` itself right after calling this — a `return` in here only
@@ -10603,7 +10640,7 @@ _build_audio_keep_list(){
 
   _log_dropped_tracks "multi-track" dropped_reasons
 
-  echo "${kept[*]}"
+  (( ${#kept[@]} > 0 )) && echo "${kept[*]}" || echo ""
 }
 
 # 4.5: shared per-stream display-line construction — was duplicated verbatim between
@@ -12062,7 +12099,7 @@ _build_subtitle_keep_list(){
     kept=("${kept[@]:0:$SUB_MAX_TRACKS}")
   fi
 
-  echo "${kept[*]}"
+  (( ${#kept[@]} > 0 )) && echo "${kept[*]}" || echo ""
 }
 
 # run_subtitle_pipeline_multi — Multi-track subtitles: filter and defer to mux_final.

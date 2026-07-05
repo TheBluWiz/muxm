@@ -2444,6 +2444,85 @@ EOF
   assert_contains "SUB_OCR_TOOL              = pgsrip" "--ocr-tool sets SUB_OCR_TOOL in effective config" "$ocr_out"
 }
 
+# v1.5.1 fix: --install-dependencies installs pgsrip (via _pipx_ensure), never sub2srt — but the
+# compiled-in SUB_OCR_TOOL default is "sub2srt". A user who follows the documented two-step setup
+# (brew install + --install-dependencies) without a separate --create-config run therefore had PGS
+# OCR silently no-op (warn + SUB_ENABLE_OCR=0) forever, since sub2srt was never installed anywhere
+# in that path. Fix: the Section-14 OCR-validation check now auto-switches SUB_OCR_TOOL from the
+# untouched "sub2srt" default to "pgsrip" when sub2srt is absent but pgsrip+tesseract are present
+# (mirrors _create_config's own auto-detection) — gated on _CLI_OCR_TOOL_EXPLICIT so an explicit
+# --ocr-tool sub2srt is never silently overridden.
+_test_config_ocr_pgsrip_fallback() {
+  # muxm's shebang is `#!/usr/bin/env bash`, and on this dev machine the modern (4.4+) bash
+  # homebrew provides lives in the SAME directory as the real sub2srt/pgsrip/tesseract
+  # (/opt/homebrew/bin) -- so we can't just prepend a fake-tools dir to the real $PATH (real
+  # sub2srt would still be found later in PATH). Build a curated PATH instead: a symlink to the
+  # real bash (so `env bash` still resolves) + the real ffmpeg/ffprobe dir + plain /usr/bin,/bin
+  # for core utilities -- deliberately excluding the homebrew bin dir that carries the real OCR
+  # tools -- plus our own fake pgsrip/tesseract. This isolates "sub2srt absent, pgsrip+tesseract
+  # present" regardless of what happens to be installed on the machine running the suite.
+  local real_bash real_ffmpeg real_ffprobe real_ffmpeg_dir
+  real_bash="$(command -v bash)"
+  real_ffmpeg="$(command -v ffmpeg)"
+  real_ffprobe="$(command -v ffprobe)"
+  if [[ -z "$real_bash" || -z "$real_ffmpeg" || -z "$real_ffprobe" ]]; then
+    skip "config-ocr-pgsrip-fallback: could not resolve real bash/ffmpeg/ffprobe to build a curated PATH"
+    return
+  fi
+  real_ffmpeg_dir="$(dirname "$real_ffmpeg")"
+
+  local ocr_dir ocr_home ocr_bin
+  ocr_dir="$TESTDIR/ocr_fallback_test"
+  ocr_home="$TESTDIR/ocr_fallback_home"
+  ocr_bin="$TESTDIR/ocr_fallback_bin"
+  mkdir -p "$ocr_dir" "$ocr_home" "$ocr_bin"
+
+  ln -sf "$real_bash" "$ocr_bin/bash"
+  # Fake pgsrip + tesseract on PATH; no .muxmrc anywhere; sub2srt intentionally excluded.
+  cat > "$ocr_bin/pgsrip" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  cat > "$ocr_bin/tesseract" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$ocr_bin/pgsrip" "$ocr_bin/tesseract"
+
+  local curated_path="$ocr_bin:$real_ffmpeg_dir:/usr/bin:/bin:/usr/sbin:/sbin"
+
+  # ---- Sanity: sub2srt must genuinely be unreachable on the curated PATH (or the positive
+  #      assertion below would be meaningless) ----
+  if PATH="$curated_path" command -v sub2srt >/dev/null 2>&1; then
+    skip "config-ocr-pgsrip-fallback: sub2srt is still reachable on the curated PATH -- cannot isolate the fallback"
+    rm -rf "$ocr_dir" "$ocr_home" "$ocr_bin"
+    return
+  fi
+
+  # ---- Default SUB_OCR_TOOL (never touched by CLI or config) auto-resolves to pgsrip ----
+  local out
+  out="$(cd "$ocr_dir" && HOME="$ocr_home" PATH="$curated_path" "$MUXM" --dry-run --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv" 2>&1)" || true
+  assert_contains "using pgsrip for PGS OCR" \
+    "config-ocr-pgsrip-fallback: default sub2srt + pgsrip/tesseract present auto-switches to pgsrip" "$out"
+  if echo "$out" | grep -qF "PGS OCR will be skipped"; then
+    fail "config-ocr-pgsrip-fallback: the old 'not in PATH -- PGS OCR will be skipped' warning still fired despite the pgsrip fallback"
+  else
+    pass "config-ocr-pgsrip-fallback: the old sub2srt-not-in-PATH warning no longer fires once pgsrip auto-resolves"
+  fi
+
+  # ---- Guard: an EXPLICIT --ocr-tool sub2srt must NOT be silently overridden ----
+  out="$(cd "$ocr_dir" && HOME="$ocr_home" PATH="$curated_path" "$MUXM" --dry-run --ocr-tool sub2srt --crf 28 --preset ultrafast "$TESTDIR/basic_sdr_subs.mkv" 2>&1)" || true
+  assert_contains "is not in PATH" \
+    "config-ocr-pgsrip-fallback: explicit --ocr-tool sub2srt keeps warning (not silently overridden)" "$out"
+  if echo "$out" | grep -qF "using pgsrip for PGS OCR"; then
+    fail "config-ocr-pgsrip-fallback: explicit --ocr-tool sub2srt was silently switched to pgsrip"
+  else
+    pass "config-ocr-pgsrip-fallback: explicit --ocr-tool sub2srt is not overridden"
+  fi
+
+  rm -rf "$ocr_dir" "$ocr_home" "$ocr_bin"
+}
+
 # RV3-01: a .muxmrc assigning CRF_VALUE directly must round-trip in BASE 10, not octal.
 # CRF_VALUE is intentionally NOT `declare -i`, so a config value like "010" survives as a raw
 # string to the base-10 normalization (→ decimal 10, never octal 8), and "08" no longer hard-
@@ -2964,6 +3043,7 @@ test_config() {
   _test_config_create_escape
   _test_config_create_injection
   _test_config_multi_injection
+  _test_config_ocr_pgsrip_fallback
 }
 
 # L: --create-config must emit string override values escaped so a value containing a
@@ -4049,6 +4129,116 @@ printf "REASON:%s\n" "$HW_ACCEL_FALLBACK_REASON"')"
     fi
   fi
 
+  # ---- Encoder-cache invalidation: stale AV1 preflight after _prefer_complete_ffmpeg switches PATH ----
+  # Root cause repro: detect_hw_accel calls ffmpeg_has_encoder first and memoizes `ffmpeg -encoders`
+  # into _FFMPEG_ENCODERS_CACHE (never refreshed by its own guard). _prefer_complete_ffmpeg runs
+  # later, finds the on-PATH ffmpeg incomplete, and prepends a complete keg-only ffmpeg-full bin to
+  # PATH — but the AV1 preflight (ffmpeg_has_encoder libaom-av1) used to read the STALE cache from
+  # the old incomplete ffmpeg, false-failing with "encoder not available" on a completely standard
+  # two-ffmpeg Homebrew setup. Two mock ffmpeg binaries, same forward-to-real-by-absolute-path trick
+  # as the "libsvtav1 missing" mock above (a bare `ffmpeg` re-exec would loop): an "incomplete" one
+  # (libx264/libx265 only) shadowing PATH first — this is what detect_hw_accel's cache-populating
+  # call sees — and a "complete" one (adds --enable-libass + libsvtav1 + libaom-av1) at the fake keg
+  # path _prefer_complete_ffmpeg scans via HOMEBREW_PREFIX.
+  local cache_keg_root="$TESTDIR/mock_cache_invalidation_prefix"
+  local cache_incomplete_dir="$cache_keg_root/incomplete"
+  local cache_complete_dir="$cache_keg_root/opt/ffmpeg-full/bin"
+  mkdir -p "$cache_incomplete_dir" "$cache_complete_dir"
+  local _cache_real_ffmpeg; _cache_real_ffmpeg="$(command -v ffmpeg)"
+  cat > "$cache_incomplete_dir/ffmpeg" <<CACHE_INCOMPLETE_EOF
+#!/bin/bash
+# Mock incomplete ffmpeg: reports libx264/libx265 only (no AV1) — this is the list that would stay
+# wrongly cached if the fix under test were reverted. Everything else forwards to the REAL ffmpeg
+# by absolute path (NOT bare \`ffmpeg\`, which would re-exec this mock infinitely).
+for arg in "\$@"; do [[ "\$arg" == "-encoders" ]] && { printf '%s\n' " V..... libx264    x" " V..... libx265    x"; exit 0; }; done
+exec "$_cache_real_ffmpeg" "\$@"
+CACHE_INCOMPLETE_EOF
+  chmod +x "$cache_incomplete_dir/ffmpeg"
+  cat > "$cache_complete_dir/ffmpeg" <<CACHE_COMPLETE_EOF
+#!/bin/bash
+# Mock complete ffmpeg-full keg: reports --enable-libass + libsvtav1 + libaom-av1, so
+# _ffmpeg_bin_is_complete accepts it and _prefer_complete_ffmpeg switches PATH to this dir.
+if [[ "\$1" == "-version" ]]; then printf '%s\n' "ffmpeg version 7.0" "configuration: --enable-libass"; exit 0; fi
+for arg in "\$@"; do [[ "\$arg" == "-encoders" ]] && { printf '%s\n' " V..... libx264    x" " V..... libx265    x" " V..... libsvtav1  x" " V..... libaom-av1 x"; exit 0; }; done
+exec "$_cache_real_ffmpeg" "\$@"
+CACHE_COMPLETE_EOF
+  chmod +x "$cache_complete_dir/ffmpeg"
+  # hw_accel is media-free (MEDIA_FREE_SUITES) — create a minimal probeable source inside the
+  # guard, same pattern as the VT+AV1 dry-run test above, using the REAL ffmpeg before PATH is
+  # restricted to the mocks.
+  local cache_src="$TESTDIR/cache_invalidation_probe.mkv"
+  ffmpeg -f lavfi -i "color=c=black:s=64x64:r=1" -t 1 -c:v libx264 -an \
+    -y "$cache_src" >/dev/null 2>&1
+  local cache_out cache_code
+  cache_out="$(cd "$TESTDIR" && HOMEBREW_PREFIX="$cache_keg_root" PATH="$cache_incomplete_dir:$PATH" "$MUXM" \
+    --profile av1-hq --video-codec libaom-av1 --dry-run "$cache_src" 2>&1)" \
+    && cache_code=$? || cache_code=$?
+  # Sanity check that the PATH switch this bug depends on actually happened — otherwise the
+  # assertion below would pass vacuously (no switch → no stale cache to exercise).
+  assert_contains "Using ffmpeg-full for libass/AV1 support" \
+    "encoder-cache-invalidation: confirms _prefer_complete_ffmpeg switched PATH (test validity check)" "$cache_out"
+  if [[ "$cache_code" -eq 0 ]] && ! grep -qE 'libaom-av1 encoder not available' <<<"$cache_out"; then
+    pass "encoder-cache-invalidation: AV1 preflight re-probes after _prefer_complete_ffmpeg switches PATH (no false 'encoder not available')"
+  else
+    fail "encoder-cache-invalidation: expected exit 0 without 'encoder not available', got exit=$cache_code output: $(tr '\n' ';' <<<"$cache_out")"
+  fi
+
+  # ---- RC3 (v1.5.1): detect_hw_accel must not crash under set -u on bash < 4.4 when
+  # HW_ACCEL_AVAILABLE resolves empty ----
+  # detect_hw_accel populates HW_ACCEL_AVAILABLE conditionally (videotoolbox only on Apple
+  # Silicon w/ hevc_videotoolbox; nvenc only w/ hevc_nvenc present) and can legitimately leave
+  # it empty — the common case on Linux/Intel-Mac/most stock ffmpeg builds. Three membership
+  # checks against it used bare "${HW_ACCEL_AVAILABLE[*]}" expansions
+  # ([[ " ${HW_ACCEL_AVAILABLE[*]} " == *"..."* ]]), which throw "unbound variable" under set -u
+  # on bash < 4.4 when the array is empty — same bug class as fix2 (_build_audio_keep_list /
+  # _build_subtitle_keep_list). Reproduced directly:
+  # `/bin/bash -c 'set -u; arr=(); [[ " ${arr[*]} " == *" foo "* ]]'` errors on bash 3.2.
+  # Extract the real detect_hw_accel body and drive it under set -u on a genuine pre-4.4 bash
+  # (same auto-detected old-bash pattern as _test_unit_keep_list_empty_old_bash), with both
+  # probes stubbed to fail so HW_ACCEL_AVAILABLE resolves to (), for each of the three HW_ACCEL
+  # settings that reach a membership check (auto, videotoolbox, nvenc). Soft-skip (not fail)
+  # when no old-bash host is available — on host bash (>= 4.4) the bare form doesn't crash.
+  local hwa_old_bash=""
+  if [[ -n "${BASH_43:-}" && -x "${BASH_43:-}" ]]; then
+    hwa_old_bash="$BASH_43"
+  elif [[ -x /bin/bash ]] && ! /bin/bash -c 'set -u; arr=(); [[ " ${arr[*]} " == *" foo "* ]]' >/dev/null 2>&1; then
+    hwa_old_bash="/bin/bash"
+  fi
+  if [[ -z "$hwa_old_bash" ]]; then
+    skip "hw-accel-empty-array-old-bash: no pre-4.4 bash interpreter available (\$BASH_43 unset, /bin/bash doesn't reproduce the bug) — cannot exercise the genuine crash path"
+  else
+    local dha_body
+    dha_body="$(_extract_muxm_fns detect_hw_accel)" \
+      || { fail "hw-accel-empty-array-old-bash: could not extract detect_hw_accel"; dha_body=""; }
+    if [[ -n "$dha_body" ]]; then
+      local hwa_mode hwa_out
+      for hwa_mode in auto videotoolbox nvenc; do
+        # shellcheck disable=SC2016  # body/call must reach $hwa_old_bash literally, unexpanded
+        hwa_out="$("$hwa_old_bash" -c "$dha_body"$'\n''set -u
+HW_ACCEL="'"$hwa_mode"'"; HW_ACCEL_AVAILABLE=(); HW_ACCEL_RESOLVED=""
+is_apple_silicon(){ return 1; }
+ffmpeg_has_encoder(){ return 1; }
+note(){ printf "NOTE:%s\n" "$*"; }
+detect_hw_accel
+printf "RESOLVED:%s\n" "$HW_ACCEL_RESOLVED"' 2>&1)"
+        if printf '%s\n' "$hwa_out" | grep -qiE 'unbound variable'; then
+          fail "hw-accel-empty-array-old-bash: detect_hw_accel(HW_ACCEL=$hwa_mode) crashed on $hwa_old_bash with an empty HW_ACCEL_AVAILABLE: $(printf '%s' "$hwa_out" | head -1)"
+        elif printf '%s\n' "$hwa_out" | grep -qE 'RESOLVED:none'; then
+          pass "hw-accel-empty-array-old-bash: detect_hw_accel(HW_ACCEL=$hwa_mode) resolves cleanly to none on $hwa_old_bash when HW_ACCEL_AVAILABLE is empty (no unbound-variable crash)"
+        else
+          fail "hw-accel-empty-array-old-bash: detect_hw_accel(HW_ACCEL=$hwa_mode) on $hwa_old_bash — expected RESOLVED:none, got: $(printf '%s' "$hwa_out" | tr '\n' ';')"
+        fi
+        if [[ "$hwa_mode" == "auto" ]]; then
+          if printf '%s\n' "$hwa_out" | grep -qE 'no supported encoder is available'; then
+            pass "hw-accel-empty-array-old-bash: --hw-accel auto with an empty HW_ACCEL_AVAILABLE still emits the software-fallback note on $hwa_old_bash"
+          else
+            fail "hw-accel-empty-array-old-bash: --hw-accel auto with an empty HW_ACCEL_AVAILABLE — expected the software-fallback note on $hwa_old_bash, got: $(printf '%s' "$hwa_out" | tr '\n' ';')"
+          fi
+        fi
+      done
+    fi
+  fi
+
   # --- Cleanup ---
   rm -rf "$rc_home"
 }
@@ -4327,7 +4517,18 @@ EOF
   # ---- skip-if-ideal: explicit --crf forces re-encode ----
   # When --crf is passed explicitly on the CLI, _CLI_CRF_EXPLICIT=1 should
   # prevent skip-if-ideal from stream-copying or skipping even for a compliant source.
-  out="$(run_muxm --dry-run --skip-if-ideal --crf 20 \
+  # RC-testfix: both invocations below now pass --profile atv-directplay-hq, whose spec
+  # (hvc1/yuv420p10le/eac3) is exactly what compliant.mp4 was built to match. Without a
+  # profile, VIDEO_COPY_IF_COMPLIANT falls back to the script's bare default of 0, so
+  # check_skip_if_ideal ALWAYS reports "does not match ideal: VIDEO_COPY_IF_COMPLIANT=0"
+  # regardless of --crf — deterministically, on every machine, not an environment-dependent
+  # flake. That made the --crf-20 assertion below pass for the wrong reason (the source was
+  # already never-ideal) and made the no-crf assertion below always miss, previously hidden
+  # behind a misleading "inconclusive" skip. With the profile set, both are genuine,
+  # deterministic pass/fail checks (verified manually: no-profile always mismatches on
+  # VIDEO_COPY_IF_COMPLIANT; with the profile, the bare compliant source is ideal, and adding
+  # --crf 20 correctly forces a mismatch on "CRF explicitly set on CLI").
+  out="$(run_muxm --dry-run --skip-if-ideal --profile atv-directplay-hq --crf 20 \
     "$TESTDIR/compliant.mp4" 2>&1)"
   if echo "$out" | grep -qiE "already matches|source already ideal|no.?processing.?needed"; then
     fail "skip-if-ideal + explicit --crf: should NOT skip when CRF is explicitly set"
@@ -4340,13 +4541,12 @@ EOF
   # above, not a generic word list — the source file is literally named "compliant.mp4", so a
   # loose alternative like a bare "compliant" would match the echoed source path even if
   # skip-if-ideal detection were completely broken (Test_Review.md Tier A #5).
-  out="$(run_muxm --dry-run --skip-if-ideal \
+  out="$(run_muxm --dry-run --skip-if-ideal --profile atv-directplay-hq \
     "$TESTDIR/compliant.mp4" 2>&1)"
   if echo "$out" | grep -qiE "already matches|source already ideal|no.?processing.?needed"; then
     pass "skip-if-ideal (no explicit --crf): compliant source still recognized as ideal"
   else
-    # May have encoded if compliance check is strict; either way no crash.
-    skip "skip-if-ideal (no explicit --crf): inconclusive (source may not qualify as ideal)"
+    fail "skip-if-ideal (no explicit --crf): compliant source should be recognized as ideal under atv-directplay-hq; got: $(printf '%s' "$out" | grep -iE 'does not match ideal|already matches' | head -1)"
   fi
 
   # ---- Container compatibility warnings ----
@@ -5897,25 +6097,62 @@ _test_audio_forceaac_stereo_bitrate() {
   # RV3-08: the forced-AAC STEREO_BITRATE override must also fire for the libfdk_aac / aac_at AAC
   # encoders (keyed on the NATIVE codec via _encoder_to_codec), not just the literal "aac". A 6ch
   # source discriminates: audio_transcode_target(6) returns the eac3 5.1 bitrate (640k), so ONLY the
-  # override changes it to STEREO_BITRATE (96k). Per-encoder skip-first guard (aac_at is macOS-only,
-  # libfdk_aac needs a special ffmpeg build).
+  # override changes it to STEREO_BITRATE (96k).
+  #
+  # RC-testfix: this used to skip per-encoder when the real ffmpeg lacked aac_at (non-macOS) or
+  # libfdk_aac (excluded from Homebrew's ffmpeg/ffmpeg-full by its nonfree license — confirmed via
+  # `brew info`; only obtainable via a third-party tap). Neither is a real muxm dependency: the
+  # decision under test (_encoder_to_codec's case-statement mapping + the STEREO_BITRATE override
+  # at the AUDIO_FORCE_CODEC site) is pure bash that runs before ffmpeg is ever invoked, and the
+  # "audio transcode: ... bitrate=" line it's graded on is log()'d immediately after that decision
+  # — before the actual ffmpeg encode call. So a fake ffmpeg that only needs to answer `-encoders`
+  # truthfully (claiming aac_at/libfdk_aac are present, exactly like the encoder-cache-invalidation
+  # mock above) is enough to drive the real code path deterministically on any machine, with no
+  # nonfree build or macOS requirement — the real ffmpeg forwarded-to for the rest of the run may
+  # itself reject the fake codec name later, but by then the log line under test already landed.
   local _6d="$TESTDIR/l_forceaac6"; mkdir -p "$_6d/h"
   ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=blue:s=320x240:r=24:d=2" -f lavfi -i "sine=d=2" \
     -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p10le -c:a ac3 -ac 6 -metadata:s:a:0 language=eng \
     "$_6d/src.mkv" 2>/dev/null || true
   if [[ ! -s "$_6d/src.mkv" ]]; then
-    skip "audio-forceaac-stereo-bitrate: could not build a 6ch ac3 fixture for the AAC-variant override check"
+    fail "audio-forceaac-stereo-bitrate: could not build a 6ch ac3 fixture for the AAC-variant override check"
   else
     printf 'STEREO_BITRATE=96k\n' > "$_6d/.muxmrc"
+    local _6fake_bin="$_6d/fake_bin"; mkdir -p "$_6fake_bin"
+    local _6real_ffmpeg; _6real_ffmpeg="$(command -v ffmpeg)"
+    cat > "$_6fake_bin/ffmpeg" <<FAKE_AAC_EOF
+#!/bin/bash
+# Claims aac_at + libfdk_aac are available (alongside the real encoder list) so
+# ffmpeg_has_encoder's preflight passes regardless of what this machine's real ffmpeg supports.
+# Everything else forwards to the REAL ffmpeg by absolute path (never bare \`ffmpeg\`, which
+# would re-exec this mock infinitely).
+for arg in "\$@"; do
+  if [[ "\$arg" == "-encoders" ]]; then
+    "$_6real_ffmpeg" -hide_banner -encoders 2>/dev/null
+    printf '%s\n' " A..... aac_at     x" " A..... libfdk_aac x"
+    exit 0
+  fi
+done
+exec "$_6real_ffmpeg" "\$@"
+FAKE_AAC_EOF
+    chmod +x "$_6fake_bin/ffmpeg"
     local _enc _6log
     for _enc in aac_at libfdk_aac; do
-      if ! ffmpeg_has_encoder "$_enc"; then
-        skip "audio-forceaac-stereo-bitrate: ffmpeg lacks the $_enc encoder — cannot test its forced-AAC bitrate override"
-        continue
-      fi
-      rm -rf "$_6d"/.muxm.tmp.* "$_6d/out.mkv"
-      ( cd "$_6d" && HOME="$_6d/h" "$MUXM" -K --no-skip-if-ideal --audio-force-codec "$_enc" --crf 30 --preset ultrafast src.mkv out.mkv >/dev/null 2>&1 )
-      _6log="$(grep -rh "audio transcode:" "$_6d"/.muxm.tmp.*/muxm.*.log 2>/dev/null | head -1)"
+      # Clean up both possible prior-iteration workdir shapes: a clean/-K success run leaves
+      # the hidden .muxm.tmp.*, while a -K run that FAILS (expected for libfdk_aac, below) gets
+      # renamed to a visible muxm-debug.* (Adjustments Phase 3 / RC5).
+      rm -rf "$_6d"/.muxm.tmp.* "$_6d"/muxm-debug.* "$_6d/out.mkv"
+      # The real ffmpeg (delegated to by the fake for anything but -encoders) may itself reject
+      # the faked-available codec name once actually invoked (expected for libfdk_aac on a
+      # machine that doesn't really have it) — the "audio transcode:" log line under test was
+      # already written before that point (see comment above), so a nonzero exit here is fine;
+      # || true keeps it from aborting the whole harness under set -e.
+      ( cd "$_6d" && HOME="$_6d/h" PATH="$_6fake_bin:$PATH" "$MUXM" -K --no-skip-if-ideal --audio-force-codec "$_enc" --crf 30 --preset ultrafast src.mkv out.mkv >/dev/null 2>&1 ) || true
+      # find's -name matches the wildcard natively (no shell glob expansion needed), and simply
+      # returns nothing (not an error) when no log exists under either workdir shape above — a
+      # bare unmatched glob passed straight to grep would exit 2 (file not found) and abort the
+      # whole harness under set -e.
+      _6log="$(find "$_6d" -maxdepth 2 -type f -name 'muxm.*.log' -exec grep -h "audio transcode:" {} \; 2>/dev/null | head -1)"
       if [[ "$_6log" == *"bitrate=96k"* ]]; then
         pass "audio-forceaac-stereo-bitrate: forced $_enc on 6ch honors STEREO_BITRATE (96k), not the eac3 640k (RV3-08)"
       else
@@ -6685,36 +6922,13 @@ test_subs() {
   assert_contains "-c:s:1 copy -metadata:s:s:1 language=spa" \
     "subs-multi-plus-external-mapping multi+ext: external sidecar stream-COPIED, not re-encoded to srt (the bug guard)" "$cz_cmd"
 
-  # T11: end-to-end PGS desync guard — the regression test for the timestamp-rebase
-  # bug this whole subtitle path guards against. ffmpeg cannot synthesize an embedded
-  # PGS fixture from text, so it is gated on a bundled-or-supplied PGS source via
-  # MUXM_PGS_FIXTURE (mirrors MUXM_DV_FIXTURE). Without one it SKIPs; the always-runnable
-  # guarantee is carried by T6 (emitter maps embedded PGS from source, never a .sup) +
-  # the sub-plan-add unit test (single-track PGS → embedded:N) + the structural fact that
-  # single-track PGS uses the same byte-identical, desync-free source-mapping mechanism
-  # as multi-track.
-  # Skip-first guard (not an else-skip) per the soft-skip ratchet, _test_meta_soft_skip.
-  if [[ -z "${MUXM_PGS_FIXTURE:-}" || ! -s "${MUXM_PGS_FIXTURE:-}" ]]; then
-    skip "subs-pgs-e2e-pts-preserved PGS e2e sync: no MUXM_PGS_FIXTURE (ffmpeg cannot synthesize PGS — set MUXM_PGS_FIXTURE=/path/to/pgs_source.mkv with a non-zero first cue)"
-  else
-    local pgs_off pgs_out="$TESTDIR/charz_pgs.mkv"
-    pgs_off="$(ffprobe -v error -select_streams s:0 -show_entries packet=pts_time -of csv=p=0 "$MUXM_PGS_FIXTURE" 2>/dev/null | grep -E '^[0-9]' | head -1)"
-    run_muxm --keep-log --output-ext mkv --crf 28 --preset ultrafast "$MUXM_PGS_FIXTURE" "$pgs_out" >/dev/null 2>&1
-    cz_cmd="$(extract_mux_cmd "$TESTDIR/charz_pgs.muxm.log")"
-    assert_not_contains ".sup" \
-      "subs-pgs-e2e-pts-preserved PGS: mux command has NO standalone .sup input (maps from source)" "$cz_cmd"
-    if [[ -f "$pgs_out" ]]; then
-      local out_off
-      out_off="$(ffprobe -v error -select_streams s:0 -show_entries packet=pts_time -of csv=p=0 "$pgs_out" 2>/dev/null | grep -E '^[0-9]' | head -1)"
-      if [[ -n "$pgs_off" && "$out_off" == "$pgs_off" ]]; then
-        pass "subs-pgs-e2e-pts-preserved PGS e2e: output first-sub PTS preserved ($out_off == source $pgs_off; no rebase)"
-      else
-        fail "subs-pgs-e2e-pts-preserved PGS e2e: first-sub PTS expected '$pgs_off', got '${out_off:-none}' (desync regression?)"
-      fi
-    else
-      fail "subs-pgs-e2e-pts-preserved PGS e2e: encode produced no output"
-    fi
-  fi
+  # T11 (end-to-end PGS desync guard) removed: it could only ever run given a real,
+  # externally-supplied PGS source (ffmpeg cannot synthesize embedded PGS from text), so it
+  # was unautomatable on any machine without one and always SKIPped in practice. Real,
+  # always-runnable regression coverage for the same bug (PGS timestamp-rebase on the
+  # single-track path) lives in T6 (emitter maps embedded PGS from source, never a .sup)
+  # and the sub-plan-add unit test (single-track PGS → embedded:N) — both run
+  # unconditionally, no fixture needed, and were verified RED against the pre-fix binary.
 
   # Basic encode with subs
   outfile="$TESTDIR/subs_test1.mkv"
@@ -11165,6 +11379,126 @@ _test_unit_empty_array_safe() {
       fail "unit-empty-array-safe-set-u: $old_bash ($old_ver) errored on the array-safe expansion (rc=$rc)"
     fi
   fi
+
+  # (5) Static, STAR-form guard (RC2/v1.5.1): part (3) above only greps the double-quoted "${arr[@]}"
+  # (AT) bare form — it never caught a bare "${kept[*]}" (STAR) echo, which is exactly how
+  # _build_audio_keep_list / _build_subtitle_keep_list crashed under set -u on bash < 4.4 when every
+  # track was filtered out (an ordinary, documented outcome — "empty string if no tracks survive the
+  # filter" — not an edge case). RV3-05's whole-file sweep this same release only checked the AT form
+  # and missed both sites. This check is name-agnostic (not tied to "kept"): it anchors on a
+  # standalone `echo "${VAR[*]}"` statement with NOTHING else on the line. The safe replacement,
+  # `(( ${#VAR[@]} > 0 )) && echo "${VAR[*]}" || echo ""`, always has the guard clause BEFORE `echo`
+  # on the same line, so it can never match this anchored pattern — while the original bare form
+  # (just `  echo "${kept[*]}"` alone on its line) matches it exactly.
+  local star_bad
+  star_bad="$(grep -nE '^[[:space:]]*echo "\$\{[A-Za-z_][A-Za-z0-9_]*\[\*\]\}"[[:space:]]*$' "$MUXM" || true)"
+  if [[ -z "$star_bad" ]]; then
+    pass "unit-empty-array-safe-set-u: no bare unguarded \"\${VAR[*]}\" echo statement remains in muxm (STAR-form sibling of check 3)"
+  else
+    fail "unit-empty-array-safe-set-u: bare unguarded \"\${VAR[*]}\" echo found (bash<4.4 set -u crash risk): $star_bad"
+  fi
+
+  # (6) Static, membership-test STAR-form guard (RC3/v1.5.1, detect_hw_accel): a THIRD shape
+  # neither (3) (bare AT-form) nor (5) (bare echo STAR-form) catches — a STAR-form expansion used
+  # inside a `[[ " ${VAR[*]} " == *"..."* ]]` membership test, as detect_hw_accel used for
+  # HW_ACCEL_AVAILABLE (a subset-of-{videotoolbox,nvenc} array that can legitimately resolve
+  # empty on any host with neither backend — the common case on Linux/Intel-Mac/stock ffmpeg).
+  # The fix guards each comparison with a same-line `(( ${#HW_ACCEL_AVAILABLE[@]} > 0 )) &&`
+  # count check before the `[[`, so every surviving reference to the bare STAR-form must be
+  # preceded on its own line by that guard; skip-proof (unlike the behavioral old-bash test
+  # above, this runs on any host, no pre-4.4 interpreter required).
+  local hwa_bad
+  hwa_bad="$(grep -nE '\$\{HW_ACCEL_AVAILABLE\[\*\]\}' "$MUXM" | grep -v '\${#HW_ACCEL_AVAILABLE\[@\]}' || true)"
+  if [[ -z "$hwa_bad" ]]; then
+    pass "unit-empty-array-safe-set-u: every \"\${HW_ACCEL_AVAILABLE[*]}\" membership test is guarded by a same-line \${#HW_ACCEL_AVAILABLE[@]} count check (membership-test STAR-form sibling of checks 3/5)"
+  else
+    fail "unit-empty-array-safe-set-u: unguarded \"\${HW_ACCEL_AVAILABLE[*]}\" membership test found (bash<4.4 set -u crash risk): $hwa_bad"
+  fi
+}
+
+# RC2 (v1.5.1): behavioral companion to _test_unit_empty_array_safe part (5) — a genuine crash
+# repro (not just a static grep) proving _build_audio_keep_list and _build_subtitle_keep_list no
+# longer abort under set -u on a real pre-4.4 bash when EVERY track is filtered out. Both
+# functions' own docstrings document this as normal ("Empty string if no tracks survive the
+# filter"), so an all-non-preferred-language multi-track source is an ordinary case, not an edge
+# case. On host bash (>= 4.4) the OLD bare form does NOT crash (bash 4.4 fixed bare "${arr[*]}" on
+# an empty array under set -u), so this needs a genuine old interpreter — same auto-detection as
+# _test_unit_empty_array_safe part (4): macOS system /bin/bash is a real pre-4.4 build even when a
+# modern bash is on PATH via Homebrew. Soft-skip (not fail) when no old-bash host is available.
+_test_unit_keep_list_empty_old_bash() {
+  local old_bash=""
+  if [[ -n "${BASH_43:-}" && -x "${BASH_43:-}" ]]; then
+    old_bash="$BASH_43"
+  elif [[ -x /bin/bash ]] && ! /bin/bash -c 'set -u; arr=(); printf "%s" "${arr[*]}"' >/dev/null 2>&1; then
+    old_bash="/bin/bash"
+  fi
+  if [[ -z "$old_bash" ]]; then
+    skip "unit-keep-list-empty-old-bash: no pre-4.4 bash interpreter available (\$BASH_43 unset, /bin/bash doesn't reproduce the bug) — cannot exercise the genuine crash path"
+    return
+  fi
+
+  # Both functions' REAL dependency chains (_audio_stream_info's `declare -gA` cache,
+  # _normalize_codec_lang's/_norm_lang_code's `local -n` namerefs and `${var,,}` case-folding) use
+  # bash 4.0+/4.3+ features that a genuine bash 3.2 rejects outright (e.g. "local: -n: invalid
+  # option") — a real, but UNRELATED, incompatibility below muxm's documented 4.3 floor. Pulling
+  # those helpers in would make this test fail on 3.2 for the wrong reason. So we extract ONLY the
+  # two functions under test plus their genuinely 3.2-safe real helpers (_split_tab,
+  # _is_text_sub_codec — plain case/parameter-expansion, no namerefs/associative arrays/case-fold),
+  # and stub everything else with minimal, behavior-equivalent replacements. This isolates exactly
+  # the code path the fix touches: the loop that drops every track, then the guarded final echo.
+
+  # -- _build_audio_keep_list: _audio_stream_count=2 tracks (mocked jpn/spa records), a stubbed
+  # _audio_lang_matches that always fails (jpn/spa never match AUDIO_LANG_PREF=eng) drives every
+  # track through the language-filter `continue`, leaving kept=() for the real fixed tail line.
+  local a_body
+  a_body="$(_extract_muxm_fns _build_audio_keep_list _split_tab)" \
+    || { fail "unit-keep-list-empty-old-bash: could not extract _build_audio_keep_list + _split_tab"; return; }
+  local a_both
+  # shellcheck disable=SC2016  # body/call must reach $old_bash literally; nothing here needs host-side expansion
+  a_both="$("$old_bash" -c "$a_body"$'\n''set -u
+AUDIO_LANG_PREF=eng; AUDIO_KEEP_COMMENTARY=1
+_audio_stream_count(){ echo 2; }
+_audio_stream_info(){ case "$1" in
+  0) printf "aac\t2\tjpn\t128000\t\t0\t0\t0\n" ;;
+  1) printf "aac\t2\tspa\t128000\t\t0\t0\t0\n" ;;
+esac; }
+_normalize_codec_lang(){ :; }
+_audio_lang_matches(){ return 1; }
+_audio_is_commentary(){ return 1; }
+_log_dropped_tracks(){ :; }
+log(){ :; }
+_build_audio_keep_list' 2>&1)" || true
+  if printf '%s\n' "$a_both" | grep -qiE 'unbound variable'; then
+    fail "unit-keep-list-empty-old-bash: _build_audio_keep_list crashed on $old_bash with an all-filtered (jpn/spa vs eng) source: $(printf '%s' "$a_both" | head -1)"
+  elif [[ -z "$a_both" ]]; then
+    pass "unit-keep-list-empty-old-bash: _build_audio_keep_list returns cleanly empty on $old_bash when every track is filtered out (no unbound-variable crash)"
+  else
+    fail "unit-keep-list-empty-old-bash: _build_audio_keep_list returned '$a_both' on $old_bash (expected empty — jpn/spa should both be dropped by AUDIO_LANG_PREF=eng)"
+  fi
+
+  # -- _build_subtitle_keep_list: 2 French subtitle tracks, a stubbed _sub_lang_matches that always
+  # fails drives both through the language filter, leaving kept=() for the real fixed tail line.
+  local s_body
+  s_body="$(_extract_muxm_fns _build_subtitle_keep_list _is_text_sub_codec)" \
+    || { fail "unit-keep-list-empty-old-bash: could not extract _build_subtitle_keep_list + _is_text_sub_codec"; return; }
+  local s_both
+  # shellcheck disable=SC2016  # body/call must reach $old_bash literally; nothing here needs host-side expansion
+  s_both="$("$old_bash" -c "$s_body"$'\n''set -u
+SUB_LANG_PREF=eng; SUB_INCLUDE_FORCED=1; SUB_INCLUDE_FULL=1; SUB_INCLUDE_SDH=1
+MUX_FORMAT=matroska; SUB_ENABLE_OCR=0; OUTPUT_EXT=mkv; SUB_MAX_TRACKS=10
+ALL_SUB_LANGS=(fre fre); ALL_SUB_TYPES=(full full); ALL_SUB_SOURCES=(embedded:0 embedded:1); ALL_SUB_CODECS=(subrip subrip)
+_sub_lang_matches(){ return 1; }
+_source_label(){ echo "$1"; }
+_log_dropped_tracks(){ :; }
+log(){ :; }
+_build_subtitle_keep_list' 2>&1)" || true
+  if printf '%s\n' "$s_both" | grep -qiE 'unbound variable'; then
+    fail "unit-keep-list-empty-old-bash: _build_subtitle_keep_list crashed on $old_bash with an all-filtered (fre vs eng) source: $(printf '%s' "$s_both" | head -1)"
+  elif [[ -z "$s_both" ]]; then
+    pass "unit-keep-list-empty-old-bash: _build_subtitle_keep_list returns cleanly empty on $old_bash when every track is filtered out (no unbound-variable crash)"
+  else
+    fail "unit-keep-list-empty-old-bash: _build_subtitle_keep_list returned '$s_both' on $old_bash (expected empty — fre tracks should both be dropped by SUB_LANG_PREF=eng)"
+  fi
 }
 
 # CR-5: the DV→MKV give-up timestamp wrap must not expand the fps array as a bare "${fps_in2[@]}"
@@ -11807,6 +12141,7 @@ test_unit() {
   _test_unit_metadata_sanitize
   _test_unit_on_error_log_buffer
   _test_unit_empty_array_safe
+  _test_unit_keep_list_empty_old_bash
   _test_unit_no_bare_fps_array
   _test_unit_grep_flags
   _test_unit_man_date_token

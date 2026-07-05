@@ -14,6 +14,8 @@ brew install TheBluWiz/taps/muxm
 muxm --profile atv-directplay-hq movie.mkv
 ```
 
+For Dolby Vision, AV1, or subtitle OCR support, run `muxm --install-dependencies` first (see [Setup Helpers](#setup-helpers)).
+
 <a id="why-muxmaster"></a>
 
 ## 💡 Why MuxMaster?
@@ -231,7 +233,7 @@ brew install TheBluWiz/taps/muxm
 muxm --install-completions      # bash/zsh tab completion
 ```
 
-This installs `muxm` with its required dependencies (bash 4.3+, ffmpeg, jq, bc) and the man page automatically.
+This installs `muxm` with its required Homebrew-managed dependencies (bash 4.3+, ffmpeg, jq) and the man page automatically. `bc` isn't part of the formula — it ships with macOS (and most Linux distros) already, which is why it isn't listed as a Homebrew dependency.
 
 **Optional dependencies** — for Dolby Vision, subtitle OCR, and subtitle burn-in:
 

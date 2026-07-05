@@ -118,7 +118,7 @@ Audio was excluded from size measurements; file sizes reflect video stream only.
 
 ### `av1-hq` — CRF 28 (1080p SDR) / CRF 24 (4K HDR), preset 6
 
-Recommended as the **primary AV1 encode profile**, and the AV1 equivalent of the existing `hevc-hq` / `hdr10-hq` baseline (HEVC CRF 18, slower).
+Recommended as the **primary AV1 encode profile**, and the AV1 equivalent of the existing `hdr10-hq` baseline (HEVC CRF 18, slower).
 
 | Metric | 1080p SDR (City of God) — CRF 28 | 4K HDR (Avatar) — CRF 24 |
 |---|---|---|

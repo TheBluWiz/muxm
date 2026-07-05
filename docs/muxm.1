@@ -776,15 +776,22 @@ Keep temporary workdir on failure.
 .B \-\-keep\-log
 On a clean run, copy the run log to
 .I <output>.muxm.log
-next to the output. On failure, a self\-contained diagnostics bundle \(em the log plus
+next to the output. On failure, diagnostics are written regardless of this
+flag. By default that is a small, self\-contained bundle \(em the log plus
 the relevant
 .IR *.err " / " *.log
-files \(em is written to
-.I <output>.muxm\-debug/
-regardless of this flag. Unlike
-.BR \-k " / " \-K ,
-which preserve the entire multi\-GB workdir, this keeps only the small
-log and diagnostics.
+files \(em written to
+.IR <output>.muxm\-debug/ .
+But if
+.BR \-k ", " \-K ", or " DEBUG=1
+is also in effect, the small\-bundle copy is skipped and the
+.B entire
+temporary workdir (including the multi\-GB video/audio intermediates) is
+instead renamed in place to a visible
+.I muxm\-debug.<suffix>
+directory on the workdir's own volume (under
+.B \-\-workdir
+this lands there rather than beside the output).
 .TP
 .B \-\-quiet
 Reduce muxm's own terminal narration to warnings and errors only (good for scripts
