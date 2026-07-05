@@ -1220,6 +1220,26 @@ _test_cli_error_codes() {
   # Invalid output extension
   assert_exit $EXIT_VALIDATION "Invalid output extension exits $EXIT_VALIDATION" --output-ext webm "$TESTDIR/basic_sdr_subs.mkv"
 
+  # rv3: an output path that is an existing DIRECTORY must be rejected (previously accepted → the
+  # temp file was mv'd INTO the dir under a hidden random name, effectively losing the output).
+  local _outdir_msg
+  _outdir_msg="$(run_muxm "$TESTDIR/basic_sdr_subs.mkv" "$TESTDIR" 2>&1 || true)"
+  assert_exit $EXIT_VALIDATION "rv3: output path that is a directory exits $EXIT_VALIDATION" "$TESTDIR/basic_sdr_subs.mkv" "$TESTDIR"
+  assert_contains "Output path is a directory" "rv3: directory-output error names the problem" "$_outdir_msg"
+
+  # rv3: --output-ext is case-folded (MKV == mkv), matching the filename-inference/multi-profile
+  # paths (previously an uppercase container died as "Invalid OUTPUT_EXT").
+  local _extcase_out
+  _extcase_out="$(run_muxm --output-ext MKV --print-effective-config "$TESTDIR/basic_sdr_subs.mkv" 2>&1 || true)"
+  assert_contains "OUTPUT_EXT                = mkv" "rv3: --output-ext MKV is case-folded to mkv" "$_extcase_out"
+
+  # rv3: --preset is validated against the effective codec. An x265 preset NAME is rejected for the
+  # AV1 encoders (which take a number); a numeric preset is rejected for x264/x265.
+  assert_exit $EXIT_VALIDATION "rv3: --preset slow rejected for libsvt-av1" \
+    --video-codec libsvt-av1 --preset slow "$TESTDIR/basic_sdr_subs.mkv"
+  assert_exit $EXIT_VALIDATION "rv3: --preset 4 rejected for libx265" \
+    --video-codec libx265 --preset 4 "$TESTDIR/basic_sdr_subs.mkv"
+
   # Missing source file
   assert_exit $EXIT_VALIDATION "Missing source file exits $EXIT_VALIDATION" /nonexistent/file.mkv
 
@@ -3044,6 +3064,43 @@ test_config() {
   _test_config_create_injection
   _test_config_multi_injection
   _test_config_ocr_pgsrip_fallback
+  _test_config_create_rv3
+}
+
+# rv3: --create-config override validation gaps.
+#  (a) a bad --ffmpeg-loglevel must be rejected up front (it is sourced on EVERY later invocation,
+#      including --version and --force-create-config recovery, so an unvalidated typo bricks the tool).
+#  (b) --crf must be validated as an integer 0–51 (not the bitrate grammar that accepted "20k").
+#  (c) an explicit --profile flag must be honored (it was stripped before the create-config prescan
+#      and silently replaced by the default profile).
+_test_config_create_rv3() {
+  local _d="$TESTDIR/cc_rv3"; mkdir -p "$_d"
+  local _rc _dummy
+  # Capture the real exit code (run_muxm_in swallows it with `|| true`); mirror assert_exit's idiom.
+
+  _dummy="$(cd "$_d" && HOME="$_d" "$MUXM" --create-config project archive --ffmpeg-loglevel eror 2>&1)" && _rc=$? || _rc=$?
+  if (( _rc == EXIT_VALIDATION )) && [[ ! -f "$_d/.muxmrc" ]]; then
+    pass "cc-rv3: bad --ffmpeg-loglevel rejected (exit 11, no config written)"
+  else
+    fail "cc-rv3: bad --ffmpeg-loglevel not rejected (rc=$_rc, file-exists=$([[ -f "$_d/.muxmrc" ]] && echo yes || echo no))"
+  fi
+  rm -f "$_d/.muxmrc"
+
+  _dummy="$(cd "$_d" && HOME="$_d" "$MUXM" --create-config project archive --crf 20k 2>&1)" && _rc=$? || _rc=$?
+  if (( _rc == EXIT_VALIDATION )) && [[ ! -f "$_d/.muxmrc" ]]; then
+    pass "cc-rv3: --crf 20k rejected (integer 0–51 expected, no config written)"
+  else
+    fail "cc-rv3: --crf 20k not rejected (rc=$_rc, wrote $([[ -f "$_d/.muxmrc" ]] && grep -m1 '^CRF_VALUE' "$_d/.muxmrc" || echo '<nothing>'))"
+  fi
+  rm -f "$_d/.muxmrc"
+
+  ( cd "$_d" && HOME="$_d" "$MUXM" --create-config project --profile hdr10-hq >/dev/null 2>&1 ) || true
+  if [[ -f "$_d/.muxmrc" ]] && grep -qE '^PROFILE_NAME="hdr10-hq"' "$_d/.muxmrc"; then
+    pass "cc-rv3: explicit --profile hdr10-hq is honored (not replaced by the default profile)"
+  else
+    fail "cc-rv3: explicit --profile ignored (got $(grep -m1 '^PROFILE_NAME' "$_d/.muxmrc" 2>/dev/null || echo '<no file>'))"
+  fi
+  rm -rf "$_d"
 }
 
 # L: --create-config must emit string override values escaped so a value containing a
@@ -7370,6 +7427,34 @@ SRT
   _test_sii_single_track_subs_ideality
   _test_subs_rv3_07
   _test_subs_direct_map_reads_cache
+  _test_subs_movtext_to_mkv
+}
+
+# rv3: an MP4 source with mov_text (MP4/MOV-native timed text) subtitles muxed to MKV must have the
+# subtitle TRANSCODED to srt. The pre-fix MKV rule sent mov_text to `-c:s copy`, which the matroska
+# muxer rejects at write-header (die 41) — AFTER the full video encode. This drives the real path.
+_test_subs_movtext_to_mkv() {
+  local _dir="$TESTDIR/movtext_mkv"; mkdir -p "$_dir/home"
+  printf '1\n00:00:00,000 --> 00:00:02,000\nhello world\n' > "$_dir/s.srt"
+  local _src="$_dir/in.mp4" _out="$_dir/out.mkv"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=navy:s=192x108:r=24:d=2" -f lavfi -i "sine=frequency=440:duration=2" -i "$_dir/s.srt" \
+    -map 0:v -map 1:a -map 2:s -c:v libx264 -preset ultrafast -c:a aac -ac 2 -c:s mov_text \
+    -metadata:s:s:0 language=eng "$_src" 2>/dev/null || true
+  if [[ ! -s "$_src" ]]; then skip "subs-movtext-mkv: could not build the mov_text MP4 fixture"; rm -rf "$_dir"; return; fi
+  local _rc=0
+  MUXM_HOME="$_dir/home" run_muxm --output-ext mkv --no-skip-if-ideal "$_src" "$_out" >/dev/null 2>&1 || _rc=$?
+  if (( _rc == 0 )) && [[ -s "$_out" ]]; then
+    local _scodec; _scodec="$(ffprobe -v error -select_streams s:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$_out" 2>/dev/null)"
+    if [[ "$_scodec" == "subrip" ]]; then
+      pass "subs-movtext-mkv: mov_text MP4 → MKV transcodes the subtitle to subrip (final mux succeeds)"
+    else
+      fail "subs-movtext-mkv: MKV output subtitle codec is '${_scodec:-<none>}', expected subrip"
+    fi
+  else
+    fail "subs-movtext-mkv: mov_text→MKV run failed (rc=$_rc) — the final mux likely died on -c:s copy of mov_text"
+  fi
+  rm -rf "$_dir"
 }
 
 # RV3-15: the direct-map subtitle fallback reads the already-collected ALL_SUB_* arrays instead of
@@ -9681,11 +9766,12 @@ _test_unit_audio_helpers() {
   _test_transcode_target "6" "eac3" "audio_transcode_target(6ch)=eac3 (5.1 bitrate)"
   _test_transcode_target "2" "aac"  "audio_transcode_target(2ch)=aac (stereo)"
   _test_transcode_target "1" "aac"  "audio_transcode_target(1ch)=aac (mono)"
-  # Intermediate channel counts: 3-5 are below the 6ch eac3 threshold → aac; 7 is ≥6 → eac3
-  _test_transcode_target "3" "aac"  "audio_transcode_target(3ch)=aac (<6ch threshold)"
-  _test_transcode_target "4" "aac"  "audio_transcode_target(4ch)=aac (<6ch threshold)"
-  _test_transcode_target "5" "aac"  "audio_transcode_target(5ch)=aac (<6ch threshold)"
-  _test_transcode_target "7" "eac3" "audio_transcode_target(7ch)=eac3 (≥6ch threshold)"
+  # Intermediate channel counts: 3-7 are SURROUND → eac3 (RV3 fix — a 5.0 source must not be
+  # AAC-encoded at the 2ch stereo bitrate). Only 1-2ch take the stereo aac tier.
+  _test_transcode_target "3" "eac3" "audio_transcode_target(3ch)=eac3 (surround, not stereo aac)"
+  _test_transcode_target "4" "eac3" "audio_transcode_target(4ch)=eac3 (surround, not stereo aac)"
+  _test_transcode_target "5" "eac3" "audio_transcode_target(5ch)=eac3 (surround, not stereo aac)"
+  _test_transcode_target "7" "eac3" "audio_transcode_target(7ch)=eac3 (surround)"
   # Verify bitrate values are wired correctly
   local transcode_body at8_result at6_result
   transcode_body="$(awk '/^audio_transcode_target\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
@@ -10101,6 +10187,71 @@ _test_unit_disk_preflight() {
   assert_muxm_fn_stdout "_preset_multiplier(bogus)=1000"      "1000" _preset_multiplier "" "bogus"
 }
 
+# Regression pack for the v1.5.1 release-review fixes. Pure/static checks (no media), each written
+# to FAIL against the pre-fix code so they actually guard the fix.
+_test_unit_rv3_release_fixes() {
+  # (1) _dv_verify_frame_count must grep the dovi_tool 2.x "Frames: N" summary line (the desync
+  #     guard was permanently inert with the old "N RPU"/"parsed N" patterns → always "unverified").
+  local vfc; vfc="$(awk '/^_dv_verify_frame_count\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ "$vfc" == *'frames:[[:space:]]*[0-9]+'* ]]; then pass "rv3: _dv_verify_frame_count greps dovi_tool 2.x 'Frames: N'"; else fail "rv3: _dv_verify_frame_count still uses the old (inert) RPU frame-count patterns"; fi
+
+  # (2) _validate_dv_rpu must grep the "Profile: N" colon form (the old 'profile N' never matched).
+  local vdr; vdr="$(awk '/^_validate_dv_rpu\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ "$vdr" == *'profile:?[[:space:]]*[0-9]+'* ]]; then pass "rv3: _validate_dv_rpu greps dovi_tool 2.x 'Profile: N'"; else fail "rv3: _validate_dv_rpu still uses the old (never-matching) 'profile N' pattern"; fi
+
+  # (3) The P7/P5→P8.1 convert must pass a GLOBAL -m mode flag BEFORE `convert` (without it the RPU
+  #     passes through unconverted while the container is stamped 8.1).
+  if grep -qE 'dovi_tool -m "\$_dv_conv_mode" convert' "$MUXM"; then pass "rv3: DV convert passes -m mode before the subcommand"; else fail "rv3: DV convert is missing the -m mode flag (P7/P5→P8.1 would be a no-op)"; fi
+
+  # (4) detect_dv_info's TEXT fallback must parse ffprobe key=value (dv_profile=N etc.), not the
+  #     ffmpeg banner 'profile: N' colon form (which loglevel=error suppresses → fallback was dead).
+  local ddi; ddi="$(awk '/^detect_dv_info\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ "$ddi" == *'dv_profile=[0-9]+'* && "$ddi" != *"'profile: [0-9]+'"* ]]; then pass "rv3: detect_dv_info fallback uses ffprobe key=value (dv_profile=), not the suppressed banner"; else fail "rv3: detect_dv_info fallback still greps the suppressed 'profile: N' banner form"; fi
+
+  # (5) mov_text must be transcoded to srt in the MKV subtitle rule (matroska rejects -c:s copy of
+  #     mov_text → die 41 after the full encode).
+  local emit; emit="$(awk '/^_emit_sub_tracks\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ "$emit" == *'mov_text|tx3g) oc="srt"'* ]]; then pass "rv3: MKV subtitle rule transcodes mov_text→srt (not copy)"; else fail "rv3: MKV subtitle rule still copies mov_text (matroska mux would fail)"; fi
+
+  # (6) _crf_ratio interpolates odd in-range AV1 CRFs (they used to fall to the >40 ceiling of 55,
+  #     under-estimating disk ~3–5×). Check a few odd values are neither 55 nor the <20 fallback.
+  local crfbody; crfbody="$(awk '/^_crf_ratio\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  local odd_bad=0 c v
+  for c in 21 25 27 31 35 39; do
+    v="$(bash -c "$crfbody"$'\n''_crf_ratio "$1" "$2"' -- libsvt-av1 "$c")"
+    if [[ "$v" == "55" || ! "$v" =~ ^[0-9]+$ ]]; then odd_bad=1; fi
+  done
+  (( odd_bad )) && fail "rv3: _crf_ratio still drops an odd AV1 CRF to the 55 ceiling" || pass "rv3: _crf_ratio interpolates odd in-range AV1 CRFs (no 55 fallthrough)"
+
+  # (7) The config trust gate must reject a world-writable file even when only GNU stat is available.
+  #     Simulate GNU: `stat -f '%Lp' FILE` prints a multi-line filesystem block and exits non-zero;
+  #     `stat -c '%a' FILE` prints the octal mode. The OLD single-`||`-chained capture concatenated
+  #     the GNU-`-f` garbage with the `-c` result → failed the ^[0-7]+$ check → treated as trusted.
+  local tgbody; tgbody="$(_extract_muxm_fns _muxm_tier_is_trusted)" || { fail "rv3: could not extract _muxm_tier_is_trusted"; return; }
+  local tf; tf="$(mktemp)"; chmod 666 "$tf"
+  local gnu_stat='stat(){ if [[ "$1" == "-f" ]]; then printf "  File: x\n    ID: y Namelen: 255\nBlocks: 1\n"; return 1; else command stat -c "%a" "$3" 2>/dev/null || command gstat -c "%a" "$3"; fi; }'
+  local rc_ww
+  rc_ww="$(bash -c "set -u; warn(){ :; }; $gnu_stat"$'\n'"$tgbody"$'\n'"_muxm_tier_is_trusted \"$tf\"; echo \$?" 2>/dev/null | tail -1)"
+  if [[ "$rc_ww" == "1" ]]; then pass "rv3: trust gate rejects a world-writable config under GNU-style stat"; else fail "rv3: trust gate is inert under GNU stat (rc=$rc_ww, expected 1=rejected)"; fi
+  chmod 644 "$tf"
+  local rc_ok
+  rc_ok="$(bash -c "set -u; warn(){ :; }; $gnu_stat"$'\n'"$tgbody"$'\n'"_muxm_tier_is_trusted \"$tf\"; echo \$?" 2>/dev/null | tail -1)"
+  if [[ "$rc_ok" == "0" ]]; then pass "rv3: trust gate accepts a 0644 config under GNU-style stat"; else fail "rv3: trust gate wrongly rejects a 0644 config (rc=$rc_ok)"; fi
+  rm -f "$tf"
+
+  # (8) x265 HDR/level appends must not produce a leading colon when the base params are empty
+  #     (a sole `--x265-params hdr10=1` strips to "" → ":hdr10" would be an unknown x265 key).
+  local bx; bx="$(awk '/^build_x265_params\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ "$bx" == *'${X265_PARAMS:+${X265_PARAMS}:}hdr10=1'* ]]; then pass "rv3: x265 HDR10 append guards against a leading colon on empty params"; else fail "rv3: x265 HDR10 append can emit a leading colon (drops hdr10 signaling)"; fi
+
+  # (9) _check_multitrack_container_safety must skip its SUBTITLE hard-stop when SUB_BURN_FORCED is
+  #     set (build_subtitle_plan demotes to single-track then, so a bitmap sub never reaches the
+  #     MP4 mux) — otherwise `--sub-multi-track --sub-burn-forced --output-ext mp4` spuriously
+  #     refuses a run the demoted pipeline handles.
+  local cms; cms="$(awk '/^_check_multitrack_container_safety\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  if [[ "$cms" == *'(( SUB_MULTI_TRACK )) && (( ! SKIP_SUBS )) && (( ! SUB_BURN_FORCED ))'* ]]; then pass "rv3: multitrack container preflight skips the sub check under SUB_BURN_FORCED (demotion modeled)"; else fail "rv3: multitrack container preflight ignores the SUB_BURN_FORCED single-track demotion (spurious hard-stop)"; fi
+}
+
 # disk_free_warn source-file-size fallback when bitrate metadata is missing.
 # disk_free_warn has many dependencies, so we source its body with stubbed helpers and a
 # `log` override that prints the preflight line to stdout, then inspect the estimate.
@@ -10142,8 +10293,11 @@ _test_unit_disk_fallback() {
   assert_contains "peak_factor=2"       "disk fallback: non-DV re-encode keeps peak_factor=2"        "$out"
 
   # peak_factor axis is independent of the size fallback: a DV re-encode reserves 3×. Drive the DV
-  # path via METADATA_CACHE (DISABLE_DV=0) so _source_has_dv_metadata need not be real.
-  out="$(bash -c "$common"$'\n''_jq_cache(){ echo 5000000; }'$'\n'"SRC_ABS='$srcfile'; VIDEO_COPY_IF_COMPLIANT=0; DISABLE_DV=0; METADATA_CACHE='dovi'"$'\n'"$body"$'\n''disk_free_warn')"
+  # path via the primary detector _source_has_dv_metadata (DISABLE_DV=0). NOTE: the peak-factor DV
+  # check no longer substring-matches the whole METADATA_CACHE JSON (that false-positived on a
+  # 'dovi' in the filename) — it now consults _source_has_dv_metadata (side-data DOVI record) and
+  # _source_video_has_dv_codec_tag (video-stream codec tag), so the test stubs the detector.
+  out="$(bash -c "$common"$'\n''_jq_cache(){ echo 5000000; }; _source_video_has_dv_codec_tag(){ return 1; }'$'\n'"SRC_ABS='$srcfile'; VIDEO_COPY_IF_COMPLIANT=0; DISABLE_DV=0; METADATA_CACHE='x'; _source_has_dv_metadata(){ return 0; }"$'\n'"$body"$'\n''disk_free_warn')"
   assert_contains "peak_factor=3"       "disk fallback: DV re-encode keeps peak_factor=3"            "$out"
 
   # Branch 2 — bitrate MISSING but size available: estimate must be NON-ZERO (synthesized from
@@ -10589,7 +10743,9 @@ _normalize_codec_lang c l; printf "%s|%s" "$c" "$l"')"
   _test_pes "movie" "movie.en.sdh.srt"     "eng"$'\t'"sdh"    "_parse_ext_sub_filename(movie.en.sdh.srt)=eng/sdh"
   # CR-13: `hi` is language-first (Hindi) when it fills the empty language slot, but stays the SDH
   # marker once a language is already set. Explicit sdh/hearing/cc markers are unaffected.
-  _test_pes "movie" "movie.hi.srt"         "hi"$'\t'"full"    "_parse_ext_sub_filename(movie.hi.srt)=hi/full (Hindi, not SDH — CR-13)"
+  # RV3-finding: `hi` now normalizes to the 3-letter ISO 639-2/T code `hin` (like en→eng), so a
+  # `movie.hi.srt` sidecar matches a `hin`-tagged stream / SUB_LANG_PREF=hin.
+  _test_pes "movie" "movie.hi.srt"         "hin"$'\t'"full"   "_parse_ext_sub_filename(movie.hi.srt)=hin/full (Hindi normalized, not SDH — CR-13)"
   _test_pes "movie" "movie.eng.hi.srt"     "eng"$'\t'"sdh"    "_parse_ext_sub_filename(movie.eng.hi.srt)=eng/sdh (hi = SDH once lang set — CR-13)"
   _test_pes "movie" "movie.hearing.srt"    "und"$'\t'"sdh"    "_parse_ext_sub_filename(movie.hearing.srt)=und/sdh (explicit SDH marker)"
 
@@ -11332,7 +11488,7 @@ _test_unit_empty_array_safe() {
   # surfaced (SII_SUB_INDICES beside SII_AUDIO_INDICES; AUDIO_MT_INDICES, the multi-track keep-list).
   local arr unsafe=""
   for arr in fps_arg _ts_fps fps_in fps_in2 _ocr_lang thread_args _child_flags _cc_override_args \
-             COMPLETED_STEPS _MULTI_PROFILES _ORIG_FILTERED_ARGS SII_AUDIO_INDICES SII_SUB_INDICES AUDIO_MT_INDICES; do
+             COMPLETED_STEPS _MULTI_PROFILES _ORIG_FILTERED_ARGS _filtered_args SII_AUDIO_INDICES SII_SUB_INDICES AUDIO_MT_INDICES; do
     if grep -E "[^+]\"\\\$\{${arr}\[@\]\}\"" "$MUXM" | grep -qvE '^[[:space:]]*#'; then
       unsafe+="$arr "
     fi
@@ -12121,6 +12277,7 @@ test_unit() {
   _test_unit_sii_container_safety
   _test_unit_misc_helpers
   _test_unit_disk_preflight
+  _test_unit_rv3_release_fixes
   _test_unit_disk_fallback
   _test_unit_disk_output_volume
   _test_unit_av1_resolution_crf
@@ -14443,8 +14600,8 @@ _test_ext_subs_hi_is_hindi() {
   local out found
   out="$( (cd "$d" && "$MUXM" --dry-run "movie.mkv" "$d/out.mkv") 2>&1 )"
   found="$(printf '%s\n' "$out" | grep -F 'External subtitle found:' | grep -F 'movie.hi.srt' | head -1)"
-  if printf '%s\n' "$found" | grep -qF '[hi] (full)'; then
-    pass "extsub-hi-is-hindi: movie.hi.srt discovered as lang=hi, type=full (Hindi, not SDH/und)"
+  if printf '%s\n' "$found" | grep -qF '[hin] (full)'; then
+    pass "extsub-hi-is-hindi: movie.hi.srt discovered as lang=hin, type=full (Hindi normalized, not SDH/und)"
   else
     fail "extsub-hi-is-hindi: movie.hi.srt misclassified. Saw: ${found:-<none>}"
   fi

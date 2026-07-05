@@ -1289,6 +1289,42 @@ is_valid_preset(){
   esac
 }
 
+# _preset_int_in_range VALUE LO HI — 0 if VALUE is an integer within [LO,HI]. Handles a leading
+# sign and leading zeros (base-10-pinned, so "08" is 8 not an octal error), for the AV1 presets.
+_preset_int_in_range(){
+  local v="$1" lo="$2" hi="$3" n neg=0
+  [[ "$v" =~ ^-?[0-9]+$ ]] || return 1
+  n="$v"; [[ "$n" == -* ]] && { neg=1; n="${n#-}"; }
+  n=$((10#$n)); (( neg )) && n=$((-n))
+  (( n >= lo && n <= hi ))
+}
+
+# is_valid_preset_for_codec PRESET CODEC — validate a preset against the encoder that will consume
+# it. x264/x265 take a NAMED preset (is_valid_preset); the AV1 encoders take a NUMBER: SVT-AV1's
+# `-preset` accepts -2..13 and libaom-av1's `-cpu-used` accepts 0..8. The old code validated every
+# preset with the x265 name grammar, so a valid AV1 numeric preset (the only form SVT-AV1/libaom
+# accept) was rejected at parse while an x265 name like `slow` passed validation and then hard-failed
+# the AV1 encode at ffmpeg. Codec is known post-config (profile applied), so this runs in Section 15.
+is_valid_preset_for_codec(){
+  local preset="$1" codec="$2"
+  case "$codec" in
+    libsvt-av1) _preset_int_in_range "$preset" -2 13 ;;
+    libaom-av1) _preset_int_in_range "$preset" 0 8 ;;
+    *)          is_valid_preset "$preset" ;;   # libx264 / libx265 (and default)
+  esac
+}
+
+# _preset_expected_help CODEC — the human-facing "valid presets" clause for an error message.
+# The x264/x265 branch leads with "Valid presets:" (a documented D10 error convention); the AV1
+# encoders take a numeric preset, so they state their integer range instead.
+_preset_expected_help(){
+  case "$1" in
+    libsvt-av1) echo "Valid --preset for SVT-AV1 is an integer -2..13 (lower = slower/better)" ;;
+    libaom-av1) echo "Valid --preset for libaom-av1 is an integer 0..8 (lower = slower/better)" ;;
+    *)          echo "Valid presets: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo" ;;
+  esac
+}
+
 # is_apple_silicon — true on arm64 Darwin (M-series and beyond).
 is_apple_silicon(){
   [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] && [[ "$(uname -m 2>/dev/null)" == "arm64" ]]
@@ -1501,8 +1537,20 @@ _check_filter_ideality() {
 # already applied). This gate is NOT applied to the CWD ./.muxmrc tier — that same-privilege,
 # project-level override is the accepted H1 trust model and keeps no gate.
 _muxm_tier_is_trusted(){
-  local f="$1" mode
-  mode="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f" 2>/dev/null || echo '')"
+  local f="$1" mode=""
+  # Probe the two stat dialects SEPARATELY, not chained in one `||` capture. On GNU coreutils
+  # `stat -f` means "filesystem status" (BSD's `-f` is a format string), so `stat -f '%Lp' FILE`
+  # treats '%Lp' as a file operand, prints a multi-line filesystem block to stdout AND exits
+  # non-zero — the old `A || B || echo` then ran the GNU `-c` branch too and APPENDED its '644' to
+  # that garbage, yielding a multi-line string that fails the ^[0-7]+$ check → treated as
+  # "unknown mode, don't block" → the whole group/world-writable gate was silently INERT on Linux.
+  # Try BSD/macOS form first; only on a clean single-line octal result do we accept it, otherwise
+  # fall through to the GNU form. Each branch's output is validated independently.
+  local _m
+  _m="$(stat -f '%Lp' "$f" 2>/dev/null)" && [[ "$_m" =~ ^[0-7]+$ ]] && mode="$_m"
+  if [[ -z "$mode" ]]; then
+    _m="$(stat -c '%a' "$f" 2>/dev/null)" && [[ "$_m" =~ ^[0-7]+$ ]] && mode="$_m"
+  fi
   [[ "$mode" =~ ^[0-7]+$ ]] || return 0            # no usable stat → best-effort, don't block
   if (( (8#$mode & 8#22) != 0 )); then             # 0o22 = group-write (0o20) | other-write (0o2)
     warn "Ignoring ${f} — it is group- or world-writable (mode ${mode}); refusing to source it as a config tier (another user could inject shell that runs as you). Fix with: chmod go-w '${f}'"
@@ -1757,7 +1805,13 @@ _dep_check_only(){
 _pipx_resolve_bin_dir(){
   local _d
   _d="$(pipx environment --value PIPX_BIN_DIR 2>/dev/null)" || true
-  [[ -z "$_d" ]] && _d="$(pipx environment 2>/dev/null | grep '^PIPX_BIN_DIR=' | cut -d= -f2)"
+  # `|| true`: when tier 1 was empty and the fallback dump has no PIPX_BIN_DIR line (or pipx itself
+  # errors), the grep exits 1 → pipefail makes the pipeline non-zero. As the last command of this
+  # assignment it is NOT errexit-exempt, so under inherit_errexit it would abort the whole
+  # --install-dependencies run instead of taking the documented "return empty → PATH fallback" path.
+  if [[ -z "$_d" ]]; then
+    _d="$(pipx environment 2>/dev/null | grep '^PIPX_BIN_DIR=' | cut -d= -f2)" || true
+  fi
   printf '%s' "$_d"
 }
 
@@ -4458,14 +4512,46 @@ _create_config() {
   # — reject it with die 11 rather than quoting garbage into the generated config. Same pattern as
   # the main CLI's _validate_rate_arg. Complements the unconditional quoting in _V above.
   local _cc_num_var
-  for _cc_num_var in CRF_VALUE STEREO_BITRATE AUDIO_FORCE_BITRATE \
-                     MAX_COPY_BITRATE LEVEL_VALUE AV1_MAXRATE AV1_BUFSIZE; do
+  for _cc_num_var in STEREO_BITRATE AUDIO_FORCE_BITRATE \
+                     MAX_COPY_BITRATE AV1_MAXRATE AV1_BUFSIZE; do
     if [[ -n "${_CC_OVERRIDES[$_cc_num_var]:-}" ]] \
        && [[ ! "${_CC_OVERRIDES[$_cc_num_var]}" =~ $_RE_BITRATE ]]; then
       die 11 "Invalid numeric value for ${_cc_num_var}: '${_CC_OVERRIDES[$_cc_num_var]}'
    Expected a number, optionally with a k/M/G suffix (e.g. 20, 1.5, 256k)."
     fi
   done
+
+  # CRF_VALUE and LEVEL_VALUE are NOT rates — the shared _RE_BITRATE grammar above wrongly accepted
+  # "20k"/"1.5"/"5.1M", persisting a value the runtime's own guards (Section 15) then reject on the
+  # NEXT run, on a config --create-config told the user was valid. Validate them the way the runtime
+  # and the CLI arms do: CRF is a strict integer 0–51, LEVEL matches _RE_LEVEL (e.g. 5.1).
+  if [[ -n "${_CC_OVERRIDES[CRF_VALUE]:-}" ]]; then
+    if [[ ! "${_CC_OVERRIDES[CRF_VALUE]}" =~ ^[0-9]+$ ]] || (( 10#${_CC_OVERRIDES[CRF_VALUE]} > 51 )); then
+      die 11 "Invalid --crf '${_CC_OVERRIDES[CRF_VALUE]}': expected an integer 0–51."
+    fi
+    _CC_OVERRIDES[CRF_VALUE]=$(( 10#${_CC_OVERRIDES[CRF_VALUE]} ))   # normalize leading-zero form
+  fi
+  if [[ -n "${_CC_OVERRIDES[LEVEL_VALUE]:-}" ]] && [[ ! "${_CC_OVERRIDES[LEVEL_VALUE]}" =~ $_RE_LEVEL ]]; then
+    die 11 "Invalid --level '${_CC_OVERRIDES[LEVEL_VALUE]}': expected a numeric level like 5.1."
+  fi
+
+  # Enum-validate the loglevel overrides — the runtime's config-load guard (Section 6) rejects a bad
+  # value with die 11 on EVERY invocation (including `muxm --version` and the documented
+  # --force-create-config recovery path, which is sourced BEFORE the create-config prescan), so an
+  # unvalidated typo here (e.g. --ffmpeg-loglevel eror) persists a config that bricks the tool.
+  # Validate up front so the generated config is always one the runtime accepts.
+  local _cc_ll
+  for _cc_ll in FFMPEG_LOGLEVEL FFPROBE_LOGLEVEL; do
+    if [[ -n "${_CC_OVERRIDES[$_cc_ll]:-}" ]] && ! is_valid_loglevel "${_CC_OVERRIDES[$_cc_ll]}"; then
+      die 11 "Invalid ${_cc_ll} '${_CC_OVERRIDES[$_cc_ll]}': valid values: ${_VALID_LOGLEVEL_STR}."
+    fi
+  done
+  # NOTE: OUTPUT_EXT / SUB_OCR_TOOL overrides are intentionally NOT enum-rejected here. They are the
+  # low-impact tier of this gap — a bad value fails cleanly on the NEXT real run at Section 15, which
+  # is AFTER the create-config prescan, so --force-create-config recovery still works (unlike the
+  # loglevel case). Rejecting OUTPUT_EXT here would also conflict with the M1 anti-injection test,
+  # which deliberately feeds a payload through --output-ext to verify the generated config ESCAPES it
+  # safely (the accepted defense-in-depth), not that it's rejected.
 
   # THREADS is NOT a rate: it must be a strict positive integer (both the runtime pools=/lp= guard
   # and the --threads CLI arm require ^[1-9][0-9]*$). RV3-03: the shared _RE_BITRATE loop above
@@ -4487,8 +4573,31 @@ _create_config() {
   if [[ -n "${_CC_OVERRIDES[VIDEO_CODEC]:-}" ]] && ! is_valid_video_codec "${_CC_OVERRIDES[VIDEO_CODEC]}"; then
     die 11 "Invalid --video-codec '${_CC_OVERRIDES[VIDEO_CODEC]}': must be libx265, libx264, libsvt-av1, or libaom-av1."
   fi
-  if [[ -n "${_CC_OVERRIDES[PRESET_VALUE]:-}" ]] && ! is_valid_preset "${_CC_OVERRIDES[PRESET_VALUE]}"; then
-    die 11 "Invalid --preset '${_CC_OVERRIDES[PRESET_VALUE]}': valid presets are ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo."
+  # Validate a --preset override against the codec the generated config will actually use — a
+  # --video-codec override wins, else the profile's own default codec (resolved by applying the
+  # profile in a subshell so it can't leak globals). The old is_valid_preset (x265 names only)
+  # wrongly rejected a valid AV1 numeric preset, e.g. `--create-config … av1-hq --preset 4`. For a
+  # multi-profile list with no codec override the effective codec is ambiguous, so accept any preset
+  # valid for SOME encoder (a name OR an AV1 number) and let each child's real run make the strict
+  # codec-aware check.
+  if [[ -n "${_CC_OVERRIDES[PRESET_VALUE]:-}" ]]; then
+    local _cc_preset="${_CC_OVERRIDES[PRESET_VALUE]}" _cc_eff_codec="" _cc_preset_ok=0
+    if [[ -n "${_CC_OVERRIDES[VIDEO_CODEC]:-}" ]]; then
+      _cc_eff_codec="${_CC_OVERRIDES[VIDEO_CODEC]}"
+    elif [[ "$profile" != *,* ]]; then
+      local _cc_np="$profile"; _normalize_profile _cc_np
+      if _is_valid_profile "$_cc_np" && declare -F "apply_profile_${_cc_np//-/_}" >/dev/null 2>&1; then
+        _cc_eff_codec="$( "apply_profile_${_cc_np//-/_}" >/dev/null 2>&1; printf '%s' "${VIDEO_CODEC:-}" )"
+      fi
+    fi
+    if [[ -n "$_cc_eff_codec" ]]; then
+      is_valid_preset_for_codec "$_cc_preset" "$_cc_eff_codec" && _cc_preset_ok=1
+      (( _cc_preset_ok )) || die 11 "Invalid --preset '$_cc_preset' for --video-codec $_cc_eff_codec. $(_preset_expected_help "$_cc_eff_codec")."
+    else
+      # Ambiguous (multi-profile, no codec override): accept a name OR an AV1 number.
+      { is_valid_preset "$_cc_preset" || _preset_int_in_range "$_cc_preset" -2 13; } \
+        || die 11 "Invalid --preset '$_cc_preset': expected an x264/x265 name (e.g. medium, slow) or an AV1 integer (SVT-AV1 -2..13, libaom 0..8)."
+    fi
   fi
 
   # Normalize deprecated aliases (single call site via _normalize_profile).
@@ -4658,8 +4767,12 @@ while (( _i < ${#_prescan_args[@]} )); do
     (( ++_i ))
   fi
 done
-# Replace positional parameters with filtered args (--profile consumed)
-set -- "${_filtered_args[@]}"
+# Replace positional parameters with filtered args (--profile consumed).
+# Array-safe expansion (RV3-05 idiom): _filtered_args is empty whenever the pre-scan consumed
+# everything — `muxm` with no args, or `muxm --profile archive` alone (a realistic "forgot the
+# source"). A bare "${_filtered_args[@]}" raises "unbound variable" under set -u on bash < 4.4 (the
+# documented 4.3 floor), aborting before the usage/diagnostic. Guard it like every sibling array.
+set -- ${_filtered_args[@]+"${_filtered_args[@]}"}
 unset _prescan_args _filtered_args _i
 
 # Multi-profile: detect comma-separated --profile and validate all names upfront.
@@ -5177,7 +5290,18 @@ _create_config_prescan() {
       _cc_override_args+=("${_cc_args[$_cc_oi]}")
       _cc_oi=$(( _cc_oi + 1 ))
     done
-    _create_config "$_cc_scope" "$_cc_profile" "$_cc_force" ${_cc_override_args[@]+"${_cc_override_args[@]}"}
+    # Honor an explicit `--profile <name>` even though it isn't the positional profile slot: the
+    # Section-11 pre-scan strips `--profile` out of the args (setting PROFILE_NAME, _PROFILE_SOURCE=cli)
+    # BEFORE this pre-scan sees them, so `muxm --create-config project --profile archive` otherwise
+    # dropped the user's profile and generated the default. Only the CLI source is honored (a
+    # config-file PROFILE_NAME must not silently override the create-config default). This is applied
+    # to the EFFECTIVE profile only — the override-offset math above still keys on the positional
+    # `_cc_profile` (empty here), so argument alignment is unchanged.
+    local _cc_eff_profile="$_cc_profile"
+    if [[ -z "$_cc_eff_profile" && "${_PROFILE_SOURCE:-}" == "cli" && -n "${PROFILE_NAME:-}" ]]; then
+      _cc_eff_profile="$PROFILE_NAME"
+    fi
+    _create_config "$_cc_scope" "$_cc_eff_profile" "$_cc_force" ${_cc_override_args[@]+"${_cc_override_args[@]}"}
     # _create_config always exits; this line is unreachable
   fi
 }
@@ -5526,8 +5650,12 @@ while [[ $# -gt 0 ]]; do
       # dropping every flag typed after --crf (including --dry-run) while a real encode runs.
       CRF_VALUE=$((10#$_crf_in)); _CLI_CRF_EXPLICIT=1; shift 2 ;;
     -p|--preset)
+      # Loose store here: preset validity depends on VIDEO_CODEC, which isn't final at parse time
+      # (a profile or .muxmrc may set it later). The codec-aware check runs in Section 15 (and the
+      # --print-effective-config path) once VIDEO_CODEC is resolved — an x265 name for x264/x265, a
+      # numeric preset for the AV1 encoders. Validating the x265 grammar here wrongly rejected the
+      # only valid AV1 preset form (a number).
       _require_val "$1" "$#" "${2:-}"; PRESET_VALUE="$2"; _CLI_PRESET_EXPLICIT=1
-      is_valid_preset "$PRESET_VALUE" || die 11 "Invalid preset: $PRESET_VALUE. Valid presets: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo."
       shift 2
       ;;
     --x265-params) _require_val "$1" "$#" "${2:-}"; X265_PARAMS_BASE="$2"; _CLI_X265_PARAMS_EXPLICIT=1; shift 2 ;;
@@ -5618,7 +5746,7 @@ while [[ $# -gt 0 ]]; do
     --skip-audio) SKIP_AUDIO=1; shift ;;
     --skip-subs)  SKIP_SUBS=1;  shift ;;
 
-    --output-ext) _require_val "$1" "$#" "${2:-}"; OUTPUT_EXT="$2"; _OUTPUT_EXT_EXPLICIT=1; shift 2 ;;
+    --output-ext) _require_val "$1" "$#" "${2:-}"; OUTPUT_EXT="${2,,}"; _OUTPUT_EXT_EXPLICIT=1; shift 2 ;;  # case-fold: `MKV` == `mkv`, matching the filename-inference + multi-profile paths
     --keep-chapters) KEEP_CHAPTERS=1; shift ;;
     --no-keep-chapters) KEEP_CHAPTERS=0; shift ;;
     --strip-metadata) STRIP_METADATA=1; shift ;;
@@ -6323,6 +6451,13 @@ if (( PRINT_EFFCONF )); then
   # Reject a bogus --output-ext up front (before resolution and the multi-profile guard) so the
   # diagnostic can't report an invalid container as "accepted" when a real run would die 11.
   _validate_output_ext_or_die
+  # Same for a --preset that doesn't fit the effective VIDEO_CODEC (single-profile only; each
+  # multi-profile child validates its own). Mirrors Section 15 so the diagnostic can't print a
+  # codec-incompatible preset as "accepted".
+  if (( ! _MULTI_PROFILE_MODE )) && (( _CLI_PRESET_EXPLICIT )) && [[ -n "${PRESET_VALUE:-}" ]] \
+     && ! is_valid_preset_for_codec "$PRESET_VALUE" "$VIDEO_CODEC"; then
+    die 11 "Invalid --preset '$PRESET_VALUE' for --video-codec $VIDEO_CODEC. $(_preset_expected_help "$VIDEO_CODEC")."
+  fi
   if (( ! _MULTI_PROFILE_MODE )); then
     SRC="${POSITIONALS[0]:-}"
     OUT="${POSITIONALS[1]:-}"
@@ -6455,6 +6590,18 @@ if [[ ! "$CRF_VALUE" =~ ^[0-9]+$ ]] || (( 10#$CRF_VALUE > 51 )); then
   die 11 "Invalid CRF_VALUE from config: integer 0–51 expected (got: ${CRF_VALUE})"
 fi
 
+# Validate an EXPLICIT --preset against the now-final VIDEO_CODEC. x264/x265 take a named preset; the
+# AV1 encoders take a number (SVT-AV1 -preset -2..13, libaom-av1 -cpu-used 0..8). The parse arm
+# stores the value loosely (codec unknown then); this is the real check. Gated on _CLI_PRESET_EXPLICIT
+# so it only fires for a user-typed --preset: the global DEFAULT PRESET_VALUE is an x265 name
+# ("slower"), which is meaningless-but-harmless when AV1 is selected without a --preset — the AV1
+# pipeline coerces that leftover default to its numeric default (6). Rejecting it here would wrongly
+# fail `--video-codec libsvt-av1` with no --preset.
+if (( _CLI_PRESET_EXPLICIT )) && [[ -n "${PRESET_VALUE:-}" ]] \
+   && ! is_valid_preset_for_codec "$PRESET_VALUE" "$VIDEO_CODEC"; then
+  die 11 "Invalid --preset '$PRESET_VALUE' for --video-codec $VIDEO_CODEC. $(_preset_expected_help "$VIDEO_CODEC")."
+fi
+
 # Re-validate the level/rate value flags after config load, mirroring the CRF re-check: a
 # sourced .muxmrc assigns these directly, bypassing the parse-time guards above. LEVEL_VALUE,
 # AV1_MAXRATE, and AV1_BUFSIZE are optional (blank = let the encoder decide), so gate on -n;
@@ -6528,6 +6675,17 @@ OUT_DIR="$(if cd -- "$OUT_DIR" 2>/dev/null; then pwd; else echo "$OUT_DIR"; fi)"
 
 OUT_BASENAME="$(basename -- "$OUT")"
 OUT_ABS="${OUT_DIR}/${OUT_BASENAME}"
+
+# Reject an output path that is an existing DIRECTORY. Only OUT_DIR (the parent) is validated
+# above; without this, passing a destination directory (a very common CLI habit, e.g.
+# `muxm movie.mkv outdir/`) is silently accepted and the final `mv "$TMP_OUT" "$OUT"` moves the
+# temp file INTO the directory under its random dot-name (outdir/.muxm.output.XXXX.mkv) — a hidden,
+# random-named, effectively-lost output, with the report/log/checksum sidecars also misnamed.
+if [[ -d "$OUT_ABS" ]]; then
+  die 11 "Output path is a directory: $OUT_ABS
+   Specify a full output FILE path (e.g. ${OUT_ABS%/}/output.${OUTPUT_EXT}), not a directory."
+fi
+
 OUT="$OUT_ABS"
 
 # Validate output doesn't contain control characters (security)
@@ -6922,13 +7080,15 @@ on_exit() {
   # stdout/stderr to it before waiting on the tee process.
 
   if (( FAILED == 0 && have_result == 1 )); then
+    # Declared before the DRY_RUN split so it is in scope for the shared cleanup/exit logic below
+    # (a dry run leaves it 1 → normal exit 0; a real run may clear it on a failed final mv).
+    local _mv_ok=1
     if (( DRY_RUN )); then
       [[ -f "$TMP_OUT" ]] && rm -f "$TMP_OUT"
       note "DRY-RUN complete — no real files were created."
     else
       # Surface a failed final mv/checksum cleanly (the ERR trap is disarmed above, so these no
       # longer abort cleanup) — warn and skip the success banner rather than claiming success.
-      local _mv_ok=1
       if [[ -f "$TMP_OUT" ]] && ! mv -f "$TMP_OUT" "$OUT"; then
         _mv_ok=0
         warn "Could not move the finished output into place: $OUT (output volume full or unwritable?)."
@@ -6952,7 +7112,10 @@ on_exit() {
     # output volume is full) must not destroy the only surviving log, so gate cleanup on
     # the copy succeeding. (Persistence runs post-drain, so its notes are terminal-only.)
     _drain_tee
-    if (( KEEP_LOG )); then
+    # Dry runs write nothing durable (contract stated one line above: "no real files were created").
+    # Skip the beside-output --keep-log persistence so a `--dry-run --keep-log` no longer creates a
+    # real ${OUT%.ext}.muxm.log next to the output that was never produced.
+    if (( ! DRY_RUN )) && (( KEEP_LOG )); then
       if _persist_log; then
         [[ -f "$LOG_PERSIST_PATH" ]] && note "Log saved: $LOG_PERSIST_PATH"
       else
@@ -6960,8 +7123,21 @@ on_exit() {
         warn "Could not write log to $LOG_PERSIST_PATH — preserving workdir: $WORKDIR"
       fi
     fi
-    (( _persist_ok )) && _cleanup_workdir 0
-    exit 0
+    if (( _mv_ok )); then
+      (( _persist_ok )) && _cleanup_workdir 0
+      exit 0
+    fi
+    # The encode finished but the final `mv "$TMP_OUT" "$OUT"` failed (output volume full/unwritable
+    # after a long encode). Do NOT exit 0 and delete the workdir — that would record a false success
+    # in any batch driver and destroy the log while stranding the finished multi-GB file at its
+    # hidden temp name. Keep the workdir (its log is the only record), leave $TMP_OUT in place, and
+    # exit non-zero (41 = final-output problem) so the failure is visible and the work is recoverable.
+    EXIT_CODE=41
+    warn "Build did NOT complete: the encode finished but the output could not be moved to: $OUT"
+    warn "  The finished file is preserved at its temporary path: $TMP_OUT"
+    warn "  Move it into place once the destination is writable:  mv '$TMP_OUT' '$OUT'"
+    [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]] && warn "  Workdir with the run log kept for diagnostics: $WORKDIR"
+    exit 41
   else
     # Decide up front whether this failure will KEEP artifacts (-k/-K/DEBUG).
     # If so, we rename the hidden workdir to a visible sibling IN PLACE (below, after the tee drains)
@@ -7029,6 +7205,11 @@ on_exit() {
         # the visible name; this terminal note gives the real location.
         note "Keeping failure artifacts at: $WORKDIR (could not rename to $VISIBLE_DEBUG_DIR)"
       fi
+    elif (( DRY_RUN )); then
+      # A dry run writes nothing durable, even on failure (e.g. interrupted with Ctrl-C): skip the
+      # beside-output diagnostics bundle (it would create a real ${OUT%.ext}.muxm-debug/ dir) and
+      # just remove the temp workdir.
+      _cleanup_workdir 1
     else
       # Non-keep path (unchanged): copy the small KB bundle beside OUT, THEN remove the workdir.
       # The copy may fail if the failure is itself "disk full on the output volume" — if so, keep
@@ -7073,7 +7254,11 @@ _acquire_out_lock() {
   OUT_LOCK_PATH="$(dirname "$OUT")/.$(basename "$OUT").lock"
   local lock="$OUT_LOCK_PATH" owner tries=0 empty_tries=0
   while ! mkdir "$lock" 2>/dev/null; do
-    owner=""; [[ -r "$lock/pid" ]] && read -r owner < "$lock/pid" 2>/dev/null
+    # `|| true`: an existing-but-EMPTY pid file (holder SIGKILL'd mid-write, or the sub-ms window
+    # where it won mkdir but hasn't written its pid yet) makes `read` return 1 as the last command of
+    # this `&&` chain — NOT errexit-exempt, so the ERR trap would fire and abort the run instead of
+    # taking the documented empty-owner retry/reclaim path below.
+    owner=""; { [[ -r "$lock/pid" ]] && read -r owner < "$lock/pid" 2>/dev/null; } || true
     # RV3-16: a live PID owning the lock is only a genuine conflict if it's actually a muxm run —
     # _pid_is_muxm guards against a recycled PID (safe-bias: uncertain → treated as live, never reclaimed).
     if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null && _pid_is_muxm "$owner"; then
@@ -7111,7 +7296,7 @@ _acquire_out_lock() {
 _check_src_replace_lock() {
   local _sl; _sl="$(dirname "$SRC_ABS")/.$(basename "$SRC_ABS").lock"
   [[ -d "$_sl" && -e "$_sl/replacing-src" ]] || return 0
-  local _owner=""; [[ -r "$_sl/pid" ]] && read -r _owner < "$_sl/pid" 2>/dev/null
+  local _owner=""; { [[ -r "$_sl/pid" ]] && read -r _owner < "$_sl/pid" 2>/dev/null; } || true  # empty pid file must not trip ERR trap
   # RV3-16: same recycled-PID guard as _acquire_out_lock. Safe-bias: an uncertain identity blocks the
   # reader (a spurious block is non-corrupting here — it only over-refuses).
   if [[ "$_owner" =~ ^[0-9]+$ ]] && kill -0 "$_owner" 2>/dev/null && _pid_is_muxm "$_owner"; then
@@ -7163,9 +7348,16 @@ _crf_ratio() {
       # Measured output/source bitrate ratios from AV1_CALIBRATION.md §6 (the prior
       # values under-estimated AV1 output size by 28–80%, causing the preflight to
       # under-warn). Out-of-range fallbacks bumped to stay monotonic with the table.
+      # The EVEN CRFs are the measured calibration points (cross-checked against the doc by the
+      # docs-parity suite). The ODD in-range CRFs (21–39) are linear interpolations between their
+      # measured neighbors — added because CRF validation accepts any 0–51 integer, so `--crf 25`
+      # is a normal invocation; without them every odd CRF fell through to the >40 ceiling (55),
+      # under-estimating `est_video_bytes` ~3–5× — the exact under-warn this table exists to prevent.
       case "$crf" in
-        20)echo 320;;22)echo 260;;24)echo 211;;26)echo 189;;28)echo 178;;30)echo 166;;
-        32)echo 153;;34)echo 130;;36)echo 108;;38)echo 88;;40)echo 70;;
+        20)echo 320;;21)echo 290;;22)echo 260;;23)echo 236;;24)echo 211;;25)echo 200;;
+        26)echo 189;;27)echo 184;;28)echo 178;;29)echo 172;;30)echo 166;;31)echo 160;;
+        32)echo 153;;33)echo 142;;34)echo 130;;35)echo 119;;36)echo 108;;37)echo 98;;
+        38)echo 88;;39)echo 79;;40)echo 70;;
         *)(( crf<20 ))&&echo 360||echo 55;;
       esac ;;
     *) echo 330 ;;  # fallback: x265 CRF 18 equivalent
@@ -7288,7 +7480,25 @@ disk_free_warn() {
       est_video_bytes=$(( (vbr / 8) * dur ))
     else
       local -i ratio preset_mult
-      ratio="$(_crf_ratio "$VIDEO_CODEC" "$CRF_VALUE")"
+      # The AV1 profiles lower CRF for ≥4K/HDR sources via _apply_av1_resolution_crf, which runs
+      # LATER in the pipeline (it needs PROFILE_DESC). So CRF_VALUE here is still the profile's base
+      # (higher) CRF, which yields a SMALLER estimate — an under-warn on exactly the largest encodes.
+      # Predict the ≥4K adjustment for the estimate (4K is detectable from the source dimensions
+      # without PROFILE_DESC; a lower CRF = larger, safer reservation). The 1080p-SDR path keeps the
+      # base CRF, so this never over-warns there; a 1080p-HDR source's smaller adjustment is not
+      # predicted here (rare, and the estimate error is minor).
+      local _est_crf="$CRF_VALUE"
+      if (( ! _CLI_CRF_EXPLICIT )); then
+        local _pw _ph
+        _pw="$(_probe_field width)"; _ph="$(_probe_field height)"
+        if { [[ "$_pw" =~ ^[0-9]+$ ]] && (( _pw >= 3840 )); } || { [[ "$_ph" =~ ^[0-9]+$ ]] && (( _ph >= 2160 )); }; then
+          case "${PROFILE_NAME:-}" in
+            streaming-av1) _est_crf=28 ;;
+            av1-hq)        _est_crf="$AV1_HQ_HDR_CRF" ;;
+          esac
+        fi
+      fi
+      ratio="$(_crf_ratio "$VIDEO_CODEC" "$_est_crf")"
       case "$VIDEO_CODEC" in
         libsvt-av1|libaom-av1) preset_mult="$(_av1_preset_multiplier "$PRESET_VALUE")" ;;
         *)                     preset_mult="$(_preset_multiplier "$PRESET_VALUE")" ;;
@@ -7360,9 +7570,7 @@ disk_free_warn() {
   if (( ! VIDEO_COPY_IF_COMPLIANT )); then
     peak_factor=2
     if (( ! DISABLE_DV )); then
-      if _source_has_dv_metadata \
-         || [[ "$METADATA_CACHE" == *dovi* || "$METADATA_CACHE" == *dolby_vision* \
-               || "$METADATA_CACHE" == *dvhe* || "$METADATA_CACHE" == *dvh1* ]]; then
+      if _source_has_dv_metadata || _source_video_has_dv_codec_tag; then
         peak_factor=3
       fi
     fi
@@ -7986,11 +8194,15 @@ build_x265_params() {
   # here and each branch only appends what it needs. (Delimiter-anchored via _x265_strip_hdr_keys.)
   X265_PARAMS="$(_x265_strip_hdr_keys "$X265_PARAMS")"
 
+  # Guard each append with ${X265_PARAMS:+${X265_PARAMS}:} (as the pools= append below does): when
+  # the base is EMPTY — e.g. _x265_strip_hdr_keys reduced a sole `--x265-params hdr10=1` to "" — a
+  # bare "${X265_PARAMS}:hdr10=1" produces a LEADING colon, and x265 parses the first key as ":hdr10"
+  # (unknown option, warning only) so the HDR10/level signaling is silently dropped.
   if [[ "$PROFILE_DESC" == "HDR10" ]]; then
-    X265_PARAMS="${X265_PARAMS}:hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited"
+    X265_PARAMS="${X265_PARAMS:+${X265_PARAMS}:}hdr10=1:hdr10-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited"
   elif [[ "$PROFILE_DESC" == "HLG" ]]; then
     # HLG: inject the correct HLG color signaling.
-    X265_PARAMS="${X265_PARAMS}:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc"
+    X265_PARAMS="${X265_PARAMS:+${X265_PARAMS}:}colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc"
   fi
   # (SDR / SDR-TONEMAP and anything else: stripped, nothing appended.)
 
@@ -8228,12 +8440,13 @@ apply_level_vbv() {
     esac
   fi
   if [[ -n "$maxrate" ]]; then
-    X265_PARAMS="${X265_PARAMS}:level-idc=${lvl}:vbv-maxrate=${maxrate}:vbv-bufsize=${bufsize}"
+    X265_PARAMS="${X265_PARAMS:+${X265_PARAMS}:}level-idc=${lvl}:vbv-maxrate=${maxrate}:vbv-bufsize=${bufsize}"
     note "Applying VBV guardrails for level ${lvl} → maxrate=${maxrate}, bufsize=${bufsize}"
   else
     (( CONSERVATIVE_VBV )) && [[ -n "$lvl" ]] && \
       warn "No VBV guardrail table for level ${lvl}; buffer compliance NOT enforced."
-    [[ -n "$lvl" ]] && X265_PARAMS="${X265_PARAMS}:level-idc=${lvl}"
+    # ${X265_PARAMS:+…}: an empty base (sole stripped HDR key) must not yield a leading ":level-idc".
+    [[ -n "$lvl" ]] && X265_PARAMS="${X265_PARAMS:+${X265_PARAMS}:}level-idc=${lvl}"
   fi
 }
 
@@ -8292,6 +8505,21 @@ _source_has_dv_metadata() {
     select(.side_data_type == "DOVI configuration record")' >/dev/null 2>&1
 }
 
+# _source_video_has_dv_codec_tag — DV signal scoped to the VIDEO STREAM's own fields (the DV HEVC
+# codec tag dvhe/dvh1, or a "dolby"/"dovi" profile string), NOT the whole probe JSON. The disk
+# preflight previously substring-matched the entire METADATA_CACHE for dovi/dvhe/dvh1, so a non-DV
+# source whose FILENAME or a tag merely contained "dovi" (e.g. /media/dovi_samples/…, a `dovi`
+# release tag) spuriously bumped the DV peak factor 2→3, inflating the workdir reservation ~1.5×
+# and hard-failing the preflight on a volume that actually had room. Scoping to the video stream's
+# codec_tag_string/profile removes that false positive while still catching tag-only DV.
+_source_video_has_dv_codec_tag() {
+  [[ -n "${METADATA_CACHE:-}" ]] || return 1
+  _jq_cache -e '
+    [.streams[] | select(.codec_type=="video")] | .[0] |
+    (((.codec_tag_string // "") | ascii_downcase) | test("dvhe|dvh1"))
+    or (((.profile // "" | tostring) | ascii_downcase) | test("dvhe|dvh1|dolby|dovi"))' >/dev/null 2>&1
+}
+
 # _source_dv_profile — Echo the source's Dolby Vision profile number (e.g. "7",
 # "8") read directly from the DOVI configuration record in the metadata cache, or
 # nothing if the source carries no DV side data. Read-only: writes no globals and
@@ -8338,10 +8566,16 @@ detect_dv_info() {
     local probe_out
     probe_out="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>&1)" || return 1
 
-    DV_SRC_PROFILE="$(printf '%s\n' "$probe_out" | grep -oiE 'profile: [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
-    DV_SRC_COMPAT_ID="$(printf '%s\n' "$probe_out" | grep -oiE 'compatibility id: [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
-    DV_SRC_BL_PRESENT="$(printf '%s\n' "$probe_out" | grep -oiE 'bl.flag: [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
-    DV_SRC_EL_PRESENT="$(printf '%s\n' "$probe_out" | grep -oiE 'el.flag: [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+    # ffprobe's `-show_streams` text writer emits side-data as key=value lines
+    # (dv_profile=8, dv_bl_signal_compatibility_id=1, el_present_flag=0) — NOT the
+    # ffmpeg banner's "profile: N" colon format (which is suppressed at loglevel
+    # error anyway). Match the same key=value keys the JSON arm reads and the
+    # sibling parser in verify_dv_container_record uses, so this fallback actually
+    # populates when the JSON arm yields nothing.
+    DV_SRC_PROFILE="$(printf '%s\n' "$probe_out" | grep -oiE 'dv_profile=[0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+    DV_SRC_COMPAT_ID="$(printf '%s\n' "$probe_out" | grep -oiE 'dv_bl_signal_compatibility_id=[0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+    DV_SRC_BL_PRESENT="$(printf '%s\n' "$probe_out" | grep -oiE 'bl_present_flag=[0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+    DV_SRC_EL_PRESENT="$(printf '%s\n' "$probe_out" | grep -oiE 'el_present_flag=[0-9]+' | grep -oE '[0-9]+' | head -1)" || true
   fi
 
   # Seed the output-profile vars to the source values. This is correct for the
@@ -8375,9 +8609,11 @@ _validate_dv_rpu() {
     return 1
   }
 
-  # Extract profile from RPU info
+  # Extract profile from RPU info. dovi_tool 2.x `info --summary` prints "Profile: 8"
+  # (colon-separated); match that first, with the legacy space-separated form as a
+  # fallback for older dovi_tool builds.
   local rpu_profile
-  rpu_profile="$(printf '%s\n' "$rpu_info" | grep -oiE 'profile [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+  rpu_profile="$(printf '%s\n' "$rpu_info" | grep -oiE 'profile:?[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)" || true
   if [[ -n "$rpu_profile" ]]; then
     note "RPU validated: DV Profile $rpu_profile"
     report_add "dv_rpu_profile" "$rpu_profile"
@@ -8436,8 +8672,27 @@ _dv_mp4box_wrap(){
   # on 23.976/24/30 content). Skipped only when SRC_FPS is undeterminable.
   local -a fps_arg=()
   [[ -n "$SRC_FPS" ]] && fps_arg=(-fps "$SRC_FPS")
-  "$MP4BOX_CMD" ${fps_arg[@]+"${fps_arg[@]}"} -add "${_src}${dvp_hint}" \
-       -new "$_dest" >"$_log" 2>&1 &
+  # MP4Box parses ':' in an `-add` argument as its option separator (that's how the ':dvp='
+  # hint works) and '#' as a fragment selector — with no escaping applied to the path. A
+  # user-supplied --workdir containing ':' or '#' (legal on macOS/Linux) would therefore split
+  # the source path mid-way and the wrap would fail (degrading to the ffmpeg wrap → no dvcC box).
+  # Both callers keep _src and _dest inside the SAME dir (WORKDIR), so run MP4Box from within
+  # that dir on basenames — the -add/-new arguments then carry no directory component and can't
+  # contain the workdir's special chars. (Our own temp basenames never contain ':' or '#'.) The
+  # log path stays absolute, written from the parent shell's cwd. Fall back to the absolute-path
+  # form only in the unexpected case that the two paths don't share a directory.
+  local _src_dir _dest_dir _run_dir=""
+  _src_dir="$(dirname -- "$_src")"; _dest_dir="$(dirname -- "$_dest")"
+  [[ "$_src_dir" == "$_dest_dir" ]] && _run_dir="$_src_dir"
+  if [[ -n "$_run_dir" ]]; then
+    local _src_base _dest_base
+    _src_base="$(basename -- "$_src")"; _dest_base="$(basename -- "$_dest")"
+    ( cd "$_run_dir" && "$MP4BOX_CMD" ${fps_arg[@]+"${fps_arg[@]}"} \
+         -add "${_src_base}${dvp_hint}" -new "$_dest_base" ) >"$_log" 2>&1 &
+  else
+    "$MP4BOX_CMD" ${fps_arg[@]+"${fps_arg[@]}"} -add "${_src}${dvp_hint}" \
+         -new "$_dest" >"$_log" 2>&1 &
+  fi
   local _pid=$!
   local _rc=0; _await_tracked_pid "$_pid" "$_label" || _rc=$?
   return "$_rc"
@@ -8535,13 +8790,15 @@ verify_dv_container_record() {
       remux_cmd+=(-map 0:v:0)          # Video from mp4box mux
       remux_cmd+=(-map 1:a? -map 1:s?) # Audio + subs from original mux
       remux_cmd+=(-c copy)
-      # Verified non-issue: no -map_metadata/-map_chapters override is needed here even
-      # under --strip-metadata / --no-keep-chapters. Input 0 ($dv_video_mp4) is a *raw HEVC ES*
-      # wrapped by mp4box, so it carries no source-origin global metadata and no chapters (only
-      # mp4box's own major_brand/encoder/creation_time tags, the GPAC analogue of ffmpeg's
-      # muxer tags on the normal path). Input 1 ($TMP_OUT) was already produced by mux_final in
-      # the post-strip state, so ffmpeg's default chapter copy reflects the flag too. The earlier
-      # audit suspected an input-0 leak; ffprobe of a real wrapped ES confirmed none.
+      # Global metadata + chapters must come from input 1 ($TMP_OUT), NOT ffmpeg's default
+      # (input 0). Input 0 ($dv_video_mp4) is a raw HEVC ES wrapped by mp4box — it carries no
+      # source-origin global tags AND none of muxm's own tags (notably the -metadata comment=
+      # PROFILE_COMMENT that mux_final stamps onto TMP_OUT). With the default map_metadata=0 the
+      # output would silently lose that comment (and, under keep-metadata, the source title) on
+      # this fallback path, diverging from the normal path. $TMP_OUT was already produced in the
+      # correct post-strip / post-keep state by mux_final, so mapping metadata + chapters from it
+      # is right in both --strip-metadata and --keep-chapters directions.
+      remux_cmd+=(-map_metadata 1 -map_chapters 1)
       remux_cmd+=(-strict unofficial -tag:v dvh1)
       remux_cmd+=(-movflags +faststart)
       remux_cmd+=(-f "$MUX_FORMAT" "$dv_final")
@@ -8860,6 +9117,11 @@ _emit_sub_tracks() {
     if [[ "$MUX_FORMAT" == "matroska" ]]; then
       case "$c" in
         ass|ssa) if (( SUB_PRESERVE_TEXT_FORMAT )); then oc="copy"; else oc="srt"; fi ;;
+        # mov_text (MP4/MOV-native timed text) has no Matroska mapping — the matroska muxer
+        # rejects `-c:s copy` of it ("Subtitle codec mov_text is not supported"), which would
+        # abort the whole final mux (die 41) AFTER the full encode. Transcode it to srt, the
+        # Matroska-native text codec (subrip), instead of copying.
+        mov_text|tx3g) oc="srt" ;;
         *)       oc="copy" ;;
       esac
     else
@@ -9357,9 +9619,15 @@ _dv_verify_frame_count() {
   v_frames="$(_count_video_frames "$V_MIXED")"
   # RPU frame count from dovi_tool info (if available)
   if (( _HAS_DOVI_TOOL )); then
+    # dovi_tool 2.x `info --summary` reports the RPU frame count as "  Frames: 10".
+    # Match that first; fall back to the legacy "N RPU" / "Parsed N" phrasings from
+    # older builds so the desync guard stays functional across dovi_tool versions.
     rpu_frames="$(dovi_tool info -i "$RPU_FINAL" --summary 2>/dev/null \
-                  | grep -oiE '[0-9]+ RPU' | grep -oE '[0-9]+' | head -1)" || true
-    # Fallback: try parsing "Parsed X RPU" format
+                  | grep -oiE 'frames:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+    if [[ -z "$rpu_frames" ]]; then
+      rpu_frames="$(dovi_tool info -i "$RPU_FINAL" --summary 2>/dev/null \
+                    | grep -oiE '[0-9]+ RPU' | grep -oE '[0-9]+' | head -1)" || true
+    fi
     if [[ -z "$rpu_frames" ]]; then
       rpu_frames="$(dovi_tool info -i "$RPU_FINAL" --summary 2>/dev/null \
                     | grep -oiE 'parsed [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
@@ -9557,6 +9825,15 @@ run_video_pipeline() {
     libsvtav1|libaom-av1)
       # AV1 encode (SVT-AV1 or libaom-av1)
       local av1_preset="${PRESET_VALUE:-6}"
+      # The global default PRESET_VALUE is an x264/x265 preset NAME ("slower"). When AV1 is selected
+      # via --video-codec (no AV1 profile, no explicit numeric --preset), that leftover name would
+      # reach SVT-AV1/libaom's numeric -preset/-cpu-used and fail. Coerce any non-integer preset to
+      # the AV1 default (6). An explicitly-set incompatible --preset is caught earlier (die 11,
+      # Section 15); this only rescues the default/config leak so the encode doesn't fail late.
+      if [[ ! "$av1_preset" =~ ^-?[0-9]+$ ]]; then
+        note "AV1 needs a numeric preset — using the AV1 default 6 (the '${av1_preset}' preset is an x264/x265 name). Pass a numeric --preset to override."
+        av1_preset=6
+      fi
       log "→ Encoding video (AV1, ${TARGET_PIXFMT}, preset ${av1_preset}, CRF ${CRF_VALUE}) → $V_BASE"
       encode_args=(
         -c:v "$VIDEO_ENCODER_FFMPEG"
@@ -9787,8 +10064,17 @@ run_video_pipeline() {
   # dovi_tool convert now operates on HEVC elementary streams (not standalone
   # RPU files). The -d flag discards the enhancement layer, producing a valid
   # single-layer Profile 8 output from the dual-layer P7/P5 input.
+  #
+  # CRITICAL: the conversion mode is a GLOBAL dovi_tool option (`-m`), placed
+  # BEFORE the `convert` subcommand — NOT a `convert` flag. Without it, dovi_tool
+  # rewrites the RPU *untouched* (mode 0 semantics) and `-d` only strips the EL
+  # NALUs, so a P7/P5 RPU would pass through unconverted while we go on to stamp
+  # the container as P8.1 — a silent profile mis-signal that strict DV players
+  # (the Apple targets) reject. Mode 2 = P7→P8.1, Mode 3 = P5→P8.1.
   if (( dv_needs_convert )); then
-    dovi_tool convert -i "$V_INJECTED" -o "$V_MIXED" -d >"$WORKDIR/rpu_convert.log" 2>&1 &
+    local _dv_conv_mode=2                       # P7 → P8.1 (removes mapping)
+    [[ "${DV_SRC_PROFILE:-}" == "5" ]] && _dv_conv_mode=3   # P5 (IPT) → P8.1
+    dovi_tool -m "$_dv_conv_mode" convert -i "$V_INJECTED" -o "$V_MIXED" -d >"$WORKDIR/rpu_convert.log" 2>&1 &
     local conv_pid=$!
     local _conv_rc=0; _await_tracked_pid "$conv_pid" "Converting DV RPU (P${DV_SRC_PROFILE} → P8.1)" || _conv_rc=$?
     if (( _conv_rc == 0 )) && [[ -s "$V_MIXED" ]]; then
@@ -10088,6 +10374,12 @@ _audio_codec_rank(){
     done
     _AUDIO_CODEC_RANK_PREF="$AUDIO_CODEC_PREFERENCE"
   fi
+  # KNOWN LIMITATION (accepted for now): a codec not named in the preference list falls back to a
+  # fixed rank 10, so the trailing `other` entry present in every built-in list does NOT actually
+  # position unlisted codecs (opus, mp3, pcm_*) — it only ranks a codec literally named "other".
+  # Making `other` a functional catch-all changes audio-track *selection* scoring, which is out of
+  # scope for a patch release (it has precise regression coverage keyed on the rank-10 fallback);
+  # deferred rather than changed here.
   echo "${_AUDIO_CODEC_RANK_CACHE[$codec]:-10}"
 }
 
@@ -10566,7 +10858,13 @@ audio_transcode_target(){
   local ch="$1"
   if (( ch >= 8 )); then
     echo "eac3 $EAC3_BITRATE_7_1"
-  elif (( ch >= 6 )); then
+  elif (( ch >= 3 )); then
+    # 3–7 channels are SURROUND → E-AC-3, not stereo AAC. Previously only ch>=6 took the surround
+    # tier and 3/4/5-channel sources fell into the stereo branch below, so a 5.0 DTS/FLAC track was
+    # AAC-encoded at STEREO_BITRATE (192k spread over 5 channels, ~38k/ch) — a severe under-bitrate
+    # and a hard quality cliff versus the same film in 5.1. E-AC-3's native encoder tops out at 6ch,
+    # so a 7-channel source is clamped to 6 by _codec_max_channels at the call site (5.1 bitrate is
+    # the right tier for 3.0/4.0/5.0/5.1 alike).
     echo "eac3 $EAC3_BITRATE_5_1"
   else
     # The ≤2ch (stereo/mono) aac transcode honors --stereo-bitrate (STEREO_BITRATE),
@@ -11277,6 +11575,12 @@ _pick_direct_text_sub_relidx(){
   for (( k=0; k<${#ALL_SUB_SOURCES[@]}; k++ )); do
     src="${ALL_SUB_SOURCES[$k]}"
     [[ "$src" == embedded:* ]] || continue
+    # NOTE (accepted design, H2 guard): this last-resort fallback deliberately does NOT re-apply
+    # the per-type SUB_INCLUDE_* filters. It exists to avoid shipping ZERO subtitles when the
+    # source has a usable text track — so even a track whose type was excluded (e.g. --no-sub-sdh
+    # on an SDH-only source) is direct-mapped here rather than dropped. See the
+    # subs-universal-no-reembed positive test, which locks this behavior. It is intentional, not a
+    # bug (a type-strict picker was tried and reverted for over-restricting the H2 fallback).
     lang="${ALL_SUB_LANGS[$k]}"
     # RV3-07: gate the language filter on `-n SUB_LANG_PREF`, matching every sibling call site
     # (the main selection loop, _build_subtitle_keep_list). An empty SUB_LANG_PREF is documented as
@@ -11386,7 +11690,7 @@ _prepare_subtitle(){
   local _preserve_pgs=0
   if [[ "$codec" == "hdmv_pgs_subtitle" || "$codec" == "pgs" ]]; then
     sup="$WORKDIR/sub.${idx}.sup"
-    if (( SUB_PRESERVE_BITMAP )) && _container_supports_bitmap_subs && (( ! SUB_BURN_FORCED )); then
+    if (( SUB_PRESERVE_BITMAP )) && _container_supports_bitmap_subs && (( ! _SUB_PREP_FORCE_TEXT )); then
       _preserve_pgs=1
     fi
   fi
@@ -11618,8 +11922,11 @@ _prepare_ext_subtitle(){
       ;;
 
     sup)
-      # PGS bitmap: preserve via stream-copy if container supports it, else OCR to SRT
-      if (( SUB_PRESERVE_BITMAP )) && _container_supports_bitmap_subs && (( ! SUB_BURN_FORCED )); then
+      # PGS bitmap: preserve via stream-copy if container supports it, else OCR to SRT.
+      # Gate on the per-track _SUB_PREP_FORCE_TEXT (set only for the forced burn target), NOT the
+      # global SUB_BURN_FORCED — otherwise a non-burned external PGS full/SDH track loses bitmap
+      # preservation whenever any forced sub is being burned.
+      if (( SUB_PRESERVE_BITMAP )) && _container_supports_bitmap_subs && (( ! _SUB_PREP_FORCE_TEXT )); then
         if (( DRY_RUN )); then
           note "[Subs] DRY-RUN: would use external PGS $basename_label as bitmap (.sup stream-copy)"
         fi
@@ -11664,6 +11971,14 @@ SRT_FORCED=""
 SRT_FULL=""
 SRT_SDH=""
 SRT_FORCED_BURN_PATH=""           # Set when SUB_BURN_FORCED=1; used by video pipeline
+# _SUB_PREP_FORCE_TEXT — set to 1 by build_subtitle_plan ONLY around preparation of the specific
+# forced track that is being routed to burn-in (SUB_BURN_FORCED). It tells _prepare_subtitle /
+# _prepare_ext_subtitle to yield TEXT (OCR a PGS source) rather than stream-copy the bitmap, since
+# the burn filter needs a text .srt. It must NOT be keyed on the global SUB_BURN_FORCED: doing so
+# disabled bitmap preservation for the *full/SDH* PGS tracks too (they are not burned), so on an
+# MKV output with a burn-forced profile a full PGS track was OCR'd (or, with OCR off, dropped —
+# a zero-subtitle output when its text sidecar had also been deduped as a "duplicate").
+declare -i _SUB_PREP_FORCE_TEXT=0
 declare -a EXTERNAL_SRT_PATHS=()  # Paths of external SRT files exported alongside output
 # DIRECT_SUB_RELIDX — relative index of a text subtitle the single-track fallback
 # direct-maps from source (there is no separate SRT_DIRECT_MAP signal
@@ -11741,6 +12056,7 @@ _norm_lang_code(){
     no) echo "nor" ;; tr) echo "tur" ;; cs) echo "ces" ;; hu) echo "hun" ;;
     ro) echo "ron" ;; el) echo "ell" ;; he) echo "heb" ;; vi) echo "vie" ;;
     th) echo "tha" ;; id) echo "ind" ;; uk) echo "ukr" ;; sk) echo "slk" ;;
+    hi) echo "hin" ;;
     # ISO 639-2/B (bibliographic) → 639-2/T (terminological), so a `fre`-tagged stream
     # matches an `fra` preference. Only the /B variants of languages already mapped above.
     fre) echo "fra" ;; ger) echo "deu" ;; dut) echo "nld" ;; gre) echo "ell" ;;
@@ -11765,14 +12081,18 @@ _norm_lang_code(){
 #   movie.en.srt          → lang=en,  type=full
 #   movie.forced.en.srt   → lang=en,  type=forced
 #   movie.en.sdh.srt      → lang=en,  type=sdh
-#   movie.hi.srt          → lang=hi,  type=full   (Hindi, not SDH)
+#   movie.hi.srt          → lang=hin, type=full   (Hindi, normalized, not SDH)
 #   movie.eng.hi.srt      → lang=eng, type=sdh    (language already set → hi = SDH marker)
 #
 # Args:    $1 — source file stem (basename without extension, may contain dots)
 #          $2 — subtitle filename (basename with extension)
+#          $3 — (optional) source container extension, lowercased (e.g. "mkv"). When the first
+#               qualifier segment equals it, it is a `<full-source-filename>.srt`-style sidecar
+#               (tools that append `.srt` to the whole name) — that segment is the container
+#               extension, NOT a language code, so it is ignored instead of parsed as lang="mkv".
 # Stdout:  lang TAB type
 _parse_ext_sub_filename(){
-  local stem="$1" fname="$2"
+  local stem="$1" fname="$2" src_ext="${3:-}"
   # Strip the last extension to get the bare name (e.g. "movie.forced.en.srt" → "movie.forced.en")
   local bare="${fname%.*}"
   # Remove the source stem prefix, then strip any leading dot
@@ -11795,13 +12115,18 @@ _parse_ext_sub_filename(){
       forced|signs|foreign) stype="forced" ;;
       sdh|hearing|cc)       stype="sdh"    ;;
       *)
+        # A leading segment equal to the source container extension is a
+        # `<full-source-filename>.srt` sidecar (e.g. `movie.mkv.srt`) — the "mkv" is the container
+        # extension the tool left in, not a language. Ignore it so it isn't parsed as lang="mkv".
+        if [[ -z "$lang" && -n "$src_ext" && "$seg" == "$src_ext" ]]; then
+          :  # container-extension carryover, not a language
         # Accept the first 2-3 letter purely alphabetic segment as language code.
         # Normalize 2-letter ISO 639-1 codes to 3-letter ISO 639-2/T codes.
         # `hi` is ambiguous — both the SDH (hearing-impaired) keyword AND ISO-639-1 for
         # Hindi. Classify as LANGUAGE first when it fills the still-empty language slot
         # (`movie.hi.srt` → lang=hi/full); only treat it as the SDH marker once a language is
         # already set (`movie.eng.hi.srt` → sdh). Explicit `sdh`/`hearing`/`cc` is unaffected (above).
-        if [[ -z "$lang" ]] && [[ "$seg" =~ ^[a-z]{2,3}$ ]]; then
+        elif [[ -z "$lang" ]] && [[ "$seg" =~ ^[a-z]{2,3}$ ]]; then
           lang="$(_norm_lang_code "$seg")"
         elif [[ "$seg" == "hi" ]]; then
           stype="sdh"
@@ -11847,8 +12172,9 @@ discover_external_subtitles(){
     return 0
   fi
 
-  local src_stem
+  local src_stem src_ext
   src_stem="$(basename -- "${SRC_ABS%.*}")"
+  src_ext="${SRC_ABS##*.}"; src_ext="${src_ext,,}"   # container ext, for the sidecar carryover guard
 
   # src_stem is interpolated into a `find -name` glob below, so any glob metacharacter in the
   # source name (`* ? [`) is matched as a wildcard, not literally — extremely common in anime naming
@@ -11900,7 +12226,7 @@ discover_external_subtitles(){
       fi
 
       fname="$(basename -- "$fpath")"
-      parsed="$(_parse_ext_sub_filename "$src_stem" "$fname")"
+      parsed="$(_parse_ext_sub_filename "$src_stem" "$fname" "$src_ext")"
       _split_tab "$parsed" lang stype  # Non-collapsing split (producer always emits both fields, but keep the pattern uniform)
       codec="$(_ext_sub_codec_from_ext "$ext")"
 
@@ -12461,7 +12787,13 @@ build_subtitle_plan(){
   # ("no subtitle tracks") config still let a forced subtitle through. pick_count is 0 here, so
   # the guard suppresses the forced sub exactly when SUB_MAX_TRACKS=0.
   if [[ -n "$forced_uidx" && $pick_count -lt $SUB_MAX_TRACKS ]]; then
+    # When the forced track is being burned, it must come out as TEXT (the burn filter needs an
+    # .srt) — signal that to the prepare helpers for THIS track only, so a PGS forced source is
+    # OCR'd rather than bitmap-preserved. Full/SDH tracks (prepared below) keep the flag at 0 and
+    # retain bitmap preservation. Reset immediately after so it never leaks to later tracks.
+    (( SUB_BURN_FORCED )) && _SUB_PREP_FORCE_TEXT=1
     sub_path="$(_prepare_sub_from_source "${ALL_SUB_SOURCES[$forced_uidx]}")"
+    _SUB_PREP_FORCE_TEXT=0
     if [[ -z "$sub_path" ]]; then
       : # preparation failed; skip silently
     elif (( SUB_BURN_FORCED )); then
@@ -12888,7 +13220,12 @@ _check_multitrack_container_safety() {
   # ---- Subtitles: every kept track is stream-copied; MP4/MOV can't carry bitmap subs and
   # flattens styled ASS/SSA.  Keep-filter mirrors Filters 1-2 of _build_subtitle_keep_list
   # (language + type); the container drop (Filter 3) becomes this hard-stop instead.
-  if (( SUB_MULTI_TRACK )) && (( ! SKIP_SUBS )); then
+  # Skip entirely when SUB_BURN_FORCED is set: build_subtitle_plan DEMOTES subtitle multi-track to
+  # single-track then (the forced sub is OCR'd/burned and bitmap subs are OCR'd-or-dropped, never
+  # stream-copied), so a bitmap sub does NOT reach the MP4/MOV mux — the multi-track hard-stop
+  # would be a spurious "use MKV" refusal of a run the demoted pipeline handles fine. (Audio
+  # multi-track is unaffected by SUB_BURN_FORCED, so its check above still runs.)
+  if (( SUB_MULTI_TRACK )) && (( ! SKIP_SUBS )) && (( ! SUB_BURN_FORCED )); then
     local _si _scodec _slang _stype
     for (( _si=0; _si<${#ALL_SUB_CODECS[@]}; _si++ )); do
       _scodec="${ALL_SUB_CODECS[$_si],,}"
