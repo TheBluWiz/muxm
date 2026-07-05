@@ -10201,6 +10201,7 @@ _test_unit_rv3_release_fixes() {
 
   # (3) The P7/P5→P8.1 convert must pass a GLOBAL -m mode flag BEFORE `convert` (without it the RPU
   #     passes through unconverted while the container is stamped 8.1).
+  # shellcheck disable=SC2016  # literal pattern grepped in the muxm source; $_dv_conv_mode must NOT expand
   if grep -qE 'dovi_tool -m "\$_dv_conv_mode" convert' "$MUXM"; then pass "rv3: DV convert passes -m mode before the subcommand"; else fail "rv3: DV convert is missing the -m mode flag (P7/P5→P8.1 would be a no-op)"; fi
 
   # (4) detect_dv_info's TEXT fallback must parse ffprobe key=value (dv_profile=N etc.), not the
@@ -10229,6 +10230,7 @@ _test_unit_rv3_release_fixes() {
   #     the GNU-`-f` garbage with the `-c` result → failed the ^[0-7]+$ check → treated as trusted.
   local tgbody; tgbody="$(_extract_muxm_fns _muxm_tier_is_trusted)" || { fail "rv3: could not extract _muxm_tier_is_trusted"; return; }
   local tf; tf="$(mktemp)"; chmod 666 "$tf"
+  # shellcheck disable=SC2016  # literal function body eval'd inside a later bash -c; $1/$3 must NOT expand now
   local gnu_stat='stat(){ if [[ "$1" == "-f" ]]; then printf "  File: x\n    ID: y Namelen: 255\nBlocks: 1\n"; return 1; else command stat -c "%a" "$3" 2>/dev/null || command gstat -c "%a" "$3"; fi; }'
   local rc_ww
   rc_ww="$(bash -c "set -u; warn(){ :; }; $gnu_stat"$'\n'"$tgbody"$'\n'"_muxm_tier_is_trusted \"$tf\"; echo \$?" 2>/dev/null | tail -1)"
@@ -10242,6 +10244,7 @@ _test_unit_rv3_release_fixes() {
   # (8) x265 HDR/level appends must not produce a leading colon when the base params are empty
   #     (a sole `--x265-params hdr10=1` strips to "" → ":hdr10" would be an unknown x265 key).
   local bx; bx="$(awk '/^build_x265_params\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  # shellcheck disable=SC2016  # literal substring matched against the extracted source; must NOT expand
   if [[ "$bx" == *'${X265_PARAMS:+${X265_PARAMS}:}hdr10=1'* ]]; then pass "rv3: x265 HDR10 append guards against a leading colon on empty params"; else fail "rv3: x265 HDR10 append can emit a leading colon (drops hdr10 signaling)"; fi
 
   # (9) _check_multitrack_container_safety must skip its SUBTITLE hard-stop when SUB_BURN_FORCED is
