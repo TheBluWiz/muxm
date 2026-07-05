@@ -4755,6 +4755,42 @@ test_video() {
     skip "A1: 4K/1080p fixtures or libsvtav1 unavailable"
   fi
   rm -f "$_a1_4k" "$_a1_1080" "$_a1_1080hdr"
+
+  _test_video_detect_dv_uses_cache
+}
+
+# RV3-15: detect_dv's stream-level check now reads the already-populated METADATA_CACHE instead of a
+# fresh `ffprobe -show_streams`. Prove it via a probe-count assertion (extract detect_dv + _jq_cache,
+# stub ffprobe to count fresh probes, seed a crafted cache):
+#   - a DV cache (dvh1 codec tag) → detected with ZERO fresh ffprobe calls (stream check hits cache);
+#   - a non-DV cache → exactly ONE fresh ffprobe (the frame probe only — frame side data isn't cached).
+_test_video_detect_dv_uses_cache() {
+  local body cnt
+  body="$(_extract_muxm_fns detect_dv _jq_cache)" || { fail "video-detect-dv-cache: could not extract detect_dv + _jq_cache"; return; }
+  cnt="$(mktemp)"
+  local env_setup
+  # shellcheck disable=SC2016  # $1/$? must expand in the CHILD bash; $cnt expands HERE (literal path).
+  env_setup="DISABLE_DV=0; FFPROBE_FLAGS=(); SRC_ABS=/dev/null; METADATA_CACHE=\"\$1\"; warn(){ :; }; ffprobe(){ printf x >> \"$cnt\"; }"
+  _run_detect(){   # $1 = METADATA_CACHE JSON → echoes "rc=<rc> probes=<n>"
+    : > "$cnt"
+    local _rc_line
+    _rc_line="$(bash -c "$env_setup"$'\n'"$body"$'\n''detect_dv; echo "rc=$?"' -- "$1" 2>/dev/null)"
+    printf '%s probes=%s' "$_rc_line" "$(wc -c < "$cnt" | tr -d ' ')"
+  }
+  local dv_out nodv_out
+  dv_out="$(_run_detect '{"streams":[{"codec_type":"video","codec_tag_string":"dvh1"}]}')"
+  nodv_out="$(_run_detect '{"streams":[{"codec_type":"video","codec_tag_string":"hvc1"}]}')"
+  if [[ "$dv_out" == "rc=0 probes=0" ]]; then
+    pass "video-detect-dv-cache: a DV source is detected from METADATA_CACHE with NO fresh ffprobe (stream check reads the cache)"
+  else
+    fail "video-detect-dv-cache: expected 'rc=0 probes=0' for a DV cache, got '$dv_out'"
+  fi
+  if [[ "$nodv_out" == "rc=1 probes=1" ]]; then
+    pass "video-detect-dv-cache: a non-DV source runs exactly ONE fresh ffprobe (the frame probe only; the stream check still used the cache)"
+  else
+    fail "video-detect-dv-cache: expected 'rc=1 probes=1' for a non-DV cache, got '$nodv_out'"
+  fi
+  rm -f "$cnt"
 }
 
 # === Suite: HDR Pipeline ===
@@ -5438,6 +5474,43 @@ EOF
   _test_audio_empty_langpref_no_crash
   _test_audio_native_stereo_en_eng_copy
   _test_audio_commentary_title
+  _test_audio_accessors_use_cache
+}
+
+# RV3-15: _audio_codec/_audio_channels now read the memoized _AUDIO_STREAM_INFO_CACHE (via
+# _audio_stream_info) instead of a fresh per-call jq fork. Prove it by stubbing jq to count forks:
+#   - with the cache seeded → correct codec/channels and ZERO jq forks (the memoized path);
+#   - control: with the cache EMPTY (but METADATA_CACHE present) → the fallback still forks jq,
+#     confirming the 0-fork result above is the cache doing the work, not a no-op stub.
+_test_audio_accessors_use_cache() {
+  local body cnt
+  body="$(_extract_muxm_fns _audio_codec _audio_channels _audio_stream_info _audio_stream_info_uncached _jq_cache _split_tab)" \
+    || { fail "audio-accessors-cache: could not extract the accessor + cache functions"; return; }
+  cnt="$(mktemp)"
+  local rec; rec=$'eac3\t6\teng\t448000\tSurround\t0\t0\t0'
+
+  # (a) Cache HIT: seed _AUDIO_STREAM_INFO_CACHE[0]; accessors must read it with no jq fork.
+  : > "$cnt"
+  local hit_out
+  hit_out="$(bash -c "declare -gA _AUDIO_STREAM_INFO_CACHE=(); _AUDIO_STREAM_INFO_CACHE[0]=\"\$1\"; jq(){ printf x >> \"$cnt\"; }"$'\n'"$body"$'\n''printf "codec=%s ch=%s" "$(_audio_codec 0)" "$(_audio_channels 0)"' -- "$rec" 2>/dev/null)"
+  local hit_jq; hit_jq="$(wc -c < "$cnt" | tr -d ' ')"
+  if [[ "$hit_out" == "codec=eac3 ch=6" && "$hit_jq" -eq 0 ]]; then
+    pass "audio-accessors-cache: _audio_codec/_audio_channels read the prefetched cache (codec=eac3 ch=6, 0 jq forks)"
+  else
+    fail "audio-accessors-cache: expected 'codec=eac3 ch=6' with 0 jq forks, got '$hit_out' with $hit_jq jq forks"
+  fi
+
+  # (b) Control — cache EMPTY: the fallback path forks jq (proves the 0-fork result is the cache).
+  : > "$cnt"
+  local miss_json='{"streams":[{"codec_type":"audio","codec_name":"aac","channels":2}]}'
+  bash -c "declare -gA _AUDIO_STREAM_INFO_CACHE=(); METADATA_CACHE=\"\$1\"; jq(){ printf x >> \"$cnt\"; command jq \"\$@\"; }"$'\n'"$body"$'\n''_audio_codec 0 >/dev/null' -- "$miss_json" 2>/dev/null || true
+  local miss_jq; miss_jq="$(wc -c < "$cnt" | tr -d ' ')"
+  if [[ "$miss_jq" -ge 1 ]]; then
+    pass "audio-accessors-cache: control — with an empty cache the accessor falls back to a jq fork ($miss_jq), so the hit path's 0 forks is the memoization at work"
+  else
+    fail "audio-accessors-cache: control expected ≥1 jq fork on the empty-cache fallback, got $miss_jq"
+  fi
+  rm -f "$cnt"
 }
 
 # CR-6: `_audio_lang_matches` is the one of four call sites NOT gated on `[[ -n "$AUDIO_LANG_PREF" ]]`
@@ -7078,6 +7151,36 @@ SRT
   _test_subs_forced_copy_gate
   _test_sii_single_track_subs_ideality
   _test_subs_rv3_07
+  _test_subs_direct_map_reads_cache
+}
+
+# RV3-15: the direct-map subtitle fallback reads the already-collected ALL_SUB_* arrays instead of
+# re-forking jq via _sp_sub_lang/_sp_sub_field/list_sub_indices. There's no per-call fork to count
+# for a data-array read, so assert it structurally: the picker reads ALL_SUB_* and no longer probes,
+# and the caller's track-add reads ALL_SUB_{LANGS,CODECS}[relidx] for the picked index.
+_test_subs_direct_map_reads_cache() {
+  local pk pk_code
+  pk="$(awk '/^_pick_direct_text_sub_relidx\(\)/,/^\}/' "$MUXM")"
+  # Strip comment lines: the doc comment legitimately NAMES the old probe helpers to explain what it
+  # replaced, so the "no re-probe" grep must look at code only.
+  pk_code="$(grep -vE '^[[:space:]]*#' <<<"$pk")"
+  if [[ -z "$pk" ]]; then
+    fail "subs-direct-map-cache: could not extract _pick_direct_text_sub_relidx (renamed/reformatted?)"
+  elif grep -qF 'ALL_SUB_SOURCES' <<<"$pk_code" && grep -qF 'ALL_SUB_LANGS' <<<"$pk_code" && grep -qF 'ALL_SUB_CODECS' <<<"$pk_code" \
+       && ! grep -qE '_sp_sub_lang|_sp_sub_field|list_sub_indices' <<<"$pk_code"; then
+    pass "subs-direct-map-cache: _pick_direct_text_sub_relidx reads the ALL_SUB_* arrays and no longer re-probes via _sp_sub_*/list_sub_indices"
+  else
+    fail "subs-direct-map-cache: _pick_direct_text_sub_relidx still re-probes or lost its ALL_SUB_* reads"
+  fi
+
+  local plan
+  plan="$(awk '/^build_subtitle_plan\(\)/,/^\}/' "$MUXM")"
+  # shellcheck disable=SC2016  # literal grep -F of the array reads ($DIRECT_SUB_RELIDX must stay unexpanded).
+  if grep -qF 'ALL_SUB_LANGS[$DIRECT_SUB_RELIDX]' <<<"$plan" && grep -qF 'ALL_SUB_CODECS[$DIRECT_SUB_RELIDX]' <<<"$plan"; then
+    pass "subs-direct-map-cache: the direct-map track-add reads ALL_SUB_LANGS/CODECS[relidx] for the picked index instead of re-probing"
+  else
+    fail "subs-direct-map-cache: the direct-map track-add no longer reads ALL_SUB_*[\$DIRECT_SUB_RELIDX]"
+  fi
 }
 
 # RV3-07: subtitle codec deliverability & dry-run fidelity + the two Section-28 mediums.
@@ -7112,10 +7215,10 @@ _prepare_subtitle 0" 2>/dev/null)"
   local pk_body
   pk_body="$(_extract_muxm_fns _pick_direct_text_sub_relidx _is_text_sub_codec)" || { fail "rv3-07: could not extract _pick_direct_text_sub_relidx"; return; }
   _pick(){   # $1=SUB_LANG_PREF → picked relidx (empty if none). Boundary: one fra text sub.
+    # RV3-15: _pick_direct_text_sub_relidx now reads the ALL_SUB_* arrays (populated upstream by
+    # merge_subtitle_sources) instead of re-probing via list_sub_indices/_sp_sub_lang/_sp_sub_field.
     bash -c "SUB_LANG_PREF='$1'
-list_sub_indices(){ echo 0; }
-_sp_sub_lang(){ echo fra; }
-_sp_sub_field(){ echo subrip; }
+ALL_SUB_SOURCES=(embedded:0); ALL_SUB_LANGS=(fra); ALL_SUB_CODECS=(subrip)
 _sub_lang_matches(){ [[ \"\$SUB_LANG_PREF\" == *fra* ]]; }
 $pk_body
 _pick_direct_text_sub_relidx" 2>/dev/null
@@ -10560,8 +10663,8 @@ _test_unit_build_subtitle_lists() {
   #     first SUB_LANG_PREF-matching TEXT subtitle (skipping bitmap + wrong-language streams).
   #   _build_subtitle_keep_list — multi-track keep list: language filter, type-inclusion flags,
   #     and the SUB_MAX_TRACKS cap.
-  # Mock the probe I/O boundary (list_sub_indices / _sp_sub_lang / _sp_sub_field for the picker;
-  # the ALL_SUB_* arrays for the keep list) and assert the returned indices.
+  # Mock the data boundary — the ALL_SUB_* arrays for BOTH the picker (RV3-15: it now reads
+  # ALL_SUB_LANGS/CODECS/SOURCES instead of re-probing) and the keep list — and assert the indices.
   local body_pdt body_bskl
   body_pdt="$(_extract_muxm_fns _pick_direct_text_sub_relidx _is_text_sub_codec _sub_lang_matches _norm_lang_code)" \
     || { fail "unit-build-subtitle-lists: could not extract _pick_direct_text_sub_relidx + _is_text_sub_codec"; return; }
@@ -10571,11 +10674,12 @@ _test_unit_build_subtitle_lists() {
   # $1=space-sep langs  $2=space-sep codecs (parallel)  [$3=SUB_LANG_PREF, default eng].
   # Emits the picked relidx (or empty).
   _pdt(){
+    # RV3-15: seed the ALL_SUB_* arrays (embedded entries in order → ALL_SUB_SOURCES[k]="embedded:k")
+    # that _pick_direct_text_sub_relidx now reads, instead of stubbing the old probe helpers.
     bash -c "SUB_LANG_PREF=\"\$3\"
 _LANGS=(\$1); _CODECS=(\$2)
-list_sub_indices(){ local k; for k in \"\${!_LANGS[@]}\"; do echo \"\$k\"; done; }
-_sp_sub_lang(){ echo \"\${_LANGS[\$1]}\"; }
-_sp_sub_field(){ echo \"\${_CODECS[\$1]}\"; }
+ALL_SUB_LANGS=(\"\${_LANGS[@]}\"); ALL_SUB_CODECS=(\"\${_CODECS[@]}\")
+ALL_SUB_SOURCES=(); for k in \"\${!_LANGS[@]}\"; do ALL_SUB_SOURCES+=(\"embedded:\$k\"); done
 $body_pdt
 _pick_direct_text_sub_relidx" -- "$1" "$2" "${3:-eng}"
   }

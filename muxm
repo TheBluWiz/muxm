@@ -8165,17 +8165,22 @@ apply_level_vbv() {
 detect_dv() {
   (( DISABLE_DV )) && return 2
 
-  local probe_output
-  probe_output="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>&1)" || {
-    warn "ffprobe failed during DV detection - assuming no DV present"
-    return 1
-  }
-
-  if printf '%s\n' "$probe_output" | grep -qiE 'dolby_vision|dv_profile|dovi|dvhe|dvh1|com\.dolby\.vision'; then
+  # RV3-15: the stream-level check reads the already-populated METADATA_CACHE instead of re-probing
+  # — cache_stream_metadata's `-show_streams` JSON carries the same codec tags and side data a fresh
+  # `ffprobe -show_streams -select_streams v:0` would (FFPROBE_FLAGS adds no -show_entries pruning),
+  # so grep the first video stream's JSON for the identical DV tokens (dvhe/dvh1 codec_tag, DOVI
+  # side data, dv_profile). detect_dv runs well after the cache is populated (and after the
+  # video-stream existence check), so the cache is always present and non-empty here.
+  local v_json
+  v_json="$(_jq_cache -c '[.streams[] | select(.codec_type=="video")][0] // empty' 2>/dev/null)" || v_json=""
+  if [[ -n "$v_json" ]] && printf '%s\n' "$v_json" | grep -qiE 'dolby_vision|dv_profile|dovi|dvhe|dvh1|com\.dolby\.vision'; then
     return 0
   fi
 
-  # Check first few frames for DV metadata
+  # Frame-level probe: the first few frames' side data catches sources whose container metadata is
+  # missing but RPU NALs are present. Frame side data is NOT in METADATA_CACHE (which holds only
+  # -show_format/-show_streams), so this genuinely needs a fresh ffprobe.
+  local probe_output
   probe_output="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_frames -read_intervals %+#5 -select_streams v:0 "$SRC_ABS" 2>&1)" || {
     warn "Frame analysis failed during DV detection - assuming no DV"
     return 1
@@ -9901,18 +9906,26 @@ _audio_tag(){ _probe_stream_field audio "$1" "tags.$2"; }
 
 # Return channel count for audio stream (0 if unavailable).
 # Args: $1 — audio stream index
+# RV3-15: read from the memoized _AUDIO_STREAM_INFO_CACHE (via _audio_stream_info) instead of a
+# fresh per-call `jq` fork — the cache record's channels field is `.channels // 0` (field 2), the
+# same value + default `_audio_field channels` produced. _split_tab's last var absorbs the tail.
 _audio_channels(){
-  local ch
-  ch="$(_audio_field "$1" channels)"
+  local _asi _c ch _rest
+  _asi="$(_audio_stream_info "$1")"
+  _split_tab "$_asi" _c ch _rest
   [[ -z "$ch" ]] && ch=0
   echo "$ch"
 }
 
 # Return codec_name for audio stream (lowercased, "unknown" if unavailable).
 # Args: $1 — audio stream index
+# RV3-15: read codec_name (field 1) from the memoized cache record (`.codec_name // "unknown"`),
+# lowercased — identical value + default the fresh `_audio_field codec_name` path produced.
 _audio_codec(){
-  local c
-  c="$(_audio_field "$1" codec_name)"; c="${c,,}"
+  local _asi c _rest
+  _asi="$(_audio_stream_info "$1")"
+  _split_tab "$_asi" c _rest
+  c="${c,,}"
   [[ -z "$c" ]] && c="unknown"
   echo "$c"
 }
@@ -11166,10 +11179,17 @@ _sub_candidate_undeliverable(){
 # Returns: relative subtitle index on stdout (empty string if none found).
 # Used as a fast path when no OCR or conversion is needed.
 _pick_direct_text_sub_relidx(){
-  local i lang codec
-  # shellcheck disable=SC2046  # Intentional word-splitting of integer list
-  for i in $(list_sub_indices); do
-    lang="$(_sp_sub_lang "$i")"
+  # RV3-15: read lang/codec from the already-collected ALL_SUB_* arrays (populated by
+  # merge_subtitle_sources, which runs before build_subtitle_plan) instead of re-forking jq per
+  # index via _sp_sub_lang/_sp_sub_field. The embedded streams are appended FIRST and in order, so
+  # ALL_SUB_SOURCES[k]=="embedded:<k>" for every embedded entry — the array index IS the source
+  # relative index. ALL_SUB_CODECS is already lowercased (via _normalize_codec_lang), matching the
+  # old `${codec,,}`. Only embedded entries carry a source-relative index; skip externals.
+  local k lang codec src
+  for (( k=0; k<${#ALL_SUB_SOURCES[@]}; k++ )); do
+    src="${ALL_SUB_SOURCES[$k]}"
+    [[ "$src" == embedded:* ]] || continue
+    lang="${ALL_SUB_LANGS[$k]}"
     # RV3-07: gate the language filter on `-n SUB_LANG_PREF`, matching every sibling call site
     # (the main selection loop, _build_subtitle_keep_list). An empty SUB_LANG_PREF is documented as
     # "keep all languages" — but _sub_lang_matches returns false for an empty pref, so without this
@@ -11177,9 +11197,9 @@ _pick_direct_text_sub_relidx(){
     if [[ -n "${SUB_LANG_PREF:-}" ]] && ! _sub_lang_matches "$lang"; then
       continue
     fi
-    codec="$(_sp_sub_field "$i" codec_name)"; codec="${codec,,}"
+    codec="${ALL_SUB_CODECS[$k]}"
     if _is_text_sub_codec "$codec"; then
-      echo "$i"
+      echo "${src#embedded:}"
       return 0
     fi
   done
@@ -12414,9 +12434,12 @@ build_subtitle_plan(){
     if [[ -n "$DIRECT_SUB_RELIDX" ]]; then
       # Unified: the direct-map text fallback folds into an embedded:N track — mapped
       # straight from the source by the emitter (the same mechanism PGS now uses).
+      # RV3-15: the picked relidx IS the embedded array index (ALL_SUB_SOURCES[k]=="embedded:k"),
+      # so read its lang/codec straight from the already-collected arrays instead of re-forking jq.
+      # ALL_SUB_CODECS is already lowercased (via _normalize_codec_lang), matching the old ${,,}.
       local _dm_lang _dm_codec
-      _dm_lang="$(_sp_sub_lang "$DIRECT_SUB_RELIDX")"
-      _dm_codec="$(_sp_sub_field "$DIRECT_SUB_RELIDX" codec_name)"; _dm_codec="${_dm_codec,,}"
+      _dm_lang="${ALL_SUB_LANGS[$DIRECT_SUB_RELIDX]}"
+      _dm_codec="${ALL_SUB_CODECS[$DIRECT_SUB_RELIDX]}"
       _sub_track_add embedded "$DIRECT_SUB_RELIDX" "$_dm_lang" "" full "$_dm_codec" 0 embed
       note "[Subs] No external SRTs prepared — enabling direct-map of TEXT subtitle stream #$DIRECT_SUB_RELIDX."
     else
