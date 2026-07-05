@@ -5447,23 +5447,31 @@ EOF
 # crash, so the genuine cross-host guard is STATIC (assert the guard line exists); a true-4.3 run via
 # $BASH_43 reproduces the crash, and an e2e smoke proves keep-all still encodes.
 _test_audio_empty_langpref_no_crash() {
-  # (1) Static drift guard (host-independent): both matchers must carry the empty-pref entry guard.
-  local a_body s_body
+  # (1) Static drift guard (host-independent). RV3-14: both matchers are now thin wrappers over the
+  # shared _lang_matches, which carries the single empty-pref entry guard (on its $2 argument). Assert
+  # (a) _lang_matches has the guard, and (b) each wrapper delegates to it with the right global — so
+  # the empty-pref protection can't silently vanish in the refactor.
+  local lm_body a_body s_body
+  lm_body="$(_extract_muxm_fns _lang_matches)"      || { fail "audio-empty-langpref-no-crash: could not extract _lang_matches"; return; }
   a_body="$(_extract_muxm_fns _audio_lang_matches)" || { fail "audio-empty-langpref-no-crash: could not extract _audio_lang_matches"; return; }
   s_body="$(_extract_muxm_fns _sub_lang_matches)"   || { fail "audio-empty-langpref-no-crash: could not extract _sub_lang_matches"; return; }
-  # shellcheck disable=SC2016  # single quotes are deliberate: grep -F matches the guard line as a
-  # LITERAL in the extracted muxm source ($AUDIO_LANG_PREF must stay unexpanded, not be substituted).
-  if printf '%s\n' "$a_body" | grep -qF '[[ -n "$AUDIO_LANG_PREF" ]] || return 1'; then
-    pass "audio-empty-langpref-no-crash: _audio_lang_matches has the empty-AUDIO_LANG_PREF entry guard"
+  # shellcheck disable=SC2016  # single quotes deliberate: grep -F matches the guard as a LITERAL
+  # ($2 must stay unexpanded, not be substituted).
+  if printf '%s\n' "$lm_body" | grep -qF '[[ -n "$2" ]] || return 1'; then
+    pass "audio-empty-langpref-no-crash: _lang_matches has the empty-pref entry guard"
   else
-    fail "audio-empty-langpref-no-crash: _audio_lang_matches is missing the [[ -n \"\$AUDIO_LANG_PREF\" ]] || return 1 entry guard"
+    fail "audio-empty-langpref-no-crash: _lang_matches is missing the [[ -n \"\$2\" ]] || return 1 entry guard"
   fi
-  # shellcheck disable=SC2016  # single quotes are deliberate: literal grep -F of the guard line
-  # in the extracted source ($SUB_LANG_PREF must stay unexpanded, not be substituted).
-  if printf '%s\n' "$s_body" | grep -qF '[[ -n "$SUB_LANG_PREF" ]] || return 1'; then
-    pass "audio-empty-langpref-no-crash: _sub_lang_matches has the empty-SUB_LANG_PREF entry guard (symmetry)"
+  # shellcheck disable=SC2016  # literal grep -F of the delegation lines (globals must stay unexpanded).
+  if printf '%s\n' "$a_body" | grep -qF '_lang_matches "$1" "$AUDIO_LANG_PREF"'; then
+    pass "audio-empty-langpref-no-crash: _audio_lang_matches delegates to _lang_matches with AUDIO_LANG_PREF"
   else
-    fail "audio-empty-langpref-no-crash: _sub_lang_matches is missing the [[ -n \"\$SUB_LANG_PREF\" ]] || return 1 entry guard"
+    fail "audio-empty-langpref-no-crash: _audio_lang_matches does not delegate to _lang_matches with AUDIO_LANG_PREF"
+  fi
+  if printf '%s\n' "$s_body" | grep -qF '_lang_matches "$1" "$SUB_LANG_PREF"'; then
+    pass "audio-empty-langpref-no-crash: _sub_lang_matches delegates to _lang_matches with SUB_LANG_PREF (symmetry)"
+  else
+    fail "audio-empty-langpref-no-crash: _sub_lang_matches does not delegate to _lang_matches with SUB_LANG_PREF"
   fi
 
   # (2) True bash-4.3 crash repro when available, else host smoke. The matcher + _norm_lang_code run
@@ -9047,7 +9055,9 @@ assert_muxm_fn_stdout() {
 # partial (and misleadingly passing) body.
 _extract_muxm_fns() {
   local fn body rc=0
+  local _need_lang_matches=0 _has_lang_matches=0
   for fn in "$@"; do
+    [[ "$fn" == "_lang_matches" ]] && _has_lang_matches=1
     body="$(awk "/^${fn}\\(\\)[[:space:]]*\\{/,/^\\}/" "$MUXM")"
     if [[ -z "$body" ]]; then
       printf 'ERROR: _extract_muxm_fns: function %s not found in %s\n' "$fn" "$MUXM" >&2
@@ -9055,7 +9065,15 @@ _extract_muxm_fns() {
       continue
     fi
     printf '%s\n' "$body"
+    # RV3-14: _audio_lang_matches/_sub_lang_matches are now thin wrappers over the shared
+    # _lang_matches — auto-emit it so any extraction of a wrapper still runs standalone (no manual
+    # dep threading at the ~8 call sites). Skip if the caller already asked for it explicitly.
+    [[ "$fn" == "_audio_lang_matches" || "$fn" == "_sub_lang_matches" ]] && _need_lang_matches=1
   done
+  if (( _need_lang_matches && ! _has_lang_matches )); then
+    body="$(awk "/^_lang_matches\\(\\)[[:space:]]*\\{/,/^\\}/" "$MUXM")"
+    [[ -n "$body" ]] && printf '%s\n' "$body"
+  fi
   return "$rc"
 }
 
@@ -9238,7 +9256,9 @@ _test_unit_audio_helpers() {
   # A bug here silently selects the wrong audio track. H2: the matcher normalizes BOTH the
   # tag and each pref entry via _norm_lang_code, so inject the real normalizer into env_setup
   # (assert_muxm_fn_exit extracts only the named function — it would otherwise be "command not found").
-  local _nlc; _nlc="$(awk '/^_norm_lang_code\(\)/,/^}/' "$MUXM")"
+  # RV3-14: the matchers are wrappers over _lang_matches — inject both it and _norm_lang_code (the
+  # single-fn extractor pulls neither on its own).
+  local _nlc; _nlc="$(awk '/^_norm_lang_code\(\)/,/^}/' "$MUXM")"$'\n'"$(awk '/^_lang_matches\(\)/,/^}/' "$MUXM")"
   assert_muxm_fn_exit "_audio_lang_matches('eng', pref='eng,spa')=match"        0 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="eng,spa"' "eng"
   assert_muxm_fn_exit "_audio_lang_matches('spa', pref='eng,spa')=match"        0 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="eng,spa"' "spa"
   assert_muxm_fn_exit "_audio_lang_matches('fra', pref='eng,spa')=no match"     1 _audio_lang_matches "$_nlc"$'\n''AUDIO_LANG_PREF="eng,spa"' "fra"
@@ -9322,7 +9342,7 @@ _test_unit_sub_helpers() {
   assert_muxm_fn_exit "_is_sdh_title('Succession')=no match (M2: 'cc' substring)" 1 _is_sdh_title "" "Succession"
 
   # ---- _sub_lang_matches (subtitle analogue of _audio_lang_matches; normalize both sides) ----
-  local _nlc_s; _nlc_s="$(awk '/^_norm_lang_code\(\)/,/^}/' "$MUXM")"
+  local _nlc_s; _nlc_s="$(awk '/^_norm_lang_code\(\)/,/^}/' "$MUXM")"$'\n'"$(awk '/^_lang_matches\(\)/,/^}/' "$MUXM")"
   assert_muxm_fn_exit "_sub_lang_matches('eng', pref='eng')=match"             0 _sub_lang_matches "$_nlc_s"$'\n''SUB_LANG_PREF="eng"' "eng"
   assert_muxm_fn_exit "_sub_lang_matches('en', pref='eng')=match (2→3, H2)"    0 _sub_lang_matches "$_nlc_s"$'\n''SUB_LANG_PREF="eng"' "en"
   assert_muxm_fn_exit "_sub_lang_matches('eng', pref='en')=match (pref 2-letter, H2)" 0 _sub_lang_matches "$_nlc_s"$'\n''SUB_LANG_PREF="en"' "eng"
@@ -12089,13 +12109,16 @@ _dv_ffmpeg_wrap_mp4 IN.hevc OUT.mp4 log.txt '$1' 'lbl'"
 # 0 = counting-failed sentinel, not silently pass. Structural: the check now has TWO "unverified"
 # report sites — the new inner else (0-sentinel) and the pre-existing outer else (non-numeric).
 _test_unit_dv_frame_count_sentinel() {
-  local rvp _n
-  rvp="$(awk '/^run_video_pipeline\(\)/,/^\}/' "$MUXM")"
-  _n="$(grep -c 'dv_frame_count_match" "unverified"' <<<"$rvp")"
+  # RV3-14: the RPU/frame-count check moved out of run_video_pipeline into the _dv_verify_frame_count
+  # helper — look for the two 'unverified' report sites there. (grep -c returns exit 1 on 0 matches;
+  # `|| true` keeps that from aborting this suite under set -e if the anchor ever drifts.)
+  local dvfc _n
+  dvfc="$(awk '/^_dv_verify_frame_count\(\)/,/^\}/' "$MUXM")"
+  _n="$(grep -c 'dv_frame_count_match" "unverified"' <<<"$dvfc")" || true
   if [[ "$_n" -eq 2 ]]; then
-    pass "unit-dv-frame-count-sentinel: the RPU/frame-count check reports 'unverified' for BOTH the 0-sentinel and non-numeric cases (2 sites)"
+    pass "unit-dv-frame-count-sentinel: the RPU/frame-count check reports 'unverified' for BOTH the 0-sentinel and non-numeric cases (2 sites in _dv_verify_frame_count)"
   else
-    fail "unit-dv-frame-count-sentinel: expected 2 'unverified' report sites in the frame-count check, found $_n (the 0-sentinel else may be missing → silent pass)"
+    fail "unit-dv-frame-count-sentinel: expected 2 'unverified' report sites in _dv_verify_frame_count, found $_n (the 0-sentinel else may be missing → silent pass)"
   fi
 }
 
@@ -12137,20 +12160,22 @@ _test_unit_ocr_lang_flags() {
     fail "unit-ocr-lang-flags: _ocr_lang_flags returned unexpected flags or aborted under set -e: ${out//$'\n'/ | }"
   fi
 
-  # Structural: all three former call sites must delegate, not inline the case statement.
-  local ps pes ps_count pes_count
+  # Structural: the OCR call sites must delegate, not inline the case statement. RV3-14: the .sup/.idx
+  # arms of _prepare_ext_subtitle were consolidated into the shared _ocr_ext_subtitle helper, so the
+  # single ext-subtitle delegation now lives there (1x) rather than duplicated in _prepare_ext_subtitle.
+  local ps oes ps_count oes_count
   ps="$(awk '/^_prepare_subtitle\(\)/,/^\}/' "$MUXM")"
-  pes="$(awk '/^_prepare_ext_subtitle\(\)/,/^\}/' "$MUXM")"
+  oes="$(awk '/^_ocr_ext_subtitle\(\)/,/^\}/' "$MUXM")"
   ps_count="$(grep -c '_ocr_lang_flags ' <<<"$ps")"
-  pes_count="$(grep -c '_ocr_lang_flags ' <<<"$pes")"
-  if [[ "$ps_count" -eq 1 && "$pes_count" -eq 2 ]]; then
-    pass "unit-ocr-lang-flags: _prepare_subtitle (1x) and _prepare_ext_subtitle (2x) delegate to _ocr_lang_flags"
+  oes_count="$(grep -c '_ocr_lang_flags ' <<<"$oes")"
+  if [[ "$ps_count" -eq 1 && "$oes_count" -eq 1 ]]; then
+    pass "unit-ocr-lang-flags: _prepare_subtitle (1x) and _ocr_ext_subtitle (1x) delegate to _ocr_lang_flags"
   else
-    fail "unit-ocr-lang-flags: expected 1 call in _prepare_subtitle and 2 in _prepare_ext_subtitle, got $ps_count and $pes_count"
+    fail "unit-ocr-lang-flags: expected 1 call in _prepare_subtitle and 1 in _ocr_ext_subtitle, got $ps_count and $oes_count"
   fi
   # shellcheck disable=SC2016  # searching muxm's own source text for the literal substring
   # case "$SUB_OCR_TOOL" in — not a variable meant to expand in this test.
-  if ! grep -q 'case "\$SUB_OCR_TOOL" in' <<<"$ps$pes"; then
+  if ! grep -q 'case "\$SUB_OCR_TOOL" in' <<<"$ps$oes"; then
     pass "unit-ocr-lang-flags: no inlined SUB_OCR_TOOL case statement remains in either function"
   else
     fail "unit-ocr-lang-flags: an inlined 'case \"\$SUB_OCR_TOOL\" in' block still exists — extraction incomplete"
@@ -12191,15 +12216,17 @@ _test_unit_run_ocr() {
     fail "unit-run-ocr: _run_ocr did not behave as expected (out=${out:0:200}, args=$args_out)"
   fi
 
-  local ps pes ps_count pes_count
+  # RV3-14: the .sup/.idx OCR arms were consolidated into _ocr_ext_subtitle, so its single _run_ocr
+  # call now covers both external-bitmap paths (was duplicated 2x in _prepare_ext_subtitle).
+  local ps oes ps_count oes_count
   ps="$(awk '/^_prepare_subtitle\(\)/,/^\}/' "$MUXM")"
-  pes="$(awk '/^_prepare_ext_subtitle\(\)/,/^\}/' "$MUXM")"
+  oes="$(awk '/^_ocr_ext_subtitle\(\)/,/^\}/' "$MUXM")"
   ps_count="$(grep -c '_run_ocr ' <<<"$ps")"
-  pes_count="$(grep -c '_run_ocr ' <<<"$pes")"
-  if [[ "$ps_count" -eq 2 && "$pes_count" -eq 2 ]]; then
-    pass "unit-run-ocr: _prepare_subtitle (2x) and _prepare_ext_subtitle (2x) delegate to _run_ocr"
+  oes_count="$(grep -c '_run_ocr ' <<<"$oes")"
+  if [[ "$ps_count" -eq 2 && "$oes_count" -eq 1 ]]; then
+    pass "unit-run-ocr: _prepare_subtitle (2x) and _ocr_ext_subtitle (1x) delegate to _run_ocr"
   else
-    fail "unit-run-ocr: expected 2 _run_ocr calls in each function, got $ps_count and $pes_count"
+    fail "unit-run-ocr: expected 2 _run_ocr calls in _prepare_subtitle and 1 in _ocr_ext_subtitle, got $ps_count and $oes_count"
   fi
 }
 
@@ -13798,9 +13825,10 @@ _test_ext_subs_hi_is_hindi() {
 # function returns a non-empty workdir path (i.e. the result was relocated and kept).
 _test_ext_subs_idx_relocate() {
   local body
-  # 3.1: _prepare_ext_subtitle's OCR branches now delegate to _ocr_lang_flags/_run_ocr — pull
-  # both in too, else the OCR dispatch under test silently no-ops (unresolved in the subshell).
-  body="$(_extract_muxm_fns _prepare_ext_subtitle _container_supports_bitmap_subs _ocr_lang_flags _run_ocr)" \
+  # 3.1/RV3-14: _prepare_ext_subtitle's .idx branch now delegates to the shared _ocr_ext_subtitle
+  # helper, which itself delegates to _ocr_lang_flags/_run_ocr — pull all three in too, else the OCR
+  # dispatch under test silently no-ops (unresolved in the subshell).
+  body="$(_extract_muxm_fns _prepare_ext_subtitle _ocr_ext_subtitle _container_supports_bitmap_subs _ocr_lang_flags _run_ocr)" \
     || { fail "extsub-idx-ocr-relocated: could not extract _prepare_ext_subtitle"; return; }
   local _dir; _dir="$(mktemp -d "$TESTDIR/rf7.XXXXXX")"
   local _work="$_dir/work"; mkdir -p "$_work"

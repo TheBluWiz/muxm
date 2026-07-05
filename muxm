@@ -1017,7 +1017,7 @@ _detect_mp4box(){
 # noted only so a future caller passing a symlinked/`..`-bearing basename knows the limitation.
 realpath_fallback(){
   local p="$1"
-  
+
   # Try GNU realpath with -m (allows missing files). Skip on macOS/BSD ($OSTYPE=darwin*), whose
   # realpath has no -m: the call always fails there, so probing it every time is pure overhead —
   # it just falls through to the portable resolver below. (Perf only.)
@@ -1026,12 +1026,12 @@ realpath_fallback(){
       return 0
     fi
   fi
-  
+
   # Fallback for macOS/BSD and systems without realpath
   local dir base
   dir="$(dirname -- "$p")"
   base="$(basename -- "$p")"
-  
+
   if [[ -d "$dir" ]]; then
     echo "$(cd "$dir" 2>/dev/null && pwd)/$base"
   elif [[ "$p" =~ ^/ ]]; then
@@ -7803,7 +7803,7 @@ decide_color_and_pixfmt() {
   # ├─ HLG (arib-std-b67)                → HLG profile, bt2020
   # ├─ HDR10 (bt2020/smpte2084)          → HDR10 profile, bt2020
   # └─ SDR (everything else)             → SDR, 10-bit if source is 10-bit
-  
+
   local tgt_pix="yuv420p" profile="SDR"
 
   if (( TONEMAP_HDR_TO_SDR )) && [[ "$prim" == "bt2020" || "$cspace" == "bt2020nc" || "$trc" == "smpte2084" || "$trc" == "arib-std-b67" || "$trc" == "hlg" ]]; then
@@ -7855,7 +7855,7 @@ decide_color_and_pixfmt() {
   fi
   PROFILE_DESC="$profile"
   TARGET_PIXFMT="$tgt_pix"
-  
+
   note "Color profile: $PROFILE_DESC, Target pixel format: $TARGET_PIXFMT"
 }
 
@@ -8164,23 +8164,23 @@ apply_level_vbv() {
 # Globals: DISABLE_DV (read), FFPROBE_FLAGS (read), SRC_ABS (read)
 detect_dv() {
   (( DISABLE_DV )) && return 2
-  
+
   local probe_output
   probe_output="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_streams -select_streams v:0 "$SRC_ABS" 2>&1)" || {
     warn "ffprobe failed during DV detection - assuming no DV present"
     return 1
   }
-  
+
   if printf '%s\n' "$probe_output" | grep -qiE 'dolby_vision|dv_profile|dovi|dvhe|dvh1|com\.dolby\.vision'; then
     return 0
   fi
-  
+
   # Check first few frames for DV metadata
   probe_output="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_frames -read_intervals %+#5 -select_streams v:0 "$SRC_ABS" 2>&1)" || {
     warn "Frame analysis failed during DV detection - assuming no DV"
     return 1
   }
-  
+
   printf '%s\n' "$probe_output" | grep -qiE 'DOVI|dolby' && return 0
   return 1
 }
@@ -9118,6 +9118,190 @@ _dv_give_up_to_base(){
   mark_done "Use base video ($_reason)"
 }
 
+# _dv_extract_rpu — extract the source DV RPU into $RPU_P7. Returns 0 if RPU_P7 was populated, 1
+# otherwise (including under --dry-run, where neither attempt runs). RV3-14: lifted verbatim out of
+# run_video_pipeline; the "RPU in hand" reclaim and the give-up/die decisions stay in the caller.
+#
+# Primary method: pipe ffmpeg → dovi_tool via stdin. This matches the dovi_tool README's recommended
+# workflow and avoids subtle file-based-extraction issues (EOS/EOB NAL handling, buffer-flushing
+# differences) that fail on some sources — particularly iPhone P8.4 HLG MOV files.
+# Fallback: extract from an on-demand demuxed ES file on disk.
+# Globals: DRY_RUN, FFMPEG_FLAGS, SRC_ABS, RPU_P7, V_SRC_ES, WORKDIR.
+_dv_extract_rpu() {
+  local rpu_extracted=0
+
+  # Primary: piped extraction (ffmpeg → dovi_tool stdin)
+  if (( ! DRY_RUN )); then
+    log "→ Extracting DV RPU via piped stdin…"
+    (
+      set +eE  # Prevent ERR trap from firing inside this subshell
+      ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy \
+           -bsf:v hevc_mp4toannexb -f hevc - 2>"$WORKDIR/rpu_pipe_demux.err" \
+         | dovi_tool extract-rpu - -o "$RPU_P7" >"$WORKDIR/rpu_pipe.log" 2>&1
+    ) &
+    # NOTE: $! is the SUBSHELL pid, not the grandchild ffmpeg/dovi_tool pid. This is intentional and
+    # harmless: on Ctrl-C the INT handler signals the whole process group, so the grandchildren die
+    # with the subshell; _ACTIVE_FFMPEG_PID only needs to name a process whose death releases the
+    # tee pipe, and killing the subshell does that. Not a bug — don't "fix" it to a grandchild pid.
+    local rpu_pipe_pid=$!
+    local _rpu_pipe_rc=0; _await_tracked_pid "$rpu_pipe_pid" "Extracting DV RPU (piped)" || _rpu_pipe_rc=$?
+    if (( _rpu_pipe_rc == 0 )); then
+      if [[ -s "$RPU_P7" ]]; then
+        rpu_extracted=1
+        log "DV RPU extracted successfully (piped method)."
+      else
+        warn "Piped RPU extraction produced empty file — trying file-based fallback."
+      fi
+    else
+      warn "Piped RPU extraction failed — trying file-based fallback."
+      log "See: $WORKDIR/rpu_pipe_demux.err and $WORKDIR/rpu_pipe.log"
+    fi
+  fi
+
+  # Fallback: file-based extraction from a demuxed ES (produced on demand here).
+  if (( ! rpu_extracted && ! DRY_RUN )); then
+    log "→ Piped RPU extraction unavailable — falling back to on-demand ES demux…"
+    if _ensure_src_es; then
+      log "→ Extracting DV RPU from demuxed ES file (fallback)…"
+      dovi_tool extract-rpu -i "$V_SRC_ES" -o "$RPU_P7" >"$WORKDIR/rpu_file.log" 2>&1 &
+      local rpu_file_pid=$!
+      local _rpu_file_rc=0; _await_tracked_pid "$rpu_file_pid" "Extracting DV RPU (file fallback)" || _rpu_file_rc=$?
+      if (( _rpu_file_rc == 0 )); then
+        if [[ -s "$RPU_P7" ]]; then
+          rpu_extracted=1
+          log "DV RPU extracted successfully (file-based fallback)."
+        fi
+      else
+        warn "File-based RPU extraction also failed."
+        log "See: $WORKDIR/rpu_file.log"
+      fi
+    else
+      warn "Could not produce a demuxed ES for fallback RPU extraction."
+    fi
+  fi
+
+  if (( rpu_extracted )); then return 0; else return 1; fi
+}
+
+# _dv_analyze_profile — inspect the source DV profile and decide whether the injected HEVC will need
+# a post-injection P7/P5→P8 conversion (via dovi_tool convert). Emits the profile-specific
+# notes/warnings/report entries. Returns 0 when conversion is needed, 1 otherwise. RV3-14: lifted
+# verbatim from run_video_pipeline's decision tree; the caller keeps the dv_needs_convert flag.
+# Globals: DV_SRC_PROFILE, DV_SRC_COMPAT_ID, DV_SRC_EL_PRESENT, DV_CONVERT_TO_P81_IF_FAIL (read).
+_dv_analyze_profile() {
+  if [[ "${DV_SRC_PROFILE:-}" == "8" ]]; then
+    # Source is already Profile 8 — RPU is single-layer compatible, no conversion needed.
+    # Preserves original compat_id (1=PQ, 2=SDR, 4=HLG) and all RPU metadata.
+    note "Source DV is Profile 8 (compat_id=${DV_SRC_COMPAT_ID:-?}) — RPU passes through unchanged."
+    report_add "dv_rpu_action" "passthrough (already P8, compat_id=${DV_SRC_COMPAT_ID:-?})"
+    return 1
+
+  elif [[ "${DV_SRC_PROFILE:-}" == "7" || "${DV_SRC_PROFILE:-}" == "5" ]]; then
+    # Source is dual-layer (P7) or IPT (P5) — needs conversion to single-layer P8.
+    # Conversion happens AFTER RPU injection: dovi_tool convert now operates on
+    # HEVC elementary streams (not standalone RPU files).
+    if (( DV_CONVERT_TO_P81_IF_FAIL )); then
+      note "Source DV is Profile ${DV_SRC_PROFILE} — will convert to Profile 8 after injection…"
+
+      # Profile 5 carries an IPT-PQ-c2 ("ICtCp") base layer, not a standard BT.2020 image.
+      # muxm decodes and re-encodes that base layer as-is, and `dovi_tool convert -d` rewrites
+      # ONLY the RPU — the base-layer pixels are never color-converted out of IPT. So a P5→P8.1
+      # conversion is best-effort: on non-DV players (which ignore the RPU) the base layer may
+      # render with incorrect colors. P7 is unaffected — its base layer is already BT.2020.
+      if [[ "${DV_SRC_PROFILE:-}" == "5" ]]; then
+        warn "Source DV is Profile 5 (IPT base layer). muxm re-encodes the base layer as-is and"
+        warn "  converts only the RPU to P8.1 — the IPT base layer is NOT color-converted, so this"
+        warn "  is best-effort: colors may be incorrect on non-DV players. Verify the output, or"
+        warn "  keep the original if exact P5 color fidelity matters."
+        report_add "dv_p5_base_best_effort" "true (P5 IPT base layer not color-converted)"
+      fi
+
+      # Warn about enhancement layer data loss for P7
+      if [[ "${DV_SRC_EL_PRESENT:-}" == "1" ]]; then
+        warn "DV Profile ${DV_SRC_PROFILE} has an enhancement layer (EL) that carries additional"
+        warn "  highlight/shadow detail. The EL will be discarded during P7→P8 conversion."
+        warn "  This is a lossy operation — DV image quality may be slightly reduced."
+        report_add "dv_el_loss" "true (P${DV_SRC_PROFILE} EL discarded)"
+      fi
+
+      # Warn about HLG compat_id mismatch: dovi_tool convert produces P8.1 (PQ, compat_id=1)
+      # but HLG sources use compat_id=4. Players may misinterpret the fallback layer.
+      if [[ "${DV_SRC_COMPAT_ID:-}" == "4" ]]; then
+        warn "Source is HLG Dolby Vision (compat_id=4) but dovi_tool convert targets P8.1 (PQ, compat_id=1)."
+        warn "  The DV RPU will be converted, but the compatibility ID will change from HLG to PQ."
+        warn "  Impact: Non-DV players may interpret the base layer as PQ instead of HLG."
+        report_add "dv_compat_id_mismatch" "source=4(HLG) → output=1(PQ)"
+      fi
+      return 0
+    else
+      warn "Source DV is Profile ${DV_SRC_PROFILE} (dual-layer) but conversion is disabled"
+      warn "  (profile-8.1 conversion is disabled via --no-dv-convert-p81). Using the raw RPU — DV playback will likely fail."
+      report_add "dv_rpu_action" "passthrough (P${DV_SRC_PROFILE}, conversion disabled)"
+      return 1
+    fi
+
+  else
+    # Unknown or unrecognized DV profile — attempt passthrough
+    if [[ -n "${DV_SRC_PROFILE:-}" ]]; then
+      warn "Unrecognized DV profile: ${DV_SRC_PROFILE}. Attempting RPU passthrough."
+      warn "  DV playback behavior is unpredictable for this profile."
+    else
+      warn "Could not determine source DV profile. Attempting RPU passthrough."
+    fi
+    report_add "dv_rpu_action" "passthrough (unknown profile ${DV_SRC_PROFILE:-?})"
+    return 1
+  fi
+}
+
+# _dv_verify_frame_count — compare the finalized DV video's frame count ($V_MIXED) against the RPU
+# frame count ($RPU_FINAL). Emits the ok/unverified report entries directly, and on a real mismatch
+# (outside the ±2-frame tolerance) emits the mismatch warnings + report entry and returns 1 so the
+# caller can decide die-vs-revert-to-base. Returns 0 when aligned OR unverifiable (counts missing /
+# non-numeric / 0 = counting-failed sentinel). RV3-14: lifted verbatim from run_video_pipeline.
+# Globals: V_MIXED, RPU_FINAL, _HAS_DOVI_TOOL (read).
+_dv_verify_frame_count() {
+  local v_frames rpu_frames
+  v_frames="$(_count_video_frames "$V_MIXED")"
+  # RPU frame count from dovi_tool info (if available)
+  if (( _HAS_DOVI_TOOL )); then
+    rpu_frames="$(dovi_tool info -i "$RPU_FINAL" --summary 2>/dev/null \
+                  | grep -oiE '[0-9]+ RPU' | grep -oE '[0-9]+' | head -1)" || true
+    # Fallback: try parsing "Parsed X RPU" format
+    if [[ -z "$rpu_frames" ]]; then
+      rpu_frames="$(dovi_tool info -i "$RPU_FINAL" --summary 2>/dev/null \
+                    | grep -oiE 'parsed [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+    fi
+  fi
+
+  if [[ -n "$rpu_frames" && "$rpu_frames" =~ ^[0-9]+$ && -n "$v_frames" && "$v_frames" =~ ^[0-9]+$ ]]; then
+    if (( v_frames > 0 && rpu_frames > 0 )); then
+      local frame_diff=$(( v_frames - rpu_frames ))
+      # Allow ±2 frame tolerance (encoder may add/drop frames at boundaries)
+      if (( frame_diff > 2 || frame_diff < -2 )); then
+        warn "RPU frame count mismatch: video has $v_frames frames but RPU has $rpu_frames frames."
+        warn "  Difference: ${frame_diff} frames. DV may flicker or desync on mismatched frames."
+        warn "  This can occur when the re-encode changes frame count (e.g., framerate conversion)."
+        report_add "dv_frame_count_match" "MISMATCH (video=$v_frames, rpu=$rpu_frames, diff=$frame_diff)"
+        return 1
+      else
+        note "RPU frame count verified: video=$v_frames, rpu=$rpu_frames (within tolerance)."
+        report_add "dv_frame_count_match" "ok (video=$v_frames, rpu=$rpu_frames)"
+      fi
+    else
+      # RV3-11: a 0 count is _count_video_frames's documented "counting failed" sentinel (and
+      # dovi_tool can report 0 the same way). Report it UNVERIFIED — exactly like the non-numeric
+      # case in the outer else — instead of silently passing the desync check (the old no-else
+      # here fell through with no report/warning, claiming a clean run it never actually verified).
+      note "Could not verify RPU/video frame count alignment (a count returned 0 = counting failed)."
+      report_add "dv_frame_count_match" "unverified"
+    fi
+  else
+    note "Could not verify RPU/video frame count alignment (counting unavailable)."
+    report_add "dv_frame_count_match" "unverified"
+  fi
+  return 0
+}
+
 run_video_pipeline() {
   # Check copy-if-compliant first
   if (( VIDEO_COPY_IF_COMPLIANT )); then
@@ -9420,67 +9604,11 @@ run_video_pipeline() {
     return 0
   fi
 
-  # Try extracting RPU from the source.
-  #
-  # Primary method: pipe ffmpeg → dovi_tool via stdin.
-  # This matches the dovi_tool README's recommended workflow and avoids
-  # subtle issues with file-based extraction (EOS/EOB NAL handling,
-  # buffer flushing differences) that cause failures on some sources
-  # — particularly iPhone P8.4 HLG MOV files.
-  #
-  # Fallback: extract from the previously demuxed ES file on disk.
-
+  # Try extracting the source RPU into RPU_P7 (see _dv_extract_rpu for the piped-primary /
+  # on-demand-ES-fallback strategy). RV3-14: the two attempts moved into the helper; the
+  # "RPU in hand" reclaim and the give-up/die decisions stay here in the caller.
   local rpu_extracted=0
-
-  # Primary: piped extraction (ffmpeg → dovi_tool stdin)
-  if (( ! DRY_RUN )); then
-    log "→ Extracting DV RPU via piped stdin…"
-    (
-      set +eE  # Prevent ERR trap from firing inside this subshell
-      ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map 0:v:0 -c copy \
-           -bsf:v hevc_mp4toannexb -f hevc - 2>"$WORKDIR/rpu_pipe_demux.err" \
-         | dovi_tool extract-rpu - -o "$RPU_P7" >"$WORKDIR/rpu_pipe.log" 2>&1
-    ) &
-    # NOTE: $! is the SUBSHELL pid, not the grandchild ffmpeg/dovi_tool pid. This is intentional and
-    # harmless: on Ctrl-C the INT handler signals the whole process group, so the grandchildren die
-    # with the subshell; _ACTIVE_FFMPEG_PID only needs to name a process whose death releases the
-    # tee pipe, and killing the subshell does that. Not a bug — don't "fix" it to a grandchild pid.
-    local rpu_pipe_pid=$!
-    local _rpu_pipe_rc=0; _await_tracked_pid "$rpu_pipe_pid" "Extracting DV RPU (piped)" || _rpu_pipe_rc=$?
-    if (( _rpu_pipe_rc == 0 )); then
-      if [[ -s "$RPU_P7" ]]; then
-        rpu_extracted=1
-        log "DV RPU extracted successfully (piped method)."
-      else
-        warn "Piped RPU extraction produced empty file — trying file-based fallback."
-      fi
-    else
-      warn "Piped RPU extraction failed — trying file-based fallback."
-      log "See: $WORKDIR/rpu_pipe_demux.err and $WORKDIR/rpu_pipe.log"
-    fi
-  fi
-
-  # Fallback: file-based extraction from a demuxed ES (produced on demand here).
-  if (( ! rpu_extracted && ! DRY_RUN )); then
-    log "→ Piped RPU extraction unavailable — falling back to on-demand ES demux…"
-    if _ensure_src_es; then
-      log "→ Extracting DV RPU from demuxed ES file (fallback)…"
-      dovi_tool extract-rpu -i "$V_SRC_ES" -o "$RPU_P7" >"$WORKDIR/rpu_file.log" 2>&1 &
-      local rpu_file_pid=$!
-      local _rpu_file_rc=0; _await_tracked_pid "$rpu_file_pid" "Extracting DV RPU (file fallback)" || _rpu_file_rc=$?
-      if (( _rpu_file_rc == 0 )); then
-        if [[ -s "$RPU_P7" ]]; then
-          rpu_extracted=1
-          log "DV RPU extracted successfully (file-based fallback)."
-        fi
-      else
-        warn "File-based RPU extraction also failed."
-        log "See: $WORKDIR/rpu_file.log"
-      fi
-    else
-      warn "Could not produce a demuxed ES for fallback RPU extraction."
-    fi
-  fi
+  if _dv_extract_rpu; then rpu_extracted=1; fi
 
   # RPU is now in hand (RPU_P7) — the source ES, if it was demuxed for the
   # fallback, is dead. Reclaim it immediately (it can be ~source-sized).
@@ -9516,69 +9644,11 @@ run_video_pipeline() {
   cp -f "$RPU_P7" "$RPU_FINAL" 2>/dev/null \
     || warn "Failed to copy extracted RPU to staging path — DV injection will likely fail."
 
-  # Flag: set to 1 when the injected HEVC needs P7/P5→P8 conversion via
-  # dovi_tool convert after RPU injection.
+  # Decide whether the injected HEVC will need a post-injection P7/P5→P8 conversion via dovi_tool
+  # convert. _dv_analyze_profile emits the profile-specific notes/warnings and returns 0 when
+  # conversion is needed. RV3-14: the decision tree moved into the helper; the flag stays here.
   local -i dv_needs_convert=0
-
-  if [[ "${DV_SRC_PROFILE:-}" == "8" ]]; then
-    # Source is already Profile 8 — RPU is single-layer compatible, no conversion needed.
-    # Preserves original compat_id (1=PQ, 2=SDR, 4=HLG) and all RPU metadata.
-    note "Source DV is Profile 8 (compat_id=${DV_SRC_COMPAT_ID:-?}) — RPU passes through unchanged."
-    report_add "dv_rpu_action" "passthrough (already P8, compat_id=${DV_SRC_COMPAT_ID:-?})"
-
-  elif [[ "${DV_SRC_PROFILE:-}" == "7" || "${DV_SRC_PROFILE:-}" == "5" ]]; then
-    # Source is dual-layer (P7) or IPT (P5) — needs conversion to single-layer P8.
-    # Conversion happens AFTER RPU injection: dovi_tool convert now operates on
-    # HEVC elementary streams (not standalone RPU files).
-    if (( DV_CONVERT_TO_P81_IF_FAIL )); then
-      note "Source DV is Profile ${DV_SRC_PROFILE} — will convert to Profile 8 after injection…"
-      dv_needs_convert=1
-
-      # Profile 5 carries an IPT-PQ-c2 ("ICtCp") base layer, not a standard BT.2020 image.
-      # muxm decodes and re-encodes that base layer as-is, and `dovi_tool convert -d` rewrites
-      # ONLY the RPU — the base-layer pixels are never color-converted out of IPT. So a P5→P8.1
-      # conversion is best-effort: on non-DV players (which ignore the RPU) the base layer may
-      # render with incorrect colors. P7 is unaffected — its base layer is already BT.2020.
-      if [[ "${DV_SRC_PROFILE:-}" == "5" ]]; then
-        warn "Source DV is Profile 5 (IPT base layer). muxm re-encodes the base layer as-is and"
-        warn "  converts only the RPU to P8.1 — the IPT base layer is NOT color-converted, so this"
-        warn "  is best-effort: colors may be incorrect on non-DV players. Verify the output, or"
-        warn "  keep the original if exact P5 color fidelity matters."
-        report_add "dv_p5_base_best_effort" "true (P5 IPT base layer not color-converted)"
-      fi
-
-      # Warn about enhancement layer data loss for P7
-      if [[ "${DV_SRC_EL_PRESENT:-}" == "1" ]]; then
-        warn "DV Profile ${DV_SRC_PROFILE} has an enhancement layer (EL) that carries additional"
-        warn "  highlight/shadow detail. The EL will be discarded during P7→P8 conversion."
-        warn "  This is a lossy operation — DV image quality may be slightly reduced."
-        report_add "dv_el_loss" "true (P${DV_SRC_PROFILE} EL discarded)"
-      fi
-
-      # Warn about HLG compat_id mismatch: dovi_tool convert produces P8.1 (PQ, compat_id=1)
-      # but HLG sources use compat_id=4. Players may misinterpret the fallback layer.
-      if [[ "${DV_SRC_COMPAT_ID:-}" == "4" ]]; then
-        warn "Source is HLG Dolby Vision (compat_id=4) but dovi_tool convert targets P8.1 (PQ, compat_id=1)."
-        warn "  The DV RPU will be converted, but the compatibility ID will change from HLG to PQ."
-        warn "  Impact: Non-DV players may interpret the base layer as PQ instead of HLG."
-        report_add "dv_compat_id_mismatch" "source=4(HLG) → output=1(PQ)"
-      fi
-    else
-      warn "Source DV is Profile ${DV_SRC_PROFILE} (dual-layer) but conversion is disabled"
-      warn "  (profile-8.1 conversion is disabled via --no-dv-convert-p81). Using the raw RPU — DV playback will likely fail."
-      report_add "dv_rpu_action" "passthrough (P${DV_SRC_PROFILE}, conversion disabled)"
-    fi
-
-  else
-    # Unknown or unrecognized DV profile — attempt passthrough
-    if [[ -n "${DV_SRC_PROFILE:-}" ]]; then
-      warn "Unrecognized DV profile: ${DV_SRC_PROFILE}. Attempting RPU passthrough."
-      warn "  DV playback behavior is unpredictable for this profile."
-    else
-      warn "Could not determine source DV profile. Attempting RPU passthrough."
-    fi
-    report_add "dv_rpu_action" "passthrough (unknown profile ${DV_SRC_PROFILE:-?})"
-  fi
+  if _dv_analyze_profile; then dv_needs_convert=1; fi
 
   # Validate RPU integrity before injection
   if ! _validate_dv_rpu "$RPU_FINAL"; then
@@ -9648,61 +9718,26 @@ run_video_pipeline() {
     fi
   fi
 
-  # Verify RPU frame count matches encoded video frame count.
-  # Mismatched counts cause DV flicker, color shifts, or player crashes
-  # on frames where the RPU and video desync.
-  local v_frames rpu_frames
-  v_frames="$(_count_video_frames "$V_MIXED")"
-  # RPU frame count from dovi_tool info (if available)
-  if (( _HAS_DOVI_TOOL )); then
-    rpu_frames="$(dovi_tool info -i "$RPU_FINAL" --summary 2>/dev/null \
-                  | grep -oiE '[0-9]+ RPU' | grep -oE '[0-9]+' | head -1)" || true
-    # Fallback: try parsing "Parsed X RPU" format
-    if [[ -z "$rpu_frames" ]]; then
-      rpu_frames="$(dovi_tool info -i "$RPU_FINAL" --summary 2>/dev/null \
-                    | grep -oiE 'parsed [0-9]+' | grep -oE '[0-9]+' | head -1)" || true
+  # Verify the RPU frame count matches the encoded video (mismatched counts cause DV flicker, color
+  # shifts, or player crashes where RPU and video desync). _dv_verify_frame_count reports the
+  # ok/unverified/mismatch cases and returns non-zero ONLY on a real mismatch — where the caller
+  # keeps the die-vs-revert seam. RV3-14: the counting/tolerance logic moved into the helper.
+  if ! _dv_verify_frame_count; then
+    if (( ! ALLOW_DV_FALLBACK )); then
+      die 44 "DV RPU/frame mismatch — refusing to ship desynced Dolby Vision (ALLOW_DV_FALLBACK=0)"
     fi
-  fi
-
-  if [[ -n "$rpu_frames" && "$rpu_frames" =~ ^[0-9]+$ && -n "$v_frames" && "$v_frames" =~ ^[0-9]+$ ]]; then
-    if (( v_frames > 0 && rpu_frames > 0 )); then
-      local frame_diff=$(( v_frames - rpu_frames ))
-      # Allow ±2 frame tolerance (encoder may add/drop frames at boundaries)
-      if (( frame_diff > 2 || frame_diff < -2 )); then
-        warn "RPU frame count mismatch: video has $v_frames frames but RPU has $rpu_frames frames."
-        warn "  Difference: ${frame_diff} frames. DV may flicker or desync on mismatched frames."
-        warn "  This can occur when the re-encode changes frame count (e.g., framerate conversion)."
-        report_add "dv_frame_count_match" "MISMATCH (video=$v_frames, rpu=$rpu_frames, diff=$frame_diff)"
-        if (( ! ALLOW_DV_FALLBACK )); then
-          die 44 "DV RPU/frame mismatch — refusing to ship desynced Dolby Vision (ALLOW_DV_FALLBACK=0)"
-        fi
-        # The fully injected/converted DV video (the current V_MIXED, e.g.
-        # video_mixed.hevc — full-size on a real title) is dead now that we're reverting
-        # to the base encode. Reclaim it BEFORE aliasing V_MIXED to V_BASE (inside the
-        # helper below), so we don't carry an orphaned multi-GB intermediate to end-of-run
-        # (same _reclaim convention; only this give-up branch holds a *completed* injected
-        # video — the earlier branches fail during/before injection, leaving at most a
-        # partial/empty file).
-        _reclaim "$V_MIXED" "DV abandoned on frame mismatch — injected video superseded by base"
-        _dv_give_up_to_base "DV frame mismatch"
-        # Give up like the sibling fallback branches above: return now so we do NOT
-        # pre-wrap the base video with dvcC/dvh1 signaling and re-set OUTPUT_HAS_DV=1 below.
-        return 0
-      else
-        note "RPU frame count verified: video=$v_frames, rpu=$rpu_frames (within tolerance)."
-        report_add "dv_frame_count_match" "ok (video=$v_frames, rpu=$rpu_frames)"
-      fi
-    else
-      # RV3-11: a 0 count is _count_video_frames's documented "counting failed" sentinel (and
-      # dovi_tool can report 0 the same way). Report it UNVERIFIED — exactly like the non-numeric
-      # case in the outer else — instead of silently passing the desync check (the old no-else
-      # here fell through with no report/warning, claiming a clean run it never actually verified).
-      note "Could not verify RPU/video frame count alignment (a count returned 0 = counting failed)."
-      report_add "dv_frame_count_match" "unverified"
-    fi
-  else
-    note "Could not verify RPU/video frame count alignment (counting unavailable)."
-    report_add "dv_frame_count_match" "unverified"
+    # The fully injected/converted DV video (the current V_MIXED, e.g.
+    # video_mixed.hevc — full-size on a real title) is dead now that we're reverting
+    # to the base encode. Reclaim it BEFORE aliasing V_MIXED to V_BASE (inside the
+    # helper below), so we don't carry an orphaned multi-GB intermediate to end-of-run
+    # (same _reclaim convention; only this give-up branch holds a *completed* injected
+    # video — the earlier branches fail during/before injection, leaving at most a
+    # partial/empty file).
+    _reclaim "$V_MIXED" "DV abandoned on frame mismatch — injected video superseded by base"
+    _dv_give_up_to_base "DV frame mismatch"
+    # Give up like the sibling fallback branches above: return now so we do NOT
+    # pre-wrap the base video with dvcC/dvh1 signaling and re-set OUTPUT_HAS_DV=1 below.
+    return 0
   fi
 
   # The base encode is no longer needed once the DV video (V_MIXED) is finalized
@@ -9955,22 +9990,21 @@ _audio_codec_rank(){
   echo "${_AUDIO_CODEC_RANK_CACHE[$codec]:-10}"
 }
 
-# Check if a language tag matches any entry in AUDIO_LANG_PREF.
-# Both the stream tag and each pref entry are run through _norm_lang_code, so 2-letter
-# and 3-letter codes (and 639-2/B vs /T variants) match symmetrically: `en`↔`eng`,
-# `ja`↔`jpn`, `fre`↔`fra`. Returns 0 (true) if the tag matches, 1 otherwise.
-# Args: $1 — language tag (e.g., "en", "eng", "spa", "und")
-# Globals: AUDIO_LANG_PREF (read)
-_audio_lang_matches(){
+# _lang_matches LANG PREF_CSV — 0 (true) if normalized LANG equals any comma-separated code in
+# PREF_CSV, 1 otherwise. Both the stream tag and each pref entry are run through _norm_lang_code,
+# so 2-letter and 3-letter codes (and 639-2/B vs /T variants) match symmetrically: `en`↔`eng`,
+# `ja`↔`jpn`, `fre`↔`fra`.
+# RV3-14: single parametrized implementation shared by the audio/subtitle wrappers below, which
+# were byte-identical apart from the global they read. An empty PREF_CSV yields a 0-element prefs
+# array and `for pref in "${prefs[@]}"` aborts under set -u on bash < 4.4 — guard at entry (empty
+# pref matches nothing; every caller treats empty as keep-all upstream, so this preserves semantics).
+# Args: $1 — language tag (e.g. "en", "eng", "und"); $2 — comma-separated preference list.
+_lang_matches(){
   local lang pref
-  local -a prefs   # Declare local (sibling _sub_lang_matches does) — don't leak to global scope
-  # Empty AUDIO_LANG_PREF (the documented keep-all `--audio-lang-pref ""`) yields a
-  # 0-element prefs array; `for pref in "${prefs[@]}"` aborts under set -u on bash < 4.4.
-  # Guard at entry (empty pref matches nothing — callers treat empty as keep-all upstream),
-  # mirroring the `-n` gating the other call sites already apply and the _sub_lang_matches note.
-  [[ -n "$AUDIO_LANG_PREF" ]] || return 1
+  local -a prefs
+  [[ -n "$2" ]] || return 1
   lang="$(_norm_lang_code "$1")"
-  IFS=',' read -r -a prefs <<< "$AUDIO_LANG_PREF"
+  IFS=',' read -r -a prefs <<< "$2"
   for pref in "${prefs[@]}"; do
     pref="${pref// /}"
     [[ -z "$pref" ]] && continue
@@ -9979,27 +10013,13 @@ _audio_lang_matches(){
   return 1
 }
 
-# Subtitle analogue of _audio_lang_matches: does a subtitle language tag match any
-# entry in SUB_LANG_PREF, normalizing BOTH sides via _norm_lang_code? This closes
-# the embedded-vs-external asymmetry — an embedded `en` sub now survives an `eng` filter,
-# matching how external `movie.en.srt` (parsed to `eng`) is already treated.
-# An empty/whitespace-only SUB_LANG_PREF matches nothing here; callers gate on
-# `-n SUB_LANG_PREF` first (empty = keep-all), preserving the existing semantics.
-# Args: $1 — language tag. Globals: SUB_LANG_PREF (read).
-_sub_lang_matches(){
-  local lang pref
-  local -a prefs
-  # Symmetry/defense-in-depth: same empty-array footgun as _audio_lang_matches.
-  [[ -n "$SUB_LANG_PREF" ]] || return 1
-  lang="$(_norm_lang_code "$1")"
-  IFS=',' read -r -a prefs <<< "$SUB_LANG_PREF"
-  for pref in "${prefs[@]}"; do
-    pref="${pref// /}"
-    [[ -z "$pref" ]] && continue
-    [[ "$lang" == "$(_norm_lang_code "$pref")" ]] && return 0
-  done
-  return 1
-}
+# _audio_lang_matches TAG — does TAG match any entry in AUDIO_LANG_PREF? Globals: AUDIO_LANG_PREF.
+_audio_lang_matches(){ _lang_matches "$1" "$AUDIO_LANG_PREF"; }
+
+# _sub_lang_matches TAG — does a subtitle language TAG match any entry in SUB_LANG_PREF? Closes the
+# embedded-vs-external asymmetry (an embedded `en` sub survives an `eng` filter, matching how an
+# external `movie.en.srt`, parsed to `eng`, is already treated). Globals: SUB_LANG_PREF.
+_sub_lang_matches(){ _lang_matches "$1" "$SUB_LANG_PREF"; }
 
 # Check if an audio stream's title tag suggests commentary or descriptive audio.
 # Matches common English and international keywords in the title.
@@ -10542,6 +10562,18 @@ _audio_pretty_line(){
   return 0
 }
 
+# _int_in_list NEEDLE [ITEM...] — 0 (true) if the integer NEEDLE equals any of the ITEM args, 1
+# otherwise. RV3-14: shared by the audio/subtitle multi-track "is this source index in the keep
+# list?" scans, which independently hand-rolled the same linear loop. Callers pass the keep-list
+# either as an array expansion or an unquoted word-split string; both arrive here as positional args.
+_int_in_list(){
+  local _needle="$1" _it; shift
+  for _it in "$@"; do
+    (( _it == _needle )) && return 0
+  done
+  return 1
+}
+
 # run_audio_pipeline_multi — Multi-track audio: filter and defer to mux_final.
 #
 # Called instead of the single-track pipeline when AUDIO_MULTI_TRACK=1.
@@ -10629,9 +10661,7 @@ run_audio_pipeline_multi(){
 
     # Check if this index is in the keep list
     local _is_kept=0
-    for idx in ${AUDIO_MT_INDICES[@]+"${AUDIO_MT_INDICES[@]}"}; do
-      (( idx == i )) && { _is_kept=1; break; }
-    done
+    if _int_in_list "$i" ${AUDIO_MT_INDICES[@]+"${AUDIO_MT_INDICES[@]}"}; then _is_kept=1; fi
 
     _audio_pretty_line pretty "$i" "$_c" "$_ch_i" "$_l" "$_t" "$_br_i"
 
@@ -10680,7 +10710,7 @@ run_audio_pipeline(){
   # shellcheck disable=SC2034
   local n best idx codec ch lang br title
   n="$(_audio_stream_count)"
-  
+
   if (( n == 0 )); then
     note "No audio streams detected."
     HAS_AUDIO=0
@@ -11391,12 +11421,58 @@ _prepare_subtitle(){
       echo ""
       return 0
       ;;
-      
+
     *)
       warn "[Subs] Unsupported subtitle codec '$codec' for #$idx — skipping."
       ;;
   esac
 
+  echo ""
+  return 0
+}
+
+# _ocr_ext_subtitle EXT_PATH FEXT KIND LOG_BASENAME — OCR an external bitmap subtitle (.sup PGS /
+# .idx VobSub) to SRT; echoes the SRT path in WORKDIR, or "" when OCR is disabled or the OCR failed.
+# RV3-14: the .sup and .idx arms of _prepare_ext_subtitle duplicated this ~20-line orchestration,
+# differing only in the format label (KIND), the source/output extension (FEXT), and the OCR log
+# basename (LOG_BASENAME). Always returns 0 (failure is signalled by an empty stdout, as before).
+# Globals: WORKDIR, SUB_ENABLE_OCR, SUB_OCR_TOOL, SUB_OCR_LANG, DRY_RUN.
+_ocr_ext_subtitle(){
+  local ext_path="$1" fext="$2" kind="$3" log_base="$4"
+  local basename_label; basename_label="$(basename -- "$ext_path")"
+  local log="$WORKDIR/$log_base"
+
+  if (( ! SUB_ENABLE_OCR )); then
+    warn "[Subs] External $kind $basename_label requires OCR but OCR is disabled — skipping."
+    echo ""
+    return 0
+  fi
+
+  local srt_out="$WORKDIR/ext_${basename_label%.$fext}.srt"
+
+  if (( DRY_RUN )); then
+    printf "1\n00:00:00,000 --> 00:00:00,500\n(dry-run external $kind)\n" >"$srt_out" 2>/dev/null || true
+    note "[Subs] DRY-RUN: would OCR external $kind $basename_label"
+    echo "$srt_out"
+    return 0
+  fi
+
+  local -a _ocr_lang=()
+  _ocr_lang_flags _ocr_lang "$SUB_OCR_TOOL" "$SUB_OCR_LANG"
+  _run_ocr "$ext_path" "$log" "OCR external $kind: $basename_label" _ocr_lang
+
+  # Some OCR tools write the .srt next to the source file, not into the workdir. Relocate it before
+  # the existence check — otherwise a SUCCESSFUL OCR leaves $srt_out empty and is misreported as failed.
+  local relocated="${ext_path%.$fext}.srt"
+  if [[ -s "$relocated" ]]; then
+    mv -f "$relocated" "$srt_out" || true
+  fi
+
+  if [[ -s "$srt_out" ]] && grep -q ' --> ' "$srt_out"; then
+    echo "$srt_out"
+    return 0
+  fi
+  warn "[Subs] OCR failed for external $kind $basename_label. See: $log"
   echo ""
   return 0
 }
@@ -11443,76 +11519,14 @@ _prepare_ext_subtitle(){
         return 0
       fi
 
-      if (( ! SUB_ENABLE_OCR )); then
-        warn "[Subs] External PGS $basename_label requires OCR but OCR is disabled — skipping."
-        echo ""
-        return 0
-      fi
-
-      local srt_out="$WORKDIR/ext_${basename_label%.sup}.srt"
-
-      if (( DRY_RUN )); then
-        printf "1\n00:00:00,000 --> 00:00:00,500\n(dry-run external PGS)\n" >"$srt_out" 2>/dev/null || true
-        note "[Subs] DRY-RUN: would OCR external PGS $basename_label"
-        echo "$srt_out"
-        return 0
-      fi
-
-      local -a _ocr_lang=()
-      _ocr_lang_flags _ocr_lang "$SUB_OCR_TOOL" "$SUB_OCR_LANG"
-      _run_ocr "$ext_path" "$WORKDIR/ext_ocr_sup.log" "OCR external PGS: $basename_label" _ocr_lang
-
-      # Some OCR tools write .srt next to source file; relocate to workdir
-      local sup_srt="${ext_path%.sup}.srt"
-      if [[ -s "$sup_srt" ]]; then
-        mv -f "$sup_srt" "$srt_out" || true
-      fi
-
-      if [[ -s "$srt_out" ]] && grep -q ' --> ' "$srt_out"; then
-        echo "$srt_out"
-        return 0
-      fi
-      warn "[Subs] OCR failed for external PGS $basename_label. See: $WORKDIR/ext_ocr_sup.log"
-      echo ""
-      return 0
+      _ocr_ext_subtitle "$ext_path" sup PGS ext_ocr_sup.log
+      return $?
       ;;
 
     idx)
       # VobSub: OCR to SRT (partner .sub must exist — checked in discover_external_subtitles)
-      if (( ! SUB_ENABLE_OCR )); then
-        warn "[Subs] External VobSub $basename_label requires OCR but OCR is disabled — skipping."
-        echo ""
-        return 0
-      fi
-
-      local srt_out="$WORKDIR/ext_${basename_label%.idx}.srt"
-
-      if (( DRY_RUN )); then
-        printf "1\n00:00:00,000 --> 00:00:00,500\n(dry-run external VobSub)\n" >"$srt_out" 2>/dev/null || true
-        note "[Subs] DRY-RUN: would OCR external VobSub $basename_label"
-        echo "$srt_out"
-        return 0
-      fi
-
-      local -a _ocr_lang=()
-      _ocr_lang_flags _ocr_lang "$SUB_OCR_TOOL" "$SUB_OCR_LANG"
-      _run_ocr "$ext_path" "$WORKDIR/ext_ocr_vobsub.log" "OCR external VobSub: $basename_label" _ocr_lang
-
-      # Some OCR tools write the .srt next to the source .idx, not into the workdir. Relocate
-      # it before the existence check (mirrors the .sup branch above) — otherwise a SUCCESSFUL
-      # VobSub OCR left $srt_out empty and was misreported as "OCR failed" and dropped.
-      local vob_srt="${ext_path%.idx}.srt"
-      if [[ -s "$vob_srt" ]]; then
-        mv -f "$vob_srt" "$srt_out" || true
-      fi
-
-      if [[ -s "$srt_out" ]] && grep -q ' --> ' "$srt_out"; then
-        echo "$srt_out"
-        return 0
-      fi
-      warn "[Subs] OCR failed for external VobSub $basename_label. See: $WORKDIR/ext_ocr_vobsub.log"
-      echo ""
-      return 0
+      _ocr_ext_subtitle "$ext_path" idx VobSub ext_ocr_vobsub.log
+      return $?
       ;;
 
     *)
@@ -12097,10 +12111,7 @@ run_subtitle_pipeline_multi(){
 
     # Check if this unified index survived the filter
     local _is_kept=0
-    local _k
-    for _k in $keep_list; do
-      (( _k == i )) && { _is_kept=1; break; }
-    done
+    if _int_in_list "$i" $keep_list; then _is_kept=1; fi
 
     if (( _is_kept )); then
       say "  $pretty ✓"
@@ -12510,7 +12521,7 @@ mux_final() {
       a_primary_idx=$next_idx
       next_idx=$(( next_idx + 1 ))
     fi
-    
+
     if (( ! SKIP_AUDIO )) && [[ -n "${AAC_STEREO:-}" && -s "$AAC_STEREO" ]]; then
       ff_in+=( -i "$AAC_STEREO" )
       a_stereo_idx=$next_idx
@@ -12989,7 +13000,7 @@ main() {
       return 0
     fi
   fi
-  
+
   # Detect Dolby Vision
   # detect_dv returns: 0=detected, 1=not found, 2=skipped (DISABLE_DV).
   # Use || to capture non-zero returns without triggering errexit.
