@@ -11408,6 +11408,8 @@ _test_unit_empty_array_safe() {
   # preceded on its own line by that guard; skip-proof (unlike the behavioral old-bash test
   # above, this runs on any host, no pre-4.4 interpreter required).
   local hwa_bad
+  # shellcheck disable=SC2016  # searching muxm's own source text for the literal substrings
+  # ${HW_ACCEL_AVAILABLE[*]} / ${#HW_ACCEL_AVAILABLE[@]} — not variables meant to expand here.
   hwa_bad="$(grep -nE '\$\{HW_ACCEL_AVAILABLE\[\*\]\}' "$MUXM" | grep -v '\${#HW_ACCEL_AVAILABLE\[@\]}' || true)"
   if [[ -z "$hwa_bad" ]]; then
     pass "unit-empty-array-safe-set-u: every \"\${HW_ACCEL_AVAILABLE[*]}\" membership test is guarded by a same-line \${#HW_ACCEL_AVAILABLE[@]} count check (membership-test STAR-form sibling of checks 3/5)"
