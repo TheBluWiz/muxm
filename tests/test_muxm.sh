@@ -8596,6 +8596,29 @@ _test_metadata_escape_sanitize() {
 #   - --replace-source requires interactive TTY (rejected in pipes/scripts)
 #   - --force-replace-source replaces the source file without prompting
 #   - CLI flags appear in --help and --print-effective-config
+# RV3-16: the output/source locks now gate the "live owner" decision on _pid_is_muxm (a recycled PID
+# belonging to an unrelated process must not read as a live muxm lock). To simulate a GENUINE live
+# muxm owner, spawn a background process whose `ps` command line contains the muxm script basename
+# (a bare `sleep` no longer qualifies). Sets _MUXM_HOLDER_PID / _MUXM_HOLDER_SCRIPT (PID empty if this
+# platform's `ps` doesn't surface the process name → caller should skip). Caller kills the PID + rm's
+# the script. MUST be called as a plain statement (NOT via $()): a background job started inside a
+# command-substitution subshell is reaped when that subshell returns, so $() would lose the holder.
+_spawn_muxm_named_sleeper() {
+  local _dir="$1" _script _pid _tries=0 _cmd
+  _MUXM_HOLDER_PID=""; _MUXM_HOLDER_SCRIPT=""
+  _script="$(mktemp "$_dir/muxm-lock-holder.XXXXXX")" || return
+  printf '#!/bin/bash\nsleep 30\n' > "$_script"; chmod +x "$_script"
+  bash "$_script" & _pid=$!
+  # The name-in-ps rendering can lag process start and varies by platform; poll briefly.
+  while (( _tries < 10 )); do
+    _cmd="$(ps -ww -p "$_pid" -o command= 2>/dev/null)"
+    [[ "$_cmd" == *muxm* ]] && { _MUXM_HOLDER_PID="$_pid"; _MUXM_HOLDER_SCRIPT="$_script"; return; }
+    [[ -n "$_cmd" ]] || break     # process already gone
+    sleep 0.05; (( _tries++ ))
+  done
+  kill "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true; rm -f "$_script"
+}
+
 test_collision() {
   section "Collision Handling (auto-versioning & source replacement)"
 
@@ -8750,20 +8773,27 @@ test_collision() {
     if [[ ! -s "$_m4_src" ]]; then
       skip "collision-concurrent-run-lock: could not build the concurrency-lock fixture"
     else
-      # (a) Live owner → refuse with exit 11.
-      sleep 30 & local _m4_live=$!
-      mkdir "$_m4_lock"; printf '%s\n' "$_m4_live" > "$_m4_lock/pid"
-      local _m4_code
-      (cd "$_m4_dir" && "$MUXM" --output-ext mkv "$_m4_src" "$_m4_out" >/dev/null 2>&1) && _m4_code=$? || _m4_code=$?
-      # The fail-message wording ("output clobbered?") long implied this was checked; it wasn't
-      # (Test_Review.md Tier A #6) — a muxm bug that returns 11 *after* partially writing the
-      # output would previously still pass here.
-      if [[ "$_m4_code" == "$EXIT_VALIDATION" && ! -e "$_m4_out" ]]; then
-        pass "collision-concurrent-run-lock: a live concurrent-run lock refuses the second run (exit 11, no output written)"
+      # (a) Live owner → refuse with exit 11. RV3-16: the owner must be muxm-identifiable (a bare
+      # sleep now reads as a recycled non-muxm PID and would be reclaimed), so spawn a muxm-named holder.
+      _spawn_muxm_named_sleeper "$_m4_dir"
+      if [[ -z "$_MUXM_HOLDER_PID" ]]; then
+        skip "collision-concurrent-run-lock: this platform's ps does not surface the process name — cannot simulate a live muxm lock owner"
       else
-        fail "collision-concurrent-run-lock: expected exit 11 with no output against a live lock, got exit $_m4_code, output present: $([[ -e "$_m4_out" ]] && echo yes || echo no)"
+        local _m4_live="$_MUXM_HOLDER_PID" _m4_hscript="$_MUXM_HOLDER_SCRIPT"
+        mkdir "$_m4_lock"; printf '%s\n' "$_m4_live" > "$_m4_lock/pid"
+        local _m4_code
+        (cd "$_m4_dir" && "$MUXM" --output-ext mkv "$_m4_src" "$_m4_out" >/dev/null 2>&1) && _m4_code=$? || _m4_code=$?
+        # The fail-message wording ("output clobbered?") long implied this was checked; it wasn't
+        # (Test_Review.md Tier A #6) — a muxm bug that returns 11 *after* partially writing the
+        # output would previously still pass here.
+        if [[ "$_m4_code" == "$EXIT_VALIDATION" && ! -e "$_m4_out" ]]; then
+          pass "collision-concurrent-run-lock: a live concurrent-run lock (muxm owner) refuses the second run (exit 11, no output written)"
+        else
+          fail "collision-concurrent-run-lock: expected exit 11 with no output against a live lock, got exit $_m4_code, output present: $([[ -e "$_m4_out" ]] && echo yes || echo no)"
+        fi
+        kill "$_m4_live" 2>/dev/null || true; wait "$_m4_live" 2>/dev/null || true; rm -f "$_m4_hscript"
       fi
-      kill "$_m4_live" 2>/dev/null || true; wait "$_m4_live" 2>/dev/null || true; rm -rf "$_m4_lock"
+      rm -rf "$_m4_lock"
 
       # (b) Stale owner (a reaped/dead PID) → reclaim and proceed.
       local _m4_dead; sleep 0.1 & _m4_dead=$!; wait "$_m4_dead" 2>/dev/null || true
@@ -8826,17 +8856,24 @@ test_collision() {
       skip "collision-source-replace-lock: could not build the source-replace fixture"
     else
       local _m5_code
-      # (a) A live owner holding the source lock WITH the replacing-src marker → a reader (different
-      #     OUT) refuses with exit 11 and writes nothing, rather than reading a soon-to-be-replaced file.
-      sleep 30 & local _m5_live=$!
-      mkdir "$_m5_srclock"; printf '%s\n' "$_m5_live" > "$_m5_srclock/pid"; : > "$_m5_srclock/replacing-src"
-      (cd "$_m5_dir" && "$MUXM" --output-ext mkv "$_m5_src" "$_m5_out" >/dev/null 2>&1) && _m5_code=$? || _m5_code=$?
-      if [[ "$_m5_code" == "$EXIT_VALIDATION" && ! -e "$_m5_out" ]]; then
-        pass "collision-source-replace-lock: a reader refuses a source a live run is replacing (exit 11, no output)"
+      # (a) A live muxm owner holding the source lock WITH the replacing-src marker → a reader
+      #     (different OUT) refuses with exit 11 and writes nothing, rather than reading a
+      #     soon-to-be-replaced file. RV3-16: the owner must be muxm-identifiable (see M4(a)).
+      _spawn_muxm_named_sleeper "$_m5_dir"
+      if [[ -z "$_MUXM_HOLDER_PID" ]]; then
+        skip "collision-source-replace-lock: this platform's ps does not surface the process name — cannot simulate a live muxm replacer"
       else
-        fail "collision-source-replace-lock: expected exit 11 with no output against a live replace-marker, got exit $_m5_code, output present: $([[ -e "$_m5_out" ]] && echo yes || echo no)"
+        local _m5_live="$_MUXM_HOLDER_PID" _m5_hscript="$_MUXM_HOLDER_SCRIPT"
+        mkdir "$_m5_srclock"; printf '%s\n' "$_m5_live" > "$_m5_srclock/pid"; : > "$_m5_srclock/replacing-src"
+        (cd "$_m5_dir" && "$MUXM" --output-ext mkv "$_m5_src" "$_m5_out" >/dev/null 2>&1) && _m5_code=$? || _m5_code=$?
+        if [[ "$_m5_code" == "$EXIT_VALIDATION" && ! -e "$_m5_out" ]]; then
+          pass "collision-source-replace-lock: a reader refuses a source a live muxm run is replacing (exit 11, no output)"
+        else
+          fail "collision-source-replace-lock: expected exit 11 with no output against a live replace-marker, got exit $_m5_code, output present: $([[ -e "$_m5_out" ]] && echo yes || echo no)"
+        fi
+        kill "$_m5_live" 2>/dev/null || true; wait "$_m5_live" 2>/dev/null || true; rm -f "$_m5_hscript"
       fi
-      kill "$_m5_live" 2>/dev/null || true; wait "$_m5_live" 2>/dev/null || true; rm -rf "$_m5_srclock"
+      rm -rf "$_m5_srclock"
 
       # (b) Control: a live owner holding the SAME source lock but WITHOUT the replacing-src marker
       #     (an ordinary run, not a replacer) must NOT block a second run reading that source — two
@@ -9056,6 +9093,130 @@ test_edge() {
     if (( ! found )); then
       fail "Auto-generated output: no output file found in $auto_dir"
     fi
+  fi
+
+  _test_edge_disk_undeterminable_duration
+  _test_edge_recycled_pid_lock_reclaimed
+  _test_edge_control_char_nonc_locale
+  _test_edge_duration_subsecond
+}
+
+# RV3-16: when source duration is undeterminable, disk_free_warn must NOT collapse the audio-size
+# term to ~1s (dur=1 fallback). It now omits the audio term (0) and logs a caveat; the source-size-
+# derived video term still bounds the whole file. Extraction test with a stubbed duration of 0.
+_test_edge_disk_undeterminable_duration() {
+  local body
+  body="$(_extract_muxm_fns disk_free_warn _split_tab)" \
+    || { fail "edge-disk-undeterminable-duration: could not extract disk_free_warn + _split_tab"; return; }
+  local srcfile; srcfile="$(mktemp "$TESTDIR/disk_dur0.XXXXXX")"
+  head -c 10485760 /dev/zero > "$srcfile"   # 10 MiB
+  # A real audio track exists (n_audio=1, passthrough eac3 @ 448 kbps) so a non-omitted term would be large.
+  local common='
+    DISK_CHECK=1; VIDEO_CODEC=libx265; CRF_VALUE=28; PRESET_VALUE=medium
+    DISABLE_DV=1; AUDIO_MULTI_TRACK=0; AUDIO_FORCE_CODEC=""; METADATA_CACHE=""
+    DISK_FREE_WARN_GB=0; WORKDIR=/tmp; OUT_DIR=/tmp
+    _audio_stream_count(){ echo 1; }
+    _audio_stream_info(){ printf "eac3\t6\teng\t448000\tSurround\t0\t0\t0\n"; }
+    _source_has_dv_metadata(){ return 1; }
+    _crf_ratio(){ echo 50; }; _preset_multiplier(){ echo 1000; }; _av1_preset_multiplier(){ echo 1000; }
+    _gb(){ echo 0; }; _jq_cache(){ echo ""; }
+    df(){ printf "Filesystem 1K-blocks Used Available Capacity Mounted\nstubdev 100000000000 0 99999999999 1%% /\n"; }
+    die(){ echo "DIE:$*"; }; say(){ :; }; log(){ printf "%s " "$@"; printf "\n"; }
+  '
+  local out_unknown out_known
+  out_unknown="$(bash -c "$common"$'\n''_get_source_duration_secs(){ echo 0; }'$'\n'"SRC_ABS='$srcfile'; VIDEO_COPY_IF_COMPLIANT=0"$'\n'"$body"$'\n''disk_free_warn')"
+  out_known="$(bash -c "$common"$'\n''_get_source_duration_secs(){ echo 100; }'$'\n'"SRC_ABS='$srcfile'; VIDEO_COPY_IF_COMPLIANT=0"$'\n'"$body"$'\n''disk_free_warn')"
+  if grep -qF "audio_bytes=0" <<<"$out_unknown" && grep -qiF "duration undeterminable" <<<"$out_unknown"; then
+    pass "edge-disk-undeterminable-duration: audio term omitted (audio_bytes=0) with a caveat, not silently collapsed to ~1s"
+  else
+    fail "edge-disk-undeterminable-duration: expected audio_bytes=0 + a caveat; got $(grep -oE 'audio_bytes=[0-9]+' <<<"$out_unknown"), caveat=$(grep -qiF 'duration undeterminable' <<<"$out_unknown" && echo yes || echo no)"
+  fi
+  # Control: with a KNOWN duration the same track IS estimated (non-zero) — proves the omission is the dur=0 path.
+  if grep -qE 'audio_bytes=[1-9][0-9]*' <<<"$out_known" && ! grep -qiF "duration undeterminable" <<<"$out_known"; then
+    pass "edge-disk-undeterminable-duration: control — a KNOWN duration estimates the audio term (non-zero, no caveat)"
+  else
+    fail "edge-disk-undeterminable-duration: control expected non-zero audio_bytes + no caveat, got $(grep -oE 'audio_bytes=[0-9]+' <<<"$out_known")"
+  fi
+  rm -f "$srcfile"
+}
+
+# RV3-16: a LIVE but NON-muxm process holding the output lock (an unrelated process that recycled a
+# dead muxm's PID) must be reclaimed, not treated as a live muxm run. Complements the M4/M5 tests
+# (which prove a real muxm owner still refuses). Skip-guard if this platform's ps can't surface the
+# process command (safe-bias would then correctly REFUSE, which this test's expectation inverts).
+_test_edge_recycled_pid_lock_reclaimed() {
+  if ! ffmpeg_has_encoder libx265; then
+    skip "edge-recycled-pid-lock: ffmpeg lacks libx265 — cannot build the fixture"
+    return
+  fi
+  local _d; _d="$(mktemp -d "$TESTDIR/rpid.XXXXXX")"
+  local _src="$_d/s.mkv" _out="$_d/o.mkv" _lock="$_d/.o.mkv.lock"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=320x180:rate=24:duration=1" \
+    -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p "$_src" 2>/dev/null
+  if [[ ! -s "$_src" ]]; then skip "edge-recycled-pid-lock: could not build the fixture"; rm -rf "$_d"; return; fi
+  sleep 30 & local _sp=$!
+  # Guard: only meaningful if ps clearly shows this non-muxm process (else muxm safe-biases to refuse).
+  if [[ "$(ps -ww -p "$_sp" -o command= 2>/dev/null)" != *sleep* ]]; then
+    skip "edge-recycled-pid-lock: this platform's ps does not surface process commands — cannot distinguish a non-muxm PID"
+    kill "$_sp" 2>/dev/null || true; wait "$_sp" 2>/dev/null || true; rm -rf "$_d"; return
+  fi
+  mkdir "$_lock"; printf '%s\n' "$_sp" > "$_lock/pid"
+  local _code
+  (cd "$_d" && "$MUXM" --output-ext mkv "$_src" "$_out" >/dev/null 2>&1) && _code=$? || _code=$?
+  if [[ "$_code" == 0 && -s "$_out" ]]; then
+    pass "edge-recycled-pid-lock: a live NON-muxm process holding the lock (recycled PID) is reclaimed, not treated as a live muxm run"
+  else
+    fail "edge-recycled-pid-lock: expected reclaim + proceed (exit 0, output), got exit $_code, output: $([[ -s "$_out" ]] && echo yes || echo no)"
+  fi
+  kill "$_sp" 2>/dev/null || true; wait "$_sp" 2>/dev/null || true; rm -rf "$_d"
+}
+
+# RV3-16: the control-character filename guards are LC_ALL=C-pinned, so they fire byte-deterministically
+# regardless of the ambient locale. Run under a non-C (UTF-8) locale with a 0x01 in the source name and
+# assert the guard still dies (exit 11).
+_test_edge_control_char_nonc_locale() {
+  if ! ffmpeg_has_encoder libx265; then
+    skip "edge-control-char-nonc-locale: ffmpeg lacks libx265 — cannot build the fixture"
+    return
+  fi
+  # Honesty guard: without an installed UTF-8 locale, LC_ALL=<utf8> silently falls back to C and the
+  # test would no longer exercise the NON-C path it claims to. Pick a real one, or skip (not hollow-pass).
+  local _utf8_locale
+  _utf8_locale="$(locale -a 2>/dev/null | grep -iE '^(en_US|C)\.utf-?8$' | head -1)"
+  if [[ -z "$_utf8_locale" ]]; then
+    skip "edge-control-char-nonc-locale: no UTF-8 locale installed — cannot exercise the non-C path"
+    return
+  fi
+  local _d; _d="$(mktemp -d "$TESTDIR/ctrlc.XXXXXX")"
+  local _ctrl_src="$_d/$(printf 'src\x01bad').mkv"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=160x120:rate=24:duration=1" \
+    -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p "$_ctrl_src" 2>/dev/null
+  if [[ ! -e "$_ctrl_src" ]]; then skip "edge-control-char-nonc-locale: could not build a control-char-named fixture (filesystem restriction)"; rm -rf "$_d"; return; fi
+  local _out _code
+  _out="$( cd "$_d" && LANG="$_utf8_locale" LC_ALL="$_utf8_locale" "$MUXM" --output-ext mkv "$_ctrl_src" out.mkv 2>&1 )" && _code=$? || _code=$?
+  if [[ "$_code" == "$EXIT_VALIDATION" ]] && grep -qiF "control characters" <<<"$_out"; then
+    pass "edge-control-char-nonc-locale: the LC_ALL=C-pinned control-char guard fires under a UTF-8 locale ($_utf8_locale, exit 11)"
+  else
+    fail "edge-control-char-nonc-locale: expected exit 11 + a control-char message under en_US.UTF-8, got exit $_code"
+  fi
+  rm -rf "$_d"
+}
+
+# RV3-16: a genuinely sub-second source (Tier-1 stream.duration rounds to "0") must be accepted as
+# determined — NOT fall through to a later tier and adopt a different value. Feed a cache whose Tier-1
+# duration is 0.4s and whose Matroska DURATION tag disagrees (5s); assert the result is 0, not 5.
+_test_edge_duration_subsecond() {
+  local body
+  body="$(_extract_muxm_fns _get_source_duration_secs _jq_cache)" \
+    || { fail "edge-duration-subsecond: could not extract _get_source_duration_secs + _jq_cache"; return; }
+  local _dur
+  _dur="$(bash -c 'METADATA_CACHE="$1"; _CACHED_SRC_DURATION_SECS=""; DEBUG=0; log(){ :; }
+'"$body"'
+_get_source_duration_secs' -- '{"streams":[{"codec_type":"video","duration":"0.4","tags":{"DURATION":"00:00:05.000000000"}}],"format":{}}')"
+  if [[ "$_dur" == "0" ]]; then
+    pass "edge-duration-subsecond: sub-second stream.duration 0.4 → 0s, no fallthrough to the disagreeing 5s Matroska tag"
+  else
+    fail "edge-duration-subsecond: expected 0 (Tier-1 wins), got '$_dur' (fell through to a later tier?)"
   fi
 }
 
@@ -11324,6 +11485,33 @@ if _video_is_copy_compliant; then printf "0|%s" "$_COPY_REJECT_REASON"; else pri
   _vcc_assert "unit-video-copy-bitrate-ceiling: un-parseable rate '80X' → warn + ceiling skipped (copyable)" 0 "" "$(_vcc hevc yuv420p '' '' 100000000 'MAX_COPY_BITRATE=80X')"
 }
 
+# RV3-16: _probe_field's pre-cache ffprobe fallback now passes -select_streams v:0 so it queries the
+# first VIDEO stream, matching the cached branch's `select(.codec_type=="video") | .[0]`. Without it,
+# `-show_entries stream=$field | head -n1` could return a non-video (e.g. audio) stream's blank value.
+# Stub ffprobe to emulate real -select_streams behavior: with v:0 → the video value; without → all
+# streams (audio blank first). The fix makes _probe_field return the video value, not the blank.
+_test_unit_probe_field_precache_video() {
+  local body
+  body="$(_extract_muxm_fns _probe_field)" || { fail "unit-probe-field-precache: could not extract _probe_field"; return; }
+  local out
+  # shellcheck disable=SC2016  # $@/$() must expand in the child bash, not here.
+  out="$(bash -c '
+    FFPROBE_FLAGS=(); METADATA_CACHE=""   # empty cache → take the pre-cache fallback branch
+    ffprobe(){
+      local a sel=0
+      for a in "$@"; do [[ "$a" == "v:0" ]] && sel=1; done
+      if (( sel )); then printf "hevc\n"; else printf "\n"; printf "hevc\n"; fi   # v:0→video only; all→audio(blank) then video
+    }
+    '"$body"'
+    printf "[%s]" "$(_probe_field codec_name /some/src.mkv)"
+  ')"
+  if [[ "$out" == "[hevc]" ]]; then
+    pass "unit-probe-field-precache: the pre-cache fallback filters to the first VIDEO stream (returns 'hevc', not a non-video stream's blank value)"
+  else
+    fail "unit-probe-field-precache: expected '[hevc]', got '$out' (a non-video/blank value leaked — -select_streams v:0 missing?)"
+  fi
+}
+
 _test_unit_pixfmt_gate_helpers() {
   # 3.5b (C1): direct unit tests for the two self-sufficient helpers the skip-if-ideal copy gate
   # relies on (in place of the stale TARGET_PIXFMT / IS_DV reads):
@@ -11622,6 +11810,7 @@ test_unit() {
   _test_unit_report_add_escaping
   _test_unit_duration_tier3
   _test_unit_video_copy_compliant
+  _test_unit_probe_field_precache_video
   _test_unit_pixfmt_gate_helpers
   _test_unit_sw_encoder_preflight
   _test_unit_hdr10_static_metadata

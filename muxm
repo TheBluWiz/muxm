@@ -853,7 +853,12 @@ _get_source_duration_secs() {
     return
   fi
 
-  local dur="" result=0
+  # RV3-16: empty string is the "not yet determined" sentinel — distinct from a legitimate
+  # rounded-to-zero duration. The old code seeded result=0 and fell through each tier on
+  # `result == "0"`, so a genuinely sub-second source (Tier 1 rounds to "0") needlessly re-probed
+  # Tiers 2/3 and could adopt a DIFFERENT (wrong) later-tier value. Now a tier that determines any
+  # value — including "0" — is final; only a still-empty result advances.
+  local dur="" result=""
 
   # Tier 1: standard stream-level duration (common in MP4, rare in MKV)
   dur="$(_jq_cache -r \
@@ -864,7 +869,7 @@ _get_source_duration_secs() {
   fi
 
   # Tier 2: container/format-level duration (most containers)
-  if [[ "$result" == "0" ]]; then
+  if [[ -z "$result" ]]; then
     dur="$(_jq_cache -r \
       '.format.duration // empty' | head -n1)"
     if [[ "$dur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -874,7 +879,7 @@ _get_source_duration_secs() {
   fi
 
   # Tier 3: Matroska tags — DURATION as "HH:MM:SS.nnnnnnnnn"
-  if [[ "$result" == "0" ]]; then
+  if [[ -z "$result" ]]; then
     local tag_dur
     tag_dur="$(_jq_cache -r \
       '[.streams[] | select(.codec_type=="video")] | .[0].tags.DURATION // empty' | head -n1)"
@@ -885,8 +890,11 @@ _get_source_duration_secs() {
     fi
   fi
 
-  [[ "$result" == "0" ]] && \
+  # Genuinely undeterminable → log once and normalize to the "0" the callers expect for "unknown".
+  if [[ -z "$result" ]]; then
     log "Duration: unable to determine from stream, format, or Matroska tags — progress bar unavailable"
+    result=0
+  fi
 
   _CACHED_SRC_DURATION_SECS="$result"
   echo "$result"
@@ -6433,7 +6441,11 @@ SRC_ABS="$(realpath_fallback "$SRC")"
 # Validate filename doesn't contain control characters (security)
 # This catches newlines, tabs, null bytes, and other chars that could cause
 # field-splitting issues in the printf '%s\n' patterns used throughout.
-if [[ "$SRC_ABS" =~ [[:cntrl:]] ]]; then
+# RV3-16: pin LC_ALL=C so [[:cntrl:]] classifies by byte (0x00-0x1f, 0x7f) deterministically — a
+# non-C locale can reclassify the control set. `[[` is a keyword and can't take an env prefix, so
+# scope the assignment to a subshell (one-shot check; the fork is negligible). Matches the file's
+# other locale-pinned checks (LC_ALL=C tr/awk/sort, LC_NUMERIC=C printf).
+if ( LC_ALL=C; [[ "$SRC_ABS" =~ [[:cntrl:]] ]] ); then
   die 11 "Source filename contains control characters - potential security risk. Rename the file to remove control characters."
 fi
 
@@ -6483,7 +6495,8 @@ OUT_ABS="${OUT_DIR}/${OUT_BASENAME}"
 OUT="$OUT_ABS"
 
 # Validate output doesn't contain control characters (security)
-if [[ "$OUT_ABS" =~ [[:cntrl:]] ]]; then
+# RV3-16: LC_ALL=C-pinned in a subshell, same rationale as the SRC_ABS guard above.
+if ( LC_ALL=C; [[ "$OUT_ABS" =~ [[:cntrl:]] ]] ); then
   die 11 "Output filename contains control characters - potential security risk. Rename the file to remove control characters."
 fi
 
@@ -6677,10 +6690,10 @@ _print_completed_steps(){
 _cleanup_workdir() {
   local keep_on_failure="${1:-0}"
   if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && $KEEP_TEMP_ALWAYS -eq 0 ]]; then
-    if (( keep_on_failure && KEEP_TEMP )); then
-      note "Keeping failure artifacts at: $WORKDIR"
-      return
-    fi
+    # RV3-16: the former `keep_on_failure && KEEP_TEMP → keep` branch was dead code — on_exit only
+    # reaches `_cleanup_workdir 1` on the non-keep failure path, which is entered precisely when
+    # KEEP_TEMP (and KEEP_TEMP_ALWAYS/DEBUG) are 0 (else it renames the workdir to a visible dir and
+    # clears WORKDIR before ever calling here). So keep_on_failure=1 always implies KEEP_TEMP=0.
     if (( ! keep_on_failure )); then
       (( KEEP_TEMP )) && note "--keep-temp preserves workdir on failure only; use -K/--keep-temp-always to keep on success."
     fi
@@ -6994,6 +7007,25 @@ on_exit() {
   fi
 }
 
+# _pid_is_muxm PID — best-effort identity check for the lock owner: 0 if the live process PID looks
+# like a muxm run (its command line mentions this script's basename), 1 only when it clearly does
+# NOT. RV3-16: `kill -0` alone can't tell a still-running muxm from an unrelated process that
+# recycled a dead muxm's PID; without this, a recycled PID would spuriously refuse a new run.
+#
+# SAFE-BIAS: uncertainty (ps absent/failed/empty) returns 0 = "treat as live". A false "live" only
+# costs a spurious refusal (the user clears the stale lock); a false "dead" would RECLAIM the lock and
+# start a SECOND writer on the same $OUT — data corruption. So we only reclaim when ps definitively
+# shows a non-muxm command. `ps -ww` avoids the default command-column truncation that would eat the
+# basename at the end of `… bash /path/muxm`. Portable across macOS and Linux. Not bulletproof — an
+# unrelated process whose args happen to contain the basename would read as live (a documented, safe
+# residual, since it only over-refuses).
+_pid_is_muxm() {
+  local _pid="$1" _cmd _self="${BASH_SOURCE[0]##*/}"
+  _cmd="$(ps -ww -p "$_pid" -o command= 2>/dev/null)" || return 0   # can't tell → assume live (safe)
+  [[ -z "$_cmd" ]] && return 0                                       # can't tell → assume live (safe)
+  [[ "$_cmd" == *"$_self"* ]]
+}
+
 # _acquire_out_lock — refuse to start when another LIVE muxm run already targets this $OUT, and
 # reclaim a lock orphaned by a dead one (on_exit cannot run on SIGKILL). The lock is a hidden
 # directory beside the output (…/.<basename>.lock — e.g. …/.Movie.mkv.lock) created atomically by
@@ -7006,7 +7038,9 @@ _acquire_out_lock() {
   local lock="$OUT_LOCK_PATH" owner tries=0 empty_tries=0
   while ! mkdir "$lock" 2>/dev/null; do
     owner=""; [[ -r "$lock/pid" ]] && read -r owner < "$lock/pid" 2>/dev/null
-    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+    # RV3-16: a live PID owning the lock is only a genuine conflict if it's actually a muxm run —
+    # _pid_is_muxm guards against a recycled PID (safe-bias: uncertain → treated as live, never reclaimed).
+    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null && _pid_is_muxm "$owner"; then
       die 11 "Another muxm run (PID $owner) is already writing to this output: $OUT — wait for it to finish, choose a different output path, or remove the stale lock with: rm -rf '$lock'"
     fi
     # An empty/unreadable pid file may simply mean the holder just won the mkdir race but has
@@ -7042,7 +7076,9 @@ _check_src_replace_lock() {
   local _sl; _sl="$(dirname "$SRC_ABS")/.$(basename "$SRC_ABS").lock"
   [[ -d "$_sl" && -e "$_sl/replacing-src" ]] || return 0
   local _owner=""; [[ -r "$_sl/pid" ]] && read -r _owner < "$_sl/pid" 2>/dev/null
-  if [[ "$_owner" =~ ^[0-9]+$ ]] && kill -0 "$_owner" 2>/dev/null; then
+  # RV3-16: same recycled-PID guard as _acquire_out_lock. Safe-bias: an uncertain identity blocks the
+  # reader (a spurious block is non-corrupting here — it only over-refuses).
+  if [[ "$_owner" =~ ^[0-9]+$ ]] && kill -0 "$_owner" 2>/dev/null && _pid_is_muxm "$_owner"; then
     die 11 "Source is being replaced by another live muxm run (PID $_owner): $SRC_ABS — wait for it to finish before reading this file, or use a different source."
   fi
   return 0
@@ -7161,9 +7197,16 @@ disk_free_warn() {
   (( DISK_CHECK )) || return 0
 
   # ---- Duration (integer seconds, via three-tier cached lookup) ----
-  local -i dur
+  local -i dur dur_known=1
   dur="$(_get_source_duration_secs)"
-  (( dur <= 0 )) && dur=1
+  if (( dur <= 0 )); then
+    # RV3-16: duration undeterminable. Keep dur=1 so the video src_size-synthesis math stays
+    # well-defined (dur cancels out there — see the vbr synthesis below), but the audio estimate
+    # scales LINEARLY with duration and has no size-based fallback, so a dur=1 collapses it to ~1s
+    # of audio. Skip the audio term entirely (below) and note the caveat rather than silently
+    # under-reserving. The video term (source-size derived) still covers the whole file conservatively.
+    dur=1; dur_known=0
+  fi
 
   # ---- Source file size (single stat; the bitrate-free fallback below) ----
   # MKV inputs frequently carry no per-stream (or container) bit_rate, which used to
@@ -7231,7 +7274,9 @@ disk_free_warn() {
   local -i est_audio_bytes=0
   local -i n_audio
   n_audio="$(_audio_stream_count)"
-  if (( n_audio > 0 )); then
+  # RV3-16: only estimate audio when the duration is known — otherwise a dur=1 fallback would
+  # collapse this term to ~1s (see the duration block above). Left at 0 with a caveat logged below.
+  if (( dur_known && n_audio > 0 )); then
     local -i max_tracks=$n_audio
     (( AUDIO_MULTI_TRACK )) || max_tracks=1
     local -i i
@@ -7309,6 +7354,9 @@ disk_free_warn() {
 
   log "Disk preflight: video_bytes=${est_video_bytes} audio_bytes=${est_audio_bytes} src_size=${src_size} peak_factor=${peak_factor}" \
       "est_output=${est_output} est_peak=${est_peak} need_workdir=${need_workdir} need_output=${need_output} (~$(_gb "$need_workdir")GB peak)"
+  # RV3-16: caveat when duration was undeterminable — the audio-size term was omitted (not collapsed
+  # to ~1s), and the estimate rests on the source-size-derived video term alone.
+  (( dur_known )) || log "Disk preflight caveat: source duration undeterminable — audio-size term omitted from the estimate (the source-size-derived video term still bounds the whole file)."
 
   # ---- Enforce per-volume (hard stop; override with --no-disk-check) ----
   # WORKDIR holds the large intermediates; OUT_DIR holds the final file. Check
@@ -7683,8 +7731,11 @@ _probe_field(){
     _jq_cache -r \
       "[.streams[] | select(.codec_type==\"video\")] | .[0].$field // empty" | head -n1 || true
   else
-    # Pre-cache fallback (should only occur if called before cache_stream_metadata)
-    ffprobe "${FFPROBE_FLAGS[@]}" -show_entries "stream=$field" \
+    # Pre-cache fallback (should only occur if called before cache_stream_metadata).
+    # RV3-16: -select_streams v:0 restricts to the first VIDEO stream, matching the cached branch's
+    # `select(.codec_type=="video") | .[0]`. Without it, `-show_entries stream=$field` emits the
+    # field for EVERY stream and `head -n1` could return a non-video (e.g. audio) stream's value.
+    ffprobe "${FFPROBE_FLAGS[@]}" -select_streams v:0 -show_entries "stream=$field" \
             -of default=nk=1:nw=1 "${2:-}" 2>/dev/null | head -n1 || true
   fi
 }
@@ -11798,8 +11849,11 @@ discover_external_subtitles(){
       # Reject sidecar paths containing control characters, mirroring the SRC_ABS/OUT guards:
       # a newline/tab/etc. in the name could corrupt a log or report line downstream. Warn (with the
       # control bytes rendered as '?' so the warning itself stays clean) and skip — never mux it.
-      if [[ "$fpath" =~ [[:cntrl:]] ]]; then
-        warn "[Subs] Skipping external subtitle with control characters in its path: ${fpath//[[:cntrl:]]/?}"
+      # RV3-16: LC_ALL=C-pin the guard (byte-deterministic [[:cntrl:]]), same as the SRC_ABS/OUT
+      # guards. Pin the display sanitization too — a non-C locale could otherwise leave a raw control
+      # byte in the warning, the very log corruption this guard exists to prevent.
+      if ( LC_ALL=C; [[ "$fpath" =~ [[:cntrl:]] ]] ); then
+        warn "[Subs] Skipping external subtitle with control characters in its path: $(LC_ALL=C; printf '%s' "${fpath//[[:cntrl:]]/?}")"
         continue
       fi
 
