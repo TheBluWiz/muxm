@@ -141,7 +141,19 @@ _muxm_completions() {
 # If running in zsh, enable bash completion emulation BEFORE calling `complete`.
 # Without this, the unconditional `complete` below would error in zsh.
 if [[ -n "${ZSH_VERSION:-}" ]]; then
-    autoload -Uz bashcompinit && bashcompinit
+    # M-19: bashcompinit's `complete` shim calls compdef, which only compinit defines. If the user's
+    # ~/.zshrc never runs compinit (e.g. a minimal aliases-only rc), calling bashcompinit alone left
+    # `complete` erroring with "command not found: compdef" on every new shell, and the completion
+    # never registered. Run compinit first (idempotent; -u skips the insecure-dir prompt) so compdef
+    # exists. Kept to portable zsh builtins — no zsh-only `$+functions` syntax (this file is also
+    # parsed by bash when sourced there).
+    autoload -Uz compinit bashcompinit
+    compinit -u 2>/dev/null
+    bashcompinit 2>/dev/null
 fi
 
-complete -o filenames -o bashdefault -F _muxm_completions muxm
+# -o default: fall back to readline filename completion when the handler leaves COMPREPLY empty (the
+# free-form-value flags above do this) — L-1: without it, `--ext-subs-dir <Tab>` (a directory-valued
+# flag) and the other free-form flags offered NO completion at all, contradicting their own
+# "fall through to files" comment. -o bashdefault keeps variable/hostname fallbacks.
+complete -o filenames -o bashdefault -o default -F _muxm_completions muxm

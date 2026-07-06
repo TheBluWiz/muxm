@@ -533,6 +533,7 @@ declare -i SUB_BURN_FORCED=0
 # Export non-forced subtitles as external .srt files alongside output
 declare -i SUB_EXPORT_EXTERNAL=0
 declare -i _EXPORT_MKV_ADVISORY_SHOWN=0   # One-shot guard for _warn_export_external_mkv
+declare -Ag _CONTAINER_ADVISORY_SHOWN=()  # L-6: per-message one-shot guard for _warn_container_unusual (fired in BOTH Section 13 and the post-resolution tail)
 # Keep chapter markers in output
 declare -i KEEP_CHAPTERS=1
 # Strip non-essential metadata from output
@@ -929,7 +930,7 @@ _jq_cache() {
   local _jq_err_file="${WORKDIR:-/tmp}/jq_debug_err.tmp"
   _jq_out="$(printf '%s\n' "$METADATA_CACHE" | jq "$@" 2>"$_jq_err_file")"
   _jq_rc=$?
-  _jq_err="$(<"$_jq_err_file" 2>/dev/null)"
+  _jq_err="$(cat "$_jq_err_file" 2>/dev/null)"   # L-7: `$(<file 2>/dev/null)` — the added redirection demotes the fast `<file` form to a null command with redirections, reading NOTHING; use cat so DEBUG jq stderr is actually captured
   log "[jq_cache] filter: $*"
   log "[jq_cache] rc=${_jq_rc}  result=${_jq_out:0:300}"
   [[ -n "$_jq_err" ]] && log "[jq_cache] jq stderr: ${_jq_err:0:300}"
@@ -1221,6 +1222,21 @@ _validate_media_file(){
 # for ENOSPC ("No space left on device") and emit a specific warning if found.
 # Call this before die() when an ffmpeg command or file operation fails, so the
 # user gets an actionable message instead of a generic "encode failed".
+# M-7: robust `df -Pk` field extraction. Positional `$4` (Available) / `$1` (Filesystem) break when
+# the df "Filesystem" source contains a SPACE — the muxm-core case of an SMB/CIFS/NAS share like
+# "//user@nas/My Share" (and macOS mount points like "/Volumes/My Share"). A shifted `$4` then reads
+# the *Used* column (silent under-warn → the ENOSPC preflight fails to fire) or a "NN%" token (an
+# arithmetic-syntax abort on every run on that volume). Key off the capacity percentage field, which
+# is positionally stable regardless of spaces: Available is always the field immediately before it,
+# and the source is everything before the first all-numeric (1K-blocks) field. Both echo "" on
+# failure (callers already guard on empty). `-P` guarantees a single unwrapped data line (row 2).
+_df_avail_kb(){
+  df -Pk "$1" 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+%$/){print $(i-1); exit}}'
+}
+_df_source(){
+  df -Pk "$1" 2>/dev/null | awk 'NR==2{out=""; for(i=1;i<=NF;i++){ if($i ~ /^[0-9]+$/) break; out=(out=="")?$i:out" "$i } print out}'
+}
+
 # Args: $1 — error log file path (or any file on the relevant volume)
 # Globals: WORKDIR (read, for volume fallback)
 _check_disk_full() {
@@ -1233,7 +1249,7 @@ _check_disk_full() {
   # Fallback: check available space on the workdir volume directly
   local avail_kb=""
   local check_dir="${WORKDIR:-${OUT_DIR:-.}}"
-  avail_kb="$(df -Pk "$check_dir" 2>/dev/null | awk 'NR==2{print $4}')"
+  avail_kb="$(_df_avail_kb "$check_dir")"
   if [[ -n "$avail_kb" ]] && (( avail_kb < 1024 )); then
     warn "Disk full: less than 1 MB free on temp volume ($check_dir) — free space and retry."
   fi
@@ -1286,6 +1302,17 @@ is_valid_preset(){
   case "$1" in
     ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo) return 0;;
     *) return 1;;
+  esac
+}
+# --checksum-algo validated via the same inline-validator shape as its siblings above. Called from
+# the CLI parse arm (immediate parse-time failure), the Section-15 sourced-.muxmrc bypass check, AND
+# _create_config's override validation (M-15). Defined EARLY (before _create_config_prescan runs at
+# top level) alongside is_valid_video_codec/is_valid_preset so the prescan can reach it — one
+# function, three call sites, instead of duplicating the enum list.
+_validate_checksum_algo_arg(){
+  case "$2" in
+    sha256|blake2b|auto) return 0 ;;
+    *) die 11 "Invalid $1 '$2': expected one of sha256, blake2b, auto." ;;
   esac
 }
 
@@ -1559,13 +1586,23 @@ _muxm_tier_is_trusted(){
   return 0
 }
 
-# _muxm_user_tier_is_elevation_risk EUID — return 0 (⇒ skip the $HOME/.muxmrc tier) when running as
-# root (euid 0) VIA sudo/su with the invoking user's $HOME preserved (SUDO_USER/SUDO_UID present),
-# so root doesn't execute an unprivileged user's config (RV3-04, Finding #3). A genuine root login
-# (no SUDO_*) returns 1 → root's own ~/.muxmrc is still sourced. Taking euid as an ARG (the call
-# site passes the read-only $EUID) keeps the real privilege check un-spoofable AND unit-testable.
+# _muxm_user_tier_is_elevation_risk EUID HOME_OWNER_UID — return 0 (⇒ skip the $HOME/.muxmrc tier)
+# when running as root (euid 0) over a $HOME that root does NOT own — i.e. an unprivileged user's
+# home preserved into a root session (`sudo -E`, `env_keep += HOME`, or `su` WITHOUT `-`). Sourcing
+# that user's ~/.muxmrc would execute their shell as root (RV3-04, Finding #3).
+#
+# M-13: the ground truth is OWNERSHIP of $HOME, not SUDO_* presence. The old SUDO_* proxy was wrong
+# in BOTH directions: it MISSED `su` without `-` (which sets no SUDO_* but keeps the caller's HOME —
+# the real elevation vector), and it FALSE-FIRED on plain `sudo` (default `env_reset` sets HOME=/root,
+# root's OWN home, yet SUDO_USER is set → it wrongly skipped root's /root/.muxmrc). Checking whether
+# root owns $HOME handles every case: genuine root login, `sudo` (env_reset), and `su -` all leave
+# HOME root-owned → source it; `sudo -E` / `su` (no dash) leave HOME owned by the unprivileged user
+# → skip it. Both EUID and the owner uid are passed as ARGS (call site reads the read-only $EUID and
+# stats $HOME) so the real privilege check stays un-spoofable AND the predicate is pure/unit-testable.
 _muxm_user_tier_is_elevation_risk(){
-  (( ${1:-1} == 0 )) && [[ -n "${SUDO_USER:-}${SUDO_UID:-}" ]]
+  (( ${1:-1} == 0 )) || return 1                 # not root → same-privilege, never a risk
+  [[ "${2:-}" =~ ^[0-9]+$ ]] || return 1         # owner undeterminable → best-effort, don't block
+  (( ${2} != 0 ))                                # risk iff $HOME is NOT root-owned
 }
 
 # Source a config file if it exists and is readable. Tracks loaded files for diagnostics.
@@ -1576,8 +1613,22 @@ _muxm_try_source(){
   local f="$1" tier="${2:-}"
   [[ -r "$f" ]] || return 0
   [[ "$tier" == "trusted" ]] && ! _muxm_tier_is_trusted "$f" && return 0  # rejected (warned) → skip
+  # M-12: source with errexit relaxed. Under the caller's `set -e`, a nonzero return from `. "$f"`
+  # aborts the WHOLE process — and this runs in Section 6, BEFORE the Section-18 ERR/EXIT traps are
+  # installed, so the abort is completely SILENT: a config whose last statement is a false test (the
+  # extremely common `[[ -d /some/path ]] && WORKDIR_BASE=…` guard idiom) made every invocation,
+  # including `muxm --help`, exit 1 with zero output and no hint the config was at fault. Relax
+  # errexit for the source, capture the status, and surface a diagnostic instead of dying. The H1
+  # accepted trust model is unchanged — the config's code still executes; we only stop its trailing
+  # (or interim) exit status from killing muxm. Restoring `set -e` afterwards also defends against a
+  # config that turns errexit off and never restores it.
+  local _rc=0
+  set +e
   # shellcheck disable=SC1090
   . "$f"
+  _rc=$?
+  set -e
+  (( _rc == 0 )) || warn "Config '$f' returned non-zero status ($_rc) during load (a trailing false test, or a failing command). Settings before that point were applied; muxm continues. End the file with a plain assignment or ': ;' to silence this."
   MUXM_CONFIG_LOADED+=("$f")
 }
 # Structural: single authoritative list of all .muxmrc-configurable variables. The
@@ -1644,11 +1695,16 @@ _muxm_try_source /etc/.muxmrc trusted
 # that case (a genuine root login — no SUDO_USER/SUDO_UID — still sources root's own ~/.muxmrc).
 # The /etc tier above is unaffected (it is the system-owned config, meant to be read by everyone).
 if [[ -n "${HOME:-}" ]]; then
-  if _muxm_user_tier_is_elevation_risk "$EUID"; then
-    [[ -r "$HOME/.muxmrc" ]] && warn "Skipping ${HOME}/.muxmrc — running as root via sudo/su with the invoking user's \$HOME preserved; sourcing it would execute that user's config as root. Use 'sudo muxm --create-config system <profile>' for a root-owned config."
+  # M-13: stat $HOME's owner uid (BSD `stat -f %u` / GNU `stat -c %u`) and pass it to the pure
+  # predicate. An undeterminable owner (empty) makes the predicate best-effort don't-block.
+  _home_owner_uid="$(stat -f '%u' "$HOME" 2>/dev/null)"
+  [[ "$_home_owner_uid" =~ ^[0-9]+$ ]] || _home_owner_uid="$(stat -c '%u' "$HOME" 2>/dev/null)"
+  if _muxm_user_tier_is_elevation_risk "$EUID" "${_home_owner_uid:-}"; then
+    [[ -r "$HOME/.muxmrc" ]] && warn "Skipping ${HOME}/.muxmrc — running as root while \$HOME (${HOME}) is owned by another user (sudo -E / su without -); sourcing it would execute that user's config as root. Use 'sudo muxm --create-config system <profile>' for a root-owned config."
   else
     _muxm_try_source "$HOME/.muxmrc" trusted
   fi
+  unset _home_owner_uid
 fi
 _muxm_try_source "./.muxmrc"   # Sources from $PWD — intentional project-level override (see section header; H1 WONTFIX — no trust gate)
 
@@ -3312,7 +3368,12 @@ _require_sudo_for(){
 # available, there's nothing reliable to check against, so this stays silent rather than guess.
 # Args: $1 — the installed man directory
 _warn_if_not_on_manpath(){
-  local _mandir="$1" _resolved
+  # M-18: $1 is the man1 SUBDIR (…/share/man/man1), but `manpath` / $MANPATH list man ROOTS
+  # (…/share/man) — `man` appends manN/ to a root itself. Comparing the man1 subdir against the
+  # roots therefore NEVER matched, so this warned after every successful install, with remediation
+  # advice that added the man1 dir as a root (making `man` look under …/man1/man1/). Compare — and
+  # advise adding — the ROOT.
+  local _mandir="$1" _manroot="${1%/man1}" _resolved
   if command -v manpath >/dev/null 2>&1; then
     _resolved="$(manpath 2>/dev/null)"
   else
@@ -3320,13 +3381,13 @@ _warn_if_not_on_manpath(){
   fi
   [[ -n "$_resolved" ]] || return 0
   case ":$_resolved:" in
-    *":$_mandir:"*) ;;  # already on the search path — nothing to warn about
+    *":$_manroot:"*) ;;  # root already on the search path — nothing to warn about
     *)
       # shellcheck disable=SC2016  # backticks are literal decoration around the %s placeholder
-      printf '  ⚠️  %s is not on your man search path — `man %s` may not find it.\n' "$_mandir" "$CLI_NAME"
+      printf '  ⚠️  %s is not on your man search path — `man %s` may not find it.\n' "$_manroot" "$CLI_NAME"
       # shellcheck disable=SC2016  # $MANPATH is a copy-pasteable shell snippet for the user,
       # not an expansion of this process's env — must stay literal.
-      printf '     Add it with: export MANPATH="%s:$MANPATH"\n' "$_mandir"
+      printf '     Add it with: export MANPATH="%s:$MANPATH"\n' "$_manroot"
       ;;
   esac
 }
@@ -3600,10 +3661,22 @@ _muxm_completions() {
 # If running in zsh, enable bash completion emulation BEFORE calling `complete`.
 # Without this, the unconditional `complete` below would error in zsh.
 if [[ -n "${ZSH_VERSION:-}" ]]; then
-    autoload -Uz bashcompinit && bashcompinit
+    # M-19: bashcompinit's `complete` shim calls compdef, which only compinit defines. If the user's
+    # ~/.zshrc never runs compinit (e.g. a minimal aliases-only rc), calling bashcompinit alone left
+    # `complete` erroring with "command not found: compdef" on every new shell, and the completion
+    # never registered. Run compinit first (idempotent; -u skips the insecure-dir prompt) so compdef
+    # exists. Kept to portable zsh builtins — no zsh-only `$+functions` syntax (this file is also
+    # parsed by bash when sourced there).
+    autoload -Uz compinit bashcompinit
+    compinit -u 2>/dev/null
+    bashcompinit 2>/dev/null
 fi
 
-complete -o filenames -o bashdefault -F _muxm_completions muxm
+# -o default: fall back to readline filename completion when the handler leaves COMPREPLY empty (the
+# free-form-value flags above do this) — L-1: without it, `--ext-subs-dir <Tab>` (a directory-valued
+# flag) and the other free-form flags offered NO completion at all, contradicting their own
+# "fall through to files" comment. -o bashdefault keeps variable/hostname fallbacks.
+complete -o filenames -o bashdefault -o default -F _muxm_completions muxm
 COMPLETIONS_EOF
 }
 # <<< end embedded completion script >>>
@@ -4546,6 +4619,14 @@ _create_config() {
       die 11 "Invalid ${_cc_ll} '${_CC_OVERRIDES[$_cc_ll]}': valid values: ${_VALID_LOGLEVEL_STR}."
     fi
   done
+  # M-15: enum-validate the CHECKSUM_ALGO override with the SAME validator the runtime uses
+  # (_validate_checksum_algo_arg, also the Section-15 sourced-.muxmrc guard). CHECKSUM_ALGO is the
+  # HIGH-impact tier alongside the loglevels above — the runtime's post-parse guard rejects a bad
+  # value with die 11 on EVERY invocation, so an unvalidated typo here (e.g. --checksum-algo md5)
+  # persists a config that bricks the tool. Belongs with the loglevel check, not the low-impact
+  # OUTPUT_EXT/SUB_OCR_TOOL exemption below (those fail only on the next real run).
+  [[ -n "${_CC_OVERRIDES[CHECKSUM_ALGO]:-}" ]] \
+    && _validate_checksum_algo_arg "--checksum-algo" "${_CC_OVERRIDES[CHECKSUM_ALGO]}"
   # NOTE: OUTPUT_EXT / SUB_OCR_TOOL overrides are intentionally NOT enum-rejected here. They are the
   # low-impact tier of this gap — a bad value fails cleanly on the NEXT real run at Section 15, which
   # is AFTER the create-config prescan, so --force-create-config recovery still works (unlike the
@@ -5277,6 +5358,19 @@ _create_config_prescan() {
     _cc_i=$((_cc_i + 1))
   done
   if (( _cc_found )); then
+    # L-2: override flags placed BEFORE --create-config are only honored for --profile (special-cased
+    # below); every other flag there is silently dropped (this prescan collects overrides only from
+    # AFTER the scope/profile). Warn once so `muxm --crf 18 --create-config user hdr10-hq` doesn't
+    # quietly ignore the --crf. Read-only scan; does not alter the override collection.
+    local _cc_pi=0 _cc_skip_next=0
+    while (( _cc_pi < _cc_i )); do
+      if (( _cc_skip_next )); then _cc_skip_next=0; _cc_pi=$(( _cc_pi + 1 )); continue; fi
+      case "${_cc_args[$_cc_pi]}" in
+        --profile) _cc_skip_next=1 ;;   # honored from any position — not a dropped override
+        -*) warn "Ignoring '${_cc_args[$_cc_pi]}' before --create-config — put override flags AFTER the scope/profile (e.g. 'muxm --create-config ${_cc_scope:-user} ${_cc_profile:-<profile>} ${_cc_args[$_cc_pi]} …'). Only --profile is honored before it." ;;
+      esac
+      _cc_pi=$(( _cc_pi + 1 ))
+    done
     # Collect any remaining args after scope+profile as config override flags
     local _cc_override_start
     if [[ -n "$_cc_profile" ]]; then
@@ -5299,7 +5393,17 @@ _create_config_prescan() {
     # `_cc_profile` (empty here), so argument alignment is unchanged.
     local _cc_eff_profile="$_cc_profile"
     if [[ -z "$_cc_eff_profile" && "${_PROFILE_SOURCE:-}" == "cli" && -n "${PROFILE_NAME:-}" ]]; then
-      _cc_eff_profile="$PROFILE_NAME"
+      if (( _MULTI_PROFILE_MODE )); then
+        # M-14: a CLI `--profile a,b` was split into _MULTI_PROFILES with PROFILE_NAME truncated to
+        # the first element (Section 11, "Use first profile for single-pass … checks"). Rejoin the
+        # full comma list so `--create-config … --profile a,b` emits a MULTI-profile config (via
+        # _create_config_emit_multi) instead of silently dropping every profile but the first. The
+        # positional form (`--create-config user a,b`) already carries the comma list intact.
+        # Subshell-scope the IFS join so it can't leak into the _create_config call below.
+        _cc_eff_profile="$(IFS=','; printf '%s' "${_MULTI_PROFILES[*]}")"
+      else
+        _cc_eff_profile="$PROFILE_NAME"
+      fi
     fi
     _create_config "$_cc_scope" "$_cc_eff_profile" "$_cc_force" ${_cc_override_args[@]+"${_cc_override_args[@]}"}
     # _create_config always exits; this line is unreachable
@@ -5417,6 +5521,17 @@ _run_multi_profiles() {
       fi
     fi
     _prof_ext="${_prof_ext,,}"
+    # M-11: the passthrough fallback above may yield a source/user extension that is NOT a valid
+    # OUTPUT container — a .ts/.avi/.webm source, or an EXTENSIONLESS source whose "${SRC##*.}" is
+    # the entire path — which the child's parser rejects with die 11 ("Invalid OUTPUT_EXT … got: ts")
+    # after this dispatch has already started. Mirror single-profile _resolve_output_and_sub_policy,
+    # which maps an unsupported source container to mkv. (No-op for the explicit-CLI branch above:
+    # OUTPUT_EXT there is already parser-validated to one of these.)
+    case "$_prof_ext" in
+      mp4|m4v|mov|mkv) ;;
+      *) note "Multi-profile: profile '${_mp}' source container .${_prof_ext} is not a supported output — defaulting to .mkv."
+         _prof_ext="mkv" ;;
+    esac
     _prof_exts+=("$_prof_ext")
     _child_outs+=("${_out_stem_full}.${_mp}.${_prof_ext}")
   done
@@ -5582,19 +5697,6 @@ _validate_force_codec_arg(){
     *) die 11 "Invalid $1 '$2': unknown audio encoder. Valid: libopus, libmp3lame, libvorbis, aac, libfdk_aac, aac_at, ac3, eac3, flac." ;;
   esac
 }
-# 4.1: --checksum-algo validated via the same inline-validator shape as its siblings above,
-# instead of a structurally separate case statement that only ran after the whole CLI parse loop
-# finished. Called both at the CLI parse site (immediate parse-time failure, matching every
-# other _validate_*_arg flag) and again below as the sourced-.muxmrc bypass check (a config file
-# assigns CHECKSUM_ALGO directly, skipping the CLI arm) — one function, two call sites, instead
-# of duplicating the enum list.
-_validate_checksum_algo_arg(){
-  case "$2" in
-    sha256|blake2b|auto) return 0 ;;
-    *) die 11 "Invalid $1 '$2': expected one of sha256, blake2b, auto." ;;
-  esac
-}
-
 POSITIONALS=()
 # _ORIG_FILTERED_ARGS was captured as this same (post-`--profile`-filter) "$@", so an arg's index
 # in it is (_MAIN_ARGC0 - current $#). Record that for each POSITIONAL below (RV3-12).
@@ -5655,7 +5757,16 @@ while [[ $# -gt 0 ]]; do
       # --print-effective-config path) once VIDEO_CODEC is resolved — an x265 name for x264/x265, a
       # numeric preset for the AV1 encoders. Validating the x265 grammar here wrongly rejected the
       # only valid AV1 preset form (a number).
-      _require_val "$1" "$#" "${2:-}"; PRESET_VALUE="$2"; _CLI_PRESET_EXPLICIT=1
+      # M-16: do NOT route through _require_val — it rejects any leading-dash value, but SVT-AV1's
+      # valid preset range is -2..13 (advertised by _preset_expected_help), so `--preset -2` died at
+      # parse. Accept a leading-dash NEGATIVE INTEGER here (scoped to --preset only); still reject an
+      # actual flag (a non-numeric leading-dash token like --crf), preserving flag-swallow protection.
+      # The codec-aware validity check (an x265 name vs an AV1 integer) still runs in Section 15.
+      (( $# >= 2 )) || die 11 "$1 requires a value"
+      if [[ "${2:-}" == -* && ! "${2:-}" =~ ^-[0-9]+$ ]]; then
+        die 11 "$1 requires a value, not a flag (got: ${2:-})"
+      fi
+      PRESET_VALUE="$2"; _CLI_PRESET_EXPLICIT=1
       shift 2
       ;;
     --x265-params) _require_val "$1" "$#" "${2:-}"; X265_PARAMS_BASE="$2"; _CLI_X265_PARAMS_EXPLICIT=1; shift 2 ;;
@@ -5746,7 +5857,12 @@ while [[ $# -gt 0 ]]; do
     --skip-audio) SKIP_AUDIO=1; shift ;;
     --skip-subs)  SKIP_SUBS=1;  shift ;;
 
-    --output-ext) _require_val "$1" "$#" "${2:-}"; OUTPUT_EXT="${2,,}"; _OUTPUT_EXT_EXPLICIT=1; shift 2 ;;  # case-fold: `MKV` == `mkv`, matching the filename-inference + multi-profile paths
+    # M-17: only mark EXPLICIT for a NON-EMPTY value. `--output-ext ""` (realistic via `--output-ext
+    # "$EXT"` with an unset var) otherwise set _OUTPUT_EXT_EXPLICIT=1 with OUTPUT_EXT="", which SKIPPED
+    # both container-resolution paths (filename inference + source passthrough, gated on !explicit) —
+    # OUTPUT_EXT stayed "" forever, yielding a "movie." trailing-dot filename force-muxed as MP4 even
+    # for an MKV source. Treating explicit-empty as non-explicit lets resolution pick the right container.
+    --output-ext) _require_val "$1" "$#" "${2:-}"; OUTPUT_EXT="${2,,}"; [[ -n "$OUTPUT_EXT" ]] && _OUTPUT_EXT_EXPLICIT=1; shift 2 ;;  # case-fold: `MKV` == `mkv`, matching the filename-inference + multi-profile paths
     --keep-chapters) KEEP_CHAPTERS=1; shift ;;
     --no-keep-chapters) KEEP_CHAPTERS=0; shift ;;
     --strip-metadata) STRIP_METADATA=1; shift ;;
@@ -5830,10 +5946,59 @@ _warn_export_external_mkv(){
 
 # Warn when OUTPUT_EXT matches an unusual/unsupported container for a profile.
 # Args: profile ext msg
+# L-6: per-MESSAGE one-shot. It marks "shown" only when it ACTUALLY warns (OUTPUT_EXT == ext), so
+# it can be called safely in BOTH phases — Section 13 (where a passthrough profile's OUTPUT_EXT is
+# still "" and nothing fires) AND the tail of _resolve_output_and_sub_policy (where OUTPUT_EXT is
+# resolved). Whichever phase the container actually matches, the advisory fires exactly once.
 _warn_container_unusual(){
   local _p="$1" _ext="$2" _msg="$3"
   [[ "$OUTPUT_EXT" != "$_ext" ]] && return 0
+  [[ -n "${_CONTAINER_ADVISORY_SHOWN[$_msg]:-}" ]] && return 0
+  _CONTAINER_ADVISORY_SHOWN[$_msg]=1
   _warn_conflict "$_p" "--output-ext $_ext" "$_msg"
+  return 0
+}
+
+# _emit_container_advisories PROFILE — the per-profile "unusual output container" advisories, split
+# out of the Section-13 conflict case (L-6) so they can run in BOTH phases (see _warn_container_unusual).
+# Section 13 catches an explicit --output-ext / mkv-setting profile (the only container state known
+# pre-resolution); the _resolve_output_and_sub_policy tail catches PASSTHROUGH profiles
+# (atv-directplay-*, av1/streaming/universal) whose OUTPUT_EXT resolves to the source container only
+# there — which previously skipped these advisories entirely. Kept as one source of truth (no inline
+# duplicates in the Section-13 case). Args: $1 — profile name (already normalized).
+_emit_container_advisories(){
+  local _p="$1"
+  case "$_p" in
+    atv-directplay-hq|atv-directplay-animation)
+      _warn_container_unusual "$_p" "mov" \
+        "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play." ;;
+    streaming-hevc)
+      _warn_container_unusual "$_p" "mkv" \
+        "MKV is unusual for streaming targets. MP4 recommended for broadest client support."
+      _warn_container_unusual "$_p" "mov" \
+        "MOV is unusual for streaming targets. MP4 recommended for broadest client support." ;;
+    av1-hq)
+      _warn_container_unusual "$_p" "mp4" \
+        "MP4 has limited AV1+HDR10 support. av1-hq uses MKV to preserve HDR10."
+      _warn_container_unusual "$_p" "mov" \
+        "MOV has limited AV1+HDR10 support. av1-hq uses MKV to preserve HDR10." ;;
+    streaming-av1)
+      _warn_container_unusual "$_p" "mkv" \
+        "MKV is unusual for streaming targets. streaming-av1 uses MP4 for broadest client support." ;;
+    animation)
+      _warn_container_unusual "$_p" "mp4" \
+        "MP4 cannot carry styled ASS/SSA or PGS bitmap subtitles. MKV recommended for animation."
+      _warn_container_unusual "$_p" "mov" \
+        "MOV cannot carry styled ASS/SSA or PGS bitmap subtitles. MKV recommended for animation." ;;
+    universal)
+      _warn_container_unusual "$_p" "mkv" \
+        "MKV is unusual for max compatibility. MP4 recommended for widest device support."
+      _warn_container_unusual "$_p" "mov" \
+        "MOV is unusual for max compatibility. MP4 recommended for widest device support." ;;
+    youtube-upload)
+      _warn_container_unusual "$_p" "mkv" \
+        "YouTube requires MP4. MKV output may be rejected or not process correctly." ;;
+  esac
   return 0
 }
 
@@ -5924,6 +6089,10 @@ _warn_ignored_knobs() {
 }
 
 if [[ -n "${PROFILE_NAME:-}" ]]; then
+  # L-6: container advisories run here (catching an explicit --output-ext) AND again at the tail of
+  # _resolve_output_and_sub_policy (catching a passthrough profile's resolved container). One source
+  # of truth, per-message one-shot — see _emit_container_advisories / _warn_container_unusual.
+  _emit_container_advisories "$PROFILE_NAME"
   case "$PROFILE_NAME" in
 
     archive)
@@ -5996,9 +6165,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
 
       # No MKV warning: MKV Direct Plays on Apple TV via Plex/Infuse (the native TV.app
       # requires MP4, but that is not a footgun worth a conflict warning).
-      # MOV is unusual but works
-      _warn_container_unusual "$PROFILE_NAME" "mov" \
-        "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play."
+      # MOV container advisory now in _emit_container_advisories (L-6; also fires for passthrough).
       # Tone-mapping defeats HDR purpose
       (( TONEMAP_HDR_TO_SDR )) && \
         _warn_conflict "$PROFILE_NAME" "--tonemap" \
@@ -6014,9 +6181,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
     atv-directplay-animation)
       # No MKV warning: MKV Direct Plays on Apple TV via Plex/Infuse (passthrough may also
       # produce MKV — that is intentional and supported).
-      # MOV is unusual
-      _warn_container_unusual "$PROFILE_NAME" "mov" \
-        "MOV may work on Apple TV but mp4 is recommended for broadest Direct Play."
+      # MOV container advisory now in _emit_container_advisories (L-6; also fires for passthrough).
       # Tone-mapping defeats HDR purpose
       (( TONEMAP_HDR_TO_SDR )) && \
         _warn_conflict "$PROFILE_NAME" "--tonemap" \
@@ -6039,11 +6204,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       ;;
 
     streaming-hevc)
-      # Container choices unusual for streaming targets
-      _warn_container_unusual "$PROFILE_NAME" "mkv" \
-        "MKV is unusual for streaming targets. MP4 recommended for broadest client support."
-      _warn_container_unusual "$PROFILE_NAME" "mov" \
-        "MOV is unusual for streaming targets. MP4 recommended for broadest client support."
+      # Container (MKV/MOV) advisories now in _emit_container_advisories (L-6; also fires for passthrough).
       # Lossless audio increases file size significantly
       (( AUDIO_LOSSLESS_PASSTHROUGH )) && \
         _warn_conflict "$PROFILE_NAME" "--audio-lossless-passthrough" \
@@ -6053,12 +6214,8 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       ;;
 
     av1-hq)
-      # C10: av1-hq has no dedicated conflict arm. MP4/MOV have limited AV1+HDR10 support;
-      # the profile forces MKV.
-      _warn_container_unusual "$PROFILE_NAME" "mp4" \
-        "MP4 has limited AV1+HDR10 support. av1-hq uses MKV to preserve HDR10."
-      _warn_container_unusual "$PROFILE_NAME" "mov" \
-        "MOV has limited AV1+HDR10 support. av1-hq uses MKV to preserve HDR10."
+      # C10: av1-hq's container advisories (MP4/MOV limited AV1+HDR10 support) are now in
+      # _emit_container_advisories (L-6; also fires for passthrough). Codec/audio/tonemap checks below.
       # Switching off AV1 defeats the entire purpose of an AV1 archival profile.
       if ! _is_av1_codec "$VIDEO_CODEC"; then
         _warn_conflict "$PROFILE_NAME" "--video-codec $VIDEO_CODEC" \
@@ -6080,9 +6237,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
         _warn_conflict "$PROFILE_NAME" "--video-codec $VIDEO_CODEC" \
           "streaming-av1 targets AV1-capable platforms; selecting $VIDEO_CODEC overrides the profile."
       fi
-      # MKV is unusual for streaming targets (the profile uses MP4).
-      _warn_container_unusual "$PROFILE_NAME" "mkv" \
-        "MKV is unusual for streaming targets. streaming-av1 uses MP4 for broadest client support."
+      # Container (MKV) advisory now in _emit_container_advisories (L-6; also fires for passthrough).
       # Tone-mapping defeats HDR streaming intent.
       (( TONEMAP_HDR_TO_SDR )) && \
         _warn_conflict "$PROFILE_NAME" "--tonemap" \
@@ -6090,11 +6245,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       ;;
 
     animation)
-      # Container choices that drop subtitle fidelity
-      _warn_container_unusual "$PROFILE_NAME" "mp4" \
-        "MP4 cannot carry styled ASS/SSA or PGS bitmap subtitles. MKV recommended for animation."
-      _warn_container_unusual "$PROFILE_NAME" "mov" \
-        "MOV cannot carry styled ASS/SSA or PGS bitmap subtitles. MKV recommended for animation."
+      # Container (MP4/MOV) advisories now in _emit_container_advisories (L-6; also fires for passthrough).
       # Burning subs destroys ASS styling
       (( SUB_BURN_FORCED )) && \
         _warn_conflict "$PROFILE_NAME" "--sub-burn-forced" \
@@ -6115,11 +6266,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       ;;
 
     universal)
-      # Container choices unusual for max-compatibility targets
-      _warn_container_unusual "$PROFILE_NAME" "mkv" \
-        "MKV is unusual for max compatibility. MP4 recommended for widest device support."
-      _warn_container_unusual "$PROFILE_NAME" "mov" \
-        "MOV is unusual for max compatibility. MP4 recommended for widest device support."
+      # Container (MKV/MOV) advisories now in _emit_container_advisories (L-6; also fires for passthrough).
       # Lossless passthrough defeats compatibility
       (( AUDIO_LOSSLESS_PASSTHROUGH )) && \
         _warn_conflict "$PROFILE_NAME" "--audio-lossless-passthrough" \
@@ -6135,9 +6282,7 @@ if [[ -n "${PROFILE_NAME:-}" ]]; then
       ;;
 
     youtube-upload)
-      # MKV won't ingest well on YouTube
-      _warn_container_unusual "$PROFILE_NAME" "mkv" \
-        "YouTube requires MP4. MKV output may be rejected or not process correctly."
+      # Container (MKV) advisory now in _emit_container_advisories (L-6; also fires for passthrough).
       # Lossless audio won't survive YouTube's transcode pipeline
       (( AUDIO_LOSSLESS_PASSTHROUGH )) && \
         _warn_conflict "$PROFILE_NAME" "--audio-lossless-passthrough" \
@@ -6292,6 +6437,13 @@ _resolve_output_and_sub_policy(){
   # passthrough case the Section-13 conflict block could not see (OUTPUT_EXT was "" there). One-shot
   # guarded, so if the conflict block already warned (explicit mkv) this is a no-op — no double-warn.
   _warn_export_external_mkv
+  # L-6: same for the per-profile "unusual container" advisories — a passthrough profile
+  # (atv-directplay-*, av1/streaming/universal) whose OUTPUT_EXT resolved to the source container only
+  # now would otherwise never see them (its Section-13 call ran with OUTPUT_EXT=""). Per-message
+  # one-shot, so an explicit --output-ext already warned in Section 13 is a no-op here. Called
+  # unconditionally (the function no-ops on an empty/unknown profile) so this trailing statement can't
+  # return non-zero and trip `set -e` when no profile is set — a bare `cond && action` here would.
+  _emit_container_advisories "${PROFILE_NAME:-}"
 }
 
 # Display the resolved configuration from all sources (config files + profile + CLI).
@@ -6465,6 +6617,13 @@ if (( PRINT_EFFCONF )); then
       SRC_ABS="$(realpath_fallback "$SRC")"
       _resolve_output_and_sub_policy
     fi
+  else
+    # L-3: multi-profile --print-effective-config resolves NOTHING per child here (the encode-time
+    # dispatch that runs each profile as its own pass is downstream of this exit), so only the parent
+    # state — the FIRST profile with its container left "<pending>" — is printed. Say so plainly
+    # rather than letting the reader assume it reflects every profile. Per-profile config is available
+    # by running --print-effective-config with that single --profile.
+    note "Multi-profile mode: the config below is the FIRST profile ('${_MULTI_PROFILES[0]}') only; the ${#_MULTI_PROFILES[@]} profiles ($(IFS=,; printf '%s' "${_MULTI_PROFILES[*]}")) each run as a separate pass and resolve their own container. Re-run with a single --profile to see another profile's exact config."
   fi
   print_effective_config
 fi
@@ -6614,6 +6773,15 @@ fi
 # a sourced .muxmrc assigns them directly, so re-validate here too (both optional → gate on -n).
 [[ -n "$MAX_COPY_BITRATE"    && ! "$MAX_COPY_BITRATE"    =~ $_RE_BITRATE ]] && die 11 "Invalid MAX_COPY_BITRATE from config: expected a bitrate like 80000k or 80M (got: ${MAX_COPY_BITRATE})"
 [[ -n "$AUDIO_FORCE_BITRATE" && ! "$AUDIO_FORCE_BITRATE" =~ $_RE_BITRATE ]] && die 11 "Invalid AUDIO_FORCE_BITRATE from config: expected a bitrate like 256k (got: ${AUDIO_FORCE_BITRATE})"
+# L-4: HW_ACCEL_QUALITY (CLI: integer 0-100) and THREADS (CLI: positive integer) also bypass their
+# parse-time guards when assigned by a sourced .muxmrc — the re-validation contract above covers the
+# other knobs but had missed these two, so a bad value (e.g. HW_ACCEL_QUALITY="abc", THREADS="4x")
+# slipped through to a cryptic mid-encode ffmpeg failure (die 40) instead of a clean startup die 11.
+if [[ -n "${HW_ACCEL_QUALITY:-}" ]]; then
+  { [[ "$HW_ACCEL_QUALITY" =~ ^[0-9]+$ ]] && (( 10#$HW_ACCEL_QUALITY <= 100 )); } \
+    || die 11 "Invalid HW_ACCEL_QUALITY from config: expected an integer 0-100 (got: ${HW_ACCEL_QUALITY})"
+fi
+[[ -n "${THREADS:-}" && ! "$THREADS" =~ ^[1-9][0-9]*$ ]] && die 11 "Invalid THREADS from config: expected a positive integer (got: ${THREADS})"
 
 # Resolve and validate source file
 SRC_ABS="$(realpath_fallback "$SRC")"
@@ -6713,13 +6881,23 @@ if [[ "$SRC_ABS" -ef "$OUT_ABS" ]]; then
     fi
   else
     # Auto-version: filename(1).ext, filename(2).ext, ...
-    _ver_base="${OUT_ABS%.*}"
-    _ver_ext="${OUT_ABS##*.}"
+    # L-5: split the extension within the BASENAME only. "${OUT_ABS%.*}" / "${OUT_ABS##*.}" strip at
+    # the last dot ANYWHERE in the path, so an extensionless output in a dotted directory (e.g.
+    # /data/v1.0/movie) versioned to /data/v1(1).0/movie — a nonexistent directory — and the final mv
+    # then failed after a full encode. With no dot in the basename at all it was worse
+    # (/home/u/movie → /home/u/movie(1)./home/u/movie).
+    _ver_dir="$(dirname -- "$OUT_ABS")"
+    _ver_name="$(basename -- "$OUT_ABS")"
+    if [[ "$_ver_name" == *.* ]]; then
+      _ver_base="${_ver_dir}/${_ver_name%.*}"; _ver_ext=".${_ver_name##*.}"
+    else
+      _ver_base="${_ver_dir}/${_ver_name}"; _ver_ext=""   # extensionless output → movie(1), not movie(1).movie
+    fi
     _ver=1
-    OUT_ABS="${_ver_base}(${_ver}).${_ver_ext}"
+    OUT_ABS="${_ver_base}(${_ver})${_ver_ext}"
     while [[ -e "$OUT_ABS" ]]; do
       (( _ver++ ))
-      OUT_ABS="${_ver_base}(${_ver}).${_ver_ext}"
+      OUT_ABS="${_ver_base}(${_ver})${_ver_ext}"
     done
     OUT_BASENAME="$(basename -- "$OUT_ABS")"
     OUT="$OUT_ABS"
@@ -6871,6 +7049,14 @@ log "$(print_effective_config)"
 trap 'on_error $LINENO "$BASH_COMMAND" "$?"' ERR
 trap 'FAILED=1; EXIT_CODE=130; FAIL_MSG="Interrupted by user (SIGINT)"; _term_print "\n"; exit 130' INT
 trap 'FAILED=1; EXIT_CODE=143; FAIL_MSG="Terminated (SIGTERM)"; exit 143' TERM
+# Without these, an untrapped terminating signal still runs the EXIT trap, but with FAILED unchanged
+# (0) — on_exit would then take the SUCCESS path and promote a truncated TMP_OUT over $OUT, checksum
+# a partial/still-growing file, and print "Build SUCCEEDED". A closed SSH session / terminal delivers
+# SIGHUP to the process group; SIGPIPE arrives if muxm's own stdout is piped to a consumer that exits
+# early. Mark the run FAILED (so on_exit takes the failure/cleanup path) before exiting.
+trap 'FAILED=1; EXIT_CODE=129; FAIL_MSG="Hangup (SIGHUP)"; exit 129' HUP
+trap 'FAILED=1; EXIT_CODE=131; FAIL_MSG="Quit (SIGQUIT)"; exit 131' QUIT
+trap 'FAILED=1; EXIT_CODE=141; FAIL_MSG="Broken pipe (SIGPIPE)"; exit 141' PIPE
 
 _print_completed_steps(){
   [[ ${#COMPLETED_STEPS[@]} -gt 0 ]] || return 0
@@ -7168,7 +7354,17 @@ on_exit() {
     # output produced) do we surface the reason here. Printed BEFORE the tee drains so it is
     # captured in the copied log — the bundle then self-documents where it lives. The bundle is
     # kept on every failure, regardless of --keep-log.
-    if (( ${_ERROR_PRINTED:-0} )); then
+    # L-14: a failed/interrupted DRY RUN keeps no diagnostics bundle (the dry-run arm below removes
+    # the workdir and skips _persist_failure_bundle), so don't print a "Diagnostics: <dir>/"
+    # breadcrumb that points at a directory which never gets created.
+    if (( DRY_RUN )); then
+      [[ ${_ERROR_PRINTED:-0} -eq 0 && -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely an earlier parse/runtime error)."
+      if [[ -n "$FAIL_MSG" ]]; then
+        printf "%sBuild FAILED (exit %s): %s [dry-run — no diagnostics kept].\n" "${_PFX_FAIL-❌ }" "${EXIT_CODE:-1}" "$FAIL_MSG"
+      else
+        printf "%sBuild FAILED (exit %s) [dry-run — no diagnostics kept].\n" "${_PFX_FAIL-❌ }" "${EXIT_CODE:-1}"
+      fi
+    elif (( ${_ERROR_PRINTED:-0} )); then
       printf "%sBuild FAILED (exit %s). Diagnostics: %s/\n" "${_PFX_FAIL-❌ }" "${EXIT_CODE:-1}" "$_diag_dir"
     else
       [[ -z "$FAIL_MSG" ]] && FAIL_MSG="No output produced (likely an earlier parse/runtime error)."
@@ -7269,7 +7465,12 @@ _acquire_out_lock() {
     # not treat that sub-millisecond window as a stale lock to reclaim: give the holder a brief moment
     # to populate the pid and re-check, and only fall through to reclaim if it stays empty. A present
     # but non-numeric pid, or a numeric pid whose process is gone, is genuinely stale and reclaimed now.
-    if [[ -z "$owner" ]] && (( ++empty_tries <= 3 )); then
+    # L-16: give the holder a generous grace period to populate its pid before treating an empty file
+    # as stale. The old ~0.15s (3×0.05s) budget was too tight under load — a real holder that hadn't
+    # yet written its pid was misjudged stale and its LIVE lock reclaimed, so two runs wrote the same
+    # $OUT (and the concurrent-lock test flaked). ~2s (40×0.05s) tolerates a loaded scheduler while
+    # still bounding a genuinely abandoned empty lock.
+    if [[ -z "$owner" ]] && (( ++empty_tries <= 40 )); then
       sleep 0.05
       continue
     fi
@@ -7278,7 +7479,16 @@ _acquire_out_lock() {
     (( ++tries > 3 )) && die 11 "Could not acquire the output lock '$lock' — remove it manually: rm -rf '$lock'"
     rm -rf "$lock" 2>/dev/null || true
   done
-  printf '%s\n' "$$" > "$lock/pid" 2>/dev/null || true
+  # L-16: write our pid ATOMICALLY (temp + mv within the lock dir) so a contender never reads a
+  # half-written pid, and RETRY briefly — a single silently-dropped write (the old `> pid || true`)
+  # left a permanently-empty pid file that every later contender then reclaimed as "stale".
+  local _pw_try=0
+  while (( _pw_try++ < 5 )); do
+    if printf '%s\n' "$$" > "$lock/.pid.tmp" 2>/dev/null && mv -f "$lock/.pid.tmp" "$lock/pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.02
+  done
   # RV3-13: a --replace-source run renames its output ONTO the source it just read. Drop a marker
   # so a concurrent run that READS this same file (its OUT differs, so it never contends on this
   # lock) can refuse to start rather than read a file that's about to be replaced out from under it.
@@ -7465,7 +7675,13 @@ disk_free_warn() {
   # → ≈ source size; re-encode → ratio applied to the source-derived rate). src_size
   # includes audio + container, so this slightly overestimates the video portion —
   # the safe (conservative) direction for a disk guard.
-  if (( vbr == 0 && src_size > 0 )); then
+  # L-15: also synthesize from src_size when the DURATION is unknown (dur forced to 1). A source with
+  # a bit_rate TAG but no determinable duration (truncated / still-writing file) otherwise kept its
+  # metadata vbr, and (vbr/8)*dur with dur=1 collapsed est_video_bytes to ~1 second of video (single-
+  # digit MB) for a multi-GB re-encode — leaving only the DISK_FREE_WARN_GB floor. Re-deriving vbr
+  # from size makes dur cancel (src_size*8/1 → (vbr/8)*1 = src_size), restoring a source-sized
+  # reservation. The RV3-16 dur-cancels note only held on the vbr==0 synthesis path; extend it here.
+  if (( src_size > 0 )) && { (( vbr == 0 )) || (( ! dur_known )); }; then
     vbr=$(( src_size * 8 / dur ))
   fi
 
@@ -7606,11 +7822,11 @@ disk_free_warn() {
   # WORKDIR holds the large intermediates; OUT_DIR holds the final file. Check
   # each, skipping the duplicate check when both resolve to the same volume.
   local wd_dev od_dev
-  wd_dev="$(df -Pk "$WORKDIR" 2>/dev/null | awk 'NR==2{print $1}')"
-  od_dev="$(df -Pk "$OUT_DIR"  2>/dev/null | awk 'NR==2{print $1}')"
+  wd_dev="$(_df_source "$WORKDIR")"
+  od_dev="$(_df_source "$OUT_DIR")"
 
   local wd_avail_kb
-  wd_avail_kb="$(df -Pk "$WORKDIR" 2>/dev/null | awk 'NR==2{print $4}')"
+  wd_avail_kb="$(_df_avail_kb "$WORKDIR")"
   if [[ -n "$wd_avail_kb" ]] && (( wd_avail_kb * 1024 < need_workdir )); then
     die 11 "Not enough disk space for working files: ~$(_gb "$need_workdir")GB needed but only ~$(_gb "$(( wd_avail_kb * 1024 ))")GB free on the workdir volume ($WORKDIR).
    muxm stages large video intermediates here (peak ≈ ${peak_factor}× the encoded video). Free space,
@@ -7619,7 +7835,7 @@ disk_free_warn() {
 
   if [[ -n "$od_dev" && "$od_dev" != "$wd_dev" ]]; then
     local od_avail_kb
-    od_avail_kb="$(df -Pk "$OUT_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+    od_avail_kb="$(_df_avail_kb "$OUT_DIR")"
     if [[ -n "$od_avail_kb" ]] && (( od_avail_kb * 1024 < need_output )); then
       die 11 "Not enough disk space for the output file: ~$(_gb "$need_output")GB needed but only ~$(_gb "$(( od_avail_kb * 1024 ))")GB free on the output volume ($OUT_DIR).
    Free space, choose an output path on a roomier volume, or pass --no-disk-check to override this guard."
@@ -7772,7 +7988,13 @@ check_skip_if_ideal() {
   fi
 
   # ---- Audio compliance (skip-if-ideal only) ----
-  if (( ideal )) && (( AUDIO_MULTI_TRACK )); then
+  if (( ideal )) && (( SKIP_AUDIO )); then
+    # M-6: audio disabled (--skip-audio) — the real pipeline emits NO audio (HAS_AUDIO=0), but a skip
+    # ships every source audio track. So any embedded audio track means the skip would diverge from
+    # the pipeline. Mirrors the SKIP_SUBS disqualifier below (applies to single- AND multi-track).
+    local _sii_skipaud_n; _sii_skipaud_n="$(_audio_stream_count)"
+    (( _sii_skipaud_n > 0 )) && { ideal=0; reason="$_sii_skipaud_n audio track(s) present but audio is disabled (--skip-audio)"; }
+  elif (( ideal )) && (( AUDIO_MULTI_TRACK )); then
     # Multi-track: source is ideal only if every audio track survives the filter.
     # If any track would be dropped (commentary, wrong language), we need to remux.
     _check_filter_ideality "audio" "_build_audio_keep_list" "_audio_stream_count" ideal reason
@@ -7826,8 +8048,29 @@ check_skip_if_ideal() {
     fi
   fi
 
+  # ---- Channel-cap check (skip-if-ideal only, single-track) ----
+  # M-6: single-track mode caps the primary track to MAX_AUDIO_CHANNELS (and force-transcodes a
+  # capped lossless track). A skip ships the uncapped source verbatim, so a source track with more
+  # channels than the cap is NOT ideal. (Multi-track copies every track as-is and does not apply the
+  # channel cap; SKIP_AUDIO already disqualified above.) By this point single-track ideality implies
+  # exactly one audio stream (RV3-02), so index 0 is the track that would ship.
+  if (( ideal )) && (( ! AUDIO_MULTI_TRACK )) && (( ! SKIP_AUDIO )) && (( MAX_AUDIO_CHANNELS > 0 )); then
+    local _sii_capch
+    _sii_capch="$(_audio_channels 0)"
+    if [[ -n "$_sii_capch" ]] && (( _sii_capch > MAX_AUDIO_CHANNELS )); then
+      ideal=0; reason="audio has ${_sii_capch}ch but MAX_AUDIO_CHANNELS=${MAX_AUDIO_CHANNELS} (skip would ship it uncapped)"
+    fi
+  fi
+
   # ---- Subtitle compliance (skip-if-ideal only) ----
-  if (( ideal )) && (( SUB_MULTI_TRACK )); then
+  if (( ideal )) && (( SKIP_SUBS )); then
+    # M-6: subtitles disabled (--skip-subs) — the pipeline keeps none, so any embedded subtitle would
+    # be shipped in excess by a skip. Hoisted ABOVE the SUB_MULTI_TRACK branch: _build_subtitle_keep_list
+    # (used by _check_filter_ideality) does NOT consult SKIP_SUBS, so the multi-track path previously
+    # skipped this disqualifier entirely (only the single-track arm below checked it).
+    local _sii_skipsub_n; _sii_skipsub_n="$(_sub_count)"
+    (( _sii_skipsub_n > 0 )) && { ideal=0; reason="$_sii_skipsub_n subtitle track(s) present but subtitles are disabled (--skip-subs)"; }
+  elif (( ideal )) && (( SUB_MULTI_TRACK )); then
     # Multi-track: source is ideal only if every subtitle track survives the filter.
     # If any track would be dropped (wrong language, excluded type, cap), we need to remux.
     _check_filter_ideality "subtitle" "_build_subtitle_keep_list" "_sub_count" ideal reason
@@ -8439,6 +8682,22 @@ apply_level_vbv() {
       5.2) maxrate="$LEVEL_VBV_5_2_MAXRATE"; bufsize="$LEVEL_VBV_5_2_BUFSIZE" ;;
     esac
   fi
+  # M-5: libx264 enforces level/VBV too, but through -x264-params with x264 KEY names (`level`, not
+  # x265's `level-idc`) and it reads X264_PARAMS_BASE — NOT X265_PARAMS. The shared x265 append below
+  # was therefore a silent no-op for libx264 (the encode never saw it) while STILL printing "Applying
+  # VBV guardrails", so a `--level` on an H.264 encode was quietly discarded. Route per codec. x264's
+  # vbv-* want bare kbps, so strip the table's `k` suffix. (AV1 / VideoToolbox already returned above.)
+  if [[ "$VIDEO_CODEC" == "libx264" ]]; then
+    if [[ -n "$maxrate" ]]; then
+      X264_PARAMS_BASE="${X264_PARAMS_BASE:+${X264_PARAMS_BASE}:}level=${lvl}:vbv-maxrate=${maxrate%k}:vbv-bufsize=${bufsize%k}"
+      note "Applying VBV guardrails for level ${lvl} → maxrate=${maxrate}, bufsize=${bufsize}"
+    else
+      (( CONSERVATIVE_VBV )) && [[ -n "$lvl" ]] && \
+        warn "No VBV guardrail table for level ${lvl}; buffer compliance NOT enforced."
+      [[ -n "$lvl" ]] && X264_PARAMS_BASE="${X264_PARAMS_BASE:+${X264_PARAMS_BASE}:}level=${lvl}"
+    fi
+    return 0
+  fi
   if [[ -n "$maxrate" ]]; then
     X265_PARAMS="${X265_PARAMS:+${X265_PARAMS}:}level-idc=${lvl}:vbv-maxrate=${maxrate}:vbv-bufsize=${bufsize}"
     note "Applying VBV guardrails for level ${lvl} → maxrate=${maxrate}, bufsize=${bufsize}"
@@ -8472,7 +8731,12 @@ detect_dv() {
   # side data, dv_profile). detect_dv runs well after the cache is populated (and after the
   # video-stream existence check), so the cache is always present and non-empty here.
   local v_json
-  v_json="$(_jq_cache -c '[.streams[] | select(.codec_type=="video")][0] // empty' 2>/dev/null)" || v_json=""
+  # L-13: match ONLY the DV-bearing fields (codec_tag_string, profile, side_data_list), NOT the whole
+  # stream JSON — which includes .tags (title/handler_name). A DV-STRIPPED remux whose video stream
+  # title carries a release name like "Movie.2160p.DoVi.Remux" otherwise false-matched, triggering a
+  # costly RPU extraction pass (or a hard die 40 with ALLOW_DV_FALLBACK=0) on a genuinely non-DV
+  # source. Mirrors the tag-scoped check _source_video_has_dv_codec_tag already uses for the preflight.
+  v_json="$(_jq_cache -r '[.streams[] | select(.codec_type=="video")][0] | "\(.codec_tag_string // "")\t\(.profile // "")\t\((.side_data_list // []) | tostring)"' 2>/dev/null)" || v_json=""
   if [[ -n "$v_json" ]] && printf '%s\n' "$v_json" | grep -qiE 'dolby_vision|dv_profile|dovi|dvhe|dvh1|com\.dolby\.vision'; then
     return 0
   fi
@@ -9268,10 +9532,17 @@ _video_is_copy_compliant() {
   # If tone-mapping is requested, can't copy — check actual source color metadata
   # (PROFILE_DESC is not yet set when check_skip_if_ideal runs, so probe directly)
   if (( TONEMAP_HDR_TO_SDR )); then
-    local _sii_prim _sii_trc
+    local _sii_prim _sii_trc _sii_cspace
     _sii_prim="$(_lower "$(_probe_field color_primaries)")"
     _sii_trc="$(_lower "$(_probe_field color_transfer)")"
-    if [[ "$_sii_prim" == "bt2020" || "$_sii_trc" == "smpte2084" || "$_sii_trc" == "arib-std-b67" ]]; then
+    _sii_cspace="$(_lower "$(_probe_field color_space)")"
+    # M-4: use the SAME HDR predicate as decide_color_and_pixfmt (the "if (( TONEMAP_HDR_TO_SDR ))"
+    # gate) — it also matches color_space==bt2020nc and trc==hlg. This gate previously omitted both,
+    # so a partially-tagged HDR source (bt2020nc matrix but empty primaries/transfer, or HLG-by-trc)
+    # was judged copy-compliant and STREAM-COPIED un-tonemapped, while the re-encode path would have
+    # classified it HDR and tone-mapped it.
+    if [[ "$_sii_prim" == "bt2020" || "$_sii_cspace" == "bt2020nc" || "$_sii_trc" == "smpte2084" \
+       || "$_sii_trc" == "arib-std-b67" || "$_sii_trc" == "hlg" ]]; then
       _COPY_REJECT_REASON="tone-mapping required (HDR source cannot be copied)"
       return 1
     fi
@@ -10488,7 +10759,12 @@ _audio_stream_info(){
 #
 # Factors (highest weight first):
 #   1. Language preference   — +AUDIO_SCORE_LANG_BONUS (150) if language matches AUDIO_LANG_PREF
-#      Ensures preferred language wins over higher-channel foreign tracks.
+#      The strongest SINGLE signal, and it outscores a same-codec/same-bitrate foreign track that is
+#      up to ~7 channels larger. It is NOT an absolute override, though: with the default weights the
+#      combined channel + surround + codec-rank + bitrate advantage of a foreign track can exceed the
+#      150-point bonus (e.g. a foreign 7.1 E-AC-3 vs a preferred-language mono/stereo AAC), so a
+#      strongly-favoured foreign track can still win. Raise AUDIO_SCORE_LANG_BONUS (≳ 280) if you want
+#      preferred language to win unconditionally. (M-3: corrected — this used to claim it always wins.)
 #   2. Channel count         — ch × AUDIO_SCORE_CHANNEL_MULTIPLIER (20)
 #      More channels = higher fidelity; 7.1 scores higher than 5.1.
 #      5.4: COUNT only, not channel_layout-aware — a discrete 7.1 track and a 5.1.4
@@ -10884,6 +11160,9 @@ _codec_max_channels(){
     eac3) echo 6 ;;   # ffmpeg native eac3 encoder: 5.1 max
     ac3)  echo 6 ;;   # ffmpeg native ac3 encoder: 5.1 max
     aac)  echo 48 ;;  # ffmpeg native aac: effectively unlimited
+    libmp3lame|mp3) echo 2 ;;  # libmp3lame: mono/stereo only — an unclamped -ac 6 is a fatal
+                               # "channel layout '5.1' is not supported" (die 43). Clamping to 2
+                               # makes the call-site re-derive the target as a stereo transcode.
     *)    echo 64 ;;  # conservative fallback — no known encoder needs >64
   esac
 }
@@ -11225,11 +11504,16 @@ run_audio_pipeline(){
     else
       read -r _ tgt_br <<< "$(audio_transcode_target "$effective_ch")"
       if [[ "$_tgt_native" == "aac" ]]; then
-        # Honor STEREO_BITRATE instead of a hardcoded 256k. Masked today because
-        # `universal` (the only profile forcing AAC) sets STEREO_BITRATE=256k, but --stereo-bitrate
-        # / a .muxmrc override was silently ignored on the force-AAC path. RV3-08: key on the
-        # NATIVE codec (_encoder_to_codec) so the override also fires for the libfdk_aac / aac_at
-        # AAC encoders, not just the literal "aac" (consistent with L4).
+        # Honor STEREO_BITRATE instead of a hardcoded 256k. Masked in-profile because `universal`
+        # (the only profile forcing AAC) sets STEREO_BITRATE=256k AND caps channels at 2, but
+        # --stereo-bitrate / a .muxmrc override was silently ignored on the force-AAC path. RV3-08:
+        # key on the NATIVE codec (_encoder_to_codec) so the override also fires for the libfdk_aac /
+        # aac_at AAC encoders, not just the literal "aac" (consistent with L4).
+        # NOTE (M-2, reviewed 2026-07-05): a pre-release review proposed gating this on effective_ch<=2
+        # (so a 5.1 forced-AAC would keep the surround-tier bitrate). REVERTED — forcing AAC is a
+        # deliberate "compact AAC output" intent and STEREO_BITRATE is its governing knob regardless of
+        # channel count; this is intentional RV3-08 behavior locked by _test_audio_forceaac_stereo_bitrate
+        # (6ch → STEREO_BITRATE, not eac3 640k). WONTFIX by design.
         tgt_br="$STEREO_BITRATE"
       fi
       [[ -n "${AUDIO_FORCE_BITRATE:-}" ]] && tgt_br="$AUDIO_FORCE_BITRATE"
@@ -11542,10 +11826,16 @@ _sub_candidate_undeliverable(){
   _is_text_sub_codec "$c" && return 1            # text is always deliverable
   case "$c" in
     hdmv_pgs_subtitle|pgs)
-      # PGS: _prepare_subtitle can stream-copy it into MKV (bitmap preserve) OR OCR it to text.
-      _container_supports_bitmap_subs && return 1   # MKV stream-copies the PGS bitmap as-is
-      (( SUB_ENABLE_OCR )) && return 1              # OCR converts the PGS bitmap → text
-      return 0                                      # non-MKV + OCR off → undeliverable
+      # PGS deliverability must match what _prepare_subtitle / build_subtitle_plan will ACTUALLY do
+      # for THIS config, or a usable text sidecar gets deduped against a PGS that is then dropped —
+      # ZERO subtitles shipped. Two corrections over the old blanket verdicts:
+      #  - MKV stream-copies the PGS bitmap ONLY when SUB_PRESERVE_BITMAP=1. Under --no-sub-preserve-
+      #    bitmap the copy is disabled, so an MKV PGS is deliverable only if it can instead be OCR'd.
+      #  - OCR converts PGS → text, but multi-track mode does NOT OCR (build_subtitle_plan Filter 3),
+      #    so OCR counts toward deliverability in SINGLE-track mode only.
+      { _container_supports_bitmap_subs && (( SUB_PRESERVE_BITMAP )); } && return 1
+      (( SUB_ENABLE_OCR )) && (( ! SUB_MULTI_TRACK )) && return 1
+      return 0                                      # can neither copy nor OCR in this config
       ;;
     *)
       # RV3-07: VobSub (dvd_subtitle) / DVB (dvb_subtitle) and any other non-text, non-PGS bitmap.
@@ -11608,7 +11898,12 @@ _ocr_lang_flags(){
   local _tool="$2" _lang="$3"
   _olf_out=()
   case "$_tool" in
-    pgsrip)  [[ -n "$_lang" ]] && _olf_out=(--language "$_lang") ;;
+    pgsrip)  ;;  # H-1: pgsrip's --language is a FILTER on the language it parses from the input
+                 # FILENAME, not a tessdata hint. A workdir "sub.N.sup" parses as `und`, so
+                 # `--language eng` excluded EVERY file (ripping nothing, exit 0). pgsrip also
+                 # derives its tesseract model from the filename language. We instead feed pgsrip a
+                 # language-NAMED input (sub.N.<lang>.sup / the external movie.<lang>.sup), which sets
+                 # both the (unfiltered) processing AND the correct tessdata — so no --language flag.
     sub2srt) ;;  # sub2srt does not support a language flag
     *)       [[ -n "$_lang" ]] && _olf_out=(-l "$_lang") ;;
   esac
@@ -11780,7 +12075,11 @@ _prepare_subtitle(){
       local -a _ocr_lang=()
       _ocr_lang_flags _ocr_lang "$SUB_OCR_TOOL" "$SUB_OCR_LANG"
 
-      # Try vobsub conversion if muxer is available
+      # Try vobsub conversion if muxer is available.
+      # L-12: ffmpeg ships a vobsub DEMUXER but no vobsub MUXER, so ffmpeg_has_muxer vobsub is false
+      # on every current build — this fast path is effectively dead, and the OCR always runs on the
+      # .sup directly below. Kept as a forward-compat path, but note: if a build ever DID gain the
+      # muxer, this would feed pgsrip a .idx it cannot read; a pgsrip build should prefer the .sup path.
       if ffmpeg_has_muxer vobsub; then
         vob_base="$WORKDIR/sub.${idx}.vob"
         ffmpeg "${FFMPEG_FLAGS[@]}" -i "$sup" -map 0:s:0 -c:s dvdsub -f vobsub "$vob_base" 2>"$WORKDIR/sub_${idx}_vobsub.err" &
@@ -11807,13 +12106,35 @@ _prepare_subtitle(){
       fi
 
       # Fallback: try OCR tool directly on .sup
-      _run_ocr "$sup" "$WORKDIR/sub_${idx}_ocr_sup.log" "Running OCR on subtitle #${idx} (SUP)" _ocr_lang
-      # Check common output locations for the SRT
-      if [[ -s "${sup%.sup}.srt" ]]; then
-        mv -f "${sup%.sup}.srt" "$srt" || true
-        _ocr_ok=1
-      elif [[ -s "${sup}.srt" ]]; then
-        mv -f "${sup}.srt" "$srt" || true
+      # H-1: pgsrip reads the input FILENAME to pick both its language filter and tesseract model, so
+      # OCR a language-NAMED hardlink (sub.N.<lang>.sup) instead of the bare sub.N.sup (which parses
+      # as `und` → tesseract `-l und`, and would have been filtered out by any --language). Derive the
+      # language from SUB_OCR_LANG, else the track's own tag, else eng; take the first of a `+`-joined
+      # multi-language value for the filename (pgsrip normalizes to alpha-2 on output).
+      local _ocr_input="$sup"
+      if [[ "$SUB_OCR_TOOL" == "pgsrip" ]]; then
+        local _pgs_lang="${SUB_OCR_LANG%%+*}"
+        [[ -z "$_pgs_lang" ]] && _pgs_lang="$(_sp_sub_lang "$idx")"
+        [[ -z "$_pgs_lang" || "$_pgs_lang" == "und" ]] && _pgs_lang="eng"
+        _ocr_input="$WORKDIR/sub.${idx}.${_pgs_lang}.sup"
+        ln -f "$sup" "$_ocr_input" 2>/dev/null || cp -f "$sup" "$_ocr_input" 2>/dev/null || _ocr_input="$sup"
+      fi
+      _run_ocr "$_ocr_input" "$WORKDIR/sub_${idx}_ocr_sup.log" "Running OCR on subtitle #${idx} (SUP)" _ocr_lang
+      # Check common output locations for the SRT. pgsrip writes it beside the input using the
+      # alpha-2 language code (sub.N.<xx>.srt), which differs from the input's suffix — so after the
+      # exact-name checks, glob for any sub.N.*.srt the tool produced.
+      local _ocr_srt=""
+      if [[ -s "${_ocr_input%.sup}.srt" ]]; then _ocr_srt="${_ocr_input%.sup}.srt"
+      elif [[ -s "${sup%.sup}.srt" ]]; then _ocr_srt="${sup%.sup}.srt"
+      elif [[ -s "${sup}.srt" ]]; then _ocr_srt="${sup}.srt"
+      else
+        local _g
+        for _g in "$WORKDIR/sub.${idx}."*.srt; do
+          [[ -s "$_g" ]] && { _ocr_srt="$_g"; break; }
+        done
+      fi
+      if [[ -n "$_ocr_srt" && -s "$_ocr_srt" ]]; then
+        [[ "$_ocr_srt" != "$srt" ]] && { mv -f "$_ocr_srt" "$srt" || true; }
         _ocr_ok=1
       fi
       if (( _ocr_ok )) && [[ -s "$srt" ]] && grep -q ' --> ' "$srt"; then
@@ -11876,6 +12197,20 @@ _ocr_ext_subtitle(){
   # Some OCR tools write the .srt next to the source file, not into the workdir. Relocate it before
   # the existence check — otherwise a SUCCESSFUL OCR leaves $srt_out empty and is misreported as failed.
   local relocated="${ext_path%."$fext"}.srt"
+  if [[ ! -s "$relocated" ]]; then
+    # L-17: pgsrip writes the SRT beside the source using the ALPHA-2 language code, so a 3-letter
+    # sidecar (movie.eng.sup) OCRs to movie.en.srt — NOT the movie.eng.srt this checked, so the
+    # success was misreported as failure AND the stray movie.en.srt was left littering the source
+    # dir (to be rediscovered as a new sidecar next run). Glob the source dir for any .srt sharing
+    # the sidecar's leading stem (before its language segment) that OCR just produced, and relocate it.
+    local _ext_dir _ext_stem _g
+    _ext_dir="$(dirname -- "$ext_path")"
+    _ext_stem="${basename_label%."$fext"}"   # e.g. movie.eng
+    _ext_stem="${_ext_stem%.*}"              # e.g. movie  (strip the language segment)
+    for _g in "$_ext_dir/$_ext_stem".*.srt; do
+      [[ -s "$_g" ]] && { relocated="$_g"; break; }
+    done
+  fi
   if [[ -s "$relocated" ]]; then
     mv -f "$relocated" "$srt_out" || true
   fi
@@ -12915,6 +13250,12 @@ mux_final() {
   # s_sdh_idx, forced_present/full_present/sdh_present, src_sub_idx — are gone; the
   # unified _emit_sub_tracks now owns subtitle input/-map/-c:s for both modes.)
   local _src_input_idx=""   # shared index when source is used as ffmpeg input
+  # M-9: 1 when the chosen video input carries NO source chapters/global metadata (a DV pre-wrapped
+  # MP4 or a raw HEVC ES) — set in the video-input selection below. On that path ffmpeg's default
+  # KEEP_CHAPTERS/metadata (from input 0) silently drops the source's chapters+tags, so they must be
+  # mapped explicitly from the source. A .mkv/.mp4 intermediate (normal re-encode) and the
+  # copy-from-source path already carry them on input 0 → leave ffmpeg's default alone (=0).
+  local -i _vid_lacks_src_meta=0
   # Parallel arrays for deduplicating external subtitle file inputs in multi-track mode
   local -a _ext_sub_paths=()   # unique external subtitle file paths (insertion order)
   local -a _ext_sub_idxs=()    # ffmpeg -i index for each unique external subtitle path
@@ -12934,6 +13275,7 @@ mux_final() {
     ff_in+=( -i "$V_DV_MP4" )
     vid_idx=$next_idx
     next_idx=$(( next_idx + 1 ))
+    _vid_lacks_src_meta=1   # M-9: the raw-ES wrap carries no source chapters/global metadata
   elif [[ -n "${V_MIXED:-}" && -s "$V_MIXED" ]]; then
     # Validate video before muxing
     if ! ffprobe -v error "$V_MIXED" >/dev/null 2>&1; then
@@ -12948,6 +13290,9 @@ mux_final() {
     ff_in+=( -i "$V_MIXED" )
     vid_idx=$next_idx
     next_idx=$(( next_idx + 1 ))
+    # M-9: a raw HEVC ES (*.hevc) carries no source chapters/global metadata; a .mkv/.mp4 intermediate
+    # inherited them during the encode, so only the raw case needs explicit source mapping later.
+    [[ "$V_MIXED" == *.hevc ]] && _vid_lacks_src_meta=1
   else
     die 42 "No encoded video stream found."
   fi
@@ -13089,11 +13434,15 @@ mux_final() {
     note "Adding Dolby Vision container signalling (so Apple devices recognise the DV stream)."
     log  "DV container signalling flags: -strict unofficial -tag:v dvh1"
     report_add "dv_mux_flags" "strict unofficial + dvh1 tag"
-  elif (( OUTPUT_HAS_DV )) && [[ "$MUX_FORMAT" == "matroska" ]] && [[ -n "${V_DV_MP4:-}" ]]; then
-    # The DV video is sourced from a pre-wrapped MP4 (needed to give the raw HEVC
-    # ES the packet timestamps the Matroska muxer requires). That MP4 carries an
-    # 'dvh1'/'dvhe' fourcc tag which the Matroska muxer rejects outright:
+  elif (( OUTPUT_HAS_DV )) && [[ "$MUX_FORMAT" == "matroska" ]] && { [[ -n "${V_DV_MP4:-}" ]] || (( VIDEO_COPY_FROM_SOURCE )); }; then
+    # M-8: also fire for VIDEO_COPY_FROM_SOURCE. The DV video reaching a Matroska mux with an
+    # 'dvh1'/'dvhe' fourcc has TWO origins: (a) a pre-wrapped MP4 in V_DV_MP4 (raw HEVC ES given the
+    # packet timestamps Matroska requires), and (b) a stream-COPY of a dvh1/dvhe-tagged DV MP4 source
+    # (copy-compliant profile + --output-ext mkv). The old gate only covered (a); case (b) reached the
+    # matroska muxer with the source's dvh1 tag and died 41 ("Tag dvh1 incompatible with output codec
+    # id"). The Matroska muxer rejects that fourcc outright:
     #   "Tag dvh1 incompatible with output codec id".
+    # For an already-hvc1 source (a DV MKV copied to MKV) the override below is a harmless no-op.
     # Override with 'hvc1' so the mux succeeds. DV fidelity then depends on how the
     # pre-wrap was produced: the DV RPU is ALWAYS preserved in-band (carried in the
     # HEVC bitstream by -c copy); container-level DV signalling (dvcC → Matroska
@@ -13107,12 +13456,27 @@ mux_final() {
     report_add "dv_mux_flags" "matroska: strict unofficial + hvc1 tag"
   fi
 
+  # M-9: on the DV pre-wrap / raw-ES video path the source is often NOT one of the mux inputs (audio
+  # came from intermediates, subs from files), so ffmpeg's default chapter/metadata copy (from input 0
+  # — the chapter/tag-less wrap) yields NOTHING while we report "preserved". If we still need the
+  # source for chapters OR metadata below, add it as a trailing input used ONLY for -map_chapters /
+  # -map_metadata (its streams are not -map'd). Same mechanism the DV-container fallback remux uses.
+  if (( _vid_lacks_src_meta )) && [[ -z "$_src_input_idx" ]] && { (( KEEP_CHAPTERS )) || (( ! STRIP_METADATA )); }; then
+    ff_in+=( -i "$SRC_ABS" )
+    _src_input_idx=$next_idx
+    next_idx=$(( next_idx + 1 ))
+  fi
+
   # Chapter handling
   if (( ! KEEP_CHAPTERS )); then
     ff_codec+=( -map_chapters -1 )
     note "Stripping chapter markers from output."
     report_add "chapters" "stripped"
   else
+    # M-9: map chapters EXPLICITLY from the source when input 0 carries none (DV pre-wrap / raw ES).
+    # The .mkv/.mp4-intermediate and copy-from-source paths keep ffmpeg's default (input 0 already
+    # has the source chapters).
+    (( _vid_lacks_src_meta )) && [[ -n "$_src_input_idx" ]] && ff_codec+=( -map_chapters "$_src_input_idx" )
     report_add "chapters" "preserved"
   fi
 
@@ -13122,6 +13486,9 @@ mux_final() {
     note "Stripping non-essential metadata from output."
     report_add "metadata" "stripped"
   else
+    # M-9: as chapters — pull GLOBAL metadata explicitly from the source when input 0 is a tag-less
+    # wrap; leave ffmpeg's default (input 0) for the intermediate/copy-from-source paths.
+    (( _vid_lacks_src_meta )) && [[ -n "$_src_input_idx" ]] && ff_codec+=( -map_metadata "$_src_input_idx" )
     report_add "metadata" "preserved"
   fi
 
@@ -13196,8 +13563,15 @@ _check_multitrack_container_safety() {
   # against the container rule too, so a foreign-language lossless-only source into MP4/MOV fails this
   # preflight (before the long re-encode) rather than late at mux_final (die 41). (_build_audio_keep_list
   # re-runs in the pipeline, so its dropped-track log lines appear twice at -v — an accepted cost.)
-  if (( AUDIO_MULTI_TRACK )) && (( ! SKIP_AUDIO )); then
-    local _ai _codec _profile
+  # M-10: skip the audio arm when --audio-track / --audio-force-codec is set — run_audio_pipeline
+  # DEMOTES multi-track to single-track then (the one kept track is selected/transcoded, never bulk
+  # stream-copied), so a lossless / MP4-unsafe source track does NOT reach the MP4/MOV mux; the
+  # multi-track hard-stop would be a spurious "use MKV" refusal of a run the demoted pipeline handles
+  # fine. Mirrors the SUB_BURN_FORCED exemption on the subtitle arm below (see run_audio_pipeline's
+  # demotion at "Demote to single-track if the user set overrides that are incompatible").
+  if (( AUDIO_MULTI_TRACK )) && (( ! SKIP_AUDIO )) \
+     && [[ -z "${AUDIO_TRACK_OVERRIDE:-}" ]] && [[ -z "${AUDIO_FORCE_CODEC:-}" ]]; then
+    local _ai _codec
     local -a _keep_idxs=()
     read -r -a _keep_idxs <<< "$(_build_audio_keep_list)"
     if (( ${#_keep_idxs[@]} == 0 )) && (( $(_audio_stream_count) > 0 )); then
@@ -13206,14 +13580,17 @@ _check_multitrack_container_safety() {
       local _fk_idx; _fk_idx="$(select_best_audio | cut -f1)"
       [[ "$_fk_idx" =~ ^[0-9]+$ ]] && _keep_idxs=("$_fk_idx")
     fi
+    # H-3: gate every kept track through _sii_audio_is_container_safe — the SAME source of truth the
+    # single-track path uses (MP4/MOV whitelist: aac|ac3|eac3|alac). The old hand-rolled blocklist
+    # only caught truehd/mlp + DTS-HD MA and drifted from that whitelist, so FLAC / PCM / DTS-core /
+    # Opus / MP3 tracks passed this preflight and were then bulk-copied into MP4 — dying at mux_final
+    # on older ffmpeg, or shipping a poorly-compatible MP4 that single-track mode would have transcoded.
+    # Multi-track copies verbatim (no transcode fallback), so an unsafe codec genuinely cannot be
+    # preserved in MP4/MOV — fail fast with "use MKV".
     for _ai in ${_keep_idxs[@]+"${_keep_idxs[@]}"}; do
       _codec="$(_audio_field "$_ai" codec_name)"; _codec="${_codec,,}"
-      case "$_codec" in
-        truehd|mlp) _blk+=("audio #${_ai}: ${_codec} (lossless)") ;;
-        dts|dca)
-          _profile="$(_audio_field "$_ai" profile)"
-          [[ "${_profile,,}" == *"hd ma"* ]] && _blk+=("audio #${_ai}: DTS-HD MA (lossless)") ;;
-      esac
+      _sii_audio_is_container_safe "$_codec" \
+        || _blk+=("audio #${_ai}: ${_codec} (cannot be stream-copied into .${_ext})")
     done
   fi
 

@@ -1560,6 +1560,7 @@ test_cli() {
   _test_cli_config_missing_val
   _test_cli_replace_source_eof
   _test_cli_create_config
+  _test_cli_prerelease_fixes
 
   # F6: no advisory may emit the invalid muxm flag value `--video-codec libsvtav1`. muxm's flag
   # value is `libsvt-av1` (hyphenated); `libsvtav1` is the ffmpeg ENCODER name, not a valid
@@ -1761,6 +1762,72 @@ _test_cli_create_config() {
     fail "cli-create-config-enum: expected CHECKSUM=0 persisted, got: $(grep -E '^CHECKSUM=' "$_cc_enum_dir/.muxmrc" 2>/dev/null | tr '\n' ' ')"
   fi
   rm -rf "$_cc_enum_dir"
+}
+
+# Pre-release fix sweep (2026-07-05) — CLI-surface regression coverage: M-16 (negative SVT-AV1
+# presets), M-17 (empty --output-ext resolves), M-14 (create-config multi-profile via flag),
+# M-15 (create-config rejects a bad --checksum-algo at write time), L-2 (override flags before
+# --create-config warn).
+_test_cli_prerelease_fixes() {
+  local src="$TESTDIR/basic_sdr_subs.mkv" out
+  # ---- M-16: a leading-dash NEGATIVE INTEGER preset (SVT-AV1's -2..13) is accepted; a real flag is
+  #      still rejected; and a negative preset that doesn't fit the codec is rejected downstream. ----
+  out="$(run_muxm --video-codec libsvt-av1 --preset -2 --print-effective-config "$src")"
+  assert_contains "PRESET_VALUE              = -2" "cli-prerelease M-16: SVT-AV1 --preset -2 is accepted" "$out"
+  out="$(run_muxm --video-codec libx265 --preset -2 --print-effective-config "$src")"
+  assert_contains "Invalid --preset '-2'" "cli-prerelease M-16: --preset -2 with libx265 is rejected (codec-aware)" "$out"
+  out="$(run_muxm --preset --crf 20 "$src")"
+  assert_contains "requires a value, not a flag" "cli-prerelease M-16: --preset --crf still refuses a real flag as the value (flag-swallow guard intact)" "$out"
+
+  # ---- M-17: --output-ext "" must resolve the container (mkv source → .mkv passthrough), NOT leave
+  #      OUTPUT_EXT empty (which produced a "movie." trailing-dot filename force-muxed as MP4). ----
+  out="$(run_muxm --output-ext "" --dry-run "$src")"
+  assert_contains "Output     :" "cli-prerelease M-17: empty --output-ext still produces an output plan" "$out"
+  assert_not_contains "basic_sdr_subs." "cli-prerelease M-17: empty --output-ext does not yield a trailing-dot 'name.' output" "$(grep -E '^=== Output' <<<"$out")"
+  if grep -qE '^=== Output .*\.mkv' <<<"$out"; then
+    pass "cli-prerelease M-17: empty --output-ext resolves an mkv source to a .mkv output (not MP4)"
+  else
+    fail "cli-prerelease M-17: expected a .mkv output for an empty --output-ext on an mkv source, got: $(grep -E '^=== Output' <<<"$out" | head -1)"
+  fi
+
+  # ---- M-14: `--create-config … --profile a,b` (flag form) must emit a MULTI-profile config, not
+  #      silently drop all but the first profile. Isolated HOME so `user` scope writes here. ----
+  local _pf_dir; _pf_dir="$(mktemp -d "$TESTDIR/cc_multiflag.XXXXXX")"
+  ( MUXM_HOME="$_pf_dir" run_muxm_in "$_pf_dir" --create-config user --profile archive,universal ) >/dev/null 2>&1
+  if grep -qF 'PROFILE_NAME="archive,universal"' "$_pf_dir/.muxmrc" 2>/dev/null; then
+    pass "cli-prerelease M-14: --create-config --profile archive,universal emits a multi-profile config"
+  else
+    fail "cli-prerelease M-14: flag-form multi-profile create-config dropped profiles, got: $(grep -iE 'PROFILE' "$_pf_dir/.muxmrc" 2>/dev/null | head -2 | tr '\n' ' ')"
+  fi
+  rm -rf "$_pf_dir"
+
+  # ---- M-15: a bad --checksum-algo override must be rejected at create time (die 11) and write NO
+  #      config — the old behavior persisted a value that bricked every later invocation. ----
+  local _ca_dir; _ca_dir="$(mktemp -d "$TESTDIR/cc_badalgo.XXXXXX")"
+  out="$(MUXM_HOME="$_ca_dir" run_muxm_in "$_ca_dir" --create-config user hdr10-hq --checksum-algo md5 2>&1)"
+  if grep -qiF "Invalid --checksum-algo 'md5'" <<<"$out" && [[ ! -f "$_ca_dir/.muxmrc" ]]; then
+    pass "cli-prerelease M-15: --create-config with a bad --checksum-algo is rejected at write time and writes no config"
+  else
+    fail "cli-prerelease M-15: bad --checksum-algo should die 11 and write nothing, got config=$([[ -f "$_ca_dir/.muxmrc" ]] && echo yes || echo no) out='${out:0:120}'"
+  fi
+  # Control: a valid algo still writes the config.
+  out="$(MUXM_HOME="$_ca_dir" run_muxm_in "$_ca_dir" --create-config user hdr10-hq --checksum-algo blake2b 2>&1)"
+  if grep -qF 'CHECKSUM_ALGO="blake2b"' "$_ca_dir/.muxmrc" 2>/dev/null; then
+    pass "cli-prerelease M-15: a valid --checksum-algo still writes the config (no over-rejection)"
+  else
+    fail "cli-prerelease M-15: valid --checksum-algo blake2b was not persisted"
+  fi
+  rm -rf "$_ca_dir"
+
+  # ---- L-2: an override flag placed BEFORE --create-config is silently dropped (only --profile is
+  #      honored there) — it must now warn, and --profile before it must NOT warn. ----
+  local _ov_dir; _ov_dir="$(mktemp -d "$TESTDIR/cc_preoverride.XXXXXX")"
+  out="$(MUXM_HOME="$_ov_dir" run_muxm_in "$_ov_dir" --crf 18 --create-config user hdr10-hq 2>&1)"
+  assert_contains "Ignoring '--crf' before --create-config" "cli-prerelease L-2: an override flag before --create-config warns it is ignored" "$out"
+  rm -f "$_ov_dir/.muxmrc"
+  out="$(MUXM_HOME="$_ov_dir" run_muxm_in "$_ov_dir" --profile archive --create-config user 2>&1)"
+  assert_not_contains "Ignoring '--profile'" "cli-prerelease L-2: --profile before --create-config is honored (not warned)" "$out"
+  rm -rf "$_ov_dir"
 }
 
 # L3: --level and the rate flags (--av1-maxrate/--av1-bufsize/--stereo-bitrate) are validated at
@@ -2585,12 +2652,14 @@ _test_config_tier_trust() {
   local body
   body="$(_extract_muxm_fns _muxm_user_tier_is_elevation_risk)" \
     || { fail "config-tier-trust: could not extract _muxm_user_tier_is_elevation_risk"; return; }
-  _elev(){ bash -c "$body"$'\n'"SUDO_USER='$2'; SUDO_UID='$3'"$'\n''_muxm_user_tier_is_elevation_risk "$1" && echo SKIP || echo SOURCE' -- "$1"; }
+  # M-13: predicate is now pure over (euid, $HOME-owner-uid) — SUDO_* is no longer consulted (it
+  # missed `su` without `-` and false-fired on plain `sudo`). $1=euid, $2=owner uid of $HOME.
+  _elev(){ bash -c "$body"$'\n''_muxm_user_tier_is_elevation_risk "$1" "$2" && echo SKIP || echo SOURCE' -- "$1" "$2"; }
   local g
-  g="$(_elev 0 alice '')";   [[ "$g" == SKIP   ]] && pass "config-tier-trust: root via sudo (euid 0 + SUDO_USER) skips \$HOME/.muxmrc"                    || fail "config-tier-trust: euid0+SUDO_USER expected SKIP, got '$g'"
-  g="$(_elev 0 '' 42)";      [[ "$g" == SKIP   ]] && pass "config-tier-trust: root via sudo (euid 0 + SUDO_UID) skips \$HOME/.muxmrc"                     || fail "config-tier-trust: euid0+SUDO_UID expected SKIP, got '$g'"
-  g="$(_elev 0 '' '')";      [[ "$g" == SOURCE ]] && pass "config-tier-trust: genuine root login (euid 0, no SUDO_*) still sources \$HOME/.muxmrc"        || fail "config-tier-trust: euid0 no-SUDO expected SOURCE, got '$g'"
-  g="$(_elev 1000 alice '')";[[ "$g" == SOURCE ]] && pass "config-tier-trust: non-root sudo -u (euid 1000) sources \$HOME/.muxmrc (same privilege)"      || fail "config-tier-trust: euid1000 expected SOURCE, got '$g'"
+  g="$(_elev 0 1000)";  [[ "$g" == SKIP   ]] && pass "config-tier-trust: root over a non-root-owned \$HOME (sudo -E / su without -) skips \$HOME/.muxmrc" || fail "config-tier-trust: euid0+home-owner-1000 expected SKIP, got '$g'"
+  g="$(_elev 0 0)";     [[ "$g" == SOURCE ]] && pass "config-tier-trust: genuine root login / sudo env_reset / su - (euid 0, root-owned \$HOME) sources \$HOME/.muxmrc" || fail "config-tier-trust: euid0+home-owner-0 expected SOURCE, got '$g'"
+  g="$(_elev 0 '')";    [[ "$g" == SOURCE ]] && pass "config-tier-trust: euid 0 but \$HOME owner undeterminable → best-effort, don't block"               || fail "config-tier-trust: euid0+no-owner expected SOURCE, got '$g'"
+  g="$(_elev 1000 1000)";[[ "$g" == SOURCE ]] && pass "config-tier-trust: non-root (euid 1000) sources \$HOME/.muxmrc (same privilege)"                  || fail "config-tier-trust: euid1000 expected SOURCE, got '$g'"
 
   # (b) a group/world-writable $HOME/.muxmrc is rejected (warn), a 0644 one is sourced. Run from a
   # clean CWD (no ./.muxmrc) so only the $HOME tier is under test.
@@ -3065,6 +3134,66 @@ test_config() {
   _test_config_multi_injection
   _test_config_ocr_pgsrip_fallback
   _test_config_create_rv3
+  _test_config_prerelease_fixes
+}
+
+# Pre-release fix sweep (2026-07-05) — config-source regression coverage: M-12 (a .muxmrc whose last
+# statement is a false test no longer silently kills every invocation before the traps exist) and
+# L-4 (a bad HW_ACCEL_QUALITY / THREADS from a sourced .muxmrc now fails with a clean startup die 11
+# instead of a cryptic mid-encode ffmpeg error).
+_test_config_prerelease_fixes() {
+  local _d; _d="$(mktemp -d "$TESTDIR/cfg_prerelease.XXXXXX")"
+  # ---- M-12: a config ending in the common `[[ -d /path ]] && VAR=…` guard idiom returns non-zero.
+  #      Under set -e that used to abort the whole process BEFORE the Section-18 traps were installed
+  #      → every invocation (incl. --version) exited 1 with ZERO output. Must now run and warn. ----
+  printf 'CRF_VALUE="20"\n[[ -d /nonexistent_muxm_%s ]] && WORKDIR_BASE=/nonexistent\n' "$$" > "$_d/.muxmrc"
+  local _rc=0 _out
+  _out="$(cd "$_d" && HOME="$_d" "$MUXM" --version 2>&1)" || _rc=$?
+  if (( _rc == 0 )) && grep -qiF "MuxMaster" <<<"$_out"; then
+    pass "config-prerelease M-12: a .muxmrc ending in a false test no longer silently kills muxm (--version still runs)"
+  else
+    fail "config-prerelease M-12: --version died (rc=$_rc) on a config with a trailing false test — the silent-death regression"
+  fi
+  if grep -qiF "returned non-zero status" <<<"$_out"; then
+    pass "config-prerelease M-12: the config's non-zero load status is surfaced as a warning (not silent)"
+  else
+    fail "config-prerelease M-12: expected a 'returned non-zero status' warning for the trailing-false-test config"
+  fi
+  # Settings BEFORE the false test are still applied.
+  _out="$(cd "$_d" && HOME="$_d" "$MUXM" --print-effective-config 2>/dev/null)" || true
+  assert_contains "CRF_VALUE                 = 20" "config-prerelease M-12: settings before the failing line are still applied" "$_out"
+
+  # ---- L-4: a bad HW_ACCEL_QUALITY / THREADS assigned directly by a sourced .muxmrc (bypassing the
+  #      CLI parse-time guard) must be re-validated in Section 15 with a clean die 11. That check runs
+  #      on a real run (NOT --print-effective-config, which exits earlier), so drive it with --dry-run
+  #      over a tiny source fixture. ----
+  local _l4_src="$_d/l4src.mkv"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=red:s=64x64:r=24:d=1" -f lavfi -i "sine=d=1" \
+    -c:v libx265 -preset ultrafast -crf 30 -c:a aac -shortest "$_l4_src" 2>/dev/null || true
+  if [[ ! -s "$_l4_src" ]]; then
+    skip "config-prerelease L-4: could not build a tiny source fixture (ffmpeg/libx265 unavailable)"
+    rm -rf "$_d"; return
+  fi
+  printf 'HW_ACCEL_QUALITY="abc"\n' > "$_d/.muxmrc"
+  _rc=0; _out="$(cd "$_d" && HOME="$_d" "$MUXM" --dry-run "$_l4_src" 2>&1)" || _rc=$?
+  if (( _rc == 11 )) && grep -qiF "Invalid HW_ACCEL_QUALITY" <<<"$_out"; then
+    pass "config-prerelease L-4: a bad HW_ACCEL_QUALITY from .muxmrc dies 11 at startup (not mid-encode)"
+  else
+    fail "config-prerelease L-4: expected die 11 for HW_ACCEL_QUALITY=abc, got rc=$_rc out='${_out:0:100}'"
+  fi
+  printf 'THREADS="4x"\n' > "$_d/.muxmrc"
+  _rc=0; _out="$(cd "$_d" && HOME="$_d" "$MUXM" --dry-run "$_l4_src" 2>&1)" || _rc=$?
+  if (( _rc == 11 )) && grep -qiF "Invalid THREADS" <<<"$_out"; then
+    pass "config-prerelease L-4: a bad THREADS from .muxmrc dies 11 at startup"
+  else
+    fail "config-prerelease L-4: expected die 11 for THREADS=4x, got rc=$_rc out='${_out:0:100}'"
+  fi
+  # Control: valid values are accepted (dry-run completes).
+  printf 'HW_ACCEL_QUALITY="70"\nTHREADS="4"\n' > "$_d/.muxmrc"
+  _rc=0; ( cd "$_d" && HOME="$_d" "$MUXM" -K --dry-run "$_l4_src" >/dev/null 2>&1 ) || _rc=$?
+  (( _rc == 0 )) && pass "config-prerelease L-4: valid HW_ACCEL_QUALITY/THREADS are accepted (no over-rejection)" \
+                 || fail "config-prerelease L-4: valid HW_ACCEL_QUALITY=70/THREADS=4 unexpectedly rejected (rc=$_rc)"
+  rm -rf "$_d"
 }
 
 # rv3: --create-config override validation gaps.
@@ -8707,6 +8836,96 @@ test_containers() {
   else
     skip "A2: could not generate MP4 source fixture"
   fi
+
+  # ---- Pre-release fix sweep (2026-07-05) ----
+  # H-3: a multi-track COPY run to MP4/MOV must hard-stop BEFORE the encode for a container-unsafe
+  # audio codec — now derived from the same _sii_audio_is_container_safe whitelist the single-track
+  # path uses (aac|ac3|eac3|alac). FLAC (which the old hand-rolled blocklist missed) must be rejected
+  # with "use --output-ext mkv", failing fast rather than at mux_final (or shipping a poor MP4).
+  local _h3_src="$TESTDIR/h3_flac.mkv"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=green:s=320x180:r=24:d=1" -f lavfi -i "sine=d=1" \
+    -c:v libx265 -preset ultrafast -crf 30 -c:a flac -metadata:s:a:0 language=eng "$_h3_src" 2>/dev/null || true
+  if [[ ! -s "$_h3_src" ]]; then
+    skip "containers-prerelease H-3: could not build a FLAC fixture (ffmpeg flac/libx265 unavailable)"
+  else
+    local _h3_log _h3_code=0
+    _h3_log="$(cd "$TESTDIR" && "$MUXM" --profile archive --output-ext mp4 --preset ultrafast --crf 30 "$_h3_src" 2>&1)" || _h3_code=$?
+    if [[ "$_h3_code" -eq "$EXIT_VALIDATION" ]] && grep -qiE "can't preserve|--output-ext mkv" <<<"$_h3_log"; then
+      pass "containers-prerelease H-3: FLAC + archive→mp4 multi-track hard-stops pre-encode (exit 11, recommend MKV)"
+    else
+      fail "containers-prerelease H-3: FLAC → mp4 multi-track expected exit 11 hard-stop, got exit $_h3_code"
+    fi
+    if grep -qiE 'Encoding video|final mux failed' <<<"$_h3_log"; then
+      fail "containers-prerelease H-3: FLAC hard-stop fired too LATE (encode started / mux ran) — the die-41-after-encode regression"
+    else
+      pass "containers-prerelease H-3: FLAC hard-stop fired before any encode"
+    fi
+    # Control: the same source to MKV is fine (FLAC is carried losslessly).
+    local _h3_mkv="$TESTDIR/h3_out.mkv"; rm -f "$_h3_mkv"
+    (cd "$TESTDIR" && "$MUXM" -K --profile archive --preset ultrafast --crf 30 "$_h3_src" "$_h3_mkv" >/dev/null 2>&1) || true
+    if [[ -s "$_h3_mkv" ]]; then
+      pass "containers-prerelease H-3: the same FLAC source to MKV still succeeds (no over-rejection)"
+    else
+      fail "containers-prerelease H-3: FLAC + archive→mkv should succeed but produced no output"
+    fi
+    rm -f "$_h3_mkv" "$_h3_src"
+  fi
+
+  # M-6: skip-if-ideal must honor --skip-audio. On an otherwise-ideal source (compliant HEVC/mkv for
+  # archive), --skip-audio makes the real pipeline emit NO audio, but a skip would ship every source
+  # track — so the source is NOT ideal and must be remuxed, not hard-linked.
+  local _m6_src="$TESTDIR/m6_ideal.mkv"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=red:s=320x180:r=24:d=1" -f lavfi -i "sine=d=1" \
+    -c:v libx265 -preset ultrafast -crf 30 -c:a ac3 "$_m6_src" 2>/dev/null || true
+  if [[ ! -s "$_m6_src" ]]; then
+    skip "containers-prerelease M-6: could not build an HEVC/ac3 fixture"
+  else
+    local _m6_base _m6_skip
+    _m6_base="$(cd "$TESTDIR" && "$MUXM" --profile archive --dry-run "$_m6_src" 2>&1)" || true
+    _m6_skip="$(cd "$TESTDIR" && "$MUXM" --profile archive --skip-audio --dry-run "$_m6_src" 2>&1)" || true
+    if ! grep -qiE 'already matches|skipping processing' <<<"$_m6_base"; then
+      # The fresh HEVC/mkv+AC3 source is expected to be ideal for archive; if the host's encoder makes
+      # it non-ideal for an unrelated reason, the negative case below is not exercised.
+      skip "containers-prerelease M-6: source was not deemed ideal even without --skip-audio — skipping the negative case"
+    else
+      pass "containers-prerelease M-6: the source IS ideal for archive without --skip-audio (baseline)"
+      if grep -qiE 'does not match ideal.*audio is disabled|audio track.*audio is disabled' <<<"$_m6_skip"; then
+        pass "containers-prerelease M-6: skip-if-ideal + --skip-audio is NOT ideal (audio would be shipped), so it remuxes (M-6)"
+      else
+        fail "containers-prerelease M-6: --skip-audio on an ideal source should disqualify the skip, got: $(grep -iE 'ideal|skipping' <<<"$_m6_skip" | head -1)"
+      fi
+    fi
+    rm -f "$_m6_src"
+  fi
+
+  # L-6: per-profile "unusual container" advisories must ALSO fire for a PASSTHROUGH profile whose
+  # OUTPUT_EXT resolves to the source container only during resolution (Section 13 saw OUTPUT_EXT="").
+  # atv-directplay-hq passes a .mov source through to .mov → the MOV advisory must now appear; and an
+  # explicit --output-ext mov must still fire it exactly ONCE (the one-shot guard: no double-warn).
+  local _l6_mov="$TESTDIR/l6_passthrough.mov"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=red:s=64x64:r=24:d=1" -f lavfi -i "sine=d=1" \
+    -c:v libx265 -tag:v hvc1 -preset ultrafast -crf 30 -c:a aac -shortest "$_l6_mov" 2>/dev/null || true
+  if [[ ! -s "$_l6_mov" ]]; then
+    skip "containers-prerelease L-6: could not build a .mov fixture"
+  else
+    local _l6_pass _l6_expl _l6_n
+    _l6_pass="$(cd "$TESTDIR" && "$MUXM" --profile atv-directplay-hq --dry-run "$_l6_mov" 2>&1)" || true
+    _l6_n="$(grep -c "MOV may work on Apple TV" <<<"$_l6_pass")"
+    if [[ "$_l6_n" == 1 ]]; then
+      pass "containers-prerelease L-6: a passthrough profile resolving to .mov now emits the MOV container advisory (once)"
+    else
+      fail "containers-prerelease L-6: expected the passthrough MOV advisory exactly once, got $_l6_n occurrence(s)"
+    fi
+    # Explicit --output-ext mov: Section 13 fires it; the resolution twin call must NOT double it.
+    _l6_expl="$(cd "$TESTDIR" && "$MUXM" --profile atv-directplay-hq --output-ext mov --dry-run "$_l6_mov" 2>&1)" || true
+    _l6_n="$(grep -c "MOV may work on Apple TV" <<<"$_l6_expl")"
+    if [[ "$_l6_n" == 1 ]]; then
+      pass "containers-prerelease L-6: an explicit --output-ext mov fires the advisory exactly once (one-shot, no double-warn)"
+    else
+      fail "containers-prerelease L-6: explicit --output-ext mov should warn once, got $_l6_n occurrence(s)"
+    fi
+    rm -f "$_l6_mov"
+  fi
 }
 
 # === Suite: Metadata Tests ===
@@ -9409,7 +9628,7 @@ test_edge() {
 # derived video term still bounds the whole file. Extraction test with a stubbed duration of 0.
 _test_edge_disk_undeterminable_duration() {
   local body
-  body="$(_extract_muxm_fns disk_free_warn _split_tab)" \
+  body="$(_extract_muxm_fns disk_free_warn _split_tab _df_avail_kb _df_source)" \
     || { fail "edge-disk-undeterminable-duration: could not extract disk_free_warn + _split_tab"; return; }
   local srcfile; srcfile="$(mktemp "$TESTDIR/disk_dur0.XXXXXX")"
   head -c 10485760 /dev/zero > "$srcfile"   # 10 MiB
@@ -10262,7 +10481,7 @@ _test_unit_rv3_release_fixes() {
 # are deterministic for a 10 MiB source @ 100 s, libx265 CRF 28 (_crf_ratio=50, preset 1000).
 _test_unit_disk_fallback() {
   local body
-  body="$(awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  body="$(awk '/^_df_avail_kb\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^_df_source\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
   if [[ -z "$body" ]]; then fail "disk_free_warn not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
 
   local srcfile; srcfile="$(mktemp "$TESTDIR/disk_fallback.XXXXXX")"
@@ -10336,7 +10555,10 @@ _test_unit_disk_output_volume() {
   # sanity case proves the die is specific to the cross-volume branch (not a blanket always-die).
   # M-DISK-1 inverts the cross-volume guard (!= → ==) → the output check is skipped → no die → red.
   local body
-  body="$(awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  # disk_free_warn now reads the df columns via _df_avail_kb / _df_source (robust to spaces in the
+  # filesystem source — M-7), so extract those helpers alongside it. The df() mock below still drives
+  # them (they parse `df -Pk` output; the mock ignores -Pk and prints the fixture rows).
+  body="$(awk '/^_df_avail_kb\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^_df_source\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
   if [[ -z "$body" ]]; then fail "disk_free_warn not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
   local srcfile; srcfile="$(mktemp "$TESTDIR/disk_ov.XXXXXX")"
   head -c 10485760 /dev/zero > "$srcfile"   # 10 MiB, so the stat-based estimate is non-degenerate
@@ -10655,6 +10877,16 @@ note() { :; }'
   out="$(bash -c "$novbv_env"$'\n'"$body"$'\n'"apply_level_vbv 5.1; echo \"\$X265_PARAMS\"")"
   if ! echo "$out" | grep -qF "vbv-maxrate"; then pass "apply_level_vbv(5.1, CONSERVATIVE_VBV=0): no vbv-maxrate"; else fail "apply_level_vbv(5.1, CONSERVATIVE_VBV=0): unexpected vbv-maxrate in '$out'"; fi
   if echo "$out" | grep -qF "level-idc=5.1"; then pass "apply_level_vbv(5.1, CONSERVATIVE_VBV=0): level-idc still injected"; else fail "apply_level_vbv(5.1, CONSERVATIVE_VBV=0): expected level-idc=5.1, got '$out'"; fi
+
+  # M-5: libx264 enforces level/VBV via -x264-params with x264 KEY names (`level`, not x265's
+  # `level-idc`) and it reads X264_PARAMS_BASE — NOT X265_PARAMS. The shared x265 append was a
+  # silent no-op for libx264 while still printing "Applying VBV guardrails". x264's vbv-* take bare
+  # kbps (the table's `k` suffix stripped).
+  local x264_env="${vbv_env/X265_PARAMS=\"\"/X265_PARAMS=\"\"; X264_PARAMS_BASE=\"\"; VIDEO_CODEC=libx264}"
+  out="$(bash -c "$x264_env"$'\n'"$body"$'\n'"apply_level_vbv 4.1; echo \"x264=\$X264_PARAMS_BASE|x265=\$X265_PARAMS\"")"
+  if echo "$out" | grep -qF "level=4.1"; then pass "apply_level_vbv(libx264 4.1): x264 'level=4.1' applied (M-5)"; else fail "apply_level_vbv(libx264 4.1): expected 'level=4.1' in X264_PARAMS_BASE, got '$out'"; fi
+  if echo "$out" | grep -qF "vbv-maxrate=10000:" && echo "$out" | grep -qF "vbv-bufsize=20000"; then pass "apply_level_vbv(libx264 4.1): VBV in bare kbps (10000/20000), k-suffix stripped (M-5)"; else fail "apply_level_vbv(libx264 4.1): expected bare-kbps vbv in X264_PARAMS_BASE, got '$out'"; fi
+  if ! echo "$out" | grep -qE "x265=[^|]*level"; then pass "apply_level_vbv(libx264 4.1): nothing leaked into X265_PARAMS (M-5)"; else fail "apply_level_vbv(libx264 4.1): level/VBV wrongly appended to X265_PARAMS, got '$out'"; fi
 }
 
 _test_unit_mapping_helpers() {
@@ -11269,8 +11501,11 @@ _test_unit_rf6_subtitle_fallback() {
   body_u="$(_extract_muxm_fns _sub_candidate_undeliverable _is_text_sub_codec _container_supports_bitmap_subs)" \
     || { fail "RF6(a): could not extract _sub_candidate_undeliverable + helpers"; return; }
   # $1=codec $2=MUX_FORMAT $3=SUB_ENABLE_OCR → exit 0 if undeliverable, 1 if deliverable.
+  # SUB_PRESERVE_BITMAP=1 / SUB_MULTI_TRACK=0 are the real defaults the predicate now also consults
+  # (MKV stream-copy only preserves a bitmap when SUB_PRESERVE_BITMAP=1; OCR only delivers in
+  # single-track mode). Set them so the truth table reflects a default run.
   _undeliv(){
-    bash -c "MUX_FORMAT=\"\$2\"; SUB_ENABLE_OCR=\"\$3\"
+    bash -c "MUX_FORMAT=\"\$2\"; SUB_ENABLE_OCR=\"\$3\"; SUB_PRESERVE_BITMAP=1; SUB_MULTI_TRACK=0
 $body_u
 _sub_candidate_undeliverable \"\$1\"; echo \$?" -- "$1" "$2" "$3"
   }
@@ -11297,7 +11532,7 @@ _sub_candidate_undeliverable \"\$1\"; echo \$?" -- "$1" "$2" "$3"
   # sidecar (srt eng/full) collides on (lang,type). Emits the final ALL_SUB_SOURCES element count.
   # $1=MUX_FORMAT $2=SUB_ENABLE_OCR $3=embedded codec
   _merge_count(){
-    bash -c "MUX_FORMAT=\"\$1\"; SUB_ENABLE_OCR=\"\$2\"; TAG_LANGUAGE_DEFAULT=und; _EMB_CODEC=\"\$3\"
+    bash -c "MUX_FORMAT=\"\$1\"; SUB_ENABLE_OCR=\"\$2\"; TAG_LANGUAGE_DEFAULT=und; _EMB_CODEC=\"\$3\"; SUB_PRESERVE_BITMAP=1; SUB_MULTI_TRACK=0
 note(){ :; }; report_add(){ :; }
 _sub_count(){ echo 1; }
 _sub_stream_info(){ printf '%s\teng\t\t0\t0\n' \"\$_EMB_CODEC\"; }   # codec lang title forced hi (full)
@@ -11326,7 +11561,7 @@ echo \"\${#ALL_SUB_SOURCES[@]}\"" -- "$1" "$2" "$3"
   # $1=MUX_FORMAT $2=SUB_ENABLE_OCR $3=embedded codec → prepared SRT_FULL marker ("embedded:0"/"ext:…").
   _plan_pick(){
     bash -c "MUX_FORMAT=\"\$1\"; SUB_ENABLE_OCR=\"\$2\"
-SKIP_SUBS=0; SUB_MULTI_TRACK=0; SUB_BURN_FORCED=0; SUB_EXPORT_EXTERNAL=0
+SKIP_SUBS=0; SUB_MULTI_TRACK=0; SUB_BURN_FORCED=0; SUB_EXPORT_EXTERNAL=0; SUB_PRESERVE_BITMAP=1
 SUB_LANG_PREF=''; SUB_INCLUDE_FORCED=1; SUB_INCLUDE_FULL=1; SUB_INCLUDE_SDH=1
 SUB_SOLE_EXT_FALLBACK=1; SUB_MAX_TRACKS=3
 SRT_FORCED=''; SRT_FULL=''; SRT_SDH=''; SRT_FORCED_BURN_PATH=''; EXTERNAL_SRT_PATHS=()
@@ -12330,6 +12565,11 @@ test_unit() {
   _test_unit_dv_ffmpeg_wrap_mp4
   _test_unit_dv_frame_count_sentinel
   _test_unit_ocr_lang_flags
+  _test_unit_codec_max_channels
+  _test_unit_df_field_parse
+  _test_unit_fatal_signal_traps
+  _test_unit_collision_versioning
+  _test_unit_detect_dv_scoped
   _test_unit_run_ocr
   _test_unit_audio_pretty_line
   _test_unit_check_mux_stream_counts
@@ -12618,7 +12858,7 @@ _test_unit_sub_track_model() {
 # assert the skipped-note fires. Perturb MUT-L-DISKNOTE drops the else-note → no note → red.
 _test_unit_disk_df_unavailable() {
   local body
-  body="$(awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  body="$(awk '/^_df_avail_kb\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^_df_source\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
   if [[ -z "$body" ]]; then fail "unit-disk-preflight-note: disk_free_warn extraction anchor failed"; return; fi
   local _stubs='
     DISK_CHECK=1; VIDEO_CODEC=libx265; CRF_VALUE=28; PRESET_VALUE=medium
@@ -12791,6 +13031,26 @@ _test_unit_warn_if_not_on_manpath() {
   else
     fail "unit-warn-if-not-on-manpath: unexpectedly printed something with no resolvable search path: ${out:0:200}"
   fi
+
+  # M-18: the arg is the man1 SUBDIR (…/share/man/man1) but MANPATH lists man ROOTS (…/share/man) —
+  # `man` appends manN/ itself. Comparing the man1 subdir against the roots NEVER matched, so it
+  # warned after every successful install with advice that added the man1 dir as a root. Must compare
+  # (and advise) the ROOT.
+  script='PATH="/nonexistent_dir_for_muxm_test"; MANPATH="/opt/brew/share/man:/usr/share/man"; CLI_NAME=muxm'$'\n'"$body"$'\n''_warn_if_not_on_manpath "/opt/brew/share/man/man1"'
+  out="$(bash -c "$script" 2>&1)"
+  if [[ -z "$out" ]]; then
+    pass "unit-warn-if-not-on-manpath: no warning when the man ROOT of the …/man1 install dir is on MANPATH (M-18)"
+  else
+    fail "unit-warn-if-not-on-manpath: false-warned for a …/man1 install whose ROOT is on MANPATH — got: ${out:0:200} (man1-vs-root regression)"
+  fi
+  # A genuinely-off-path man1 dir still warns, and advises adding the ROOT (not the man1 dir).
+  script='PATH="/nonexistent_dir_for_muxm_test"; MANPATH="/usr/share/man"; CLI_NAME=muxm'$'\n'"$body"$'\n''_warn_if_not_on_manpath "/opt/nowhere/share/man/man1"'
+  out="$(bash -c "$script" 2>&1)"
+  if grep -qiF "not on your man search path" <<<"$out" && grep -qF 'MANPATH="/opt/nowhere/share/man:' <<<"$out" && ! grep -qF "/man1" <<<"$out"; then
+    pass "unit-warn-if-not-on-manpath: an off-path …/man1 warns and advises adding the ROOT, not the man1 dir (M-18)"
+  else
+    fail "unit-warn-if-not-on-manpath: off-path man1 remediation should name the root …/share/man, got: ${out:0:200}"
+  fi
 }
 
 # 2.1: _dv_give_up_to_base must always alias V_MIXED to V_BASE and reset OUTPUT_HAS_DV=0 —
@@ -12917,8 +13177,8 @@ _test_unit_dv_frame_count_sentinel() {
 }
 
 # 3.1: _ocr_lang_flags must select the correct language flag per OCR tool — behaviorally
-# verified in isolation (pgsrip → --language, sub2srt → none, anything else → -l, empty lang →
-# none), THEN structurally verified as the ONLY path all three former case-statement copies
+# verified in isolation (pgsrip → none [language via filename, H-1], sub2srt → none, anything else
+# → -l, empty lang → none), THEN structurally verified as the ONLY path all three former case-statement copies
 # (_prepare_subtitle's PGS branch, _prepare_ext_subtitle's .sup and .idx branches) use, so the
 # three copies can never silently drift apart again.
 _test_unit_ocr_lang_flags() {
@@ -12943,8 +13203,11 @@ _test_unit_ocr_lang_flags() {
     echo "SCRIPT_COMPLETED_OK"
   '
   out="$(bash -c "$script" 2>&1)"
+  # H-1: pgsrip now emits NO --language flag — its language (filter + tesseract model) comes from the
+  # input FILENAME (`sub.N.<lang>.sup` / `movie.<lang>.sup`), so a workdir file no longer parses as
+  # `und` and gets filtered out. So pgsrip, like sub2srt, must produce an empty flag array.
   if grep -qF "SCRIPT_COMPLETED_OK" <<<"$out" \
-     && grep -qF "pgsrip:--language eng" <<<"$out" \
+     && grep -qF "pgsrip:" <<<"$out" && ! grep -qF "pgsrip:-" <<<"$out" \
      && grep -qF "sub2srt:" <<<"$out" && ! grep -qF "sub2srt:-" <<<"$out" \
      && grep -qF "other:-l eng" <<<"$out" \
      && grep -qF "pgsrip-empty:" <<<"$out" && ! grep -qF "pgsrip-empty:-" <<<"$out" \
@@ -12974,6 +13237,111 @@ _test_unit_ocr_lang_flags() {
   else
     fail "unit-ocr-lang-flags: an inlined 'case \"\$SUB_OCR_TOOL\" in' block still exists — extraction incomplete"
   fi
+}
+
+# M-1: _codec_max_channels must clamp libmp3lame/mp3 to 2 — an unclamped `-ac 6` is a fatal
+# "channel layout '5.1' is not supported by the libmp3lame encoder" (die 43). Guards the
+# --audio-force-codec libmp3lame path on any surround source. The eac3/ac3/aac limits are the
+# pre-existing contract and must not regress.
+_test_unit_codec_max_channels() {
+  local body
+  body="$(_extract_muxm_fns _codec_max_channels)" || { fail "unit-codec-max-channels: _codec_max_channels not found"; return; }
+  local out
+  _cmc(){ bash -c "$body"$'\n'"_codec_max_channels \"\$1\"" -- "$1"; }
+  [[ "$(_cmc libmp3lame)" == 2 ]] && pass "unit-codec-max-channels: libmp3lame clamps to 2 (M-1)"          || fail "unit-codec-max-channels: libmp3lame expected 2, got '$(_cmc libmp3lame)'"
+  [[ "$(_cmc mp3)" == 2 ]]        && pass "unit-codec-max-channels: mp3 clamps to 2 (M-1)"                 || fail "unit-codec-max-channels: mp3 expected 2, got '$(_cmc mp3)'"
+  [[ "$(_cmc eac3)" == 6 ]]       && pass "unit-codec-max-channels: eac3 stays 6 (no regression)"          || fail "unit-codec-max-channels: eac3 expected 6, got '$(_cmc eac3)'"
+  [[ "$(_cmc ac3)" == 6 ]]        && pass "unit-codec-max-channels: ac3 stays 6 (no regression)"           || fail "unit-codec-max-channels: ac3 expected 6, got '$(_cmc ac3)'"
+  [[ "$(_cmc aac)" == 48 ]]       && pass "unit-codec-max-channels: aac stays 48 (no regression)"          || fail "unit-codec-max-channels: aac expected 48, got '$(_cmc aac)'"
+  [[ "$(_cmc opus)" == 64 ]]      && pass "unit-codec-max-channels: unknown codec falls back to 64"        || fail "unit-codec-max-channels: opus expected 64, got '$(_cmc opus)'"
+}
+
+# M-7: _df_avail_kb / _df_source must read the correct df columns even when the filesystem SOURCE
+# name contains a space (SMB/CIFS/NAS share like "//host/My Share"). The old positional `$4`/`$1`
+# read the Used column (silent under-warn) or a "%" token (arithmetic abort). Keys off the capacity
+# percentage field.
+_test_unit_df_field_parse() {
+  local body
+  body="$(_extract_muxm_fns _df_avail_kb _df_source)" || { fail "unit-df-field-parse: _df_avail_kb/_df_source not found"; return; }
+  # df mock: a spaced filesystem source. Avail=600000 (before the 40% capacity field), Used=400000.
+  local mock='df(){ printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n//user@nas/My Share 1000000 400000 600000 40%% /Volumes/My Share\n"; }'
+  local avail source
+  avail="$(bash -c "$mock"$'\n'"$body"$'\n''_df_avail_kb /x')"
+  source="$(bash -c "$mock"$'\n'"$body"$'\n''_df_source /x')"
+  [[ "$avail" == 600000 ]] && pass "unit-df-field-parse: _df_avail_kb reads Available (600000), not Used, on a spaced source (M-7)" \
+                           || fail "unit-df-field-parse: _df_avail_kb expected 600000 (Available), got '$avail' (space-shift regression)"
+  [[ "$source" == "//user@nas/My Share" ]] && pass "unit-df-field-parse: _df_source recovers the full spaced filesystem name (M-7)" \
+                                            || fail "unit-df-field-parse: _df_source expected '//user@nas/My Share', got '$source'"
+  # A normal (space-free) source still parses.
+  local mock2='df(){ printf "Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/disk1 1000000 100000 900000 10%% /\n"; }'
+  local avail2; avail2="$(bash -c "$mock2"$'\n'"$body"$'\n''_df_avail_kb /')"
+  [[ "$avail2" == 900000 ]] && pass "unit-df-field-parse: _df_avail_kb parses a normal space-free source (900000)" \
+                            || fail "unit-df-field-parse: _df_avail_kb expected 900000 on a normal source, got '$avail2'"
+}
+
+# H-2: the Section-18 trap block must set FAILED=1 for SIGHUP/SIGQUIT/SIGPIPE. Without them an
+# untrapped fatal signal still runs the EXIT trap but with FAILED=0 → on_exit takes the SUCCESS
+# path and promotes a truncated TMP_OUT over $OUT ("Build SUCCEEDED"). Structural guard on the
+# trap installation (a live signal-delivery e2e test would race the tee/ffmpeg teardown).
+_test_unit_fatal_signal_traps() {
+  local sig ok=1
+  for sig in HUP QUIT PIPE; do
+    # Require a `trap '…FAILED=1…' <SIG>` line for each fatal signal.
+    if ! grep -qE "trap '[^']*FAILED=1[^']*' ${sig}\$" "$MUXM"; then
+      fail "unit-fatal-signal-traps: no 'trap … FAILED=1 … ${sig}' found — an untrapped ${sig} would take the success path (H-2)"
+      ok=0
+    fi
+  done
+  (( ok )) && pass "unit-fatal-signal-traps: SIGHUP/SIGQUIT/SIGPIPE each install a FAILED=1 trap (H-2)"
+}
+
+# L-5: source-collision auto-versioning must split the extension within the BASENAME only.
+# "${OUT_ABS%.*}"/"${OUT_ABS##*.}" split at the last dot ANYWHERE in the path, so an extensionless
+# output in a dotted directory (/data/v1.0/movie) versioned into a nonexistent dir. Extract the
+# versioning arithmetic verbatim from the script and drive it with the collision case.
+_test_unit_collision_versioning() {
+  # Pull the auto-version block (between its comment anchor and the OUT_BASENAME assignment) out of
+  # the script and run it with OUT_ABS pre-set + the -e guard, mirroring how the real path reaches it.
+  local blk
+  blk="$(awk '/Auto-version: filename\(1\)\.ext/{f=1} f{print} /OUT_BASENAME="\$\(basename -- "\$OUT_ABS"\)"/{exit}' "$MUXM")"
+  [[ -n "$blk" ]] || { fail "unit-collision-versioning: could not extract the auto-version block (anchor drift?)"; return; }
+  _ver(){ bash -c 'OUT_ABS="$1"; note(){ :; }
+'"$blk"'
+echo "$OUT_ABS"' -- "$1"; }
+  local got
+  got="$(_ver /data/movie.mkv)";     [[ "$got" == /data/movie\(1\).mkv ]]     && pass "unit-collision-versioning: movie.mkv → movie(1).mkv" || fail "unit-collision-versioning: movie.mkv → '$got' (expected movie(1).mkv)"
+  got="$(_ver /data/v1.0/movie)";    [[ "$got" == /data/v1.0/movie\(1\) ]]    && pass "unit-collision-versioning: extensionless in a dotted dir → /data/v1.0/movie(1) (L-5)" || fail "unit-collision-versioning: /data/v1.0/movie → '$got' (expected /data/v1.0/movie(1); dot-in-path regression)"
+  got="$(_ver /home/u/movie)";       [[ "$got" == /home/u/movie\(1\) ]]       && pass "unit-collision-versioning: no-dot basename → movie(1)" || fail "unit-collision-versioning: /home/u/movie → '$got' (expected /home/u/movie(1))"
+  got="$(_ver /data/s01e01.mkv)";    [[ "$got" == /data/s01e01\(1\).mkv ]]    && pass "unit-collision-versioning: multi-dot basename keeps its extension" || fail "unit-collision-versioning: /data/s01e01.mkv → '$got'"
+}
+
+# L-13: detect_dv's stream-level probe must match only DV-bearing fields (codec_tag_string, profile,
+# side_data_list), NOT the stream .tags — so a DV-stripped remux whose title carries "DoVi"/"DVHE"
+# does not false-trigger a costly RPU extraction (or a hard die 40 with ALLOW_DV_FALLBACK=0).
+_test_unit_detect_dv_scoped() {
+  local body
+  body="$(_extract_muxm_fns detect_dv)" || { fail "unit-detect-dv-scoped: detect_dv not found"; return; }
+  # Drive only the stream-level (first) probe: mock _jq_cache to return a jq-processed record, and
+  # stub the frame-level probe (ffprobe) to report NO DV, so the result reflects the stream check alone.
+  _dv(){
+    bash -c 'DISABLE_DV=0; FFPROBE_FLAGS=(); SRC_ABS=/x
+warn(){ :; }; note(){ :; }
+_jq_cache(){ printf "%s" "$JQREC"; }
+ffprobe(){ printf ""; return 0; }          # frame probe: emits nothing → no DV
+JQREC="$1"
+'"$body"'
+detect_dv; echo "rc=$?"' -- "$1"
+  }
+  # (a) A non-DV stream whose TITLE contains "DoVi" — the jq record extracts only tag/profile/side_data
+  #     (tags excluded), so the title never reaches the grep. Must NOT detect DV (rc != 0).
+  local out_title out_real
+  out_title="$(_dv $'[0][0][0][0]\tMain 10\t[]')"
+  [[ "$out_title" == "rc=0" ]] && fail "unit-detect-dv-scoped: a DoVi-in-title non-DV stream false-detected as DV (L-13)" \
+                               || pass "unit-detect-dv-scoped: a DoVi-in-title non-DV stream is NOT detected as DV (L-13)"
+  # (b) A genuine DV stream (dvh1 codec tag) still detects (rc == 0).
+  out_real="$(_dv $'dvh1\tMain 10\t[]')"
+  [[ "$out_real" == "rc=0" ]] && pass "unit-detect-dv-scoped: a real dvh1-tagged stream is still detected as DV" \
+                              || fail "unit-detect-dv-scoped: a real dvh1 stream was NOT detected (rc='$out_real') — over-scoped grep"
 }
 
 # 3.1: _run_ocr must spawn $SUB_OCR_TOOL with the resolved language flags, register/clear
@@ -13759,6 +14127,35 @@ test_completions() {
     pass "completions-home-unset-diagnostic: --uninstall-completions with \$HOME unset gives a muxm-specific diagnostic"
   else
     fail "completions-home-unset-diagnostic: --uninstall-completions with \$HOME unset: ${out16:0:200}"
+  fi
+
+  # ---- Pre-release fix sweep (2026-07-05) ----
+  # M-19 / L-1: the emitted completion must (a) run compinit before bashcompinit under zsh so a
+  # minimal ~/.zshrc doesn't error `compdef: command not found`, and (b) register with `-o default`
+  # so free-form-value flags (notably --ext-subs-dir) fall through to filename completion.
+  local _comp; _comp="$("$MUXM" --emit-completions 2>/dev/null)"
+  if grep -qE 'autoload -Uz[^\n]*compinit' <<<"$_comp" && grep -qF 'compinit -u' <<<"$_comp"; then
+    pass "completions-prerelease M-19: the zsh block runs compinit before bashcompinit (no compdef error on a minimal .zshrc)"
+  else
+    fail "completions-prerelease M-19: emitted completion's zsh block does not run compinit before bashcompinit"
+  fi
+  if grep -qE 'complete .*-o default.*-F _muxm_completions muxm' <<<"$_comp"; then
+    pass "completions-prerelease L-1: complete registers with -o default (free-form-value flags fall through to files)"
+  else
+    fail "completions-prerelease L-1: emitted completion's 'complete' line is missing -o default: $(grep -F 'complete ' <<<"$_comp" | tail -1)"
+  fi
+  # If zsh is present, sourcing the emitted completion in a bare shell must not error (the H-1-adjacent
+  # real repro of the compdef bug).
+  if ! command -v zsh >/dev/null 2>&1; then
+    skip "completions-prerelease M-19: zsh not installed — cannot verify the emitted completion sources cleanly"
+  else
+    local _zc; _zc="$TESTDIR/emit_comp.bash"; printf '%s\n' "$_comp" > "$_zc"
+    if zsh -f -c "source '$_zc'" >/dev/null 2>&1; then
+      pass "completions-prerelease M-19: the emitted completion sources cleanly under 'zsh -f' (no compdef error)"
+    else
+      fail "completions-prerelease M-19: emitted completion errored when sourced under 'zsh -f'"
+    fi
+    rm -f "$_zc"
   fi
 }
 
@@ -14843,6 +15240,30 @@ test_multi_profile() {
   _test_multi_profile_dispatch_diagnosed
   _test_mp_probe_profile_ext_alias
   _test_mp_positional_value_collision
+  _test_mp_prerelease_passthrough_ext
+}
+
+# M-11: a multi-profile run over PASSTHROUGH profiles (atv-directplay-*) with a source whose
+# container is NOT a valid output (a .ts/.avi/.webm source, or an extensionless source) must map the
+# per-profile extension to mkv — mirroring single-profile _resolve_output_and_sub_policy — instead of
+# passing the raw source ext as the child's --output-ext, which died 11 mid-dispatch.
+_test_mp_prerelease_passthrough_ext() {
+  local _ts="$TESTDIR/mp_passthrough.ts"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=c=red:s=64x64:r=24:d=1" -f lavfi -i "sine=d=1" \
+    -c:v libx265 -preset ultrafast -crf 30 -c:a ac3 -shortest -f mpegts "$_ts" 2>/dev/null || true
+  if [[ ! -s "$_ts" ]]; then
+    skip "multi-profile-prerelease M-11: could not build a .ts fixture (ffmpeg mpegts/libx265 unavailable)"
+    return
+  fi
+  local out; out="$(run_muxm --profile atv-directplay-hq,universal --dry-run "$_ts" 2>&1)"
+  assert_contains "is not a supported output — defaulting to .mkv" "multi-profile-prerelease M-11: an unsupported .ts source container defaults to .mkv per profile" "$out"
+  assert_not_contains "Invalid OUTPUT_EXT" "multi-profile-prerelease M-11: no child dies 11 on the raw source extension" "$out"
+  if grep -qiE 'atv-directplay-hq: (PASS|✅)' <<<"$out"; then
+    pass "multi-profile-prerelease M-11: the passthrough profile completes (dry-run) instead of exit 11"
+  else
+    fail "multi-profile-prerelease M-11: atv-directplay-hq did not complete on a .ts source: $(grep -iE 'atv-directplay-hq' <<<"$out" | head -1)"
+  fi
+  rm -f "$_ts" "$TESTDIR/mp_passthrough".*.mkv
 }
 
 # RV3-12: _probe_profile_ext must normalize a deprecated alias to its canonical name BEFORE dispatch
