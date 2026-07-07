@@ -2658,7 +2658,7 @@ _test_config_tier_trust() {
   local g
   g="$(_elev 0 1000)";  [[ "$g" == SKIP   ]] && pass "config-tier-trust: root over a non-root-owned \$HOME (sudo -E / su without -) skips \$HOME/.muxmrc" || fail "config-tier-trust: euid0+home-owner-1000 expected SKIP, got '$g'"
   g="$(_elev 0 0)";     [[ "$g" == SOURCE ]] && pass "config-tier-trust: genuine root login / sudo env_reset / su - (euid 0, root-owned \$HOME) sources \$HOME/.muxmrc" || fail "config-tier-trust: euid0+home-owner-0 expected SOURCE, got '$g'"
-  g="$(_elev 0 '')";    [[ "$g" == SOURCE ]] && pass "config-tier-trust: euid 0 but \$HOME owner undeterminable → best-effort, don't block"               || fail "config-tier-trust: euid0+no-owner expected SOURCE, got '$g'"
+  g="$(_elev 0 '')";    [[ "$g" == SKIP   ]] && pass "config-tier-trust: root (euid 0) with \$HOME owner undeterminable → fail CLOSED, skip \$HOME/.muxmrc (Finding #4: never source a possibly-foreign rc as root)" || fail "config-tier-trust: euid0+no-owner expected SKIP (fail-closed), got '$g'"
   g="$(_elev 1000 1000)";[[ "$g" == SOURCE ]] && pass "config-tier-trust: non-root (euid 1000) sources \$HOME/.muxmrc (same privilege)"                  || fail "config-tier-trust: euid1000 expected SOURCE, got '$g'"
 
   # (b) a group/world-writable $HOME/.muxmrc is rejected (warn), a 0644 one is sourced. Run from a
@@ -9628,7 +9628,7 @@ test_edge() {
 # derived video term still bounds the whole file. Extraction test with a stubbed duration of 0.
 _test_edge_disk_undeterminable_duration() {
   local body
-  body="$(_extract_muxm_fns disk_free_warn _split_tab _df_avail_kb _df_source)" \
+  body="$(_extract_muxm_fns disk_free_warn _split_tab _df_avail_kb _fs_dev)" \
     || { fail "edge-disk-undeterminable-duration: could not extract disk_free_warn + _split_tab"; return; }
   local srcfile; srcfile="$(mktemp "$TESTDIR/disk_dur0.XXXXXX")"
   head -c 10485760 /dev/zero > "$srcfile"   # 10 MiB
@@ -10481,7 +10481,7 @@ _test_unit_rv3_release_fixes() {
 # are deterministic for a 10 MiB source @ 100 s, libx265 CRF 28 (_crf_ratio=50, preset 1000).
 _test_unit_disk_fallback() {
   local body
-  body="$(awk '/^_df_avail_kb\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^_df_source\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  body="$(awk '/^_df_avail_kb\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^_fs_dev\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
   if [[ -z "$body" ]]; then fail "disk_free_warn not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
 
   local srcfile; srcfile="$(mktemp "$TESTDIR/disk_fallback.XXXXXX")"
@@ -10555,10 +10555,11 @@ _test_unit_disk_output_volume() {
   # sanity case proves the die is specific to the cross-volume branch (not a blanket always-die).
   # M-DISK-1 inverts the cross-volume guard (!= → ==) → the output check is skipped → no die → red.
   local body
-  # disk_free_warn now reads the df columns via _df_avail_kb / _df_source (robust to spaces in the
-  # filesystem source — M-7), so extract those helpers alongside it. The df() mock below still drives
-  # them (they parse `df -Pk` output; the mock ignores -Pk and prints the fixture rows).
-  body="$(awk '/^_df_avail_kb\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^_df_source\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  # disk_free_warn reads available space via _df_avail_kb (df, robust to spaces in the source — M-7)
+  # but decides volume IDENTITY via _fs_dev (stat device number — review Finding #5). Extract
+  # _df_avail_kb + disk_free_warn; _fs_dev is stubbed by the mocks below (not extracted) so the test
+  # can put OUT_DIR on a different/same device deterministically without real mounts.
+  body="$(awk '/^_df_avail_kb\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
   if [[ -z "$body" ]]; then fail "disk_free_warn not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
   local srcfile; srcfile="$(mktemp "$TESTDIR/disk_ov.XXXXXX")"
   head -c 10485760 /dev/zero > "$srcfile"   # 10 MiB, so the stat-based estimate is non-degenerate
@@ -10583,16 +10584,18 @@ _test_unit_disk_output_volume() {
     log(){ :; }
     die(){ printf "DIE|%s|%s\n" "$1" "$2"; exit "$1"; }
   '
-  # df field 1 is the device, field 4 the available KiB (awk NR==2 reads $1/$4). The cross-volume
-  # mock returns a DIFFERENT device + 1 KiB free for OUT_DIR; a roomy device for everything else.
-  # shellcheck disable=SC2016  # literal mock df() body; ${@:-1}/$OUT_DIR must expand inside `bash -c`, not now
+  # df drives AVAILABLE space (field before the NN% capacity token); _fs_dev drives volume IDENTITY.
+  # Cross-volume mock: OUT_DIR on a DIFFERENT device (111) with 1 KiB free; everything else roomy (222).
+  # shellcheck disable=SC2016  # literal mock bodies; ${@:-1}/$OUT_DIR must expand inside `bash -c`, not now
   local dfmock_diff='
     df(){ local p="${@: -1}"
       if [[ "$p" == "$OUT_DIR" ]]; then printf "FS 1K Used Avail Cap M\noddev 100 99 1 99%% /od\n"
       else printf "FS 1K Used Avail Cap M\nwddev 99999999999 0 99999999999 0%% /wd\n"; fi; }
+    _fs_dev(){ [[ "$1" == "$OUT_DIR" ]] && echo 111 || echo 222; }
   '
   local dfmock_same='
     df(){ printf "FS 1K Used Avail Cap M\nsamedev 99999999999 0 99999999999 0%% /\n"; }
+    _fs_dev(){ echo 333; }
   '
   local out rc
 
@@ -10619,8 +10622,10 @@ _test_unit_av1_resolution_crf() {
   # Source the helper with stubbed _probe_field/note/report_add and assert the resulting
   # CRF_VALUE for each (profile × resolution/HDR × --crf) case. Deterministic, no encode.
   local body
-  body="$(awk '/^_apply_av1_resolution_crf\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
-  if [[ -z "$body" ]]; then fail "_apply_av1_resolution_crf not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; fi
+  # Extract the function AND the shared helpers it now calls (_av1_resolution_crf_target /
+  # _dimensions_are_4k), so the isolated bash -c below has them defined (review Finding #7 refactor).
+  body="$(_extract_muxm_fns _av1_resolution_crf_target _dimensions_are_4k _apply_av1_resolution_crf)" \
+    || { fail "_apply_av1_resolution_crf (or a shared AV1 helper) not found in muxm — extraction anchor failed (renamed/reformatted?)"; return; }
 
   # $1 profile  $2 width  $3 height  $4 PROFILE_DESC  $5 _CLI_CRF_EXPLICIT  $6 base CRF
   _av1crf() {
@@ -12439,6 +12444,46 @@ _prepare_subtitle 0' -- "$wd" "$ocr")" || rc=$?
   rm -rf "$wd"
 }
 
+# Review Finding #2: _ocr_ext_subtitle relocates the SRT that OCR just wrote (pgsrip uses the ALPHA-2
+# code, so movie.eng.sup → movie.en.srt), but must NEVER move a user's PRE-EXISTING unrelated sidecar
+# (e.g. a real movie.ara.srt, which even sorts BEFORE movie.en.srt) out of the source directory. The
+# old glob adopted the first stem-matching .srt unconditionally — stealing the Arabic file and
+# shipping it as the English track. Extract the real function, stub _run_ocr to emit the alpha-2
+# output, and assert the pre-existing sidecar survives while the OCR output is the one relocated.
+_test_unit_ext_ocr_no_steal() {
+  local body
+  body="$(_extract_muxm_fns _ocr_ext_subtitle)" \
+    || { fail "unit-ext-ocr-no-steal: could not extract _ocr_ext_subtitle"; return; }
+  local wd src
+  wd="$(mktemp -d "${TMPDIR:-/tmp}/muxm-extocr.XXXXXX")"  || { fail "unit-ext-ocr-no-steal: mktemp failed"; return; }
+  src="$(mktemp -d "${TMPDIR:-/tmp}/muxm-extsrc.XXXXXX")" || { fail "unit-ext-ocr-no-steal: mktemp failed"; rm -rf "$wd"; return; }
+  : > "$src/movie.eng.sup"                                              # the PGS sidecar to OCR
+  printf '1\n00:00:00,000 --> 00:00:01,000\nUSER ARABIC\n' > "$src/movie.ara.srt"  # pre-existing user sidecar
+
+  local out rc=0
+  out="$(bash -c 'set +e
+WORKDIR="$1"; SUB_ENABLE_OCR=1; SUB_OCR_TOOL=pgsrip; SUB_OCR_LANG=eng; DRY_RUN=0
+warn(){ :; }; note(){ :; }; _ocr_lang_flags(){ :; }
+# Simulate pgsrip: write the SRT beside the source under the ALPHA-2 code (movie.en.srt), NOT movie.eng.srt.
+_run_ocr(){ local sup="$1"; printf "1\n00:00:00,000 --> 00:00:02,000\nOCR ENGLISH\n" > "${sup%.sup}.en.srt"; return 0; }
+'"$body"'
+_ocr_ext_subtitle "$2" sup PGS ext_ocr.log' -- "$wd" "$src/movie.eng.sup")" || rc=$?
+
+  # (a) the user's pre-existing Arabic sidecar must still be in the source dir with its content intact.
+  if [[ -f "$src/movie.ara.srt" ]] && grep -q 'USER ARABIC' "$src/movie.ara.srt" 2>/dev/null; then
+    pass "unit-ext-ocr-no-steal: a pre-existing unrelated sidecar is left untouched in the source dir (Finding #2)"
+  else
+    fail "unit-ext-ocr-no-steal: the pre-existing movie.ara.srt was moved/destroyed by the OCR relocation"
+  fi
+  # (b) the actual OCR output (alpha-2) is the file relocated into WORKDIR and returned.
+  if [[ -n "$out" && -s "$out" && "$out" == "$wd"/* ]] && grep -q 'OCR ENGLISH' "$out" 2>/dev/null; then
+    pass "unit-ext-ocr-no-steal: the alpha-2 OCR output is relocated into WORKDIR and returned"
+  else
+    fail "unit-ext-ocr-no-steal: expected the OCR'd alpha-2 SRT in WORKDIR, got '$out' (rc=$rc)"
+  fi
+  rm -rf "$wd" "$src"
+}
+
 # Log/diagnostics persistence: the two on_exit copy helpers, exercised in
 # isolation so the file-selection contract is verified deterministically (no real encode).
 # _persist_failure_bundle's selection IS the "additional troubleshooting files" decision:
@@ -12551,6 +12596,7 @@ test_unit() {
   _test_unit_sw_encoder_preflight
   _test_unit_hdr10_static_metadata
   _test_unit_ocr_dispatch
+  _test_unit_ext_ocr_no_steal
   _test_unit_persist_helpers
   _test_unit_prefer_complete_ffmpeg
   _test_unit_parse_audio_record
@@ -12858,7 +12904,7 @@ _test_unit_sub_track_model() {
 # assert the skipped-note fires. Perturb MUT-L-DISKNOTE drops the else-note → no note → red.
 _test_unit_disk_df_unavailable() {
   local body
-  body="$(awk '/^_df_avail_kb\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^_df_source\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
+  body="$(awk '/^_df_avail_kb\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^_fs_dev\(\)[[:space:]]*\{/,/^\}/' "$MUXM"; awk '/^disk_free_warn\(\)[[:space:]]*\{/,/^\}/' "$MUXM")"
   if [[ -z "$body" ]]; then fail "unit-disk-preflight-note: disk_free_warn extraction anchor failed"; return; fi
   local _stubs='
     DISK_CHECK=1; VIDEO_CODEC=libx265; CRF_VALUE=28; PRESET_VALUE=medium
@@ -13256,27 +13302,33 @@ _test_unit_codec_max_channels() {
   [[ "$(_cmc opus)" == 64 ]]      && pass "unit-codec-max-channels: unknown codec falls back to 64"        || fail "unit-codec-max-channels: opus expected 64, got '$(_cmc opus)'"
 }
 
-# M-7: _df_avail_kb / _df_source must read the correct df columns even when the filesystem SOURCE
-# name contains a space (SMB/CIFS/NAS share like "//host/My Share"). The old positional `$4`/`$1`
-# read the Used column (silent under-warn) or a "%" token (arithmetic abort). Keys off the capacity
-# percentage field.
+# M-7: _df_avail_kb must read the correct df column (Available) even when the filesystem SOURCE name
+# contains a space (SMB/CIFS/NAS share like "//host/My Share"). The old positional `$4` read the Used
+# column (silent under-warn) or a "%" token (arithmetic abort); it now keys off the capacity
+# percentage field. Volume IDENTITY is no longer derived from the (space-ambiguous) df source string —
+# _fs_dev uses the stat device number instead (review Finding #5), so it is covered here too.
 _test_unit_df_field_parse() {
   local body
-  body="$(_extract_muxm_fns _df_avail_kb _df_source)" || { fail "unit-df-field-parse: _df_avail_kb/_df_source not found"; return; }
+  body="$(_extract_muxm_fns _df_avail_kb _fs_dev)" || { fail "unit-df-field-parse: _df_avail_kb/_fs_dev not found"; return; }
   # df mock: a spaced filesystem source. Avail=600000 (before the 40% capacity field), Used=400000.
   local mock='df(){ printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n//user@nas/My Share 1000000 400000 600000 40%% /Volumes/My Share\n"; }'
-  local avail source
+  local avail
   avail="$(bash -c "$mock"$'\n'"$body"$'\n''_df_avail_kb /x')"
-  source="$(bash -c "$mock"$'\n'"$body"$'\n''_df_source /x')"
   [[ "$avail" == 600000 ]] && pass "unit-df-field-parse: _df_avail_kb reads Available (600000), not Used, on a spaced source (M-7)" \
                            || fail "unit-df-field-parse: _df_avail_kb expected 600000 (Available), got '$avail' (space-shift regression)"
-  [[ "$source" == "//user@nas/My Share" ]] && pass "unit-df-field-parse: _df_source recovers the full spaced filesystem name (M-7)" \
-                                            || fail "unit-df-field-parse: _df_source expected '//user@nas/My Share', got '$source'"
   # A normal (space-free) source still parses.
   local mock2='df(){ printf "Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/disk1 1000000 100000 900000 10%% /\n"; }'
   local avail2; avail2="$(bash -c "$mock2"$'\n'"$body"$'\n''_df_avail_kb /')"
   [[ "$avail2" == 900000 ]] && pass "unit-df-field-parse: _df_avail_kb parses a normal space-free source (900000)" \
                             || fail "unit-df-field-parse: _df_avail_kb expected 900000 on a normal source, got '$avail2'"
+  # _fs_dev: a real dir yields a numeric device id; an un-stat-able path yields "" (fail-open, callers guard).
+  local dev_real dev_missing
+  dev_real="$(bash -c "$body"$'\n''_fs_dev /')"
+  dev_missing="$(bash -c "$body"$'\n''_fs_dev /no/such/path/muxm-xyz' 2>/dev/null)"
+  [[ "$dev_real" =~ ^[0-9]+$ ]] && pass "unit-df-field-parse: _fs_dev returns a numeric device id for a real path (Finding #5)" \
+                               || fail "unit-df-field-parse: _fs_dev expected a numeric device id for /, got '$dev_real'"
+  [[ -z "$dev_missing" ]] && pass "unit-df-field-parse: _fs_dev returns empty for an un-stat-able path (fail-open, caller guards)" \
+                          || fail "unit-df-field-parse: _fs_dev expected empty for a missing path, got '$dev_missing'"
 }
 
 # H-2: the Section-18 trap block must set FAILED=1 for SIGHUP/SIGQUIT/SIGPIPE. Without them an

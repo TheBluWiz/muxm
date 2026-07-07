@@ -776,7 +776,13 @@ Keep temporary workdir on failure.
 .B \-\-keep\-log
 On a clean run, copy the run log to
 .I <output>.muxm.log
-next to the output. On failure, diagnostics are written regardless of this
+next to the output.
+Under
+.B \-\-dry\-run
+no durable log is written (dry runs create no real output), so
+.B \-\-keep\-log
+is skipped with a note.
+On failure, diagnostics are written regardless of this
 flag. By default that is a small, self\-contained bundle \(em the log plus
 the relevant
 .IR *.err " / " *.log
