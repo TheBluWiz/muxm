@@ -12,3 +12,5 @@ records (terser, deeper, and free to assume familiarity with the `muxm` script).
 | [`HW_ACCEL.md`](HW_ACCEL.md) | **Maintainer / engineering record** | Hardware-acceleration architecture and roadmap (VideoToolbox now; NVENC later). |
 | [`VIDEOTOOLBOX_CALIBRATION.md`](VIDEOTOOLBOX_CALIBRATION.md) | **User-facing reference / engineering record** | Per-profile VideoToolbox `q:v` calibration data behind the `VT_QUALITY_MAP` array; linked from the README HW-accel section. |
 | [`TESTING_PLAN.md`](TESTING_PLAN.md) | **Maintainer / engineering record** | Automated-suite map, manual test matrix, and coverage-gap analysis. |
+| [`../docker/README.md`](../docker/README.md) | **User-facing** | Running muxm in Docker on macOS/Linux/Windows — quickstarts, helpers, and maintainer notes. |
+| [`../docker/DOCKER_WINDOWS_GUIDE.md`](../docker/DOCKER_WINDOWS_GUIDE.md) | **User-facing** | Step-by-step Windows walkthrough (Docker Desktop install → setup.bat → encode.bat), assumes no CLI experience. |

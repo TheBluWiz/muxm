@@ -1,0 +1,29 @@
+# =============================================================================
+#  MuxMaster (muxm) — Docker Compose configuration
+#
+#  HOW TO USE:
+#    1. Run setup.sh (macOS/Linux) or setup.bat (Windows) once — it prepares
+#       this folder and builds the image
+#    2. Put your video files in the "input" folder (next to this file)
+#    3. Run encode.sh / encode.bat for a guided encode, or drive muxm directly:
+#         docker compose run --rm muxm --profile atv-directplay-hq /media/input/movie.mkv /media/output/movie.mp4
+#    4. Your encoded file appears in the "output" folder
+#
+#  Inside the container your folders are /media/input and /media/output —
+#  always use those paths in commands, never host paths like C:\... or ~/.
+# =============================================================================
+
+services:
+  muxm:
+    image: muxm:latest
+    build: .
+    volumes:
+      - ./input:/media/input
+      - ./output:/media/output
+
+      # Optional: mount a .muxmrc config file from your computer.
+      # /media is muxm's working directory in the container, so this lands in
+      # the project-level config tier — it applies no matter which user the
+      # container runs as (unlike /root/.muxmrc, which non-root runs ignore).
+      # Uncomment the line below if you have a custom config:
+      # - ./.muxmrc:/media/.muxmrc:ro

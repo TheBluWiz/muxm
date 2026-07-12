@@ -84,7 +84,7 @@ show_help() {
       unit          Pure unit tests (helpers, codec maps, heuristics)
       completions   Tab-completion installer/uninstaller
       setup         --install-dependencies, --install-man, etc.
-      docs          Generated-artifact parity (man page + completions vs muxm --emit-*)
+      docs          Generated-artifact parity (man page + completions vs muxm --emit-*, docker/ vs VALID_PROFILES)
 
     Medium (core fixture only, ~5s):
       cli           CLI parsing, --help, --version, error codes
@@ -17218,11 +17218,12 @@ _test_meta_soft_skip() {
 }
 
 # ---- Suite: docs (generated-artifact parity) ----
-# Verifies the two committed generated artifacts are in sync with their embedded
-# heredocs in muxm (the single source of truth):
+# Verifies the committed artifacts that shadow knowledge whose single source of
+# truth lives in muxm:
 #   * docs/muxm.1                      vs `muxm --emit-man`   (test_docs_parity.sh)
 #   * completions/muxm-completion.bash vs `muxm --emit-completions`
 #                                                            (test_completions_parity.sh)
+#   * docker/ helpers + guides         vs VALID_PROFILES     (test_docker_parity.sh)
 # Delegates to the standalone scripts so the logic lives in one place; here we
 # just translate their exit codes into the harness pass/fail counters.
 # Needs no media fixtures (see MEDIA_FREE_SUITES).
@@ -17248,6 +17249,15 @@ test_docs_parity() {
     pass "completions/muxm-completion.bash in sync with muxm embedded completion"
   else
     fail "completions/muxm-completion.bash OUT OF SYNC with muxm heredoc — run tools/gen-docs.sh and commit"
+  fi
+
+  local docker_script="${tests_dir}/test_docker_parity.sh"
+  if [[ ! -x "$docker_script" ]]; then
+    fail "docker parity: tests/test_docker_parity.sh not found or not executable ($docker_script)"
+  elif "$docker_script"; then
+    pass "docker/ distribution (helper menus, guide examples, line endings) in sync with muxm"
+  else
+    fail "docker/ distribution OUT OF SYNC with muxm — see ❌ lines above (stale profile name, line endings, or missing bundle file)"
   fi
 
   # Cross-check the prose docs (README profile table + config_profile.md

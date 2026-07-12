@@ -1,7 +1,7 @@
 # ![muxm](assets/muxm_header_small.png) MuxMaster
 
 [![Version](https://img.shields.io/badge/version-1.5.1-blue)](https://github.com/TheBluWiz/MuxMaster/releases)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#compatibility)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%20%28Docker%29-lightgrey)](#compatibility)
 [![License](https://img.shields.io/badge/license-freeware-green)](#license)
 
 **MuxMaster** (`muxm`) — a single-command video repacking and encoding utility that handles Dolby Vision, HDR10, audio track selection, subtitle processing, and container muxing so you don't have to. Built for home media enthusiasts managing Plex, Jellyfin, or Emby libraries from disc rips and downloads. Pick a profile, point it at a file, and get a properly encoded output without memorizing ffmpeg flags.
@@ -222,7 +222,7 @@ If any stage fails, `muxm` logs the failure, cleans up incomplete temp files, an
 
 ### Compatibility
 
-`muxm` requires Bash 4.3+ and runs on macOS (10.15 Catalina or later) and modern Linux distributions (Ubuntu 20.04+, Fedora 33+, Debian 11+, Arch). It is tested primarily on macOS with Homebrew-installed ffmpeg builds.
+`muxm` requires Bash 4.3+ and runs on macOS (10.15 Catalina or later) and modern Linux distributions (Ubuntu 20.04+, Fedora 33+, Debian 11+, Arch). It is tested primarily on macOS with Homebrew-installed ffmpeg builds. **Windows** is supported via [Docker](#docker) — the container bundles muxm with its entire toolchain, driven by double-clickable batch helpers.
 
 **Hardware acceleration** is supported on **macOS (Apple VideoToolbox) only**. On Linux, `--hw-accel` is accepted but encoding always runs in software. See [`docs/HW_ACCEL.md`](docs/HW_ACCEL.md) for the full architecture and backend matrix.
 
@@ -311,6 +311,24 @@ brew install ffmpeg-full jq bc gpac tesseract dovi_tool   # or: muxm --install-d
 
 `pgsrip` (the optional PGS-subtitle OCR helper) is a Python tool, so install it with
 `pipx install pgsrip` regardless of which route above you choose.
+
+<a id="docker"></a>
+
+### Docker — Windows, or any OS without the toolchain
+
+The [`docker/`](docker/) directory packages muxm and **every** dependency
+(ffmpeg, dovi_tool, MP4Box, tesseract with full language data, pgsrip) into a
+single Ubuntu-based image. This is the supported way to run MuxMaster on
+**Windows** — no WSL setup, no manual installs, and a double-clickable
+`encode.bat` that walks you through each encode:
+
+- **Windows (no command-line experience needed):** follow the
+  [step-by-step Windows guide](docker/DOCKER_WINDOWS_GUIDE.md).
+- **macOS / Linux:** `cd docker && ./setup.sh`, then `./encode.sh` — or drive
+  muxm directly with `docker compose run`. See [`docker/README.md`](docker/README.md).
+
+Encoding inside Docker is CPU-only (no VideoToolbox), so on macOS prefer the
+Homebrew install above and keep Docker as a fallback.
 
 ### Dependencies
 

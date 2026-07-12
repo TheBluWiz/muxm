@@ -1,0 +1,11 @@
+# =============================================================================
+#  MuxMaster (muxm) — .dockerignore
+#
+#  The image build only needs the `muxm` script itself (see `COPY muxm` in the
+#  Dockerfile). Excluding everything else keeps the build context tiny even
+#  when this folder also holds multi-gigabyte input/ and output/ media —
+#  without this file, `docker compose build` would upload ALL of it to the
+#  Docker daemon on every (re)build.
+# =============================================================================
+*
+!muxm
