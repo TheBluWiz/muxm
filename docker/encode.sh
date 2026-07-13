@@ -133,6 +133,40 @@ if [[ "$(uname -s)" == "Linux" ]]; then
   userflag=(--user "$(id -u):$(id -g)")
 fi
 
+# ---- Refuse if two selected inputs would write the same output ----
+# muxm defaults to overwriting its output and only auto-versions when the source
+# and output paths are identical, so two inputs whose stems collide would
+# silently clobber each other. This bites "A for all" batches: movie.mkv + movie.ts
+# both target output/movie.mp4, and the ATV passthrough widens it (movie.ts and
+# movie.avi both fall back to .mkv). Detect it here and stop before any encode runs.
+# Uses indexed arrays and an O(n^2) pair compare (not an associative array) to
+# stay compatible with macOS's stock bash 3.2. Mirrors encode.bat.
+planned=()
+collision=0
+i=0
+for chosen in "${choices[@]}"; do
+  base="${chosen%.*}"
+  src_ext="$(printf '%s' "${chosen##*.}" | tr '[:upper:]' '[:lower:]')"
+  out="$base.$(_out_ext "$src_ext")"
+  j=0
+  while (( j < i )); do
+    if [[ "${planned[$j]}" == "$out" ]]; then
+      echo " [ERROR] Two input files would both be written to \"output/$out\":" >&2
+      echo "           - ${choices[$j]}" >&2
+      echo "           - $chosen" >&2
+      collision=1
+    fi
+    j=$((j + 1))
+  done
+  planned[$i]="$out"
+  i=$((i + 1))
+done
+if (( collision )); then
+  echo >&2
+  echo " Rename one of the colliding files, or encode them one at a time, and try again." >&2
+  exit 1
+fi
+
 failures=0
 for chosen in "${choices[@]}"; do
   base="${chosen%.*}"

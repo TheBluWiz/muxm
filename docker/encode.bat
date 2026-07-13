@@ -150,6 +150,46 @@ if "!profile!"=="animation" set "outext=mkv"
 if "!profile!"=="atv-directplay-hq"        set "outext=SRC"
 if "!profile!"=="atv-directplay-animation" set "outext=SRC"
 
+REM ---- Refuse if two selected inputs would write the same output ----
+REM muxm defaults to overwriting its output and only auto-versions when the
+REM source and output paths are identical, so two inputs whose stems collide
+REM (movie.mkv + movie.ts -^> movie.mp4, or two passthrough sources both
+REM falling back to .mkv) would silently clobber each other. Detect it here
+REM and stop before any encode runs. Mirrors encode.sh.
+for /l %%n in (!firstfile!,1,!lastfile!) do (
+    set "cchosen=!file%%n!"
+    for %%i in ("!cchosen!") do set "cbase=%%~ni"
+    for %%i in ("!cchosen!") do set "cext=%%~xi"
+    set "cext=!cext:~1!"
+    set "cuse=!outext!"
+    if "!cuse!"=="SRC" (
+        set "cuse=mkv"
+        if /i "!cext!"=="mp4" set "cuse=!cext!"
+        if /i "!cext!"=="m4v" set "cuse=!cext!"
+        if /i "!cext!"=="mov" set "cuse=!cext!"
+        if /i "!cext!"=="mkv" set "cuse=!cext!"
+    )
+    set "plan%%n=!cbase!.!cuse!"
+)
+
+set "collision="
+for /l %%a in (!firstfile!,1,!lastfile!) do (
+    for /l %%b in (!firstfile!,1,!lastfile!) do (
+        if %%a lss %%b if /i "!plan%%a!"=="!plan%%b!" (
+            echo  [ERROR] Two input files would both be written to "output\!plan%%a!":
+            echo            - !file%%a!
+            echo            - !file%%b!
+            set "collision=1"
+        )
+    )
+)
+if defined collision (
+    echo.
+    echo  Rename one of the colliding files, or encode them one at a time, and try again.
+    pause
+    exit /b 1
+)
+
 set failures=0
 for /l %%n in (!firstfile!,1,!lastfile!) do (
     set "chosen=!file%%n!"

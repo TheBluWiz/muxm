@@ -17,6 +17,13 @@ services:
   muxm:
     image: muxm:latest
     build: .
+    # Run muxm under an init process (tini) instead of as PID 1. A hard-killed
+    # encode (docker kill, Docker Desktop update/crash, `wsl --shutdown`) skips
+    # muxm's cleanup and leaves output/.<name>.lock recording muxm's PID. As
+    # PID 1 that PID is always "alive" (kill -0 1 succeeds), so the next run
+    # could never reclaim the stale lock. With init, muxm gets a varying PID
+    # and the stale-lock reclaim works again.
+    init: true
     volumes:
       - ./input:/media/input
       - ./output:/media/output
@@ -25,5 +32,8 @@ services:
       # /media is muxm's working directory in the container, so this lands in
       # the project-level config tier — it applies no matter which user the
       # container runs as (unlike /root/.muxmrc, which non-root runs ignore).
+      # NOTE: .muxmrc is sourced as a shell script inside Linux, so it MUST use
+      # Unix (LF) line endings. A Windows (CRLF) file breaks muxm on every run
+      # (see "Using a Custom Config File" in DOCKER_WINDOWS_GUIDE.md).
       # Uncomment the line below if you have a custom config:
       # - ./.muxmrc:/media/.muxmrc:ro

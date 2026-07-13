@@ -164,6 +164,23 @@ Each file is processed one at a time. This can take a while for large batches --
 If you want to customize muxm's default settings:
 
 1. Create a file called `.muxmrc` in your MuxMaster folder. (See "Creating files that start with a dot" in the Troubleshooting section below if Windows won't let you.)
+
+   > **⚠ Important — save `.muxmrc` with Unix (LF) line endings, not Windows (CRLF).**
+   > muxm reads `.muxmrc` as a shell script inside the Linux container. Windows'
+   > default line endings (CRLF) leave an invisible carriage return on every line,
+   > which breaks muxm on **every** run — you'll see errors like
+   > `Invalid CRF_VALUE ... (got: 18)` (the value looks correct because the stray
+   > character is invisible) or `$'\r': command not found`.
+   >
+   > Plain Notepad creates new files as CRLF with no way to change that, so **don't
+   > create `.muxmrc` in Notepad.** Use an editor that lets you pick the line ending:
+   > - **VS Code** — click **CRLF** in the bottom-right status bar, choose **LF**, then save.
+   > - **Notepad++** — **Edit > EOL Conversion > Unix (LF)**, then save.
+   >
+   > (Editing the *existing* `docker-compose.yml` in step 2 with Notepad is fine —
+   > Notepad preserves a file's current line endings; only *creating* a brand-new
+   > `.muxmrc` is a problem.)
+
 2. Open `docker-compose.yml` in Notepad and remove the `#` from this line:
    ```
    # - ./.muxmrc:/media/.muxmrc:ro
@@ -230,7 +247,11 @@ Some antivirus tools quarantine files that are created by "unknown" processes (w
 ### Other
 
 **Creating files that start with a dot (`.muxmrc`)**
-Windows Explorer normally won't let you create files that start with a dot. If you need to create one, open a terminal in the folder and type: `echo. > .muxmrc`. Alternatively, in Notepad's Save As dialog, wrap the filename in quotes: `".muxmrc"` -- this forces Notepad to use the exact name without appending `.txt`. (Don't recreate `.dockerignore` this way -- it ships with real contents; if it's missing, re-download the release bundle.)
+Windows Explorer won't let you name a new file `.muxmrc` directly, and it must be saved with Unix (LF) line endings (see "Using a Custom Config File" above for why). The reliable way to satisfy both is a code editor:
+- **VS Code** -- File > New File, type your settings, click **CRLF** in the status bar and switch it to **LF**, then Save As `.muxmrc` (set "Save as type" to *All Files*).
+- **Notepad++** -- type your settings, choose **Edit > EOL Conversion > Unix (LF)**, then Save As `.muxmrc` (set "Save as type" to *All types*, or wrap the name in quotes: `".muxmrc"`).
+
+Avoid `echo. > .muxmrc` and plain Notepad -- both write Windows (CRLF) line endings that break muxm on every run. (Don't recreate `.dockerignore` this way -- it ships with real contents; if it's missing, re-download the release bundle.)
 
 **Updating muxm to a new version**
 Replace the `muxm` file in your MuxMaster folder with the new version, then double-click `setup.bat` again. If the update doesn't seem to take effect, run `docker compose build --no-cache` from a terminal to force a full rebuild.
