@@ -21,12 +21,6 @@ LABEL org.opencontainers.image.licenses="LicenseRef-MuxMaster-Freeware"
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TERM=xterm-256color
 
-# Pinned dovi_tool release. Bump deliberately; the URL is verified at build
-# time (curl -f fails the build), so a bad bump cannot produce a silently
-# DV-less image the way the old "query the GitHub API for latest" approach
-# could when rate-limited.
-ARG DOVI_TOOL_VERSION=2.3.2
-
 # Tesseract language data. muxm feeds pgsrip the source track's language and
 # pgsrip picks its OCR model from it, so English-only data silently degrades
 # OCR of every non-English PGS track. Default matches the brew path
@@ -63,6 +57,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # archives and archives with subdirectories). Any failure fails the BUILD:
 # a warn-and-continue here would ship an image whose DV features silently
 # do nothing.
+#
+# Pinned dovi_tool release. Bump deliberately; the URL is verified at build
+# time (curl -f fails the build), so a bad bump cannot produce a silently
+# DV-less image the way the old "query the GitHub API for latest" approach
+# could when rate-limited. Declared HERE (after the apt layer) rather than up
+# top so a version bump busts only this small layer, not the ~1 GB apt/tesseract
+# layer above it.
+ARG DOVI_TOOL_VERSION=2.3.2
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) DOVI_ARCH="x86_64-unknown-linux-musl" ;; \
@@ -103,14 +105,17 @@ RUN dos2unix /usr/local/bin/muxm && chmod 755 /usr/local/bin/muxm
 # change that drops one breaks the build instead of a user's encode.
 # `muxm --version` is the canary for "the script cannot even start on Linux"
 # (bash/coreutils dialect regressions — a class of bug that has shipped before).
+#
+# dovi_tool and pgsrip are intentionally absent here: each already runs its own
+# `--version` as the last step of its install layer (steps 2 and 3), which fails
+# the build if the binary is broken. Re-checking them here can never fail — don't
+# re-add them.
 RUN echo "--- Dependency check ---" && \
     bash --version | head -1 && \
     ffmpeg -version | head -1 && \
     jq --version && \
-    dovi_tool --version && \
     MP4Box -version 2>&1 | head -1 && \
     tesseract --version 2>&1 | head -1 && \
-    pgsrip --version && \
     for enc in libx264 libx265 libsvtav1 libopus eac3 aac; do \
         ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw "$enc" \
             || { echo "MISSING ffmpeg encoder: $enc" >&2; exit 1; }; \
