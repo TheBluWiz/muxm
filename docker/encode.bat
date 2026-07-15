@@ -1,5 +1,9 @@
 @echo off
 setlocal enabledelayedexpansion
+REM Run from this script's own folder. A right-click "Run as administrator"
+REM starts cmd in C:\Windows\System32, where docker-compose.yml / input / output
+REM are not -- without this, the checks below fire with misleading messages.
+cd /d "%~dp0"
 REM ============================================================================
 REM  MuxMaster -- Encode Videos on Windows
 REM
@@ -26,25 +30,28 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-REM Check that required files exist
-if not exist "Dockerfile" (
-    echo  [ERROR] MuxMaster files not found in this folder.
-    echo  Make sure encode.bat is in the same folder as Dockerfile,
-    echo  docker-compose.yml, and the muxm script.
-    echo.
-    pause
-    exit /b 1
-)
-if not exist "docker-compose.yml" (
-    echo  [ERROR] docker-compose.yml not found. Run "setup.bat" first.
+REM Check the Docker Compose v2 plugin. It normally ships with Docker Desktop,
+REM but a broken/partial install leaves "docker compose" failing with a cryptic
+REM "'compose' is not a docker command" mid-run.
+docker compose version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo  [ERROR] The Docker Compose v2 plugin is missing or not working.
+    echo  Open Docker Desktop and let it finish starting. If it keeps failing,
+    echo  use Docker Desktop's Troubleshoot ^> Repair option, then try again.
     echo.
     pause
     exit /b 1
 )
 
-REM Verify input folder exists
-if not exist "input" (
-    echo  [ERROR] No "input" folder found. Run "setup.bat" first.
+REM One "did you run setup?" gate. The Dockerfile is irrelevant at encode time
+REM (the image is already built), so we only confirm what setup.bat leaves
+REM behind. Mirrors encode.sh's single Setup-incomplete check.
+set "setup_ok=1"
+if not exist "docker-compose.yml" set "setup_ok="
+if not exist "input"  set "setup_ok="
+if not exist "output" set "setup_ok="
+if not defined setup_ok (
+    echo  [ERROR] Setup incomplete - run "setup.bat" first.
     echo.
     pause
     exit /b 1
@@ -84,17 +91,34 @@ if !filecount!==1 (
 )
 
 if /i "!filechoice!"=="A" (
-    set "batchmode=1"
+    echo  Encoding all !filecount! files.
 ) else (
-    set "batchmode="
-    set "chosen=!file%filechoice%!"
-    if "!chosen!"=="" (
+    REM Turn the raw entry into a bare integer WITHOUT ever expanding it onto a
+    REM command line. The previous version indexed the file list using the raw
+    REM set /p text via percent-expansion, so an entry containing a quote or an
+    REM ampersand could abort the window or inject a command. set /a reads the
+    REM value BY NAME and only does arithmetic on it, writing only a number to
+    REM sel (never the raw string); we pre-clear sel so a non-numeric, empty, or
+    REM EOF entry leaves it undefined and is rejected below.
+    set "sel="
+    set /a sel=filechoice 2>nul
+    if not defined sel (
         echo  [ERROR] Invalid selection.
         pause
         exit /b 1
     )
-    set "firstfile=!filechoice!"
-    set "lastfile=!filechoice!"
+    if !sel! lss 1 (
+        echo  [ERROR] Invalid selection.
+        pause
+        exit /b 1
+    )
+    if !sel! gtr !filecount! (
+        echo  [ERROR] Invalid selection.
+        pause
+        exit /b 1
+    )
+    set "firstfile=!sel!"
+    set "lastfile=!sel!"
 )
 
 echo.

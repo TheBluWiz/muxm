@@ -1,4 +1,8 @@
 @echo off
+REM Run from this script's own folder. A right-click "Run as administrator"
+REM starts cmd in C:\Windows\System32, where the muxm files are not -- without
+REM this, the "files not found" checks below fire on correctly-placed files.
+cd /d "%~dp0"
 REM ============================================================================
 REM  MuxMaster -- First-Time Setup for Windows
 REM
@@ -53,6 +57,20 @@ if %errorlevel% neq 0 (
 )
 
 echo  [OK] Docker is running.
+
+REM Check the Docker Compose v2 plugin. Debian-style engines and partial Docker
+REM Desktop installs can lack it, and "docker compose build" below would then
+REM fail with a cryptic "'compose' is not a docker command".
+docker compose version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo  [ERROR] The Docker Compose v2 plugin is missing or not working.
+    echo  Open Docker Desktop and let it finish starting. If it keeps failing,
+    echo  use Docker Desktop's Troubleshoot ^> Repair option, then run this again.
+    echo.
+    pause
+    exit /b 1
+)
+echo  [OK] Docker Compose v2 is available.
 echo.
 
 REM Create folders
@@ -72,17 +90,25 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-REM Quick sanity check: run muxm --version inside the container
+REM Quick sanity check: run muxm --version inside the container. Its output is
+REM shown, not silenced: on failure the real container error prints just above the
+REM message below, and we exit non-zero instead of falling through to the
+REM "Setup complete!" banner (which had let ./setup.bat "succeed" on a dead image).
 echo.
 echo  Verifying installation...
-docker compose run --rm muxm --version >nul 2>&1
+docker compose run --rm muxm --version
 if %errorlevel% neq 0 (
-    echo  [WARNING] muxm may not be working correctly inside the container.
-    echo  Try running: docker compose run --rm muxm --help
     echo.
-) else (
-    echo  [OK] muxm is working.
+    echo  [ERROR] muxm could not run inside the container. Setup did NOT complete.
+    echo  The container's error is shown above. Try:
+    echo    docker compose run --rm muxm --help
+    echo  or rebuild from scratch with:
+    echo    docker compose build --no-cache
+    echo.
+    pause
+    exit /b 1
 )
+echo  [OK] muxm is working.
 
 echo.
 echo  =============================================
