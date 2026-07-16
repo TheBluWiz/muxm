@@ -128,7 +128,7 @@ _muxm_completions() {
     while IFS= read -r _f; do
         _ext_lower="${_f##*.}"
         case "$_ext_lower" in
-            mkv|mp4|m4v|mov|avi|ts|wmv|flv|webm) COMPREPLY+=("$_f") ;;
+            mkv|mp4|m4v|mov|avi|ts|m2ts|wmv|flv|webm) COMPREPLY+=("$_f") ;;
         esac
     done < <(compgen -f -- "$cur")
     # Also allow directories for navigation

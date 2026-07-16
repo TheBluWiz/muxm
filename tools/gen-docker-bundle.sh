@@ -37,19 +37,35 @@ tests/test_docker_parity.sh >/dev/null || {
   exit 1
 }
 
+# ---- Single source of truth for the bundle contents ----
+# Repo-relative source paths; the zip stores each by basename (the flat folder a
+# Windows user unpacks). This array drives BOTH the cp and the zip below, so they
+# can't drift from each other. tests/test_docker_parity.sh parses this same
+# `BUNDLE_FILES=( ... )` block (keep the one-path-per-line format) to check every
+# promised file exists — so the manifest lives in exactly one place.
+BUNDLE_FILES=(
+  docker/Dockerfile
+  docker/docker-compose.yml
+  docker/.dockerignore
+  docker/setup.bat
+  docker/encode.bat
+  docker/DOCKER_WINDOWS_GUIDE.md
+  muxm
+  LICENSE.md
+)
+
 OUT_DIR="$REPO_ROOT/dist"
 OUT_ZIP="$OUT_DIR/muxm-docker-windows-v${VERSION}.zip"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/muxm-bundle.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 
 mkdir -p "$OUT_DIR"
-cp docker/Dockerfile docker/docker-compose.yml docker/.dockerignore \
-   docker/setup.bat docker/encode.bat docker/DOCKER_WINDOWS_GUIDE.md \
-   muxm LICENSE.md "$STAGE/"
+cp "${BUNDLE_FILES[@]}" "$STAGE/"
 
+# Zip stores basenames (flat layout). Build the basename list from the array.
+bundle_names=()
+for f in "${BUNDLE_FILES[@]}"; do bundle_names+=("${f##*/}"); done
 rm -f "$OUT_ZIP"
-(cd "$STAGE" && zip -q "$OUT_ZIP" \
-  Dockerfile docker-compose.yml .dockerignore setup.bat encode.bat \
-  DOCKER_WINDOWS_GUIDE.md muxm LICENSE.md)
+(cd "$STAGE" && zip -q "$OUT_ZIP" "${bundle_names[@]}")
 
 echo "✅ wrote $OUT_ZIP ($(du -h "$OUT_ZIP" | cut -f1 | tr -d ' '))"

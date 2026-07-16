@@ -102,15 +102,16 @@ fi
 # too — without it the user just sees "No video files found".
 shopt -s nullglob nocaseglob
 files=()
-for f in input/*.mkv input/*.mp4 input/*.m4v input/*.mov input/*.avi input/*.ts input/*.m2ts; do
+for f in input/*.mkv input/*.mp4 input/*.m4v input/*.mov input/*.avi input/*.ts \
+         input/*.m2ts input/*.wmv input/*.flv input/*.webm; do
   files+=("${f#input/}")
 done
 shopt -u nullglob nocaseglob
 
 if [[ ${#files[@]} -eq 0 ]]; then
   echo " No video files found in the \"input\" folder."
-  echo " Put files (.mkv, .mp4, .m4v, .mov, .avi, .ts, .m2ts — any capitalization)"
-  echo " there and run this again."
+  echo " Put files (.mkv .mp4 .m4v .mov .avi .ts .m2ts .wmv .flv .webm — any"
+  echo " capitalization) there and run this again."
   exit 0
 fi
 
@@ -197,6 +198,11 @@ _out_ext() {
         mp4|m4v|mov|mkv) echo "$src_ext" ;;
         *)               echo "mkv" ;;
       esac ;;
+    # Loud default: if a profile is added to the menu but not mapped here, fail
+    # instead of emitting "/media/output/name." (empty ext). test_docker_parity.sh
+    # guards this table against muxm, so this should only ever fire mid-edit.
+    *) echo " [ERROR] internal: no output container mapped for profile '$profile'." >&2
+       exit 1 ;;
   esac
 }
 

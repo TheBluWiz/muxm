@@ -61,7 +61,7 @@ REM List files in input folder
 echo  Files in your "input" folder:
 echo  -------------------------------------------
 set filecount=0
-for %%f in (input\*.mkv input\*.mp4 input\*.m4v input\*.mov input\*.avi input\*.ts input\*.m2ts) do (
+for %%f in (input\*.mkv input\*.mp4 input\*.m4v input\*.mov input\*.avi input\*.ts input\*.m2ts input\*.wmv input\*.flv input\*.webm) do (
     set /a filecount+=1
     echo   !filecount!. %%~nxf
     set "file!filecount!=%%~nxf"
@@ -70,7 +70,7 @@ for %%f in (input\*.mkv input\*.mp4 input\*.m4v input\*.mov input\*.avi input\*.
 if !filecount!==0 (
     echo   [empty - no video files found]
     echo.
-    echo  Put video files (.mkv, .mp4, .m4v, .mov, .avi, .ts, .m2ts^)
+    echo  Put video files (.mkv .mp4 .m4v .mov .avi .ts .m2ts .wmv .flv .webm^)
     echo  in the "input" folder and run this again.
     echo.
     pause
@@ -161,18 +161,28 @@ if not defined profile (
     exit /b 1
 )
 
-REM Output container per profile -- mirrors each profile's documented
-REM container (see `muxm --help`). MP4 profiles get .mp4, MKV profiles .mkv.
-REM The two ATV profiles are container-passthrough: keep the source
-REM extension when it is a supported output container, otherwise fall back
-REM to .mkv exactly as muxm's own passthrough resolution does.
-set "outext=mp4"
+REM Output container per profile -- mirrors each profile's documented container
+REM (see `muxm --help`). Every profile is listed EXPLICITLY (no silent default):
+REM test_docker_parity.sh cross-checks this table against muxm, and the fail-arm
+REM below turns a newly-added-but-unmapped profile into a loud error rather than
+REM a mis-containered .mp4. The two ATV profiles are container-passthrough (SRC):
+REM keep the source extension when it is a supported output container, else .mkv.
+set "outext="
+if "!profile!"=="streaming-hevc"  set "outext=mp4"
+if "!profile!"=="streaming-av1"   set "outext=mp4"
+if "!profile!"=="universal"       set "outext=mp4"
+if "!profile!"=="youtube-upload"  set "outext=mp4"
 if "!profile!"=="archive"   set "outext=mkv"
 if "!profile!"=="hdr10-hq"  set "outext=mkv"
 if "!profile!"=="av1-hq"    set "outext=mkv"
 if "!profile!"=="animation" set "outext=mkv"
 if "!profile!"=="atv-directplay-hq"        set "outext=SRC"
 if "!profile!"=="atv-directplay-animation" set "outext=SRC"
+if not defined outext (
+    echo  [ERROR] internal: no output container mapped for profile "!profile!".
+    pause
+    exit /b 1
+)
 
 REM ---- Refuse if two selected inputs would write the same output ----
 REM muxm defaults to overwriting its output and only auto-versions when the
