@@ -48,7 +48,7 @@ This is a deliberate tradeoff: CPU encoding produces noticeably better quality a
 
 ## Part 2: Set Up MuxMaster
 
-1. Download the ready-made bundle -- the `muxm-docker-windows-v*.zip` file attached to the latest release at [github.com/TheBluWiz/MuxMaster/releases](https://github.com/TheBluWiz/MuxMaster/releases) -- and unzip it into a folder anywhere you like, for example `C:\MuxMaster`. It contains everything listed below, so you can skip step 2.
+1. Download the ready-made bundle -- the `muxm-docker-windows-v*.zip` file attached to the latest release at [github.com/TheBluWiz/MuxMaster/releases](https://github.com/TheBluWiz/MuxMaster/releases) -- and unzip it into a folder anywhere you like, for example `C:\MuxMaster`. It contains everything listed below, so you can skip step 2. (It also includes a copy of this guide and `LICENSE.md` -- eight files in total. Those two aren't needed to run anything; leave them be.)
 
 2. (Only if you're collecting the files by hand instead of using the bundle.) Place **all six** of these files inside that folder:
 
@@ -157,6 +157,25 @@ Get-ChildItem input\*.mkv | ForEach-Object { docker compose run --rm muxm --prof
 
 Each file is processed one at a time. This can take a while for large batches -- consider running it overnight.
 
+> **Match the extension to the profile's container.** Both loops above hardcode
+> `.mp4`, which is right for `streaming-hevc` (and for `streaming-av1`,
+> `universal`, `youtube-upload`). But muxm takes the container from the output
+> filename you give it, **overriding the profile's own choice**. So pasting one of
+> these loops with an MKV-container profile (`animation`, `hdr10-hq`, `av1-hq`,
+> `archive`) would quietly hand you an MP4 -- and MP4 can't carry everything MKV
+> can (ASS subtitles and some lossless audio, for instance), which is exactly why
+> those profiles choose MKV. Swap the profile and the extension together -- e.g.
+> for `animation`:
+>
+> ```
+> for %f in (input\*.mkv) do docker compose run --rm muxm --profile animation "/media/input/%~nxf" "/media/output/%~nf.mkv"
+> ```
+>
+> Run `docker compose run --rm muxm --help` to see each profile's container. (The
+> two `atv-directplay-*` profiles keep the source file's container, so match
+> whatever your inputs are.) The double-click `encode.bat` / `encode.sh` helpers
+> work all of this out for you -- this only matters for hand-written loops.
+
 ---
 
 ## Using a Custom Config File
@@ -235,6 +254,27 @@ If your antivirus software (Windows Defender, Norton, McAfee, etc.) is scanning 
 **Encode was killed with no error message**
 Docker may have run out of memory. By default, Docker Desktop limits itself to about half your system RAM. If you have 8 GB total, that may not be enough for demanding encodes. Open Docker Desktop > Settings > Resources and increase the memory limit. 12 GB or more is recommended if your system has it.
 
+**A killed encode left huge hidden files behind (`.muxm.tmp.*`)**
+While encoding, muxm stages its intermediate files in a hidden `.muxm.tmp.*` folder **next to the output** -- that is, inside the `output` folder on your PC, not inside Docker. A run that finishes (or fails) normally cleans this up. A run that was *hard-killed* -- Docker Desktop updated or crashed mid-encode, `wsl --shutdown`, the container was killed, or the PC lost power -- never gets the chance, so a multi-gigabyte hidden folder can be left behind. `docker system prune` will **not** reclaim it: it isn't Docker's to clean.
+
+To check, open the `output` folder and turn on hidden items (**View > Show > Hidden items** on Windows 11, or **View > Hidden items** on Windows 10). After a killed encode it's safe to delete:
+
+- `output\.muxm.tmp.*` -- leftover work folders. These are the big ones.
+- `output\.<name>.lock` -- a leftover lock for that output name.
+
+Only delete these when no encode is running.
+
+**muxm says another run is already writing to this output**
+If a previous encode was hard-killed, its lock file can be left behind and muxm refuses to start:
+
+```
+Another muxm run (PID 1) is already writing to this output: /media/output/movie.mp4
+ — wait for it to finish, choose a different output path, or remove the stale lock
+ with: rm -rf '/media/output/.movie.mp4.lock'
+```
+
+That path is the **container's** view. `/media/output` is simply your `output` folder, so the file to delete is `output\.movie.mp4.lock` on your PC (it's hidden -- turn on hidden items as above). Make sure no encode is actually running first, then delete it and re-run.
+
 **"Permission denied" or file not found**
 Make sure your video files are directly in the `input` folder (not in a subfolder), and that filenames don't contain `!` or `%` characters (see the Filenames section above).
 
@@ -258,3 +298,5 @@ Replace the `muxm` file in your MuxMaster folder with the new version, then doub
 
 **Freeing disk space**
 Docker stores its images and build cache on your system drive. Over time this can grow. To clean up, open Docker Desktop > Settings > Resources > Disk image and note the size, or run `docker system prune` in a terminal to remove unused data.
+
+If space is still missing after that, check your `output` folder for hidden `.muxm.tmp.*` leftovers from a killed encode -- `docker system prune` cannot reclaim those, because they live on your PC rather than inside Docker. See "A killed encode left huge hidden files behind" above.

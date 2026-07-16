@@ -64,6 +64,19 @@ tidy.
   running the container as your uid/gid; for direct commands, add
   `--user "$(id -u):$(id -g)"` after `run --rm` if you want the same.
   macOS and Windows (Docker Desktop) map ownership transparently — nothing to do.
+- **Root-owned `input`/`output` (Linux hosts).** If a `docker compose run` is the
+  first thing that touches this folder — before `./setup.sh` has created them —
+  the Docker engine auto-creates the missing bind-mount sources as `root:root`.
+  Every later `--user` encode then dies with "Output directory not writable", and
+  rerunning `setup.sh` **cannot** repair it (`mkdir -p` happily succeeds on a
+  directory it can't write). `setup.sh` and `encode.sh` now detect this and print
+  the one command that fixes it:
+
+  ```bash
+  sudo chown -R "$(id -u):$(id -g)" input output
+  ```
+
+  Running `./setup.sh` first avoids the situation entirely.
 - **Custom config.** Uncomment the `.muxmrc` line in `docker-compose.yml` to
   mount a config file (it lands in muxm's project-level config tier inside the
   container, so it applies on every run).
@@ -83,9 +96,19 @@ tidy.
 - `Dockerfile` pins `dovi_tool` via `ARG DOVI_TOOL_VERSION`; bump it
   deliberately. Full tesseract language data is installed by default
   (`ARG TESSERACT_LANG_PACKAGES` to slim down custom builds).
-- `tests/test_docker_parity.sh` (part of the `docs` suite) cross-checks the
-  profile names embedded in `encode.bat`, `encode.sh`, and the guides against
-  muxm's canonical `VALID_PROFILES`, and enforces CRLF on the `.bat` files —
-  rename a profile and the suite fails until these files are updated.
-- `tools/gen-docker-bundle.sh` zips the Windows-layperson bundle (the six
-  files above) for attaching to a GitHub release.
+- `tests/test_docker_parity.sh` (part of the `docs` suite) cross-checks
+  everything under `docker/` that duplicates knowledge owned by `muxm`: profile
+  names in both encode menus (assignments *and* echo'd labels) and in the guide
+  examples, each profile's output container and the container-passthrough set,
+  the input-extension globs, the Dockerfile's required-tool roster, the staged
+  `docker/muxm` copy, the bundle manifest, and line-ending policy on the `.bat`
+  files. It reads muxm's `VALID_PROFILES`, per-profile `OUTPUT_EXT`,
+  `_check_tool … required` roster, and completion source list — so a rename or a
+  container change fails the suite until these files are updated. Note this guard
+  is **not** fixed by `tools/gen-docs.sh`; these are hand-maintained files.
+- `tools/gen-docker-bundle.sh` zips the Windows-layperson bundle for attaching to
+  a GitHub release. Its `BUNDLE_FILES` array is the single source of truth for the
+  contents: the six files listed above plus `DOCKER_WINDOWS_GUIDE.md` and
+  `LICENSE.md` (redistribution requires the license — see LICENSE.md §3), so the
+  zip holds **eight**. The parity guard reads that same array, so the bundler and
+  the check can't drift apart.
