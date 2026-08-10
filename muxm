@@ -8421,12 +8421,48 @@ _x265_strip_hdr_keys() {
   printf '%s' "$_p"
 }
 
+# _x265_knows_color_name KIND VALUE — true if x265's own --colorprim/--transfer/--colormatrix
+# parser accepts VALUE for the given KIND (primaries|transfer|matrix). x265 does NOT share
+# ffmpeg's full H.273 name vocabulary — verified empirically against x265 4.2: ffmpeg's transfer
+# names "gamma22"/"gamma28" are "bt470m"/"bt470bg" in x265; ffmpeg's "unspecified" (colour value
+# 2) is rejected outright in every field; colormatrix additionally rejects "rgb" and "reserved".
+# An unrecognized name must NEVER reach -x265-params: x265 logs "Invalid value for X: Y" but
+# ffmpeg still exits 0, and the resulting SPS VUI field is written as 0 (Reserved) rather than
+# left at the safe default of 2 (Unspecified) — silently WORSE than doing nothing. Callers must
+# treat a false return as "do not append this field" (matches the pre-fix, incomplete-but-safe
+# behavior), never substitute a guessed value.
+# Args: $1 — primaries|transfer|matrix; $2 — the candidate name (from COLOR_ARGS, i.e. an
+#            ffmpeg -color_primaries/-color_trc/-colorspace value)
+_x265_knows_color_name() {
+  local kind="$1" val="$2"
+  case "$kind" in
+    primaries)
+      case "$val" in
+        bt709|reserved|bt470m|bt470bg|smpte170m|smpte240m|film|bt2020|smpte428|smpte431|smpte432) return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    transfer)
+      case "$val" in
+        bt709|reserved|bt470m|bt470bg|smpte170m|smpte240m|linear|log100|log316|iec61966-2-4|bt1361e|iec61966-2-1|bt2020-10|bt2020-12|smpte2084|smpte428|arib-std-b67) return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    matrix)
+      case "$val" in
+        bt709|fcc|bt470bg|smpte170m|smpte240m|ycgco|bt2020nc|bt2020c|smpte2085|chroma-derived-nc|chroma-derived-c|ictcp) return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+}
+
 # Build the final X265_PARAMS string from X265_PARAMS_BASE.
 # Adds or strips HDR-specific x265 parameters based on the detected color profile:
 #   - Non-HDR10: removes :hdr-opt=1
 #   - HDR10: appends hdr10=1, colorprim, transfer, colormatrix, range
+#   - HLG: appends colorprim, transfer, colormatrix
+#   - SDR / SDR-TONEMAP: appends colorprim, transfer, colormatrix mirroring COLOR_ARGS (see below)
 # Sets: X265_PARAMS (global)
-# Reads: X265_PARAMS_BASE, PROFILE_DESC
+# Reads: X265_PARAMS_BASE, PROFILE_DESC, COLOR_ARGS[]
 build_x265_params() {
   X265_PARAMS="$X265_PARAMS_BASE"
 
@@ -8446,8 +8482,36 @@ build_x265_params() {
   elif [[ "$PROFILE_DESC" == "HLG" ]]; then
     # HLG: inject the correct HLG color signaling.
     X265_PARAMS="${X265_PARAMS:+${X265_PARAMS}:}colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc"
+  else
+    # SDR / SDR-TONEMAP: re-state the SAME colour_primaries/transfer/matrix COLOR_ARGS already
+    # computed (decide_color_and_pixfmt — defaults an untagged source to bt709, or carries a
+    # tagged source's own values through verbatim). This is NOT redundant with COLOR_ARGS'
+    # top-level -color_primaries/-color_trc/-colorspace: ffmpeg's libx265 AVCodecContext bridge
+    # reliably carries -colorspace through to matrix_coefficients in the encoded SPS VUI, but
+    # leaves colour_primaries/transfer_characteristics at 2 (Unspecified) regardless of
+    # -color_primaries/-color_trc — confirmed via `ffmpeg -bsf:v trace_headers` on real output
+    # (colour_description_present_flag=1, colour_primaries=2, transfer_characteristics=2,
+    # matrix_coefficients=1, despite all three being requested as bt709). Every decoder parses
+    # colour info from the SPS VUI, not container-level tags, so a Direct-Play/hardware decoder
+    # renders with an incomplete colour description regardless of what COLOR_ARGS asked for — a
+    # muted/flat picture is a common symptom. x265's own --colorprim/--transfer/--colormatrix do
+    # NOT share ffmpeg's full name vocabulary, though (see _x265_knows_color_name) — re-stating
+    # COLOR_ARGS' own values here closes the gap for every name x265 actually recognizes, gated
+    # so an ffmpeg-only name (e.g. an actual GAMMA22/28-tagged or RGB-matrix source) falls back
+    # to no append — the pre-fix, incomplete-but-safe behavior — rather than reaching x265 and
+    # silently landing a worse-than-Unspecified Reserved (0) VUI value.
+    # COLOR_ARGS is always shaped (-color_primaries VAL -color_trc VAL -colorspace VAL) by every
+    # branch of decide_color_and_pixfmt, so [1]/[3]/[5] are the three values in order.
+    local _cp="${COLOR_ARGS[1]:-}" _ctc="${COLOR_ARGS[3]:-}" _cm="${COLOR_ARGS[5]:-}"
+    if [[ -n "$_cp" && -n "$_ctc" && -n "$_cm" ]] \
+       && _x265_knows_color_name primaries "$_cp" \
+       && _x265_knows_color_name transfer "$_ctc" \
+       && _x265_knows_color_name matrix "$_cm"; then
+      X265_PARAMS="${X265_PARAMS:+${X265_PARAMS}:}colorprim=${_cp}:transfer=${_ctc}:colormatrix=${_cm}"
+    else
+      log "[build_x265_params] SDR colour re-statement skipped: '$_cp'/'$_ctc'/'$_cm' not fully in x265's own colorprim/transfer/colormatrix vocabulary — leaving SPS VUI as ffmpeg's AVCodecContext bridge produces it for this source."
+    fi
   fi
-  # (SDR / SDR-TONEMAP and anything else: stripped, nothing appended.)
 
   # --threads N → genuinely cap core usage by sizing x265's worker thread pool.
   # ffmpeg's -threads does NOT size that pool (it defaults to all logical cores),

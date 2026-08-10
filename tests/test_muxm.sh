@@ -5239,6 +5239,46 @@ test_hdr() {
     fi
   fi
 
+  # SDR positive control: colour_primaries/transfer_characteristics must be POSITIVELY
+  # re-stated (not merely "not HDR", which the neg-control above already covers) in the
+  # ENCODED BITSTREAM'S OWN SPS VUI for an untagged SDR source. Before this fix, ffmpeg's
+  # libx265 AVCodecContext bridge carried COLOR_ARGS' -colorspace through to
+  # matrix_coefficients but left colour_primaries/transfer_characteristics at 2
+  # (Unspecified) regardless of -color_primaries/-color_trc — every real decoder (including
+  # an Apple TV Direct Play hardware pipeline) parses colour from the SPS VUI, not
+  # container-level tags, so an incomplete description there produces visibly muted/flat
+  # playback despite COLOR_ARGS correctly requesting bt709.
+  # HONEST LIMIT: probe_video can't discriminate this — this ffmpeg build's container-level
+  # color_primaries/color_transfer fields do not surface a value of 1 (bt709) even when
+  # correctly present in the bitstream (verified: an HDR10 encode's bt2020/smpte2084 DOES
+  # surface via probe_video; only the bt709 case is swallowed at the container-report layer).
+  # So this reads the SPS VUI directly via `-bsf:v trace_headers`, the same technique that
+  # found and confirmed the underlying bug.
+  if ! ffmpeg_has_encoder libx265; then
+    skip "sdr-vui-colour: ffmpeg lacks libx265 — cannot inspect the encoded SPS VUI"
+  elif [[ ! -s "$sdr_out" ]]; then
+    skip "sdr-vui-colour: no SDR neg-control output to inspect"
+  else
+    # trace_headers logs its field dump at ffmpeg's default (info) verbosity, not "error" — do
+    # NOT pass -v/-loglevel error here or the capture comes back empty. Every step is `|| true`
+    # (set -e/pipefail-safe): a genuinely empty/no-match result must fall through to the `fail`
+    # branch below as a red test result, not abort the whole suite.
+    local _vui _vui_prim _vui_trc
+    _vui="$(ffmpeg -loglevel info -i "$sdr_out" -map 0:v:0 -c copy -bsf:v trace_headers -f null - 2>&1)" || true
+    _vui_prim="$(printf '%s\n' "$_vui" | grep -m1 -i 'colour_primaries' | awk '{print $NF}')" || true
+    _vui_trc="$(printf '%s\n' "$_vui" | grep -m1 -i 'transfer_characteristics' | awk '{print $NF}')" || true
+    if [[ "$_vui_prim" == "1" ]]; then
+      pass "sdr-vui-colour: SPS VUI colour_primaries positively tagged BT.709 (1) on untagged SDR source"
+    else
+      fail "sdr-vui-colour: expected SPS VUI colour_primaries=1 (BT.709), got '${_vui_prim:-<none>}' — SDR branch of build_x265_params not re-stating colour on the encoded bitstream"
+    fi
+    if [[ "$_vui_trc" == "1" ]]; then
+      pass "sdr-vui-colour: SPS VUI transfer_characteristics positively tagged BT.709 (1) on untagged SDR source"
+    else
+      fail "sdr-vui-colour: expected SPS VUI transfer_characteristics=1 (BT.709), got '${_vui_trc:-<none>}' — SDR branch of build_x265_params not re-stating colour on the encoded bitstream"
+    fi
+  fi
+
   # RV3-06: an SDR encode carrying a SOLE HDR x265 key — `--x265-params transfer=smpte2084` as the
   # WHOLE param string — must NOT bake the PQ transfer into the output. build_x265_params strips the
   # baked HDR/PQ keys; before the fix the sole-content case survived (no leading/trailing colon for
@@ -11136,6 +11176,65 @@ _test_unit_x265_strip_hdr_keys() {
   fi
 }
 
+# x265's --colorprim/--transfer/--colormatrix do NOT share ffmpeg's full H.273 name vocabulary
+# (ffmpeg's transfer "gamma22"/"gamma28" are x265's "bt470m"/"bt470bg"; ffmpeg's "unspecified" is
+# rejected by every x265 field; x265's colormatrix additionally rejects "rgb"/"reserved") —
+# verified empirically against x265 4.2: an unrecognized name is NOT a parse error (ffmpeg still
+# exits 0) but writes the SPS VUI field as 0 (Reserved), worse than the safe default of 2
+# (Unspecified). _x265_knows_color_name is the allowlist gate build_x265_params' SDR branch uses
+# to decide whether re-stating COLOR_ARGS' colour values into -x265-params is safe.
+_test_unit_x265_color_name_allowlist() {
+  local body
+  body="$(_extract_muxm_fns _x265_knows_color_name)" \
+    || { fail "unit-x265-color-allowlist: could not extract _x265_knows_color_name"; return; }
+  local -a rejected=(
+    "primaries unspecified" "primaries jedec-p22"
+    "transfer unspecified" "transfer gamma22" "transfer gamma28"
+    "matrix unspecified" "matrix rgb" "matrix reserved"
+  )
+  local -a accepted=(
+    "primaries bt709" "transfer bt709" "matrix bt709"
+    "primaries smpte240m" "transfer smpte240m" "matrix smpte240m" "matrix smpte170m"
+  )
+  local pair kind val rc fail_before=$FAIL
+  for pair in "${rejected[@]}"; do
+    read -r kind val <<< "$pair"
+    rc=0; bash -c "$body"$'\n''_x265_knows_color_name "$1" "$2"' -- "$kind" "$val" || rc=$?
+    (( rc == 0 )) && fail "unit-x265-color-allowlist: '$kind'/'$val' was ALLOWED — x265 rejects this name and writes VUI=0 (Reserved), not this value"
+  done
+  (( FAIL == fail_before )) && pass "unit-x265-color-allowlist: every known x265-rejected name (unspecified/gamma22/gamma28/rgb/reserved/jedec-p22) is rejected"
+
+  fail_before=$FAIL
+  for pair in "${accepted[@]}"; do
+    read -r kind val <<< "$pair"
+    rc=0; bash -c "$body"$'\n''_x265_knows_color_name "$1" "$2"' -- "$kind" "$val" || rc=$?
+    (( rc != 0 )) && fail "unit-x265-color-allowlist: '$kind'/'$val' was REJECTED — this is a real x265-accepted name"
+  done
+  (( FAIL == fail_before )) && pass "unit-x265-color-allowlist: every real x265-accepted name (bt709, smpte240m, smpte170m) is allowed"
+
+  # End-to-end: build_x265_params' SDR branch re-states a fully-tagged non-default COLOR_ARGS
+  # (the pass-through case, as distinct from the untagged-source-defaults-to-bt709 case already
+  # covered by the hdr suite's real-encode 'sdr-vui-colour' test).
+  local bx_body e2e
+  bx_body="$(_extract_muxm_fns _x265_strip_hdr_keys _x265_knows_color_name build_x265_params)" \
+    || { fail "unit-x265-color-allowlist: could not extract build_x265_params + deps"; return; }
+  e2e="$(bash -c "$bx_body"$'\n''X265_PARAMS_BASE=""; PROFILE_DESC="SDR"; VIDEO_ENCODER_FFMPEG="libx265"; THREADS=""; COLOR_ARGS=(-color_primaries smpte240m -color_trc smpte240m -colorspace smpte240m); build_x265_params; printf "%s" "$X265_PARAMS"')"
+  if [[ "$e2e" == "colorprim=smpte240m:transfer=smpte240m:colormatrix=smpte240m" ]]; then
+    pass "unit-x265-color-allowlist: SDR branch re-states a fully-tagged non-default COLOR_ARGS (smpte240m) verbatim"
+  else
+    fail "unit-x265-color-allowlist: expected 'colorprim=smpte240m:transfer=smpte240m:colormatrix=smpte240m', got '$e2e'"
+  fi
+
+  # Safety: a COLOR_ARGS value outside x265's vocabulary must fall through to NO append —
+  # never reach -x265-params where it would silently corrupt the VUI to 0 (Reserved).
+  e2e="$(bash -c "$bx_body"$'\n''X265_PARAMS_BASE=""; PROFILE_DESC="SDR"; VIDEO_ENCODER_FFMPEG="libx265"; THREADS=""; COLOR_ARGS=(-color_primaries bt709 -color_trc gamma22 -colorspace bt709); build_x265_params; printf "%s" "$X265_PARAMS"')"
+  if [[ -z "$e2e" ]]; then
+    pass "unit-x265-color-allowlist: SDR branch skips the append when one COLOR_ARGS value ('gamma22') isn't in x265's vocabulary — no corrupted VUI value reaches -x265-params"
+  else
+    fail "unit-x265-color-allowlist: expected no append for an unrecognized COLOR_ARGS value, got X265_PARAMS='$e2e'"
+  fi
+}
+
 _test_unit_fps_helpers() {
   # ---- _fps_to_decimal ----
   # Converts a frame rate (exact rational "num/den" or a plain decimal) to a
@@ -12571,6 +12670,7 @@ test_unit() {
   _test_unit_mapping_helpers
   _test_unit_av1_helpers
   _test_unit_x265_strip_hdr_keys
+  _test_unit_x265_color_name_allowlist
   _test_unit_fps_helpers
   _test_unit_extract_helper
   _test_unit_score_audio_stream
