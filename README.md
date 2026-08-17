@@ -1,6 +1,6 @@
 # ![muxm](assets/muxm_header_small.png) MuxMaster
 
-[![Version](https://img.shields.io/badge/version-1.5.1-blue)](https://github.com/TheBluWiz/MuxMaster/releases)
+[![Version](https://img.shields.io/badge/version-1.6.0-blue)](https://github.com/TheBluWiz/MuxMaster/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%20%28Docker%29-lightgrey)](#compatibility)
 [![License](https://img.shields.io/badge/license-freeware-green)](#license)
 

@@ -105,11 +105,11 @@ fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="1.5.1"
+readonly VERSION="1.6.0"
 # Release date for the man-page .TH line, co-located with VERSION so a release bump updates
 # both together. _man_emit substitutes it for the __DATE__ token (like __VERSION__) — the date is no
 # longer a hidden literal buried mid-heredoc that the docs-parity guard can't see drifting.
-readonly RELEASE_DATE="2026-07-06"
+readonly RELEASE_DATE="2026-08-17"
 
 # Canonical list of valid profile names (space-separated for compgen/iteration).
 # All profile validation, error messages, completions, and config generators

@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-17
+
 ### Added
 
 - **Docker distribution overhauled and made publishable (Windows accessibility)** — the `docker/` directory is now a complete, tested, cross-platform distribution channel rather than a Windows-only draft:
