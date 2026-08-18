@@ -6,6 +6,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com), and this 
 
 ## [Unreleased]
 
+### Fixed
+
+- **Skip-if-ideal silently stripped Dolby Vision signalling from MP4-family outputs** — `muxm dv_source.MOV` under a container-passthrough profile (`atv-directplay-hq`, `atv-directplay-animation`) reported `Build SUCCEEDED`, wrote a `.b2` checksum, and produced a file that no longer activates Dolby Vision on any player. Three things combined: the profile sets both `OUTPUT_EXT=""` (passthrough) and `SKIP_IF_IDEAL=1`, so a `.MOV` DV source that already meets the profile qualifies as "ideal"; the skip path's **copy-remux** branch fires whenever metadata must be stamped (audio titles, profile comment) or streams filtered; and ffmpeg cannot write the `dvcC`/`dvvC` configuration box on a stream copy into the MP4 family — a bare `ffmpeg -i dv.MOV -map 0:v:0 -c copy out.mov` loses the DOVI configuration record, verified against ffmpeg 8.1.2. Matroska is unaffected (DV rides in codec private data, which survives `-c copy` intact), and the raw-hardlink branch is a byte copy that was never at risk.
+
+  The loss was silent because `check_skip_if_ideal` returns **before** `detect_dv` runs — the function's very next line is `# Detect Dolby Vision`. So `IS_DV` was still 0, muxm's DV pipeline (`dovi_tool` + `_dv_mp4box_wrap`) never ran to put the box back, and the existing container guard that refuses DV-into-`.mov` never fired. `_video_is_copy_compliant` already compensates for this same ordering with a read-only `_source_has_dv_metadata` probe for its DV-profile gate; the container-signalling case had no equivalent.
+
+  Only the signalling was lost, never the data: the RPU survives the remux in-band, byte-identical across all 258 frames of the bundled HLG+DV fixture. That is still fatal in practice, since players key DV activation off the configuration box and otherwise fall back to the HDR10/HLG base layer.
+
+  New `_sii_would_lose_dv_signaling` gates the skip on all four conditions (copy-remux branch **and** DV enabled **and** MP4-family container **and** source actually carries DV), and `_sii_skip_is_dv_safe` joins it to the branch condition so a hit declines the skip and falls through to the normal pipeline. `_sii_compute_needs_remux` was lifted out of the inline block so the decision happens **before** `write_json_report` serializes a "skipped" report that would then be wrong — `report_add` appends rather than replaces, so declining after it would also have duplicated the chapters/metadata entries `mux_final` adds. It now also evaluates under `--dry-run`, so a dry run predicts the same branch as a real run.
+
+  **This is a deliberate behaviour change:** the invocation above now *fails* (exit 11, the existing "output container .mov is not supported for DV muxing" error with its `--output-ext mkv|mp4` / `--no-dv` guidance) instead of succeeding with a broken file. Escape hatches are unchanged: pass `--no-dv` to accept the loss, or target `.mp4`/`.mkv`. Verified that the three non-triggering cases are untouched — a DV `.mkv` under passthrough still skips with DV intact, `--no-dv` on the DV `.MOV` still skips via copy-remux, and non-DV sources are unaffected. New `unit-sii-dv-guard` covers the four-condition truth table and every `_sii_compute_needs_remux` trigger, including that it returns exit 0 on the no-remux case (the `(( )) &&` idiom would otherwise leak a false status into the skip condition).
+
+- **VideoToolbox encodes left `colour_primaries`/`transfer_characteristics` Unspecified in the bitstream whenever muxm asserted the colour instead of inheriting it — the hardware half of the v1.6.0 SDR colour fix** — the v1.6.0 fix ("SDR/SDR-TONEMAP encodes left `colour_primaries`/`transfer_characteristics` Unspecified…") diagnosed ffmpeg's `AVCodecContext`→encoder colour bridge correctly but repaired only the software arm. The same bridge drops `-color_primaries`/`-color_trc` for `hevc_videotoolbox`/`h264_videotoolbox` exactly as it does for libx265 — only `-colorspace` reaches `matrix_coefficients` — so `--hw-accel videotoolbox` kept shipping the very bitstream, and the very muted/flat Direct-Play picture, that fix was written to eliminate. `build_x265_params` closes the gap by re-stating COLOR_ARGS' values through `-x265-params`; VideoToolbox has no colour options to re-state through (`ffmpeg -h encoder=hevc_videotoolbox` lists none — only quality, profile, allow_sw, realtime and friends), so `build_videotoolbox_params` now stamps the SPS VUI **after** the encoder runs, via the `hevc_metadata`/`h264_metadata` bitstream filter (new `VIDEOTOOLBOX_BSF_ARGS[]`, appended by both VT encode arms).
+
+  Measured with `ffmpeg -bsf:v trace_headers` on ffmpeg 8.1.2 / Apple Silicon — primaries/transfer/matrix in the encoded SPS:
+
+  | source | libx265 | hevc_videotoolbox (before) | hevc_videotoolbox (after) |
+  |---|---|---|---|
+  | untagged SDR | 1 / 1 / 1 | **2 / 2 / 1** | 1 / 1 / 1 |
+  | tagged HDR10 | 9 / 16 / 9 | 9 / 16 / 9 | 9 / 16 / 9 |
+  | HDR→SDR tone-map | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+
+  Only the **untagged** case was ever wrong: a tagged HDR10/HLG source reaches VT as tagged frames and already landed the right VUI, and the tone-map path is stamped by `zscale`. That makes this precisely a fix for sources muxm has to *assert* colour for — which is the common case for older/ripped SDR libraries whose `color_primaries`/`color_transfer`/`color_space` all probe as `unknown`. The stamp is applied unconditionally rather than only to the failing case: COLOR_ARGS is by definition the colour the output is meant to declare, so re-writing an already-correct field writes the same value back (verified idempotent — the HLG+DV fixture re-encode produces the same 9/18/9 before and after).
+
+  Because the filter runs post-encode it also corrects output when VideoToolbox falls back to its **own internal software encoder** (`-allow_sw 1`, the default), which is not muxm's libx265 path and was never covered by the v1.6.0 fix.
+
+  A new `_h273_color_code` maps ffmpeg's colour names to the numeric H.273 codes the filter takes (tables E-3/E-4/E-5). Working in numbers rather than names sidesteps the vocabulary gaps that force `_x265_knows_color_name` to bail: ffmpeg's `gamma22`/`gamma28` have no x265 spelling but map cleanly to 4/5 here, so a gamma22/28-tagged source now gets a correct VUI on the VT path where the software path still declines to re-state (**deliberate asymmetry** — the software behaviour is unchanged and out of scope for this fix). The stamp is all-or-nothing, mirroring `build_x265_params`' gate: `unknown`/`unspecified`/`reserved` and an RGB matrix stay unmapped, so a triple containing any of them leaves the VUI exactly as the encoder wrote it rather than half-stamped or stamped with a non-conformant 0 (Reserved). `video_full_range_flag` is deliberately left alone — muxm never sets `-color_range` and VT already emits 0 (limited).
+
+  Verified end-to-end through the real pipeline, not just isolated ffmpeg calls: an untagged 1080p SDR source encoded with `--hw-accel videotoolbox` goes from `2/2/1` (shipped v1.6.0) to `1/1/1`, the software path is unchanged (no software-path code touched; its VUI re-verified at `1/1/1`), and the bundled HLG+Dolby-Vision fixture re-encodes to `9/18/9` with RPU extract/inject intact and frame-count parity verified (258/258) — the DV arm matters because it muxes a raw elementary stream, where the container carries no colour at all.
+
+  Also corrected: the 4:2:2/4:4:4 rejection in `build_videotoolbox_params` pointed users at `--no-hw-accel`, which has never been a muxm flag (only `--no-hw-accel-allow-sw` exists); it now says `--hw-accel none`.
+
+  **Known gap, not addressed here:** VideoToolbox does not emit the HDR10 static-metadata **SEI** (payload 137 mastering-display / 144 content-light) that libx265 writes from the same input side data. Container-level metadata is unaffected — a VT-encoded MKV/MP4 carries byte-identical `MasteringMetadata`/MaxCLL — so this is invisible unless the bitstream travels without its container, which is exactly what the DV path does while the RPU is injected.
+
+
 ## [1.6.0] - 2026-08-17
 
 ### Added

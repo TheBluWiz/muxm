@@ -242,6 +242,11 @@ declare -a REPORT_ENTRIES=()
 # of -map 0, ensuring only container-compatible streams reach the output.
 declare -a SII_AUDIO_INDICES=()
 declare -a SII_SUB_INDICES=()
+# Computed by _sii_compute_needs_remux before the skip-if-ideal branch commits, so the Dolby
+# Vision guard can decline the skip while the JSON report is still unwritten.
+declare -i _SII_NEEDS_REMUX=0
+declare -i _SII_TOTAL_A=0
+declare -i _SII_TOTAL_S=0
 
 # ===== Section 4: Opinionated defaults ========================================================
 # ---- Video encode (x265/x264)
@@ -8263,6 +8268,86 @@ check_skip_if_ideal() {
   fi
 }
 
+# ---- Skip-if-ideal Dolby Vision guard --------------------------------------------------------
+
+# _sii_compute_needs_remux — decide whether the skip-if-ideal path must copy-remux the source
+# (to stamp metadata or filter streams) rather than hardlink it verbatim.
+#
+# Lifted out of run_video_pipeline's skip-if-ideal block so the decision is available BEFORE
+# write_json_report serializes a "skipped" report: the DV guard below must be able to decline
+# the skip while that report is still unwritten. (report_add appends rather than replaces, so
+# declining after it would also duplicate the chapters/metadata entries mux_final adds on the
+# normal path.) Also runs under --dry-run, so a dry run predicts the same branch as a real run.
+#
+# Reads:  INCLUDE_AUDIO_TITLES, PROFILE_COMMENT, PROFILE_NAME, SII_AUDIO_INDICES[],
+#         SII_SUB_INDICES[], STRIP_METADATA, KEEP_CHAPTERS
+# Writes: _SII_NEEDS_REMUX, _SII_TOTAL_A, _SII_TOTAL_S
+_sii_compute_needs_remux() {
+  _SII_NEEDS_REMUX=0
+  (( INCLUDE_AUDIO_TITLES && ${#SII_AUDIO_INDICES[@]} > 0 )) && _SII_NEEDS_REMUX=1
+  (( PROFILE_COMMENT )) && [[ -n "${PROFILE_NAME:-}" ]] && _SII_NEEDS_REMUX=1
+  # Stream filtering: if keep-lists exclude any streams, we must remux
+  _SII_TOTAL_A="$(_audio_stream_count)"
+  _SII_TOTAL_S="$(_sub_count)"
+  (( ${#SII_AUDIO_INDICES[@]} < _SII_TOTAL_A )) && _SII_NEEDS_REMUX=1
+  (( ${#SII_SUB_INDICES[@]} < _SII_TOTAL_S )) && _SII_NEEDS_REMUX=1
+  # --strip-metadata / --no-keep-chapters must reach the output even on the
+  # skip-the-encode path. Force the copy-remux branch (never the raw hardlink, which
+  # would ship the source verbatim) whenever either flag demands a change.
+  (( STRIP_METADATA )) && _SII_NEEDS_REMUX=1
+  (( ! KEEP_CHAPTERS )) && _SII_NEEDS_REMUX=1
+  return 0   # explicit: the (( )) && idiom above would otherwise leak a false as the exit status
+}
+
+# _sii_would_lose_dv_signaling NEEDS_REMUX — true when taking the skip-if-ideal COPY-REMUX
+# branch would silently strip the source's Dolby Vision container signalling.
+#
+# ffmpeg cannot write the dvcC/dvvC configuration box on a stream copy into the MP4 family: a
+# bare `ffmpeg -i dv.MOV -map 0:v:0 -c copy out.mov` (or .mp4) drops the DOVI configuration
+# record — verified against ffmpeg 8.1.2. Matroska is unaffected: it carries DV in codec private
+# data, which survives -c copy intact. muxm's normal pipeline compensates for the MP4 case with
+# dovi_tool + MP4Box (_dv_mp4box_wrap), but the skip-if-ideal path returns long before any of
+# that runs — and before detect_dv has set IS_DV — so the loss was silent, the run still
+# reporting Build SUCCEEDED over a file that no longer activates DV.
+#
+# Only the container signalling is at risk: the RPU survives the remux in-band, byte-identical
+# (verified across all 258 frames of the bundled HLG+DV fixture). That is still fatal in
+# practice — players key DV activation off the configuration box and otherwise fall back to the
+# HDR10/HLG base layer.
+#
+# The raw-hardlink branch is a byte copy and preserves DV perfectly, so it is never at risk;
+# NEEDS_REMUX gates on that.
+#
+# Uses _source_has_dv_metadata rather than IS_DV for exactly the reason _video_is_copy_compliant's
+# DV-profile gate does: on the skip-if-ideal path detect_dv has not run and IS_DV is still 0.
+#
+# Args:  $1 — 1 if the copy-remux branch would be taken
+# Reads: DISABLE_DV, MUX_FORMAT
+_sii_would_lose_dv_signaling() {
+  (( ${1:-0} ))                     || return 1   # hardlink branch ships the source verbatim
+  (( ! DISABLE_DV ))                || return 1   # --no-dv: user opted out of DV handling
+  [[ "$MUX_FORMAT" != "matroska" ]] || return 1   # MKV carries DV through -c copy intact
+  _source_has_dv_metadata
+}
+
+# _sii_skip_is_dv_safe — second half of run_video_pipeline's skip-if-ideal condition. Computes
+# _SII_NEEDS_REMUX, then returns non-zero (declining the skip) when that remux would strip DV
+# signalling, so the caller falls through to the normal pipeline — which preserves DV for .mp4
+# (dovi_tool + MP4Box) and refuses cleanly for .mov via the existing container guard.
+#
+# This is a deliberate behaviour change: `muxm dv_source.MOV` under a container-passthrough
+# profile previously reported Build SUCCEEDED and wrote a DV-less file. It now runs the real
+# pipeline and, for .mov, errors instead. Escape hatches: --no-dv, or target .mp4/.mkv.
+_sii_skip_is_dv_safe() {
+  _sii_compute_needs_remux
+  if _sii_would_lose_dv_signaling "$_SII_NEEDS_REMUX"; then
+    note "Source matches the profile, but the skip-if-ideal metadata remux would strip Dolby Vision signalling from a ${OUTPUT_EXT:-$MUX_FORMAT} output — running the full pipeline instead so DV is preserved."
+    report_add "skip_if_ideal" "declined (copy-remux would strip DV signalling)"
+    return 1
+  fi
+  return 0
+}
+
 # Query a field from the first video stream in the metadata cache.
 # Falls back to ffprobe if cache is empty (called before cache_stream_metadata).
 # Args: $1 — field name (e.g., codec_name, pix_fmt, color_primaries)
@@ -8511,6 +8596,86 @@ _x265_knows_color_name() {
   esac
 }
 
+# _h273_color_code KIND VALUE — map an ffmpeg colour NAME to the numeric H.273 code
+# (ISO/IEC 23091-2 tables E-3/E-4/E-5) that an HEVC/H.264 SPS VUI actually stores. Prints the
+# code and returns 0; prints nothing and returns 1 for a name with no safe numeric mapping.
+#
+# This is the VideoToolbox counterpart to _x265_knows_color_name. The software path repairs
+# ffmpeg's dropped -color_primaries/-color_trc by re-stating them as x265 *names*; the VT path
+# has no such lever — hevc_videotoolbox/h264_videotoolbox expose no colour options at all — so
+# it stamps the VUI post-encode with the hevc_metadata/h264_metadata bitstream filter, which
+# takes raw *numbers*. Numbers also sidestep x265's vocabulary gaps: ffmpeg's gamma22/gamma28
+# have no x265 spelling (_x265_knows_color_name bails on them) but map cleanly to 4/5 here.
+#
+# Deliberately NOT mapped, so the caller's gate skips the stamp entirely:
+#   - "unknown"/"unspecified" — 2 is already what the encoder leaves behind; stamping it back
+#     is a no-op that would only mask a genuinely untranslatable triple.
+#   - matrix "rgb"/"gbr" (0, Identity) — muxm always emits 4:2:0 YUV, so an RGB matrix on the
+#     output is nonsense; x265's list omits it for the same reason.
+#   - the exotic H.273 late additions (ipt-c2, ycgco-re, ycgco-ro) — never produced by
+#     decide_color_and_pixfmt, and a guessed code is worse than no stamp.
+#
+# Args: $1 — primaries|transfer|matrix; $2 — the candidate name (a COLOR_ARGS entry, i.e. an
+#            ffmpeg -color_primaries/-color_trc/-colorspace value)
+_h273_color_code() {
+  local kind="$1" val="$2" code=""
+  case "$kind" in
+    primaries)
+      case "$val" in
+        bt709) code=1 ;;
+        bt470m) code=4 ;;
+        bt470bg) code=5 ;;
+        smpte170m) code=6 ;;
+        smpte240m) code=7 ;;
+        film) code=8 ;;
+        bt2020) code=9 ;;
+        smpte428|smpte428_1) code=10 ;;
+        smpte431) code=11 ;;
+        smpte432) code=12 ;;
+        jedec-p22|ebu3213) code=22 ;;
+        *) return 1 ;;
+      esac ;;
+    transfer)
+      case "$val" in
+        bt709) code=1 ;;
+        gamma22|bt470m) code=4 ;;
+        gamma28|bt470bg) code=5 ;;
+        smpte170m) code=6 ;;
+        smpte240m) code=7 ;;
+        linear) code=8 ;;
+        log100|log) code=9 ;;
+        log316|log_sqrt) code=10 ;;
+        iec61966-2-4|iec61966_2_4) code=11 ;;
+        bt1361e|bt1361) code=12 ;;
+        iec61966-2-1|iec61966_2_1) code=13 ;;
+        bt2020-10|bt2020_10bit) code=14 ;;
+        bt2020-12|bt2020_12bit) code=15 ;;
+        smpte2084) code=16 ;;
+        smpte428|smpte428_1) code=17 ;;
+        arib-std-b67) code=18 ;;
+        *) return 1 ;;
+      esac ;;
+    matrix)
+      case "$val" in
+        bt709) code=1 ;;
+        fcc) code=4 ;;
+        bt470bg) code=5 ;;
+        smpte170m) code=6 ;;
+        smpte240m) code=7 ;;
+        ycgco|ycocg) code=8 ;;
+        bt2020nc|bt2020_ncl) code=9 ;;
+        bt2020c|bt2020_cl) code=10 ;;
+        smpte2085) code=11 ;;
+        chroma-derived-nc) code=12 ;;
+        chroma-derived-c) code=13 ;;
+        ictcp) code=14 ;;
+        *) return 1 ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$code"
+}
+
 # Build the final X265_PARAMS string from X265_PARAMS_BASE.
 # Adds or strips HDR-specific x265 parameters based on the detected color profile:
 #   - Non-HDR10: removes :hdr-opt=1
@@ -8610,12 +8775,18 @@ build_av1_params() {
 # master_display / max_cll flags — ffmpeg 6.0+ carries input side data
 # forward to the muxer, which writes the correct MP4 atoms (colr/mdcv/clli)
 # or MKV Colour/MasteringMetadata elements automatically (verified in the
-# HDR10 and DV spikes).
+# HDR10 and DV spikes, and re-verified against ffmpeg 8.1.2: a VT-encoded
+# MKV carries byte-identical MasteringMetadata/MaxCLL to the libx265 one).
+# What VT does NOT emit is the equivalent *bitstream* SEI (payload types 137
+# mastering-display / 144 content-light) that libx265 writes from the same
+# side data — invisible while the output stays in a container, but the DV
+# path muxes a raw ES (see v_needs_raw_es in run_video_pipeline) where the
+# container carrier does not exist. Tracked separately; not fixed here.
 #
 # Reads:  VIDEO_ENCODER_FFMPEG, VIDEO_CODEC, HW_ACCEL_QUALITY, VT_QUALITY_MAP,
 #         VT_QUALITY_DEFAULT, PROFILE_NAME, HW_ACCEL_ALLOW_SW, OUTPUT_EXT,
-#         PROFILE_DESC, X264_PARAMS_BASE
-# Writes: VIDEOTOOLBOX_ARGS[]
+#         PROFILE_DESC, X264_PARAMS_BASE, COLOR_ARGS[]
+# Writes: VIDEOTOOLBOX_ARGS[], VIDEOTOOLBOX_BSF_ARGS[]
 build_videotoolbox_params() {
   VIDEOTOOLBOX_ARGS=()
 
@@ -8643,7 +8814,7 @@ build_videotoolbox_params() {
       # target up front with a clean error instead of forwarding an unsupported pix_fmt into a VT
       # encode that would fail cryptically mid-run. (Software libx265 honors 4:2:2/4:4:4; VT does not.)
       if [[ "$TARGET_PIXFMT" == *422* || "$TARGET_PIXFMT" == *444* ]]; then
-        die 11 "hevc_videotoolbox does not support a 4:2:2/4:4:4 pixel format (TARGET_PIXFMT=$TARGET_PIXFMT). Use software encoding (--no-hw-accel) or a 4:2:0 target."
+        die 11 "hevc_videotoolbox does not support a 4:2:2/4:4:4 pixel format (TARGET_PIXFMT=$TARGET_PIXFMT). Use software encoding (--hw-accel none) or a 4:2:0 target."
       fi
       # 10-bit HDR/SDR → Main10, 8-bit SDR → Main.
       if [[ "$TARGET_PIXFMT" == *"10le"* ]]; then   # matches yuv420p10le AND p010le (both contain "10le")
@@ -8665,6 +8836,53 @@ build_videotoolbox_params() {
       fi
       ;;
   esac
+
+  # ---- SPS VUI colour stamp (VIDEOTOOLBOX_BSF_ARGS) ------------------------------------------
+  # ffmpeg's AVCodecContext→encoder colour bridge drops -color_primaries/-color_trc for
+  # VideoToolbox exactly as it does for libx265 (only -colorspace reaches matrix_coefficients),
+  # so an encode whose colour muxm *asserts* rather than inherits lands
+  # colour_primaries=2/transfer_characteristics=2 (Unspecified) in the bitstream no matter what
+  # COLOR_ARGS requested — the same defect, and the same muted/flat Direct-Play picture, that
+  # build_x265_params fixes on the software side by re-stating the values through -x265-params.
+  # VT has no colour options to re-state through (`ffmpeg -h encoder=hevc_videotoolbox` lists
+  # none), so the equivalent lever is the hevc_metadata/h264_metadata bitstream filter, which
+  # rewrites the VUI fields after the encoder has run.
+  #
+  # Measured on ffmpeg 8.1.2 / Apple Silicon, primaries/transfer/matrix in the encoded SPS:
+  #   untagged SDR source  → libx265 1/1/1, hevc_videotoolbox 2/2/1   ← the case this fixes
+  #   tagged HDR10 source  → both 9/16/9 (VT reads colour off the decoded frames)
+  #   HDR→SDR tone-map     → both 1/1/1 (zscale stamps the output frame colour properties)
+  # Stamping unconditionally rather than only for the failing case is deliberate and idempotent:
+  # COLOR_ARGS is by definition the colour the output is meant to declare, so re-writing an
+  # already-correct field writes the same value back.
+  #
+  # Running post-encode also means the stamp survives VideoToolbox's internal software fallback
+  # (-allow_sw 1, muxm's default), which is VT's own encoder, not muxm's libx265 path.
+  #
+  # All-or-nothing, mirroring build_x265_params' gate: if any of the three names has no H.273
+  # code, nothing is stamped and the VUI is left exactly as the encoder wrote it (the pre-fix,
+  # incomplete-but-safe behavior) rather than half-stamped. video_full_range_flag is left alone —
+  # muxm never sets -color_range, and VT already emits 0 (limited), which is what every profile
+  # wants; stamping it would be a behavior change beyond the colour description.
+  VIDEOTOOLBOX_BSF_ARGS=()
+  local _vt_bsf=""
+  case "$VIDEO_ENCODER_FFMPEG" in
+    hevc_videotoolbox) _vt_bsf="hevc_metadata" ;;
+    h264_videotoolbox) _vt_bsf="h264_metadata" ;;
+  esac
+  if [[ -n "$_vt_bsf" ]]; then
+    # COLOR_ARGS is always shaped (-color_primaries VAL -color_trc VAL -colorspace VAL) by every
+    # branch of decide_color_and_pixfmt, so [1]/[3]/[5] are the three values in order.
+    local _cp="${COLOR_ARGS[1]:-}" _ctc="${COLOR_ARGS[3]:-}" _cm="${COLOR_ARGS[5]:-}"
+    local _cpn="" _ctcn="" _cmn=""
+    if _cpn="$(_h273_color_code primaries "$_cp")" \
+       && _ctcn="$(_h273_color_code transfer "$_ctc")" \
+       && _cmn="$(_h273_color_code matrix "$_cm")"; then
+      VIDEOTOOLBOX_BSF_ARGS=( -bsf:v "${_vt_bsf}=colour_primaries=${_cpn}:transfer_characteristics=${_ctcn}:matrix_coefficients=${_cmn}" )
+    else
+      log "[build_videotoolbox_params] SPS VUI colour stamp skipped: '$_cp'/'$_ctc'/'$_cm' has no complete H.273 numeric mapping — leaving the VUI as ${VIDEO_ENCODER_FFMPEG} wrote it."
+    fi
+  fi
 }
 
 # build_video_encoder_params — dispatch parameter assembly based on the
@@ -10283,6 +10501,7 @@ run_video_pipeline() {
         -pix_fmt yuv420p
         "${COLOR_ARGS[@]}"
         "${VIDEOTOOLBOX_ARGS[@]}"
+        ${VIDEOTOOLBOX_BSF_ARGS[@]+"${VIDEOTOOLBOX_BSF_ARGS[@]}"}
       )
       report_add "video_codec" "h264 (hw: videotoolbox)"
       ;;
@@ -10309,6 +10528,10 @@ run_video_pipeline() {
       # extra swscale pass. COLOR_ARGS carries HDR10/HLG metadata; ffmpeg
       # forwards input side data (mastering display, content light level) to
       # the muxer, which writes the correct MP4 atoms / MKV elements.
+      # VIDEOTOOLBOX_BSF_ARGS stamps the SPS VUI colour description after the
+      # encoder runs — COLOR_ARGS alone does not reach it (build_videotoolbox_params).
+      # Guarded expansion: the array is empty (or unset on a software encode)
+      # whenever the colour triple has no complete H.273 mapping.
       local _vt_pixfmt="$TARGET_PIXFMT"
       [[ "$_vt_pixfmt" == "yuv420p10le" ]] && _vt_pixfmt="p010le"
       log "→ Encoding video (${PROFILE_DESC} via VideoToolbox, ${_vt_pixfmt}, q:v ${VIDEOTOOLBOX_ARGS[1]:-?}) → $V_BASE"
@@ -10317,6 +10540,7 @@ run_video_pipeline() {
         -pix_fmt "$_vt_pixfmt"
         "${COLOR_ARGS[@]}"
         "${VIDEOTOOLBOX_ARGS[@]}"
+        ${VIDEOTOOLBOX_BSF_ARGS[@]+"${VIDEOTOOLBOX_BSF_ARGS[@]}"}
       )
       report_add "video_codec" "hevc (hw: videotoolbox)"
       ;;
@@ -13848,7 +14072,7 @@ main() {
 
   # Skip-if-ideal: check early and exit if source is already compliant
   if (( SKIP_IF_IDEAL )); then
-    if check_skip_if_ideal; then
+    if check_skip_if_ideal && _sii_skip_is_dv_safe; then
       # Source is ideal — write report and exit clean.
       # Record the metadata/chapters disposition for --report-json, mirroring mux_final's
       # report_add on the normal path (same "stripped"/"preserved" values and order). The
@@ -13860,21 +14084,11 @@ main() {
       if (( STRIP_METADATA )); then report_add "metadata" "stripped"; else report_add "metadata" "preserved"; fi
       write_json_report
       if (( ! DRY_RUN )); then
-        # Determine if a remux is needed (metadata stamping or stream filtering)
-        local _sii_needs_remux=0
-        (( INCLUDE_AUDIO_TITLES && ${#SII_AUDIO_INDICES[@]} > 0 )) && _sii_needs_remux=1
-        (( PROFILE_COMMENT )) && [[ -n "${PROFILE_NAME:-}" ]] && _sii_needs_remux=1
-        # Stream filtering: if keep-lists exclude any streams, we must remux
-        local _sii_total_a _sii_total_s
-        _sii_total_a="$(_audio_stream_count)"
-        _sii_total_s="$(_sub_count)"
-        (( ${#SII_AUDIO_INDICES[@]} < _sii_total_a )) && _sii_needs_remux=1
-        (( ${#SII_SUB_INDICES[@]} < _sii_total_s )) && _sii_needs_remux=1
-        # --strip-metadata / --no-keep-chapters must reach the output even on the
-        # skip-the-encode path. Force the copy-remux branch (never the raw hardlink, which
-        # would ship the source verbatim) whenever either flag demands a change.
-        (( STRIP_METADATA )) && _sii_needs_remux=1
-        (( ! KEEP_CHAPTERS )) && _sii_needs_remux=1
+        # Already computed by _sii_skip_is_dv_safe in this branch's own condition — it has to
+        # run before write_json_report so the DV guard can decline the skip while the report is
+        # still unwritten. Reuse the results rather than re-probing the stream counts.
+        local _sii_needs_remux="$_SII_NEEDS_REMUX"
+        local _sii_total_a="$_SII_TOTAL_A" _sii_total_s="$_SII_TOTAL_S"
 
         if (( _sii_needs_remux )); then
           # Build explicit per-stream maps from validated keep-lists

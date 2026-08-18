@@ -4261,6 +4261,7 @@ printf "%s|%s" "$VIDEO_ENCODER_FFMPEG" "$HW_ACCEL_FALLBACK_REASON"')"
     _vtp_args="$(bash -c '
 HW_ACCEL_QUALITY=80; HW_ACCEL_ALLOW_SW=1; VT_QUALITY_DEFAULT=65
 VIDEO_ENCODER_FFMPEG=hevc_videotoolbox; TARGET_PIXFMT=yuv420p10le; OUTPUT_EXT=mp4; X264_PARAMS_BASE=""
+log(){ :; }; _h273_color_code(){ return 1; }; COLOR_ARGS=()  # VUI-stamp collaborators; real coverage in _test_unit_vt_vui_color_stamp
 '"$_vtp_body"'
 build_videotoolbox_params
 printf "%s " "${VIDEOTOOLBOX_ARGS[@]}"')"
@@ -4279,6 +4280,7 @@ printf "%s " "${VIDEOTOOLBOX_ARGS[@]}"')"
     _vtp_args8="$(bash -c '
 HW_ACCEL_QUALITY=70; HW_ACCEL_ALLOW_SW=1; VT_QUALITY_DEFAULT=65
 VIDEO_ENCODER_FFMPEG=hevc_videotoolbox; TARGET_PIXFMT=yuv420p; OUTPUT_EXT=mkv; X264_PARAMS_BASE=""
+log(){ :; }; _h273_color_code(){ return 1; }; COLOR_ARGS=()  # VUI-stamp collaborators; real coverage in _test_unit_vt_vui_color_stamp
 '"$_vtp_body"'
 build_videotoolbox_params
 printf "%s " "${VIDEOTOOLBOX_ARGS[@]}"')"
@@ -11235,6 +11237,165 @@ _test_unit_x265_color_name_allowlist() {
   fi
 }
 
+# VideoToolbox exposes no colour options to re-state COLOR_ARGS through (the lever
+# build_x265_params uses on the software side), so build_videotoolbox_params stamps the SPS VUI
+# post-encode with the hevc_metadata/h264_metadata bitstream filter, which takes numeric H.273
+# codes rather than names. _h273_color_code is that name→code map. The stamp is all-or-nothing:
+# a triple containing an unmappable name leaves the VUI exactly as the encoder wrote it rather
+# than half-stamped, mirroring _x265_knows_color_name's gate on the software side.
+_test_unit_vt_vui_color_stamp() {
+  local body
+  body="$(_extract_muxm_fns _h273_color_code)" \
+    || { fail "unit-vt-vui-stamp: could not extract _h273_color_code"; return; }
+
+  # --- name → H.273 code (ISO/IEC 23091-2 tables E-3/E-4/E-5)
+  local -a mapped=(
+    "primaries bt709 1" "primaries bt2020 9" "primaries smpte240m 7" "primaries film 8"
+    "transfer bt709 1" "transfer smpte2084 16" "transfer arib-std-b67 18"
+    "transfer gamma22 4" "transfer gamma28 5" "transfer bt2020-10 14"
+    "matrix bt709 1" "matrix bt2020nc 9" "matrix smpte170m 6" "matrix ictcp 14"
+  )
+  local spec kind val want got rc fail_before=$FAIL
+  for spec in "${mapped[@]}"; do
+    read -r kind val want <<< "$spec"
+    got="$(bash -c "$body"$'\n''_h273_color_code "$1" "$2"' -- "$kind" "$val")" || got="<none>"
+    [[ "$got" == "$want" ]] || fail "unit-vt-vui-stamp: '$kind'/'$val' mapped to '$got', expected '$want'"
+  done
+  (( FAIL == fail_before )) && pass "unit-vt-vui-stamp: _h273_color_code maps every colour name muxm emits to its H.273 code"
+
+  # --- names that must NOT map: 2 (Unspecified) is already what the encoder leaves behind, 0 is
+  # Reserved for primaries/transfer, and an RGB matrix is nonsense on muxm's always-4:2:0 output.
+  fail_before=$FAIL
+  local -a unmapped=(
+    "primaries unknown" "primaries unspecified" "primaries reserved"
+    "transfer unknown" "transfer unspecified"
+    "matrix unknown" "matrix unspecified" "matrix rgb" "matrix gbr"
+  )
+  for spec in "${unmapped[@]}"; do
+    read -r kind val <<< "$spec"
+    rc=0; bash -c "$body"$'\n''_h273_color_code "$1" "$2" >/dev/null' -- "$kind" "$val" || rc=$?
+    (( rc == 0 )) && fail "unit-vt-vui-stamp: '$kind'/'$val' produced a code — it must stay unmappable so the stamp is skipped"
+  done
+  (( FAIL == fail_before )) && pass "unit-vt-vui-stamp: unspecified/unknown/rgb names stay unmapped so the stamp is skipped, not half-written"
+
+  # --- build_videotoolbox_params assembles the right filter per encoder arm
+  local vt_body
+  vt_body="$(_extract_muxm_fns _h273_color_code build_videotoolbox_params)" \
+    || { fail "unit-vt-vui-stamp: could not extract build_videotoolbox_params"; return; }
+  local pre='log(){ :; }; die(){ exit "$1"; }
+declare -A VT_QUALITY_MAP=([hdr10-hq]=70)
+VT_QUALITY_DEFAULT=65; HW_ACCEL_QUALITY=""; HW_ACCEL_ALLOW_SW=1
+PROFILE_NAME=""; PROFILE_DESC="SDR"; OUTPUT_EXT="mkv"; X264_PARAMS_BASE=""'
+
+  # untagged SDR — bt709 asserted by decide_color_and_pixfmt; the case this fixes (shipped 2/2/1)
+  got="$(bash -c "$vt_body"$'\n'"$pre"$'\n''VIDEO_ENCODER_FFMPEG="hevc_videotoolbox"; TARGET_PIXFMT="yuv420p"; COLOR_ARGS=(-color_primaries bt709 -color_trc bt709 -colorspace bt709); build_videotoolbox_params; printf "%s" "${VIDEOTOOLBOX_BSF_ARGS[*]}"')"
+  if [[ "$got" == "-bsf:v hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1" ]]; then
+    pass "unit-vt-vui-stamp: hevc arm stamps an asserted bt709 triple as 1/1/1"
+  else
+    fail "unit-vt-vui-stamp: hevc/bt709 built '$got'"
+  fi
+
+  got="$(bash -c "$vt_body"$'\n'"$pre"$'\n''VIDEO_ENCODER_FFMPEG="hevc_videotoolbox"; TARGET_PIXFMT="p010le"; COLOR_ARGS=(-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc); build_videotoolbox_params; printf "%s" "${VIDEOTOOLBOX_BSF_ARGS[*]}"')"
+  if [[ "$got" == *"colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9"* ]]; then
+    pass "unit-vt-vui-stamp: hevc arm stamps the HDR10 triple as 9/16/9"
+  else
+    fail "unit-vt-vui-stamp: hevc/HDR10 built '$got'"
+  fi
+
+  got="$(bash -c "$vt_body"$'\n'"$pre"$'\n''VIDEO_ENCODER_FFMPEG="hevc_videotoolbox"; TARGET_PIXFMT="yuv420p10le"; COLOR_ARGS=(-color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc); build_videotoolbox_params; printf "%s" "${VIDEOTOOLBOX_BSF_ARGS[*]}"')"
+  if [[ "$got" == *"colour_primaries=9:transfer_characteristics=18:matrix_coefficients=9"* ]]; then
+    pass "unit-vt-vui-stamp: hevc arm stamps the HLG triple as 9/18/9"
+  else
+    fail "unit-vt-vui-stamp: hevc/HLG built '$got'"
+  fi
+
+  got="$(bash -c "$vt_body"$'\n'"$pre"$'\n''VIDEO_ENCODER_FFMPEG="h264_videotoolbox"; TARGET_PIXFMT="yuv420p"; COLOR_ARGS=(-color_primaries bt709 -color_trc bt709 -colorspace bt709); build_videotoolbox_params; printf "%s" "${VIDEOTOOLBOX_BSF_ARGS[*]}"')"
+  if [[ "$got" == *"h264_metadata=colour_primaries=1"* ]]; then
+    pass "unit-vt-vui-stamp: h264 arm selects the h264_metadata filter, not hevc_metadata"
+  else
+    fail "unit-vt-vui-stamp: h264 arm built '$got'"
+  fi
+
+  # unmappable triple → empty array; the guarded expansion at the encode site must survive set -u
+  got="$(bash -c "$vt_body"$'\n'"$pre"$'\n''VIDEO_ENCODER_FFMPEG="hevc_videotoolbox"; TARGET_PIXFMT="yuv420p"; COLOR_ARGS=(-color_primaries bt709 -color_trc bt709 -colorspace rgb); build_videotoolbox_params; set -u; probe=(x ${VIDEOTOOLBOX_BSF_ARGS[@]+"${VIDEOTOOLBOX_BSF_ARGS[@]}"}); printf "%s/%s" "${#VIDEOTOOLBOX_BSF_ARGS[@]}" "${#probe[@]}"')" || got="<abort>"
+  if [[ "$got" == "0/1" ]]; then
+    pass "unit-vt-vui-stamp: an unmappable triple stamps nothing and the guarded expansion survives set -u"
+  else
+    fail "unit-vt-vui-stamp: unmappable-triple case produced '$got' (want '0/1')"
+  fi
+
+  # the encode log prints VIDEOTOOLBOX_ARGS[1] as q:v — the stamp must not sit in that array
+  got="$(bash -c "$vt_body"$'\n'"$pre"$'\n''VIDEO_ENCODER_FFMPEG="hevc_videotoolbox"; TARGET_PIXFMT="yuv420p"; COLOR_ARGS=(-color_primaries bt709 -color_trc bt709 -colorspace bt709); build_videotoolbox_params; printf "%s" "${VIDEOTOOLBOX_ARGS[1]}"')"
+  if [[ "$got" == "65" ]]; then
+    pass "unit-vt-vui-stamp: VIDEOTOOLBOX_ARGS[1] is still the q:v value the encode log line prints"
+  else
+    fail "unit-vt-vui-stamp: VIDEOTOOLBOX_ARGS[1]='$got', expected 65 — the q:v log line would print garbage"
+  fi
+}
+
+# The skip-if-ideal path returns before detect_dv runs, so a DV source taking its copy-remux
+# branch used to lose the dvcC/dvvC box silently (ffmpeg cannot write it on a stream copy into
+# the MP4 family; Matroska carries DV in codec private data and is unaffected). The guard below
+# declines the skip in exactly that case so the normal, DV-aware pipeline runs instead.
+_test_unit_sii_dv_guard() {
+  local body
+  body="$(_extract_muxm_fns _sii_would_lose_dv_signaling)" \
+    || { fail "unit-sii-dv-guard: could not extract _sii_would_lose_dv_signaling"; return; }
+
+  # needs_remux | DISABLE_DV | MUX_FORMAT | source-is-DV | expect-"would lose"
+  local -a cases=(
+    "1 0 mp4       1 yes"
+    "1 0 mov       1 yes"
+    "0 0 mp4       1 no"    # hardlink branch ships the source verbatim
+    "1 1 mp4       1 no"    # --no-dv: user opted out
+    "1 0 matroska  1 no"    # MKV survives -c copy intact
+    "1 0 mp4       0 no"    # not a DV source
+  )
+  local spec nr dis fmt isdv want rc fail_before=$FAIL
+  for spec in "${cases[@]}"; do
+    read -r nr dis fmt isdv want <<< "$spec"
+    rc=0
+    bash -c "$body"$'\n'"_source_has_dv_metadata(){ return \$(( 1 - $isdv )); }
+DISABLE_DV=$dis; MUX_FORMAT=$fmt
+_sii_would_lose_dv_signaling $nr" || rc=$?
+    if [[ "$want" == "yes" ]]; then
+      (( rc == 0 )) || fail "unit-sii-dv-guard: needs_remux=$nr no_dv=$dis fmt=$fmt dv=$isdv — expected 'would lose DV', got rc=$rc"
+    else
+      (( rc != 0 )) || fail "unit-sii-dv-guard: needs_remux=$nr no_dv=$dis fmt=$fmt dv=$isdv — expected 'safe', but the guard fired"
+    fi
+  done
+  (( FAIL == fail_before )) && pass "unit-sii-dv-guard: _sii_would_lose_dv_signaling fires only for DV + copy-remux + MP4-family + DV enabled"
+
+  # _sii_compute_needs_remux: each trigger, and a clean no-remux case. Must also return exit 0
+  # even when the answer is 0 — the (( )) && idiom would otherwise leak a false exit status
+  # into the `check_skip_if_ideal && _sii_skip_is_dv_safe` condition and silently kill the skip.
+  local cbody
+  cbody="$(_extract_muxm_fns _sii_compute_needs_remux)" \
+    || { fail "unit-sii-dv-guard: could not extract _sii_compute_needs_remux"; return; }
+  local base='_audio_stream_count(){ echo 2; }; _sub_count(){ echo 1; }
+SII_AUDIO_INDICES=(0 1); SII_SUB_INDICES=(0)
+INCLUDE_AUDIO_TITLES=0; PROFILE_COMMENT=0; PROFILE_NAME=""; STRIP_METADATA=0; KEEP_CHAPTERS=1'
+  local got
+  fail_before=$FAIL
+  got="$(bash -c "$cbody"$'\n'"$base"$'\n''_sii_compute_needs_remux; printf "%s/%s" "$_SII_NEEDS_REMUX" "$?"')"
+  [[ "$got" == "0/0" ]] || fail "unit-sii-dv-guard: clean case gave '$got', want '0/0' (value 0 AND exit 0)"
+
+  local -a triggers=(
+    "INCLUDE_AUDIO_TITLES=1"
+    "PROFILE_COMMENT=1; PROFILE_NAME=atv-directplay-hq"
+    "STRIP_METADATA=1"
+    "KEEP_CHAPTERS=0"
+    "SII_AUDIO_INDICES=(0)"          # keep-list shorter than the 2 available → filtering
+    "SII_SUB_INDICES=()"             # subtitle dropped → filtering
+  )
+  local t
+  for t in "${triggers[@]}"; do
+    got="$(bash -c "$cbody"$'\n'"$base"$'\n'"$t"$'\n''_sii_compute_needs_remux; printf "%s" "$_SII_NEEDS_REMUX"')"
+    [[ "$got" == "1" ]] || fail "unit-sii-dv-guard: trigger '$t' gave _SII_NEEDS_REMUX='$got', want 1"
+  done
+  (( FAIL == fail_before )) && pass "unit-sii-dv-guard: _sii_compute_needs_remux flags every remux trigger and returns exit 0 on the no-remux case"
+}
+
 _test_unit_fps_helpers() {
   # ---- _fps_to_decimal ----
   # Converts a frame rate (exact rational "num/den" or a plain decimal) to a
@@ -12097,7 +12258,11 @@ _test_unit_probe_stream_field_nits() {
 
   # ---- build_videotoolbox_params: reject 4:2:2/4:4:4 for hevc_videotoolbox ----
   # shellcheck disable=SC2016  # literal env-setup string for assert_muxm_fn_exit — must not expand now
-  local _vtenv='die(){ exit "${1:-1}"; }; HW_ACCEL_QUALITY=80; HW_ACCEL_ALLOW_SW=1; VT_QUALITY_DEFAULT=65; X264_PARAMS_BASE=""; VIDEO_ENCODER_FFMPEG=hevc_videotoolbox; OUTPUT_EXT=mkv'
+  # build_videotoolbox_params also calls log() and _h273_color_code() for the SPS VUI colour
+  # stamp; this harness runs the function alone, so both are stubbed here exactly as die() is.
+  # _h273_color_code returns "no mapping" so the stamp is deterministically skipped — the real
+  # mapping is covered by _test_unit_vt_vui_color_stamp.
+  local _vtenv='die(){ exit "${1:-1}"; }; log(){ :; }; _h273_color_code(){ return 1; }; COLOR_ARGS=(); HW_ACCEL_QUALITY=80; HW_ACCEL_ALLOW_SW=1; VT_QUALITY_DEFAULT=65; X264_PARAMS_BASE=""; VIDEO_ENCODER_FFMPEG=hevc_videotoolbox; OUTPUT_EXT=mkv'
   assert_muxm_fn_exit "unit-probe-stream-field-nits VT: hevc_videotoolbox rejects a 4:4:4 target (clean die)" 1 \
     build_videotoolbox_params "${_vtenv}; TARGET_PIXFMT=yuv444p10le"
   assert_muxm_fn_exit "unit-probe-stream-field-nits VT: hevc_videotoolbox rejects a 4:2:2 target (clean die)" 1 \
@@ -12671,6 +12836,8 @@ test_unit() {
   _test_unit_av1_helpers
   _test_unit_x265_strip_hdr_keys
   _test_unit_x265_color_name_allowlist
+  _test_unit_vt_vui_color_stamp
+  _test_unit_sii_dv_guard
   _test_unit_fps_helpers
   _test_unit_extract_helper
   _test_unit_score_audio_stream
