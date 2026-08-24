@@ -11282,6 +11282,8 @@ _test_unit_vt_vui_color_stamp() {
   local vt_body
   vt_body="$(_extract_muxm_fns _h273_color_code build_videotoolbox_params)" \
     || { fail "unit-vt-vui-stamp: could not extract build_videotoolbox_params"; return; }
+  # shellcheck disable=SC2016  # literal preamble for the bash -c harnesses below — "$1" must
+  # reach the inner shell as die()'s positional parameter, not expand in this one
   local pre='log(){ :; }; die(){ exit "$1"; }
 declare -A VT_QUALITY_MAP=([hdr10-hq]=70)
 VT_QUALITY_DEFAULT=65; HW_ACCEL_QUALITY=""; HW_ACCEL_ALLOW_SW=1
