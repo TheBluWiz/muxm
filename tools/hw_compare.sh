@@ -368,6 +368,54 @@ printf '%s\n' $VALID_ENCODERS | grep -qxF "$ENCODER" \
 printf '%s\n' $VALID_PROFILES | grep -qxF "$PROFILE" \
   || die 11 "Invalid --profile '${PROFILE}'.  Valid: ${VALID_PROFILES// /, }"
 
+# ---- A-1: guard the hand-maintained profile subset against muxm's canonical list ----
+# VALID_PROFILES above is a deliberate SUBSET of muxm's ten, not an oversight: it is exactly
+# the set muxm carries a calibrated hardware quality for (VT_QUALITY_MAP), which is also what
+# calibration/run_sweeps.sh sweeps. `archive`, `av1-hq` and `streaming-av1` are excluded on
+# purpose — none has a VideoToolbox arm. What a hand-maintained subset cannot survive on its
+# own is a RENAME or removal upstream: the list would silently go stale, the same drift class
+# tests/test_docker_parity.sh closes for docker/. So cross-check it against a real muxm.
+#   Resolution order: $MUXM, the sibling checkout (tools/ lives beside muxm), then $PATH.
+# Graded severity, because this is a calibration tool and not the encoder:
+#   * no muxm readable        → note and skip (an installed-elsewhere copy is legitimate)
+#   * stale entry in the list → warn (maintainer signal; this run still proceeds)
+#   * the SELECTED profile is stale → die (the sweep would calibrate something muxm cannot use)
+_canonical_muxm_profiles() {
+  local candidate list
+  for candidate in "${MUXM:-}" "$(dirname "${BASH_SOURCE[0]}")/../muxm" "$(command -v muxm 2>/dev/null || true)"; do
+    [[ -n "$candidate" && -r "$candidate" ]] || continue
+    # Byte-identical extraction to tests/test_docker_parity.sh and test_muxm.sh (review L-20):
+    # an EOL-anchored sed returns EMPTY on a trailing space/comment, which would make two
+    # guards disagree about the canonical list. Keep all three in sync.
+    list="$(grep '^readonly VALID_PROFILES=' "$candidate" \
+            | sed 's/^readonly VALID_PROFILES="//;s/"$//' | head -1 || true)"
+    [[ -n "$list" ]] || continue
+    printf '%s\n' "$list"
+    return 0
+  done
+  return 1
+}
+
+_MUXM_PROFILES="$(_canonical_muxm_profiles || true)"
+if [[ -z "$_MUXM_PROFILES" ]]; then
+  note "muxm's canonical VALID_PROFILES could not be read — profile-list drift check skipped."
+  note "  Set MUXM=/path/to/muxm to enable it."
+else
+  _STALE_PROFILES=""
+  for _hp in $VALID_PROFILES; do
+    printf '%s\n' $_MUXM_PROFILES | grep -qxF "$_hp" || _STALE_PROFILES="${_STALE_PROFILES} ${_hp}"
+  done
+  if [[ -n "$_STALE_PROFILES" ]]; then
+    warn "hw_compare's profile list has drifted from muxm — unknown to muxm:${_STALE_PROFILES}"
+    warn "  Update VALID_PROFILES in this script.  muxm has: ${_MUXM_PROFILES// /, }"
+    if printf '%s\n' $_STALE_PROFILES | grep -qxF "$PROFILE"; then
+      die 11 "--profile '${PROFILE}' no longer exists in muxm — calibrating it would produce a table muxm can never apply."
+    fi
+  fi
+  unset _STALE_PROFILES _hp
+fi
+unset _MUXM_PROFILES
+
 [[ "$QUALITY_START" =~ ^[0-9]+$ ]] || die 11 "--quality-range START must be a non-negative integer"
 [[ "$QUALITY_END"   =~ ^[0-9]+$ ]] || die 11 "--quality-range END must be a non-negative integer"
 [[ "$QUALITY_STEP"  =~ ^[0-9]+$ && "$QUALITY_STEP" -gt 0 ]] \

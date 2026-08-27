@@ -12891,6 +12891,120 @@ test_unit() {
   _test_unit_loglevel_str
   _test_unit_disk_df_unavailable
   _test_unit_prepare_subtitle_workdir_gone
+  _test_unit_hdr10_static_carry
+}
+
+# _hdr10_static_carry's gate matrix (review N-1). The end-to-end proof lives in dv_vt, which
+# needs macOS + VideoToolbox + dovi_tool + MP4Box; this pins the decision logic on any host, and
+# in particular pins the two NEGATIVE guarantees the e2e cannot cheaply demonstrate:
+#   * an SDR / tone-mapped output is never stamped with the source's HDR mastering volume;
+#   * an intermediate that ALREADY carries the metadata (the libx265 raw ES, and every container
+#     intermediate) is left completely alone — the software path is untouched by this feature.
+# Both probes and the ffmpeg capability check are stubbed, so no media and no ffmpeg run.
+_test_unit_hdr10_static_carry() {
+  local body
+  body="$(_extract_muxm_fns _hdr10_static_carry _split_tab)" \
+    || { fail "hdr10-static-carry: could not extract _hdr10_static_carry"; return; }
+
+  local MD='G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)'
+  local CLL='1000,400'
+
+  # $1 PROFILE_DESC | $2 what the VIDEO INPUT carries | $3 what the SOURCE carries | $4 ffmpeg
+  # supports the options (1/0). The two probe records are "<mastering>\t<max-cll>", an empty
+  # field meaning "absent" — exactly _hdr10_static_probe's contract.
+  local _h10
+  _h10() {
+    P_DESC="$1" VID_PROBE="$2" SRC_PROBE="$3" OPTS_OK="$4" bash -c "$body"$'\n''
+      set -u
+      PROFILE_DESC="$P_DESC"; SRC_ABS=/src; VIDEO_ENCODER_FFMPEG=hevc_videotoolbox
+      _hdr10_static_probe() {
+        if [[ "$1" == /src ]]; then printf "%s" "$SRC_PROBE"; else printf "%s" "$VID_PROBE"; fi
+      }
+      _ffmpeg_hdr10_static_opts_ok() { [[ "$OPTS_OK" == 1 ]]; }
+      note() { :; }; log() { :; }; warn() { :; }; report_add() { :; }
+      _hdr10_static_carry /work/video_mixed.hevc
+      printf "%s\n" "${HDR10_STATIC_ARGS[*]}"
+    '
+  }
+
+  local got want
+  local both="${MD}"$'\t'"${CLL}" none=$'\t'
+  local md_only="${MD}"$'\t' cll_only=$'\t'"${CLL}"
+
+  # 1. The defect itself: HDR10 output, VT raw ES carries nothing, source carries both.
+  want="-mastering_display:v ${MD} -content_light:v ${CLL}"
+  got="$(_h10 HDR10 "$none" "$both" 1)"
+  if [[ "$got" == "$want" ]]; then
+    pass "hdr10-static-carry: HDR10 + stripped intermediate + full source → both fields re-attached"
+  else
+    fail "hdr10-static-carry: expected '$want', got '$got'"
+  fi
+
+  # 2. The software-path no-op: the intermediate already carries both (libx265 SEI, or any
+  #    container intermediate) → nothing is added, nothing is overwritten.
+  got="$(_h10 HDR10 "$both" "$both" 1)"
+  if [[ -z "$got" ]]; then
+    pass "hdr10-static-carry: intermediate already carries both → no-op (software/container path untouched)"
+  else
+    fail "hdr10-static-carry: expected a no-op on an already-complete intermediate, got '$got'"
+  fi
+
+  # 3/4. SDR and tone-mapped outputs must never inherit the source's HDR mastering volume.
+  got="$(_h10 SDR "$none" "$both" 1)"
+  if [[ -z "$got" ]]; then
+    pass "hdr10-static-carry: SDR output → no HDR static metadata stamped"
+  else
+    fail "hdr10-static-carry: SDR output wrongly stamped with '$got'"
+  fi
+  got="$(_h10 SDR-TONEMAP "$none" "$both" 1)"
+  if [[ -z "$got" ]]; then
+    pass "hdr10-static-carry: HDR→SDR tone-mapped output → no HDR static metadata stamped"
+  else
+    fail "hdr10-static-carry: tone-mapped output wrongly stamped with '$got'"
+  fi
+
+  # 5. HLG is carried deliberately (DV Profile 8.4 loses the metadata the same way, and only
+  #    values the SOURCE actually had are ever written).
+  want="-mastering_display:v ${MD} -content_light:v ${CLL}"
+  got="$(_h10 HLG "$none" "$both" 1)"
+  if [[ "$got" == "$want" ]]; then
+    pass "hdr10-static-carry: HLG output also carries the source's static metadata forward"
+  else
+    fail "hdr10-static-carry: HLG expected '$want', got '$got'"
+  fi
+
+  # 6. Nothing in the source → nothing invented.
+  got="$(_h10 HDR10 "$none" "$none" 1)"
+  if [[ -z "$got" ]]; then
+    pass "hdr10-static-carry: source carries no static metadata → nothing invented"
+  else
+    fail "hdr10-static-carry: fabricated '$got' from a source with no static metadata"
+  fi
+
+  # 7/8. The two fields are independent — carry only what is actually missing / available.
+  want="-content_light:v ${CLL}"
+  got="$(_h10 HDR10 "$md_only" "$both" 1)"
+  if [[ "$got" == "$want" ]]; then
+    pass "hdr10-static-carry: intermediate has mastering-display only → just MaxCLL is re-attached"
+  else
+    fail "hdr10-static-carry: expected '$want', got '$got'"
+  fi
+  want="-content_light:v ${CLL}"
+  got="$(_h10 HDR10 "$none" "$cll_only" 1)"
+  if [[ "$got" == "$want" ]]; then
+    pass "hdr10-static-carry: source has MaxCLL only → only MaxCLL is re-attached"
+  else
+    fail "hdr10-static-carry: expected '$want', got '$got'"
+  fi
+
+  # 9. An ffmpeg without -mastering_display/-content_light degrades to today's behaviour
+  #    (warn + report, no args) rather than emitting an option it cannot parse.
+  got="$(_h10 HDR10 "$none" "$both" 0)"
+  if [[ -z "$got" ]]; then
+    pass "hdr10-static-carry: ffmpeg without the options → graceful degrade, no args emitted"
+  else
+    fail "hdr10-static-carry: emitted '$got' on an ffmpeg that cannot parse the options"
+  fi
 }
 
 # build_subtitle_plan's _sub_plan_add_embed routing — the single-track desync
@@ -16969,6 +17083,183 @@ test_dv_vt() {
   else
     skip "dv_vt: could not count frames (source='$src_frames', output='$out_frames')"
   fi
+
+  # --- Assertion 3 (review N-1): HDR10 static metadata survives the VT + DV raw-ES path ---
+  _test_dv_vt_hdr10_static "$mp4box_cmd"
+}
+
+# N-1 end-to-end: hevc_videotoolbox writes no HDR10 static-metadata SEI (payload 137
+# mastering-display / 144 content-light), and the Dolby Vision path muxes a raw elementary
+# stream, so there is no container carrying it either — a VT-encoded DV output used to land with
+# a valid RPU and dvcC but NO mastering-display or MaxCLL at all. A player dropping out of DV to
+# the HDR10 base layer then tone-mapped against defaults. muxm now re-attaches the source's own
+# values at the final mux (_hdr10_static_carry).
+#
+# The bundled fixture cannot prove this on its own: it is DV Profile 8.4 (HLG) and carries NO
+# static metadata, so there would be nothing to lose. A source that carries BOTH is authored here
+# from the fixture's real RPU plus a libx265 PQ base stamped with master-display/max-cll — the
+# same construction the finding was reproduced with, a few seconds of ultrafast encode. It is
+# built rather than committed so the repo gains no second multi-megabyte binary fixture.
+#
+# Runs only after test_dv_vt's own gates (macOS, hevc_videotoolbox, dovi_tool, MP4Box, a DV
+# fixture) have already passed; libx265 is the one extra requirement. Every authoring step that
+# fails SKIPs — a broken gpac/dovi_tool install (which has happened here before) must not be
+# reported as a muxm regression. Once the fixture exists and carries what it should, every
+# assertion below is a hard pass/fail.
+_test_dv_vt_hdr10_static() {
+  local mp4box_cmd="$1"
+
+  if ! ffmpeg_has_encoder libx265; then
+    skip "dv_vt N-1: ffmpeg lacks libx265 (needed to author a DV + HDR10-static-metadata source)"
+    return 0
+  fi
+
+  local work="$TESTDIR/n1"
+  mkdir -p "$work" || { skip "dv_vt N-1: could not create $work"; return 0; }
+  local src_es="$work/src_dv.hevc" rpu="$work/rpu.bin"
+  local base="$work/base.hevc" dv_es="$work/dv.hevc" fixture="$work/dv_hdr10.mp4"
+
+  # dovi_tool inject-rpu requires the RPU and the base ES to have the SAME frame count, so the
+  # base is authored at the fixture's own frame count, fps and resolution.
+  local frames fps geom width height
+  frames="$(ffprobe -v error -select_streams v:0 -count_frames \
+    -show_entries stream=nb_read_frames -of csv=p=0 "$MUXM_DV_FIXTURE" 2>/dev/null | head -1)"
+  frames="${frames//[^0-9]/}"
+  fps="$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate \
+    -of csv=p=0 "$MUXM_DV_FIXTURE" 2>/dev/null | head -1)"
+  fps="${fps%%,*}"
+  geom="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+    -of csv=p=0 "$MUXM_DV_FIXTURE" 2>/dev/null | head -1)"
+  # ffprobe's csv writer appends a trailing separator on some builds ("1920,1080,"), so take
+  # the first two fields positionally rather than with a greedy suffix strip.
+  width="$(printf '%s' "$geom" | cut -d, -f1)";  width="${width//[^0-9]/}"
+  height="$(printf '%s' "$geom" | cut -d, -f2)"; height="${height//[^0-9]/}"
+  if [[ ! "$frames" =~ ^[0-9]+$ ]] || (( frames == 0 )) \
+     || [[ -z "$fps" || ! "$width" =~ ^[0-9]+$ || ! "$height" =~ ^[0-9]+$ ]]; then
+    skip "dv_vt N-1: could not read frames/fps/geometry from the DV fixture (frames='$frames' fps='$fps' geom='$geom')"
+    return 0
+  fi
+
+  # The exact HDR10 static values stamped into the authored source; the output must carry these
+  # back, unchanged. Chromaticity in 1/50000 units, luminance in 1/10000 cd/m² — DCI-P3-ish
+  # primaries, D65 white point, 1000 nits peak, MaxCLL 1000 / MaxFALL 400.
+  local md='G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)'
+  local cll='1000,400'
+
+  if ! ffmpeg -hide_banner -loglevel error -y -i "$MUXM_DV_FIXTURE" -map 0:v:0 -c:v copy \
+        -bsf:v hevc_mp4toannexb -f hevc "$src_es" >/dev/null 2>&1 \
+     || ! dovi_tool extract-rpu "$src_es" -o "$rpu" >/dev/null 2>&1 \
+     || [[ ! -s "$rpu" ]]; then
+    skip "dv_vt N-1: could not extract an RPU from the DV fixture (dovi_tool/ffmpeg toolchain)"
+    return 0
+  fi
+
+  if ! ffmpeg -hide_banner -loglevel error -y -f lavfi \
+        -i "testsrc2=size=${width}x${height}:rate=${fps}" -frames:v "$frames" \
+        -c:v libx265 -pix_fmt yuv420p10le -crf 30 -preset ultrafast \
+        -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
+        -x265-params "master-display=${md}:max-cll=${cll}" \
+        -an -sn -dn -f hevc "$base" >/dev/null 2>&1; then
+    skip "dv_vt N-1: could not encode the HDR10 base layer (libx265 master-display/max-cll)"
+    return 0
+  fi
+
+  if ! dovi_tool inject-rpu -i "$base" --rpu-in "$rpu" -o "$dv_es" >/dev/null 2>&1 \
+     || [[ ! -s "$dv_es" ]]; then
+    skip "dv_vt N-1: dovi_tool inject-rpu failed on the authored base layer"
+    return 0
+  fi
+
+  rm -f "$fixture"
+  if ! "$mp4box_cmd" -add "${dv_es}:dvp=8.1:fps=${fps}" -new "$fixture" >/dev/null 2>&1 \
+     || [[ ! -s "$fixture" ]]; then
+    skip "dv_vt N-1: $mp4box_cmd could not wrap the DV elementary stream"
+    return 0
+  fi
+
+  # The authored source must itself carry DV + both static-metadata kinds, or the test below is
+  # vacuous. A miss here is a broken authoring toolchain, not a muxm defect — skip, don't fail.
+  local fx_sd
+  fx_sd="$(_dv_side_data_types "$fixture")"
+  if ! printf '%s\n' "$fx_sd" | grep -qi 'mastering display' \
+     || ! printf '%s\n' "$fx_sd" | grep -qi 'content light' \
+     || ! printf '%s\n' "$fx_sd" | grep -qi 'dolby vision'; then
+    skip "dv_vt N-1: authored fixture lacks DV and/or HDR10 static metadata (toolchain) — got: $(printf '%s' "$fx_sd" | tr '\n' '/')"
+    return 0
+  fi
+  pass "dv_vt N-1: authored a DV Profile 8 source carrying mastering-display + MaxCLL"
+
+  # --- The regression itself ---
+  # archive preserves DV (so the raw-ES path is taken) and --no-video-copy-if-compliant forces a
+  # real VideoToolbox re-encode rather than a stream copy of the source.
+  local out="$TESTDIR/dv_vt_n1_out.mp4" run_log
+  rm -f "$out"
+  run_log="$(run_muxm --profile archive --hw-accel videotoolbox \
+    --no-video-copy-if-compliant --output-ext mp4 "$fixture" "$out")"
+  if [[ ! -s "$out" ]]; then
+    fail "dv_vt N-1: VT encode of the DV+HDR10 source produced no output"
+    (( VERBOSE )) && printf '%s\n' "${run_log: -1500}"
+    return 0
+  fi
+
+  local out_sd
+  out_sd="$(_dv_side_data_types "$out")"
+
+  if printf '%s\n' "$out_sd" | grep -qi 'mastering display'; then
+    pass "dv_vt N-1: VT-encoded DV output carries mastering-display metadata"
+  else
+    fail "dv_vt N-1: VT-encoded DV output lost the source's mastering-display metadata (N-1 regression)"
+  fi
+  if printf '%s\n' "$out_sd" | grep -qi 'content light'; then
+    pass "dv_vt N-1: VT-encoded DV output carries MaxCLL/MaxFALL"
+  else
+    fail "dv_vt N-1: VT-encoded DV output lost the source's MaxCLL/MaxFALL (N-1 regression)"
+  fi
+  # The fix must not have cost the thing that already worked.
+  if printf '%s\n' "$out_sd" | grep -qi 'dolby vision'; then
+    pass "dv_vt N-1: Dolby Vision RPU still present alongside the restored static metadata"
+  else
+    fail "dv_vt N-1: Dolby Vision RPU disappeared from the output"
+  fi
+
+  # Values, not just presence: a carried-forward metadata block that says something *else* than
+  # the source is worse than none. Compares the full mastering + content-light records.
+  local fx_vals out_vals
+  fx_vals="$(_dv_static_values "$fixture")"
+  out_vals="$(_dv_static_values "$out")"
+  if [[ -n "$fx_vals" && "$fx_vals" == "$out_vals" ]]; then
+    pass "dv_vt N-1: restored HDR10 static values are identical to the source's"
+  else
+    fail "dv_vt N-1: HDR10 static values differ — source='$fx_vals' output='$out_vals'"
+  fi
+
+  # And it must have happened through the carry-forward, not by accident.
+  if printf '%s' "$run_log" | grep -qF "Re-attaching the source's HDR10 static metadata"; then
+    pass "dv_vt N-1: muxm reported re-attaching the source's HDR10 static metadata"
+  else
+    fail "dv_vt N-1: expected the HDR10 static-metadata carry-forward note in muxm's output"
+  fi
+}
+
+# Side-data TYPE names on a file's first video frame, one per line (both frame- and
+# stream-level: MP4Box writes mdcv/clli as stream-level boxes, an ffmpeg-muxed file surfaces
+# them per frame, and ffmpeg 9 no longer reports either from -show_streams for some inputs).
+_dv_side_data_types() {
+  {
+    ffprobe -v error -show_frames -read_intervals %+#1 -select_streams v:0 -of json "$1" 2>/dev/null \
+      | jq -r '.frames[0].side_data_list[]?.side_data_type // empty' 2>/dev/null || true
+    ffprobe -v error -show_streams -select_streams v:0 -of json "$1" 2>/dev/null \
+      | jq -r '.streams[0].side_data_list[]?.side_data_type // empty' 2>/dev/null || true
+  } | sort -u
+}
+
+# The mastering-display and content-light RECORDS (all numeric fields), normalised and sorted,
+# for an exact source-vs-output comparison.
+_dv_static_values() {
+  ffprobe -v error -show_frames -read_intervals %+#1 -select_streams v:0 -of json "$1" 2>/dev/null \
+    | jq -Sc '[ .frames[0].side_data_list[]?
+                | select((.side_data_type // "") | test("mastering.display|content.light"; "i")) ]
+              | sort_by(.side_data_type)' 2>/dev/null || true
 }
 
 # === Suite: Software Dolby Vision round-trip (portable; no VideoToolbox) ===
@@ -17496,42 +17787,131 @@ _test_meta_soft_skip() {
 # Delegates to the standalone scripts so the logic lives in one place; here we
 # just translate their exit codes into the harness pass/fail counters.
 # Needs no media fixtures (see MEDIA_FREE_SUITES).
+# _test_tools_profile_drift — A-1: tools/hw_compare.sh hardcodes its own
+# `readonly VALID_PROFILES="…"`, a hand-maintained SUBSET of muxm's canonical ten. Nothing
+# used to check it, so a rename or removal in muxm left it silently stale — the same drift
+# class test_docker_parity.sh closes for docker/. hw_compare now self-checks at runtime when
+# it can find a muxm; this is the static half, which runs even when it cannot.
+#
+# Two assertions, because the subset is intentional and its *intent* is what can rot:
+#   1. subset ⊆ VALID_PROFILES — no entry naming a profile muxm no longer has.
+#   2. subset == VT_QUALITY_MAP's key set — the subset IS "profiles muxm carries a calibrated
+#      VideoToolbox quality for" (also exactly what calibration/run_sweeps.sh sweeps). Adding a
+#      VT calibration without extending hw_compare, or vice versa, is drift in either direction.
+#      A future nvenc-only profile is a deliberate decision that should fail here first.
+# Fails (never skips) on a missing anchor: all three files are committed, so absence is drift.
+_test_tools_profile_drift() {
+  local repo_root hw_script
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  hw_script="$repo_root/tools/hw_compare.sh"
+
+  if [[ ! -r "$hw_script" ]]; then
+    fail "tools/hw_compare.sh not found/readable at $hw_script — profile-subset drift guard could not run"
+    return
+  fi
+
+  # Same extraction on both sides (review L-20) so the two lists can never be read differently.
+  # `|| true`: a no-match grep exits 1, which under set -e + pipefail would abort the suite
+  # before the empty-result diagnostics below can fire.
+  local canonical hw_list
+  canonical="$(grep '^readonly VALID_PROFILES=' "$MUXM" | sed 's/^readonly VALID_PROFILES="//;s/"$//' || true)"
+  hw_list="$(grep '^readonly VALID_PROFILES=' "$hw_script" | sed 's/^readonly VALID_PROFILES="//;s/"$//' || true)"
+  if [[ -z "$canonical" ]]; then
+    fail "VALID_PROFILES constant not found in script — tools/ profile-subset guard could not run (drift?)"
+    return
+  fi
+  if [[ -z "$hw_list" ]]; then
+    fail "tools/hw_compare.sh has no 'readonly VALID_PROFILES=' line — was it renamed? profile-subset guard could not run"
+    return
+  fi
+
+  # ---- 1. hw_compare's list ⊆ muxm's canonical list ----
+  # Membership by padded substring, as tests/test_docker_parity.sh does it: no subshell per
+  # profile, and no unquoted expansion (this file is shellcheck-clean — keep it that way).
+  local p stale=""
+  for p in $hw_list; do
+    case " $canonical " in *" $p "*) ;; *) stale="$stale $p" ;; esac
+  done
+  if [[ -n "$stale" ]]; then
+    fail "tools/hw_compare.sh lists profile(s) muxm does not have:$stale — update its VALID_PROFILES"
+  else
+    pass "tools/hw_compare.sh profile subset is contained in muxm's VALID_PROFILES"
+  fi
+
+  # ---- 2. hw_compare's list == VT_QUALITY_MAP's key set ----
+  # Function-free extraction: the keys of the `declare -A VT_QUALITY_MAP=( [name]=NN … )` block.
+  local vt_keys
+  vt_keys="$(awk '/^declare -A VT_QUALITY_MAP=\(/{f=1;next} f&&/^\)/{f=0} f{ if (match($0, /\[[a-z0-9-]+\]/)) print substr($0, RSTART+1, RLENGTH-2) }' "$MUXM" || true)"
+  if [[ -z "$vt_keys" ]]; then
+    fail "VT_QUALITY_MAP block not found in script — hw_compare/VT-calibration parity could not be checked (drift?)"
+    return
+  fi
+  # Order-insensitive set comparison. tr does the splitting so the expansions stay quoted
+  # (this file is shellcheck-clean); hw_list is space-delimited and vt_keys newline-delimited,
+  # so both collapse through one whitespace class.
+  local hw_sorted vt_sorted hw_count
+  hw_sorted="$(printf '%s' "$hw_list" | tr -s '[:space:]' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+  vt_sorted="$(printf '%s' "$vt_keys" | tr -s '[:space:]' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+  hw_count="$(printf '%s' "$hw_sorted" | wc -w | tr -d '[:space:]')"
+  if [[ "$hw_sorted" == "$vt_sorted" ]]; then
+    pass "tools/hw_compare.sh profile subset matches VT_QUALITY_MAP exactly ($hw_count profiles)"
+  else
+    fail "tools/hw_compare.sh profile subset drifted from VT_QUALITY_MAP — hw_compare={$hw_sorted} VT_QUALITY_MAP={$vt_sorted}"
+  fi
+
+  # ---- 3. the runtime half of the guard is still wired in ----
+  # A static test that silently outlives the runtime check it documents is worse than neither.
+  if grep -q '^_canonical_muxm_profiles()' "$hw_script"; then
+    pass "tools/hw_compare.sh still carries its runtime muxm-profile drift self-check"
+  else
+    fail "tools/hw_compare.sh lost _canonical_muxm_profiles() — the runtime profile drift self-check (A-1) is gone"
+  fi
+}
+
+# _run_parity_script SCRIPT LABEL PASS_MSG FAIL_MSG — delegate one generated-artifact
+# check to its standalone script and translate the exit code into the harness counters.
+# L-9: test_docs_parity() held three byte-for-byte copies of the same
+# not-executable→fail / run→pass / else→fail wiring; a third clone was one too many.
+# The scripts print their own ✅/❌ detail (and the diff on failure), so nothing is
+# captured or re-printed here — only the verdict is recorded.
+#   LABEL is the "<area> parity:" prefix used in the not-executable message; the script's
+#   basename is derived from SCRIPT so the two can never disagree.
+# Always returns 0: under `set -e` the caller must not abort just because a check failed
+# (fail() already recorded it, and the remaining checks still have to run).
+_run_parity_script() {
+  local script="$1" label="$2" pass_msg="$3" fail_msg="$4"
+  if [[ ! -x "$script" ]]; then
+    fail "${label}: tests/$(basename "$script") not found or not executable ($script)"
+  elif "$script"; then
+    pass "$pass_msg"
+  else
+    fail "$fail_msg"
+  fi
+  return 0
+}
+
 test_docs_parity() {
   section "Suite: docs (generated-artifact parity)"
   local tests_dir
   tests_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-  # The standalone scripts print their own ✅/❌ detail (and the diff on failure).
-  local man_script="${tests_dir}/test_docs_parity.sh"
-  if [[ ! -x "$man_script" ]]; then
-    fail "docs parity: tests/test_docs_parity.sh not found or not executable ($man_script)"
-  elif "$man_script"; then
-    pass "docs/muxm.1 in sync with muxm embedded man page"
-  else
-    fail "docs/muxm.1 OUT OF SYNC with muxm heredoc — run tools/gen-docs.sh and commit"
-  fi
+  _run_parity_script "${tests_dir}/test_docs_parity.sh" "docs parity" \
+    "docs/muxm.1 in sync with muxm embedded man page" \
+    "docs/muxm.1 OUT OF SYNC with muxm heredoc — run tools/gen-docs.sh and commit"
 
-  local comp_script="${tests_dir}/test_completions_parity.sh"
-  if [[ ! -x "$comp_script" ]]; then
-    fail "completions parity: tests/test_completions_parity.sh not found or not executable ($comp_script)"
-  elif "$comp_script"; then
-    pass "completions/muxm-completion.bash in sync with muxm embedded completion"
-  else
-    fail "completions/muxm-completion.bash OUT OF SYNC with muxm heredoc — run tools/gen-docs.sh and commit"
-  fi
+  _run_parity_script "${tests_dir}/test_completions_parity.sh" "completions parity" \
+    "completions/muxm-completion.bash in sync with muxm embedded completion" \
+    "completions/muxm-completion.bash OUT OF SYNC with muxm heredoc — run tools/gen-docs.sh and commit"
 
-  local docker_script="${tests_dir}/test_docker_parity.sh"
-  if [[ ! -x "$docker_script" ]]; then
-    fail "docker parity: tests/test_docker_parity.sh not found or not executable ($docker_script)"
-  elif "$docker_script"; then
-    pass "docker/ distribution (helper menus, guide examples, line endings) in sync with muxm"
-  else
-    fail "docker/ distribution OUT OF SYNC with muxm — see ❌ lines above (stale profile name, line endings, or missing bundle file)"
-  fi
+  _run_parity_script "${tests_dir}/test_docker_parity.sh" "docker parity" \
+    "docker/ distribution (helper menus, guide examples, line endings) in sync with muxm" \
+    "docker/ distribution OUT OF SYNC with muxm — see ❌ lines above (stale profile name, line endings, or missing bundle file)"
 
   # Cross-check the prose docs (README profile table + config_profile.md
   # sections, and the AV1 _crf_ratio table) against the canonical VALID_PROFILES / script.
   _test_docs_prose_drift
+  # Cross-check the hand-maintained profile subset in tools/hw_compare.sh (A-1).
+  _test_tools_profile_drift
   # Ratchet against new `else → skip` soft-skip anti-patterns in the harness.
   _test_meta_soft_skip
 }

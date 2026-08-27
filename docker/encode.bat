@@ -1,9 +1,13 @@
 @echo off
-setlocal enabledelayedexpansion
-REM Run from this script's own folder. A right-click "Run as administrator"
-REM starts cmd in C:\Windows\System32, where docker-compose.yml / input / output
-REM are not -- without this, the checks below fire with misleading messages.
-cd /d "%~dp0"
+REM Scope every variable this script sets. The original single
+REM `setlocal enabledelayedexpansion` on line 2 did both jobs at once; the "!" check
+REM below has to run with delayed expansion OFF, so the scope push and the expansion
+REM mode are now two statements. Without this first one, the variables set before the
+REM second setlocal would leak into the caller's environment when run from an existing
+REM prompt. `disabledelayedexpansion` is stated explicitly rather than inherited so the
+REM detection still works if the script is launched from a `cmd /V:ON` prompt.
+setlocal disabledelayedexpansion
+
 REM ============================================================================
 REM  MuxMaster -- Encode Videos on Windows
 REM
@@ -13,6 +17,45 @@ REM    2. Double-click this file
 REM    3. Choose a profile when prompted
 REM    4. Encoded files appear in the "output" folder
 REM ============================================================================
+
+REM Run from this script's own folder. A right-click "Run as administrator"
+REM starts cmd in C:\Windows\System32, where docker-compose.yml / input / output
+REM are not -- without this, the checks below fire with misleading messages.
+cd /d "%~dp0"
+
+REM L-13: a filename containing "!" is mangled by the delayed expansion turned on
+REM below. The numbered file menu stores and echoes every name through !var!
+REM syntax, which consumes the character, so such a file would be listed -- and
+REM handed to the encoder -- under a name that does not exist, and only that
+REM encode fails, with a confusing "no such file". The guide already tells users
+REM to rename these; this turns that documented trade-off into an actual message.
+REM
+REM This whole block runs BEFORE `setlocal enabledelayedexpansion`, deliberately:
+REM it is the only point in the script where the literal character survives, so it
+REM is the only point where the offending names can be matched (findstr needs no
+REM escaping here) and echoed back correctly. Naming them beats a bare "one of your
+REM files is bad", and it is why the warning prints above the banner rather than
+REM next to the file menu. `if not defined` reads the live environment, so the
+REM header prints once no matter how many files match.
+set "bangnames="
+for /f "delims=" %%b in ('dir /b input\*.mkv input\*.mp4 input\*.m4v input\*.mov input\*.avi input\*.ts input\*.m2ts input\*.wmv input\*.flv input\*.webm 2^>nul ^| findstr /c:"!"') do (
+    if not defined bangnames (
+        echo.
+        echo  [WARNING] These files in your "input" folder have an exclamation mark
+        echo  in the name. Windows batch scripting removes that character, so they
+        echo  would reach the encoder under a name that does not exist and only
+        echo  those encodes would fail. Rename them, then run this again:
+        echo.
+    )
+    set "bangnames=1"
+    echo     %%b
+)
+if defined bangnames (
+    echo.
+    pause
+)
+
+setlocal enabledelayedexpansion
 
 echo.
 echo  =============================================

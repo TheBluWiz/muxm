@@ -8781,7 +8781,10 @@ build_av1_params() {
 # mastering-display / 144 content-light) that libx265 writes from the same
 # side data — invisible while the output stays in a container, but the DV
 # path muxes a raw ES (see v_needs_raw_es in run_video_pipeline) where the
-# container carrier does not exist. Tracked separately; not fixed here.
+# container carrier does not exist. That gap (review N-1) is closed at the
+# final mux, not here: _hdr10_static_carry re-attaches the source's values as
+# input options on the video input. Passing them to this encode instead is
+# inert — VT ignores them and still writes no SEI (verified).
 #
 # Reads:  VIDEO_ENCODER_FFMPEG, VIDEO_CODEC, HW_ACCEL_QUALITY, VT_QUALITY_MAP,
 #         VT_QUALITY_DEFAULT, PROFILE_NAME, HW_ACCEL_ALLOW_SW, OUTPUT_EXT,
@@ -9463,6 +9466,156 @@ _check_hdr10_static_metadata() {
   else
     report_add "hdr10_static_metadata" "present"
   fi
+}
+
+# ---- HDR10 static metadata carry-forward (review N-1) ---------------------------------------
+# hevc_videotoolbox does not emit the HDR10 static-metadata SEI messages (payload type 137
+# mastering-display-colour-volume, 144 content-light-level) that libx265 writes from the same
+# AVMasteringDisplayMetadata / AVContentLightMetadata input side data: ffmpeg's libx265 wrapper
+# forwards that side data into x265's own parameters, and VideoToolbox has no equivalent hook.
+#
+# With a CONTAINER intermediate this is invisible — the muxer writes container-level metadata from
+# the same side data, and a VT-encoded MKV carries byte-identical MasteringMetadata plus
+# MaxCLL/MaxFALL to the libx265 one. The exposure is the Dolby Vision path: run_video_pipeline sets
+# v_needs_raw_es=1 and encodes to a raw Annex-B elementary stream (-f hevc) so dovi_tool can inject
+# the RPU. There is no container to carry the metadata, and the SEI that would have carried it
+# in-band was never written. mux_final's existing raw-ES compensation (_vid_lacks_src_meta) maps
+# chapters and GLOBAL tags only — not stream-level HDR10 side data. DV Profile 8 content is an
+# HDR10 base layer plus an RPU and normally DOES carry mastering display and MaxCLL, so a player
+# falling back from DV to the base layer found no static metadata and tone-mapped against defaults.
+# Measured end to end (DV P8.1 source with both, .mp4 out, --no-video-copy-if-compliant):
+#   --hw-accel none         → mastering YES, MaxCLL YES, RPU YES, dvcC YES
+#   --hw-accel videotoolbox → mastering NO,  MaxCLL NO,  RPU YES, dvcC YES
+# i.e. Dolby Vision itself survives VT intact; the loss is precisely the HDR10 static metadata.
+#
+# Fix: re-attach the SOURCE's values as ffmpeg INPUT options on the video input at the final mux,
+# where the muxer turns them back into mdcv/clli (MP4) or MasteringMetadata + MaxCLL (Matroska).
+# The two alternatives do not work:
+#   * the hevc_metadata bitstream filter used for the VUI colour stamp exposes only
+#     colour_primaries / transfer_characteristics / matrix_coefficients / video_full_range_flag;
+#   * passing the options to the VT ENCODE is inert — verified, VT still writes no SEI — so the
+#     final mux is the only point at which the values can re-enter the pipeline.
+
+# _ffmpeg_hdr10_static_opts_ok — true when this ffmpeg accepts the -mastering_display /
+# -content_light input options WITH the value grammar used below. Probed functionally rather than
+# by version comparison or a help-text grep: muxm has no ffmpeg version floor to compare against,
+# and an option can exist while its value grammar differs. One 16x16 null-muxed frame, memoized.
+declare -i _FF_HDR10_STATIC_OPTS=-1
+_ffmpeg_hdr10_static_opts_ok() {
+  if (( _FF_HDR10_STATIC_OPTS < 0 )); then
+    _FF_HDR10_STATIC_OPTS=0
+    if ffmpeg -hide_banner -loglevel quiet \
+         -mastering_display:v "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)" \
+         -content_light:v "1000,400" \
+         -f lavfi -i "color=c=black:s=16x16:d=0.04" -f null - >/dev/null 2>&1; then
+      _FF_HDR10_STATIC_OPTS=1
+    fi
+    log "[hdr10-static] ffmpeg -mastering_display/-content_light supported: ${_FF_HDR10_STATIC_OPTS}"
+  fi
+  (( _FF_HDR10_STATIC_OPTS == 1 ))
+}
+
+# _hdr10_static_probe FILE — echo "<mastering-display>\t<max-cll>" for FILE's first video frame.
+# Either field is empty when FILE does not carry it; the tab is always present.
+#   mastering display → "G(gx,gy)B(bx,by)R(rx,ry)WP(wx,wy)L(max,min)", chromaticity in 1/50000
+#     units and luminance in 1/10000 cd/m² — exactly the grammar ffmpeg's -mastering_display
+#     option parses (and the one x265's master-display= uses).
+#   max-cll → "MaxCLL,MaxFALL".
+# Read from FRAME side data: ffmpeg 9's -show_streams reports neither, even for an MP4 whose
+# mdcv/clli boxes are present, so METADATA_CACHE cannot answer this and one frame is probed
+# instead (the same -read_intervals %+#1 probe _check_hdr10_static_metadata falls back to). One
+# frame is enough — both are static, per-stream values.
+# rat() divides the reported rational instead of assuming the /50000 and /10000 denominators
+# ffprobe happens to print unreduced today.
+_hdr10_static_probe() {
+  local f="${1:-}"
+  if [[ -z "$f" || ! -s "$f" ]]; then printf '\t'; return 0; fi
+  local out
+  out="$(ffprobe "${FFPROBE_FLAGS[@]}" -show_frames -read_intervals %+#1 -select_streams v:0 \
+           -of json "$f" 2>/dev/null | jq -r '
+    def rat($s): ($s|tostring|split("/")) as $p
+      | (if ($p|length) == 2 then (($p[0]|tonumber) / ($p[1]|tonumber)) else ($p[0]|tonumber) end);
+    def chroma($s): ((rat($s) * 50000) | round);
+    def lum($s):    ((rat($s) * 10000) | round);
+    [ .frames[0].side_data_list[]? ] as $sd
+    | ([ $sd[] | select((.side_data_type // "") | test("mastering.display"; "i")) ][0]) as $m
+    | ([ $sd[] | select((.side_data_type // "") | test("content.light";     "i")) ][0]) as $c
+    | ( if ($m == null or ($m.green_x // null) == null) then ""
+        else "G(\(chroma($m.green_x)),\(chroma($m.green_y)))B(\(chroma($m.blue_x)),\(chroma($m.blue_y)))R(\(chroma($m.red_x)),\(chroma($m.red_y)))WP(\(chroma($m.white_point_x)),\(chroma($m.white_point_y)))L(\(lum($m.max_luminance)),\(lum($m.min_luminance)))"
+        end )
+      + "\t"
+      + ( if ($c == null or ($c.max_content // null) == null) then ""
+          else "\($c.max_content),\($c.max_average)" end )' 2>/dev/null || true)"
+  # Any probe/jq failure (unreadable file, no video stream, jq arithmetic on a malformed
+  # rational) degrades to "carries neither" rather than to a half-parsed record.
+  [[ "$out" == *$'\t'* ]] || out=$'\t'
+  printf '%s' "$out"
+}
+
+# HDR10_STATIC_ARGS — ffmpeg INPUT options prepended to the video input in mux_final. Empty
+# unless the carry-forward below actually fires.
+HDR10_STATIC_ARGS=()
+
+# _hdr10_static_carry VIDEO_INPUT — populate HDR10_STATIC_ARGS[] so the final mux re-attaches the
+# source's mastering-display / MaxCLL values to VIDEO_INPUT.
+#
+# Gated on all four of:
+#   1. the output is genuinely HDR — PROFILE_DESC is HDR10 or HLG. An SDR or tone-mapped output
+#      must never be stamped with the source's HDR mastering volume. HLG is included because the
+#      only values ever written are ones the SOURCE carried (nothing is invented) and DV Profile
+#      8.4 is HLG-based, losing them by the same mechanism.
+#   2. VIDEO_INPUT is actually missing them. Deliberately encoder-agnostic rather than keyed on
+#      hevc_videotoolbox: the libx265 raw ES DOES carry the SEI, ffprobe surfaces it from the raw
+#      Annex-B stream, and this returns having done nothing — so the software path (every Linux
+#      user, and the path that already worked) is provably untouched, with no container-supplied
+#      side data layered over its own coded values. It also means a container intermediate, which
+#      already carries the metadata, is a no-op.
+#   3. the source has values to give.
+#   4. this ffmpeg understands the options.
+# The two fields are carried independently: a source can have mastering display without MaxCLL or
+# the reverse, exactly as _check_hdr10_static_metadata already reports.
+_hdr10_static_carry() {
+  HDR10_STATIC_ARGS=()
+  local vid="${1:-}"
+  [[ -n "$vid" ]] || return 0
+
+  case "${PROFILE_DESC:-}" in
+    HDR10|HLG) ;;
+    *) return 0 ;;
+  esac
+
+  local have_md="" have_cll=""
+  _split_tab "$(_hdr10_static_probe "$vid")" have_md have_cll
+  # Already complete → nothing to do (the libx265 / container-intermediate case).
+  [[ -z "$have_md" || -z "$have_cll" ]] || return 0
+
+  local src_md="" src_cll=""
+  _split_tab "$(_hdr10_static_probe "$SRC_ABS")" src_md src_cll
+  [[ -n "$src_md" || -n "$src_cll" ]] || return 0
+
+  local -a want=() carried=()
+  if [[ -z "$have_md" && -n "$src_md" ]]; then
+    want+=( -mastering_display:v "$src_md" )
+    carried+=( "mastering-display" )
+  fi
+  if [[ -z "$have_cll" && -n "$src_cll" ]]; then
+    want+=( -content_light:v "$src_cll" )
+    carried+=( "max-cll" )
+  fi
+  (( ${#want[@]} )) || return 0
+
+  if ! _ffmpeg_hdr10_static_opts_ok; then
+    warn "This ffmpeg cannot re-attach HDR10 static metadata (-mastering_display/-content_light unavailable)."
+    warn "  The output will carry no mastering-display/MaxCLL values, so a player that falls back from Dolby Vision to the HDR10 base layer tone-maps against defaults."
+    warn "  Upgrade ffmpeg, or encode with --hw-accel none (libx265 writes the metadata into the bitstream itself)."
+    report_add "hdr10_static_carry" "unsupported by this ffmpeg (${carried[*]} lost)"
+    return 0
+  fi
+
+  HDR10_STATIC_ARGS=( "${want[@]}" )
+  note "Re-attaching the source's HDR10 static metadata (${carried[*]}) at the final mux — ${VIDEO_ENCODER_FFMPEG:-the encoder} wrote no SEI carrying it."
+  log  "[hdr10-static] carry args: ${HDR10_STATIC_ARGS[*]}"
+  report_add "hdr10_static_carry" "${carried[*]} (from source)"
 }
 
 # ===== Section 25: Temp paths =================================================================
@@ -13632,7 +13785,11 @@ mux_final() {
     # Prefer DV pre-wrapped MP4 over raw ES — it carries the dvcC/dvvC box
     # that ffmpeg will copy through to the final output container.
     note "Using DV pre-wrapped MP4 as video input (dvcC box present)."
-    ff_in+=( -i "$V_DV_MP4" )
+    # N-1: restore the source's HDR10 static metadata if this wrap lost it (VideoToolbox writes
+    # no mastering-display / content-light SEI, and the DV wrap is built from that raw ES).
+    # No-op when the wrap already carries both — see _hdr10_static_carry.
+    _hdr10_static_carry "$V_DV_MP4"
+    ff_in+=( ${HDR10_STATIC_ARGS[@]+"${HDR10_STATIC_ARGS[@]}"} -i "$V_DV_MP4" )
     vid_idx=$next_idx
     next_idx=$(( next_idx + 1 ))
     _vid_lacks_src_meta=1   # M-9: the raw-ES wrap carries no source chapters/global metadata
@@ -13647,7 +13804,12 @@ mux_final() {
     if [[ "$V_MIXED" == *.hevc && -n "$SRC_FPS" ]]; then
       ff_in+=( -r "$SRC_FPS" )
     fi
-    ff_in+=( -i "$V_MIXED" )
+    # N-1: same carry-forward as the DV pre-wrap arm above. It fires on the raw .hevc ES a
+    # VideoToolbox DV encode produces (no SEI, no container = nothing carries the metadata) and
+    # is a measured no-op on a libx265 ES or a .mkv/.mp4 intermediate, both of which already
+    # carry it. Placed with -r, before -i: these are INPUT options and must precede their file.
+    _hdr10_static_carry "$V_MIXED"
+    ff_in+=( ${HDR10_STATIC_ARGS[@]+"${HDR10_STATIC_ARGS[@]}"} -i "$V_MIXED" )
     vid_idx=$next_idx
     next_idx=$(( next_idx + 1 ))
     # M-9: a raw HEVC ES (*.hevc) carries no source chapters/global metadata; a .mkv/.mp4 intermediate

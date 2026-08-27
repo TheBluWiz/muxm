@@ -91,6 +91,10 @@ But filenames containing `!` or `%` will cause errors. Rename them first:
 - `What a Movie!.mkv` -- rename to `What a Movie.mkv`
 - `100% True.mkv` -- rename to `100 Percent True.mkv`
 
+`encode.bat` catches the `!` case for you: before it does anything else it lists
+any affected filenames and waits, so you can rename them instead of watching just
+those encodes fail. The `%` case is not detected -- check those yourself.
+
 ### Option A: Double-Click (Easy)
 
 1. Copy a video file into the **`input`** folder.

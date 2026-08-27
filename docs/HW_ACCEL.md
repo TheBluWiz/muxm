@@ -79,6 +79,32 @@ Software encoders continue to use `build_x265_params` and `build_av1_params`. `b
 
 Hardware encoders do **not** accept `-x265-params`; `build_videotoolbox_params()` translates CRF/preset into `-q:v` (VideoToolbox's native quality knob). A future `build_nvenc_params()` will use `-cq`/`-preset p7` for NVENC when implemented.
 
+### HDR10 static metadata on the VideoToolbox arm
+
+`hevc_videotoolbox` does not emit the HDR10 static-metadata SEI messages (payload type 137
+mastering-display-colour-volume, 144 content-light-level) that `libx265` writes from the same
+input side data — ffmpeg's libx265 wrapper forwards that side data into x265's own parameters,
+and VideoToolbox exposes no equivalent hook. The `hevc_metadata` bitstream filter
+`build_videotoolbox_params` uses for the SPS VUI colour stamp cannot substitute: it exposes only
+`colour_primaries` / `transfer_characteristics` / `matrix_coefficients` / `video_full_range_flag`.
+
+For output that stays in a container this is invisible — the muxer writes container-level
+metadata from the same side data, and a VT-encoded MKV carries byte-identical
+`MasteringMetadata` plus MaxCLL/MaxFALL to the libx265 one. The exposure is the **Dolby Vision**
+path, where `run_video_pipeline` encodes to a raw Annex-B elementary stream so `dovi_tool` can
+inject the RPU: no container, and no in-band SEI either. A player falling back from DV to the
+HDR10 base layer then found no static metadata at all and tone-mapped against defaults.
+
+`_hdr10_static_carry` (called from `mux_final`, immediately before the video input) closes this:
+it probes the intermediate, and when the intermediate is missing values the **source** carries, it
+re-attaches them as ffmpeg `-mastering_display` / `-content_light` input options so the final
+muxer writes them back as `mdcv`/`clli` (MP4) or `MasteringMetadata` + MaxCLL (Matroska). It is
+encoder-agnostic and self-limiting: the libx265 elementary stream already carries the SEI, so
+the software path is a measured no-op. Only values present in the source are ever written, and
+never on an SDR or tone-mapped output. An ffmpeg too old for those options warns and degrades to
+the previous behaviour — `_ffmpeg_hdr10_static_opts_ok` probes for them functionally rather than
+by version.
+
 Because the VideoToolbox backend silently drops the software encode knobs, muxm warns at config time (before `--print-effective-config` exits) when a user **explicitly** types a flag that the resolved backend or codec ignores — never blocking, just surfacing. These warnings are gated on the `_CLI_*_EXPLICIT` trackers, so a value supplied by a profile or config file never warns. Covered cases: `--crf`/`--preset`/`--x265-params`/`--x264-params` under the VideoToolbox backend; `--hw-accel-quality` without any hardware backend; `--av1-params`/`--av1-maxrate`/`--av1-bufsize` on a non-AV1 codec; `--x265-params`/`--x264-params` on the wrong codec; and `--level` on an AV1 encode.
 
 ---
