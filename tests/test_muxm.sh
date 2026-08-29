@@ -9662,6 +9662,7 @@ test_edge() {
   _test_edge_disk_undeterminable_duration
   _test_edge_recycled_pid_lock_reclaimed
   _test_edge_control_char_nonc_locale
+  _test_edge_comma_decimal_locale
   _test_edge_duration_subsecond
 }
 
@@ -9762,6 +9763,49 @@ _test_edge_control_char_nonc_locale() {
     pass "edge-control-char-nonc-locale: the LC_ALL=C-pinned control-char guard fires under a UTF-8 locale ($_utf8_locale, exit 11)"
   else
     fail "edge-control-char-nonc-locale: expected exit 11 + a control-char message under en_US.UTF-8, got exit $_code"
+  fi
+  rm -rf "$_d"
+}
+
+# H-1 (checklist review 2026-08-29): muxm's numeric guards must survive an ambient LC_ALL set to a
+# COMMA-DECIMAL locale. POSIX precedence is LC_ALL > LC_* > LANG, so the former `LC_NUMERIC=C printf`
+# prefixes were silently INERT under LC_ALL=de_DE.UTF-8 — ffprobe emits "1.500000", bash's
+# locale-aware printf rejected it, and set -e killed EVERY run inside disk_free_warn before any
+# encode work began.
+#
+# This test exists because _test_edge_control_char_nonc_locale, the only other non-C locale test,
+# selects en_US/C.UTF-8 — both PERIOD-decimal — and therefore cannot observe this class at all.
+# A period-decimal "non-C" locale is not coverage for numeric parsing; only a comma-decimal one is.
+_test_edge_comma_decimal_locale() {
+  if ! ffmpeg_has_encoder libx265; then
+    skip "edge-comma-decimal-locale: ffmpeg lacks libx265 — cannot build the fixture"
+    return
+  fi
+  # Honesty guard: if no comma-decimal locale is installed, LC_ALL=<loc> silently falls back to C
+  # and the test would hollow-pass on the exact path it exists to cover. Skip instead.
+  local _loc
+  _loc="$(locale -a 2>/dev/null | grep -iE '^(de_DE|fr_FR|es_ES|pt_BR|it_IT|nl_NL)\.utf-?8$' | head -1)"
+  if [[ -z "$_loc" ]]; then
+    skip "edge-comma-decimal-locale: no comma-decimal UTF-8 locale installed — cannot exercise the numeric path"
+    return
+  fi
+  local _d; _d="$(mktemp -d "$TESTDIR/commaloc.XXXXXX")"
+  local _src="$_d/src.mkv"
+  # Fractional duration on purpose: ffprobe reports "1.500000", precisely the string a
+  # comma-decimal printf rejects. (Any duration would do — ffprobe always emits decimals — but a
+  # fractional one makes the intent explicit.)
+  ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=160x120:rate=24:duration=1.5" \
+    -c:v libx265 -preset ultrafast -crf 30 -pix_fmt yuv420p "$_src" 2>/dev/null
+  if [[ ! -s "$_src" ]]; then
+    skip "edge-comma-decimal-locale: could not build the fixture"
+    rm -rf "$_d"; return
+  fi
+  local _out _code
+  _out="$( cd "$_d" && LC_ALL="$_loc" "$MUXM" --dry-run --output-ext mkv "$_src" out.mkv 2>&1 )" && _code=$? || _code=$?
+  if [[ "$_code" == "0" ]]; then
+    pass "edge-comma-decimal-locale: full dry-run completes under $_loc (an ambient LC_ALL cannot defeat the numeric guards)"
+  else
+    fail "edge-comma-decimal-locale: expected exit 0 under $_loc, got $_code — an LC_ALL-defeatable LC_NUMERIC=C guard has regressed (H-1). Tail: $(printf '%s' "$_out" | tail -2 | tr '\n' ' ')"
   fi
   rm -rf "$_d"
 }
@@ -17715,7 +17759,7 @@ _test_docs_prose_drift() {
 #    catches creep in the config/CLI suites.
 _test_meta_soft_skip() {
   local self="${BASH_SOURCE[0]}"
-  local -i baseline=62   # History: 80→65 (converted 15 soft-skips to fail); 65→62 (replaced the R28/R29 tonemap dry-run skips with a real encode and converted the avi-fixture else-skip to a positive guard); 62→61 (replaced the host-gated NVENC-stub else-skip with a host-independent unit test); 61→60 (converted the _codec_max_channels else-skip to fail — a committed function's absence is drift, not host-optionality); 60→62 (Test_Review.md Tier A #7: widened detection to also catch a one-line if/then/else compound whose else-branch is a bare soft-skip call, and a multiline else-branch whose soft-skip call is followed by one more statement before fi — 2 pre-existing soft-skips the old anchored/adjacent-fi-only regex missed are now correctly counted; this bump reflects corrected detection, not new soft-skips). LOWER as more convert; never raise.
+  local -i baseline=61   # History: 80→65 (converted 15 soft-skips to fail); 65→62 (replaced the R28/R29 tonemap dry-run skips with a real encode and converted the avi-fixture else-skip to a positive guard); 62→61 (replaced the host-gated NVENC-stub else-skip with a host-independent unit test); 61→60 (converted the _codec_max_channels else-skip to fail — a committed function's absence is drift, not host-optionality); 60→62 (Test_Review.md Tier A #7: widened detection to also catch a one-line if/then/else compound whose else-branch is a bare soft-skip call, and a multiline else-branch whose soft-skip call is followed by one more statement before fi — 2 pre-existing soft-skips the old anchored/adjacent-fi-only regex missed are now correctly counted; this bump reflects corrected detection, not new soft-skips); 62→61 (checklist review 2026-08-29 L-1: took the notch the ratchet had been reporting on every green run — the count had already been 61, so this locks in an existing gain rather than reflecting a new conversion. The two tests added in that pass, _test_edge_comma_decimal_locale and _test_locale_numeric_guard, both use the sanctioned skip-first guard shape and so add nothing to this count). LOWER as more convert; never raise.
   local -i found
   found="$(awk '
     function trim(s){ gsub(/^[ \t]+|[ \t]+$/,"",s); return s }
@@ -17870,6 +17914,35 @@ _test_tools_profile_drift() {
 
 # _run_parity_script SCRIPT LABEL PASS_MSG FAIL_MSG — delegate one generated-artifact
 # check to its standalone script and translate the exit code into the harness counters.
+# _test_locale_numeric_guard — H-1 ratchet (checklist review 2026-08-29).
+#
+# No EXECUTABLE line in muxm may carry an `LC_NUMERIC=` prefix. POSIX locale precedence is
+# LC_ALL > LC_* > LANG, so such a prefix is silently inert whenever the caller exports LC_ALL —
+# which is exactly how muxm came to hard-fail on every invocation under a comma-decimal locale
+# (nine sites: _get_source_duration_secs, filesize_pretty, _gb, _fps_to_decimal, and main's
+# frame-rate integrity check). LC_ALL=C is the only pin that holds, and it is what the sibling
+# tools/*.sh have always used.
+#
+# COMMENTS ARE DELIBERATELY EXEMPT. muxm's header Locale-safety block discusses LC_NUMERIC by
+# name — that block is the documentation this guard enforces — so matching comment lines would
+# make the guard fail on its own rationale. Only executable code is asserted.
+#
+# This is a static ratchet (runs media-free, in the docs suite, so CI sees it on every PR);
+# _test_edge_comma_decimal_locale is the behavioural half that proves the end-to-end run.
+_test_locale_numeric_guard() {
+  if [[ ! -r "$MUXM" ]]; then
+    skip "locale-numeric-guard: cannot read $MUXM"
+    return
+  fi
+  local _hits
+  _hits="$(grep -nE 'LC_NUMERIC=' "$MUXM" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+  if [[ -z "$_hits" ]]; then
+    pass "locale-numeric-guard: no executable LC_NUMERIC= in muxm (every numeric guard is LC_ALL=C — an ambient LC_ALL cannot defeat it)"
+  else
+    fail "locale-numeric-guard: executable LC_NUMERIC= found — INERT under an ambient LC_ALL, reintroducing H-1. Use LC_ALL=C instead. Offending: $(printf '%s' "$_hits" | tr '\n' ' ')"
+  fi
+}
+
 # L-9: test_docs_parity() held three byte-for-byte copies of the same
 # not-executable→fail / run→pass / else→fail wiring; a third clone was one too many.
 # The scripts print their own ✅/❌ detail (and the diff on failure), so nothing is
@@ -17912,6 +17985,8 @@ test_docs_parity() {
   _test_docs_prose_drift
   # Cross-check the hand-maintained profile subset in tools/hw_compare.sh (A-1).
   _test_tools_profile_drift
+  # Ratchet against a relapse to LC_ALL-defeatable LC_NUMERIC=C numeric guards (H-1).
+  _test_locale_numeric_guard
   # Ratchet against new `else → skip` soft-skip anti-patterns in the harness.
   _test_meta_soft_skip
 }

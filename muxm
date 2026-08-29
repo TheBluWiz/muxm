@@ -75,15 +75,32 @@ shopt -s inherit_errexit 2>/dev/null || true
 # intermediate temp files using > redirection throughout the pipeline stages.
 # noclobber would break this pattern.
 #
-# Locale safety (audited 2026-02-27):
+# Locale safety (audited 2026-02-27; numeric guards re-audited 2026-08-29):
 #   - _lower() uses LC_ALL=C for tr '[:upper:]' '[:lower:]'
 #   - Hot paths use ${var,,} (Bash builtin, locale-independent for ASCII)
 #   - All grep -i patterns are pure ASCII (DOVI, dolby, profile, RPU, etc.)
 #   - All =~ [0-9] ranges are POSIX-safe regardless of locale
 #   - The [a-zA-Z0-9] range in OCR tool sanitization is a security reject-list
 #     (conservative direction under exotic locales)
-#   - LC_NUMERIC=C guards all printf %.Nf calls that receive bc decimal output
+#   - LC_ALL=C — NOT LC_NUMERIC=C — guards every printf/awk %.Nf call that receives
+#     ffprobe or bc decimal output. This distinction is load-bearing, not stylistic.
+#
+#     POSIX locale precedence is LC_ALL > LC_* > LANG. LC_ALL, when set in the
+#     environment, OVERRIDES every individual LC_* variable — so a per-command
+#     `LC_NUMERIC=C printf …` prefix is silently INERT under `LC_ALL=de_DE.UTF-8`.
+#     ffprobe emits C-locale decimals ("8.600000"); bash's printf then parses via a
+#     locale-aware strtod expecting ',', rejects the value, and set -e turns that into
+#     a fatal error. Every muxm run died in disk_free_warn under such an environment
+#     (checklist review 2026-08-29, finding H-1). LANG alone is harmless — LC_NUMERIC
+#     outranks LANG — which is why this survived four prior reviews and a green suite.
+#
+#     Do NOT "simplify" any of these back to LC_NUMERIC=C. Guarded by
+#     _test_locale_numeric_guard (docs suite), which fails on any executable
+#     LC_NUMERIC= in this file, and exercised end-to-end by
+#     _test_edge_comma_decimal_locale (edge suite).
 #   Validated by: LANG=C LC_ALL=C tests/test_muxm.sh --suite all
+#   AND by a comma-decimal locale (de_DE/fr_FR/es_ES/pt_BR) — a period-decimal locale
+#   such as en_US.UTF-8 cannot exercise this class at all.
 
 # Naming convention: a leading underscore marks an internal/"private" helper not meant to be
 # called from outside its subsystem; unprefixed names are the public-ish entry points (main, the
@@ -105,11 +122,11 @@ fi
 # ===== Section 2: Branding / CLI constants =====================================================
 readonly APP_NAME="MuxMaster"
 readonly CLI_NAME="muxm"
-readonly VERSION="1.6.0"
+readonly VERSION="1.6.1"
 # Release date for the man-page .TH line, co-located with VERSION so a release bump updates
 # both together. _man_emit substitutes it for the __DATE__ token (like __VERSION__) — the date is no
 # longer a hidden literal buried mid-heredoc that the docs-parity guard can't see drifting.
-readonly RELEASE_DATE="2026-08-17"
+readonly RELEASE_DATE="2026-08-29"
 
 # Canonical list of valid profile names (space-separated for compgen/iteration).
 # All profile validation, error messages, completions, and config generators
@@ -877,7 +894,7 @@ _get_source_duration_secs() {
     '[.streams[] | select(.codec_type=="video")] | .[0].duration // empty' | head -n1)"
   if [[ "$dur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     log "Duration source: stream duration = ${dur}s"
-    result="$(LC_NUMERIC=C printf '%.0f' "$dur")"
+    result="$(LC_ALL=C printf '%.0f' "$dur")"
   fi
 
   # Tier 2: container/format-level duration (most containers)
@@ -886,7 +903,7 @@ _get_source_duration_secs() {
       '.format.duration // empty' | head -n1)"
     if [[ "$dur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
       log "Duration source: format duration = ${dur}s"
-      result="$(LC_NUMERIC=C printf '%.0f' "$dur")"
+      result="$(LC_ALL=C printf '%.0f' "$dur")"
     fi
   fi
 
@@ -1087,11 +1104,11 @@ filesize_pretty(){
 
   # Human-readable formatting
   if (( bytes >= BYTES_PER_GIB )); then
-    LC_NUMERIC=C printf '%.2f GB (%s bytes)\n' "$(echo "scale=2; $bytes/$BYTES_PER_GIB" | bc)" "$bytes"
+    LC_ALL=C printf '%.2f GB (%s bytes)\n' "$(echo "scale=2; $bytes/$BYTES_PER_GIB" | bc)" "$bytes"
   elif (( bytes >= BYTES_PER_MIB )); then
-    LC_NUMERIC=C printf '%.1f MB (%s bytes)\n' "$(echo "scale=1; $bytes/$BYTES_PER_MIB" | bc)" "$bytes"
+    LC_ALL=C printf '%.1f MB (%s bytes)\n' "$(echo "scale=1; $bytes/$BYTES_PER_MIB" | bc)" "$bytes"
   elif (( bytes >= 1024 )); then
-    LC_NUMERIC=C printf '%.0f KB\n' "$(echo "scale=0; $bytes/1024" | bc)"
+    LC_ALL=C printf '%.0f KB\n' "$(echo "scale=0; $bytes/1024" | bc)"
   else
     printf '%s bytes\n' "$bytes"
   fi
@@ -1258,8 +1275,14 @@ _fs_dev(){
 # Globals: WORKDIR (read, for volume fallback)
 _check_disk_full() {
   local errfile="${1:-}"
-  # Check error log text first (most reliable — ffmpeg prints the OS error)
-  if [[ -f "$errfile" ]] && grep -q "No space left on device" "$errfile" 2>/dev/null; then
+  # Check error log text first (most reliable — ffmpeg prints the OS error).
+  # LC_ALL=C-pinned: this literal is strerror(ENOSPC), which glibc LOCALIZES when a message
+  # catalog is installed (de_DE renders it "Auf dem Gerät ist kein Speicherplatz mehr
+  # verfügbar"), so an unpinned match could silently miss on Linux. Pinning costs nothing and
+  # keeps the probe deterministic. Advisory only either way — both branches merely warn, the
+  # caller dies regardless, and the df fallback below is locale-independent — so a miss would
+  # have cost a specific hint, never the detection. Same C-locale-assumption class as H-1.
+  if [[ -f "$errfile" ]] && LC_ALL=C grep -q "No space left on device" "$errfile" 2>/dev/null; then
     warn "Disk full: 'No space left on device' detected — free space on the output volume and retry."
     return 0
   fi
@@ -6852,7 +6875,8 @@ SRC_ABS="$(realpath_fallback "$SRC")"
 # RV3-16: pin LC_ALL=C so [[:cntrl:]] classifies by byte (0x00-0x1f, 0x7f) deterministically — a
 # non-C locale can reclassify the control set. `[[` is a keyword and can't take an env prefix, so
 # scope the assignment to a subshell (one-shot check; the fork is negligible). Matches the file's
-# other locale-pinned checks (LC_ALL=C tr/awk/sort, LC_NUMERIC=C printf).
+# other locale-pinned checks, which are uniformly LC_ALL=C (tr/awk/sort/printf) — see the Locale
+# safety block in the header for why LC_NUMERIC=C is never sufficient (an ambient LC_ALL outranks it).
 if ( LC_ALL=C; [[ "$SRC_ABS" =~ [[:cntrl:]] ]] ); then
   die 11 "Source filename contains control characters - potential security risk. Rename the file to remove control characters."
 fi
@@ -7636,12 +7660,18 @@ _crf_ratio() {
 }
 
 # _preset_multiplier PRESET — echo encode-size multiplier ×1000 relative to medium
-# Faster presets typically produce larger files at the same CRF.
+# Faster presets typically produce larger files at the same CRF, so this table must be
+# monotonic non-increasing in x265 preset-speed order (ultrafast → veryslow).
+# 2026-08-29 (checklist review L-3): veryfast was 1000, which sat BELOW the slower
+# faster/fast (1050) and so violated that premise — `--preset veryfast` estimated a smaller
+# output than `--preset fast`. Reads as a transcription slip; corrected to 1050 to match its
+# neighbours. Effect is a ~5% larger (more conservative) est_video_bytes in disk_free_warn,
+# well inside the 25% safety margin applied there.
 _preset_multiplier() {
   case "${1:-medium}" in
     ultrafast) echo 2000 ;;
     superfast) echo 1400 ;;
-    veryfast)  echo 1000 ;;
+    veryfast)  echo 1050 ;;
     faster)    echo 1050 ;;
     fast)      echo 1050 ;;
     medium)    echo 1000 ;;
@@ -7676,7 +7706,7 @@ _gb() {
   local _bcv
   _bcv="$(echo "scale=2; ${1:-0} / $BYTES_PER_GIB" | bc 2>/dev/null)" || _bcv=""
   if [[ "$_bcv" =~ ^[0-9]*\.?[0-9]+$ ]]; then
-    LC_NUMERIC=C printf '%.1f' "$_bcv"
+    LC_ALL=C printf '%.1f' "$_bcv"
   else
     printf '%d' "$(( ${1:-0} / BYTES_PER_GIB ))"
   fi
@@ -8411,11 +8441,11 @@ _fps_to_decimal(){
       local num="${r%%/*}" den="${r##*/}"
       [[ "$num" =~ ^[0-9]+$ && "$den" =~ ^[0-9]+$ ]] || return 0
       (( den == 0 || num == 0 )) && return 0
-      LC_NUMERIC=C awk -v n="$num" -v d="$den" 'BEGIN{ printf "%.4f", n/d }'
+      LC_ALL=C awk -v n="$num" -v d="$den" 'BEGIN{ printf "%.4f", n/d }'
       ;;
     *)
       [[ "$r" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 0
-      LC_NUMERIC=C awk -v n="$r" 'BEGIN{ if (n+0 == 0) exit; printf "%.4f", n }'
+      LC_ALL=C awk -v n="$r" 'BEGIN{ if (n+0 == 0) exit; printf "%.4f", n }'
       ;;
   esac
 }
@@ -14570,7 +14600,7 @@ main() {
         _src_fps_dec="$(_fps_to_decimal "$SRC_FPS")"
         if [[ -n "$_src_fps_dec" ]]; then
           local _fps_ok
-          _fps_ok="$(LC_NUMERIC=C awk -v s="$_src_fps_dec" -v o="$v_fps" \
+          _fps_ok="$(LC_ALL=C awk -v s="$_src_fps_dec" -v o="$v_fps" \
             'BEGIN{ d=s-o; if (d<0) d=-d; print (s>0 && d/s <= 0.01) ? 1 : 0 }')"
           if [[ "$_fps_ok" != "1" ]]; then
             die 45 "Frame-rate integrity check failed: source ${_src_fps_dec} fps but output ${v_fps} fps. This would cause progressive audio desync; refusing to ship a desynced encode. See log: $LOGFILE"
