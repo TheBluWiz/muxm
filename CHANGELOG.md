@@ -670,6 +670,8 @@ Initial public release.
 - Structured exit codes for scripting and automation (10 = missing tool, 11 = bad arguments, 12 = corrupt source, 40–43 = pipeline failures)
 - Comprehensive test harness (`test_muxm.sh`) with 18 test suites and ~165 assertions
 
+[1.6.1]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.6.1
+[1.6.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.6.0
 [1.5.1]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.5.1
 [1.5.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.5.0
 [1.4.0]: https://github.com/TheBluWiz/MuxMaster/releases/tag/v1.4.0

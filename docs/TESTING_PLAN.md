@@ -842,31 +842,88 @@ jobs:
 
 ### Locale Regression Testing
 
-All locale-sensitive operations in `muxm` have been audited (see comment block in
-Section 1 of the script). The script is locale-safe by design:
+All locale-sensitive operations in `muxm` have been audited (see the Locale-safety
+comment block in Section 1 of the script).
+
+> **Audit corrected 2026-08-29 (checklist review H-1).** The row below for `printf`
+> locale formatting previously read **`0` / ✅ N/A** — asserting the category did not
+> exist in muxm. It did: nine sites. That false zero is a large part of why a fatal
+> numeric-locale defect survived four prior reviews and a green suite. The counts are
+> now derived from the source rather than asserted; re-derive them (commands below)
+> rather than trusting this table if it looks stale again.
 
 | Category | Count | Status | Notes |
 |----------|-------|--------|-------|
-| `_lower()` via `tr` | 1 | ✅ Guarded | `LC_ALL=C` prefix already present |
+| `_lower()` via `tr` | 1 | ✅ Guarded | `LC_ALL=C` prefix |
 | `${var,,}` (Bash builtin) | 19 | ✅ Safe | Locale-independent for ASCII input |
 | `grep -i` with ASCII patterns | 20 | ✅ Safe | Patterns are pure ASCII (DOVI, dolby, etc.) |
 | `=~` with `[0-9]` ranges | 21 | ✅ Safe | POSIX-defined, locale-independent |
 | `=~` with `[a-zA-Z0-9]` | 1 | ✅ Safe | OCR tool sanitization (reject-list; conservative direction) |
-| `sort` | 0 | ✅ N/A | — |
-| `printf` locale formatting | 0 | ✅ N/A | — |
+| `[[:cntrl:]]` filename guards | 3 | ✅ Guarded | `( LC_ALL=C; [[ … ]] )` subshell — byte-deterministic |
+| `sort` | 1 | ✅ Guarded | `LC_ALL=C` prefix (external-subtitle ordering) |
+| **`printf` decimal formatting** | **6** | ✅ Guarded | **`LC_ALL=C`** — see the warning below |
+| **`awk` decimal formatting** | **3** | ✅ Guarded | **`LC_ALL=C`** — see the warning below |
+| **`awk` decimal comparison** | **1** | ✅ Guarded | `LC_ALL=C` — fps integrity check. Uses `print`, not `printf`, so a `%f` grep **misses it**; check `LC_ALL=C awk` sites too |
+| `awk` integer/string only | 7 | ✅ Safe | Line counts, `df`/`du` field extraction, string equality — no decimals |
+| `grep` of `strerror` text | 1 | ✅ Guarded | `LC_ALL=C` — glibc localizes `strerror(ENOSPC)` |
+
+> ⚠️ **`LC_NUMERIC=C` is NOT sufficient and must never be used here.** POSIX locale
+> precedence is `LC_ALL` > `LC_*` > `LANG`, so an `LC_ALL` set in the caller's
+> environment **overrides** a per-command `LC_NUMERIC=C` prefix, rendering it inert.
+> Under `LC_ALL=de_DE.UTF-8` this made every muxm run die in `disk_free_warn`:
+> `ffprobe` emits `8.600000`, bash's locale-aware `printf` rejected it, and `set -e`
+> turned that into `Build FAILED`. `LANG` alone is harmless (`LC_NUMERIC` outranks
+> `LANG`), which is exactly why it hid for so long. Enforced by
+> `_test_locale_numeric_guard` (docs suite).
 
 **Running the locale test:**
 
 ```bash
-# Full suite under C locale (should produce identical results to default locale)
+# 1. C locale — the "everything pinned" direction (identical results expected)
 LANG=C LC_ALL=C tests/test_muxm.sh --muxm ./muxm --suite all
 
-# Quick smoke test (fast suites only)
-LANG=C LC_ALL=C tests/test_muxm.sh --muxm ./muxm --suite cli
+# 2. COMMA-DECIMAL locale — the direction that actually finds numeric bugs.
+#    A period-decimal "non-C" locale (en_US.UTF-8, C.UTF-8) does NOT exercise this
+#    class and must not be substituted. Needs the locale installed:
+#      Linux: sudo apt-get install -y locales && sudo locale-gen de_DE.UTF-8
+LC_ALL=de_DE.UTF-8 tests/test_muxm.sh --muxm ./muxm --suite all
+
+# 3. Direct smoke test of the failing path (fastest reproduction)
+LC_ALL=de_DE.UTF-8 ./muxm --dry-run --output-ext mkv tests/fixtures/HDR1080p.MOV
 ```
 
-If any tests fail under `LANG=C` that pass under the default locale, investigate
-whether the failing `tr`/`grep`/`sed`/`sort` call needs a `LC_ALL=C` prefix.
+**Re-deriving the counts above** (do this rather than trusting the table):
+
+```bash
+# Decimal printf/awk sites — every one MUST carry an LC_ALL=C prefix.
+# NOTE the comment filter: without it this reports a false positive on the
+# explanatory comment above _gb, which quotes printf '%.1f' in prose.
+grep -nE '(printf|awk)[^|]*%[-0-9.]*f' muxm \
+  | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vc 'LC_ALL=C'          # must print 0
+
+# The %f grep above is necessary but NOT sufficient — it misses decimal work done
+# without a %f conversion (e.g. the fps integrity check's `print (d/s <= 0.01)`).
+# Review every awk site by hand; anything touching a decimal needs the prefix.
+grep -nE '\bawk\b' muxm | grep -vE '^[0-9]+:[[:space:]]*#' | grep -v 'LC_ALL=C'
+
+# Relapse check — must print nothing (comments excluded; the header Locale-safety
+# block legitimately discusses LC_NUMERIC by name). This is what
+# _test_locale_numeric_guard automates.
+grep -nE 'LC_NUMERIC=' muxm | grep -vE '^[0-9]+:[[:space:]]*#'
+```
+
+If a test fails under a **non-C** locale but passes under `C`, the failing call needs
+an `LC_ALL=C` prefix — that is the direction real defects appear in. A failure under
+`LANG=C`/`LC_ALL=C` that passes by default is the rarer inverse (usually a `tr`/`sort`
+collation assumption) and is investigated the same way.
+
+**CI note:** `.github/workflows/tests.yml` runs only the media-free suites, so the
+behavioural test (`_test_edge_comma_decimal_locale`, `edge` suite) does **not** run
+there today, and would skip regardless on a runner with no comma-decimal locale
+installed. CI's protection is the static `_test_locale_numeric_guard` ratchet, which
+catches the offending code without needing the environment that exposes it. Running
+the full suite inside the `docker/` image — already the documented next step — is
+where the behavioural half would gain CI coverage.
 
 ---
 
