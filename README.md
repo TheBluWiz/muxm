@@ -603,7 +603,7 @@ This is a solo project — not taking outside code contributions right now, but 
 If you're using MuxMaster, I'd love to hear about it — what's working, what's not, what workflows you're using it for. This is a solo project and real-world feedback shapes what gets built next.
 
 - **Bug reports** → [GitHub Issues](https://github.com/TheBluWiz/MuxMaster/issues)
-- **Everything else** (feedback, licensing, questions) → [thebluwiz@thoughtspace.place](mailto:thebluwiz@thoughtspace.place)
+- **Everything else** (feedback, licensing, questions) → [thebluwiz@icloud.com](mailto:thebluwiz@icloud.com)
 
 ---
 
